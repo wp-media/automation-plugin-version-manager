@@ -1,0 +1,9 @@
+[package]
+name = "apvm-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]

@@ -1,0 +1,11 @@
+[package]
+name = "apvm"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "apvm"
+path = "src/main.rs"
+
+[dependencies]
+apvm-core = { path = "../core" }
