@@ -56,14 +56,16 @@ impl Apvm {
         project: &str,
         version: &str,
         pr_number: u64,
-    ) -> Result<build::BuildOutput> {
+        variants: Option<&[&str]>,
+    ) -> Result<()> {
         // Now we pass references - no new instances created
         let cmd = commands::BuildCommand::new(
             &self.github,
             &self.cache,
             &self.registry,
         );
+        let variants = variants.unwrap_or(&[]);
 
-        cmd.execute(project, version, pr_number).await
+        cmd.execute(project, version, pr_number, variants).await
     }
 }

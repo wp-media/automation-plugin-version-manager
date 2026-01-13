@@ -28,11 +28,18 @@ impl<'a> BuildCommand<'a> {
     }
 
     /// Execute the build command.
+    ///
+    /// # Arguments
+    /// * `project` - Project name from registry
+    /// * `version` - Version to build
+    /// * `pr_number` - Pull request number
+    /// * `variants` - Specific variants to build (empty = all)
     pub async fn execute(
         &self,
         project: &str,
         version: &str,
         pr_number: u64,
+        variants: &[&str],
     ) -> Result<()> {
         // 1. Look up project in registry
         let project_info = self.registry.get(project)?;
@@ -46,6 +53,12 @@ impl<'a> BuildCommand<'a> {
         tracing::info!("Building {} v{} from PR #{}", project, version, pr_number);
         tracing::debug!("PR: {} -> {}", pr.head_branch, pr.base_branch);
 
+        if variants.is_empty() {
+            tracing::info!("Building all variants");
+        } else {
+            tracing::info!("Building variants: {}", variants.join(", "));
+        }
+
         // 3. Get or clone repository
         let repo = self.cache.get_or_clone(&project_info.repo_url, &project_info.repo)?;
 
@@ -55,6 +68,8 @@ impl<'a> BuildCommand<'a> {
 
         // 5. Run the build using the project's builder
         let mut runner = BuildRunner::new(repo.path().to_path_buf());
-        runner.execute_build(project_info.builder.as_ref(), version).await
+        runner
+            .execute_build(project_info.builder.as_ref(), version, variants)
+            .await
     }
 }

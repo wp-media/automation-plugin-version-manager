@@ -101,7 +101,20 @@ impl BuildRunner {
     }
 
     /// Run a full build using a Builder.
-    pub async fn execute_build(&mut self, builder: &dyn Builder, version: &str) -> Result<()> {
+    /// 
+    /// # Arguments
+    /// * `builder` - The project-specific builder
+    /// * `version` - Version string for the build
+    /// * `variants` - Specific variants to build (empty = all variants)
+    pub async fn execute_build(
+        &mut self,
+        builder: &dyn Builder,
+        version: &str,
+        variants: &[&str],
+    ) -> Result<()> {
+        // Validate requested variants
+        builder.validate_variants(variants).map_err(Error::Build)?;
+
         // Check required commands
         Self::check_required_commands(&builder.required_commands())?;
 
@@ -126,8 +139,8 @@ impl BuildRunner {
             self.run(&cmd).await?;
         }
 
-        // Run build commands
-        for cmd in builder.build_commands(version) {
+        // Run build commands for specified variants
+        for cmd in builder.build_commands(version, variants) {
             println!("Running: {}", cmd);
             self.run(&cmd).await?;
         }
