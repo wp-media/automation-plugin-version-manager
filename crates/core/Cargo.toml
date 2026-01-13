@@ -7,3 +7,24 @@ edition.workspace = true
 crate-type = ["rlib"]
 
 [dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# GitHub API client
+octocrab = { workspace = true }
+
+# Git operations (pure Rust)
+gix = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging and diagnostics
+tracing = { workspace = true }
+
+# Platform directories (config, cache, etc.)
+directories = { workspace = true }
