@@ -1,6 +1,6 @@
 //! Build command implementation.
 
-use crate::build::{BuildOutput, BuildRunner};
+use crate::build::BuildRunner;
 use crate::error::Result;
 use crate::git::RepoCache;
 use crate::github::GitHubClient;
@@ -33,7 +33,7 @@ impl<'a> BuildCommand<'a> {
         project: &str,
         version: &str,
         pr_number: u64,
-    ) -> Result<BuildOutput> {
+    ) -> Result<()> {
         // 1. Look up project in registry
         let project_info = self.registry.get(project)?;
 
@@ -53,9 +53,8 @@ impl<'a> BuildCommand<'a> {
         repo.fetch()?;
         repo.checkout(&pr.head_branch)?;
 
-        // 5. Run the build
-        let runner = BuildRunner::new(repo.path().to_path_buf());
-        let script = project_info.builder.build_command(version);
-        runner.run(&script).await
+        // 5. Run the build using the project's builder
+        let mut runner = BuildRunner::new(repo.path().to_path_buf());
+        runner.execute_build(project_info.builder.as_ref(), version).await
     }
 }

@@ -3,7 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use which::which;
+
 use crate::error::{Error, Result};
+
+use super::plugins::{Builder, OptionalCommand};
 
 /// Output from a build run.
 #[derive(Debug)]
@@ -40,6 +44,41 @@ impl BuildRunner {
         Self { working_dir }
     }
 
+    /// Check if a command is available in PATH.
+    pub fn command_exists(cmd: &str) -> bool {
+        which(cmd).is_ok()
+    }
+
+    /// Verify all required commands are available.
+    pub fn check_required_commands(commands: &[&str]) -> Result<()> {
+        let missing: Vec<&str> = commands
+            .iter()
+            .filter(|cmd| !Self::command_exists(cmd))
+            .copied()
+            .collect();
+
+        if !missing.is_empty() {
+            return Err(Error::Build(format!(
+                "Missing required commands: {}. Please install them and ensure they are in PATH.",
+                missing.join(", ")
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Install optional commands if missing.
+    pub async fn ensure_optional_commands(&self, commands: &[OptionalCommand]) -> Result<()> {
+        for cmd in commands {
+            if !Self::command_exists(cmd.name) {
+                println!("Info: '{}' is not installed. Attempting to install...", cmd.name);
+                self.run(cmd.install_cmd).await?;
+                println!("Info: '{}' installed successfully.", cmd.name);
+            }
+        }
+        Ok(())
+    }
+
     /// Run a shell command.
     pub async fn run(&self, command: &str) -> Result<BuildOutput> {
         let output = tokio::process::Command::new("sh")
@@ -53,12 +92,48 @@ impl BuildRunner {
 
         if !build_output.success {
             return Err(Error::Build(format!(
-                "Command '{}' failed with exit code {:?}",
-                command, build_output.exit_code
+                "Command '{}' failed with exit code {:?}: {}",
+                command, build_output.exit_code, build_output.stderr
             )));
         }
 
         Ok(build_output)
+    }
+
+    /// Run a full build using a Builder.
+    pub async fn execute_build(&mut self, builder: &dyn Builder, version: &str) -> Result<()> {
+        // Check required commands
+        Self::check_required_commands(&builder.required_commands())?;
+
+        // Install optional commands if needed
+        self.ensure_optional_commands(&builder.optional_commands()).await?;
+
+        // Change to build subdirectory if specified
+        if let Some(subdir) = builder.build_subdirectory() {
+            let new_dir = self.working_dir.join(subdir);
+            if !new_dir.exists() {
+                return Err(Error::Build(format!(
+                    "Build directory '{}' does not exist. Try cloning the repository first.",
+                    new_dir.display()
+                )));
+            }
+            self.working_dir = new_dir;
+        }
+
+        // Run setup commands
+        for cmd in builder.setup_commands() {
+            println!("Running: {}", cmd);
+            self.run(&cmd).await?;
+        }
+
+        // Run build commands
+        for cmd in builder.build_commands(version) {
+            println!("Running: {}", cmd);
+            self.run(&cmd).await?;
+        }
+
+        println!("Build completed successfully.");
+        Ok(())
     }
 
     /// Get the working directory.
