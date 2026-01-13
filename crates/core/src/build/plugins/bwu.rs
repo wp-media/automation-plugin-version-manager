@@ -26,10 +26,6 @@ impl Builder for BackWPupBuilder {
         }]
     }
 
-    fn build_subdirectory(&self) -> Option<&'static str> {
-        None
-    }
-
     fn setup_commands(&self) -> Vec<String> {
         vec![
             "composer install".to_string(),
