@@ -1,28 +1,12 @@
 //! Configuration loading and saving.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result};
-
-/// Project-specific configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectConfig {
-    /// Repository URL (HTTPS).
-    pub repo_url: String,
-    /// Default branch name.
-    #[serde(default = "default_branch")]
-    pub default_branch: String,
-}
-
-fn default_branch() -> String {
-    "develop".to_string()
-}
-
-use std::sync::LazyLock;
+use crate::error::Result;
 
 static APVM_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     BaseDirs::new()
@@ -30,6 +14,11 @@ static APVM_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
         .unwrap_or_else(|| PathBuf::from(".apvm"))
 });
 
+static  DEFAULT_APVM_BUILDS_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+        BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join("apvm-builds"))
+        .unwrap_or_else(|| PathBuf::from("apvm-builds"))
+});
 
 /// Main application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,9 +26,10 @@ pub struct Config {
     /// GitHub Personal Access Token.
     pub github_token: Option<String>,
     /// Cache directory for cloned repositories.
+    #[serde(default = "Config::default_cache_dir")]
     pub cache_dir: PathBuf,
-    /// Configured projects.
-    pub projects: HashMap<String, ProjectConfig>,
+    #[serde(default = "Config::default_builds_dir")]
+    pub builds_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -47,7 +37,7 @@ impl Default for Config {
         Self {
             github_token: None,
             cache_dir: Self::default_cache_dir(),
-            projects: HashMap::new(),
+            builds_dir: Self::default_builds_dir(),
         }
     }
 }
@@ -80,16 +70,22 @@ impl Config {
     }
 
     /// Get the configuration file path (~/.apvm/config.json).
-    fn config_file_path() -> PathBuf {
+    pub fn config_file_path() -> PathBuf {
         APVM_DIR.join("config.json")
     }
 
-    /// Get the default cache directory (~/.apvm/.cache).
-    fn default_cache_dir() -> PathBuf {
-        APVM_DIR.join(".cache")
+    /// Get the default cache directory (~/.apvm/cache).
+    pub fn default_cache_dir() -> PathBuf {
+        APVM_DIR.join("cache")
     }
-    #[allow(unused)]
-    fn config_dir() -> PathBuf {
-        APVM_DIR.clone()
+
+    /// Get the default builds directory (~/apvm-builds).
+    pub fn default_builds_dir() -> PathBuf {
+        DEFAULT_APVM_BUILDS_DIR.clone()
+    }
+
+    /// Get the APVM directory (~/.apvm).
+    pub fn apvm_dir() -> &'static PathBuf {
+        &APVM_DIR
     }
 }

@@ -2,8 +2,10 @@
 
 use std::collections::HashMap;
 
-use crate::build::plugins::Builder;
+use crate::build::plugins::{BackWPupBuilder, Builder};
 use crate::error::{Error, Result};
+
+pub const DEFAULT_BRANCH_NAME: &str = "develop";
 
 /// A known project.
 pub struct Project {
@@ -15,6 +17,8 @@ pub struct Project {
     pub owner: String,
     /// Repository name (GitHub).
     pub repo: String,
+    /// Default branch name.
+    pub default_branch: String,
     /// Project-specific builder.
     pub builder: Box<dyn Builder>,
 }
@@ -30,6 +34,26 @@ impl ProjectRegistry {
         Self {
             projects: HashMap::new(),
         }
+    }
+
+    /// Create registry with all known projects.
+    pub fn with_known_projects() -> Self {
+        let mut registry = Self::new();
+
+        // Register all supported projects
+        registry.register(Project {
+            name: "backwpup".to_string(),
+            repo_url: "https://github.com/wp-media/backwpup-pro.git".to_string(),
+            owner: "wp-media".to_string(),
+            repo: "backwpup-pro".to_string(),
+            default_branch: DEFAULT_BRANCH_NAME.to_string(),
+            builder: Box::new(BackWPupBuilder),
+        });
+
+        // Add more projects here as you implement their builders
+        // registry.register(Project { ... });
+
+        registry
     }
 
     /// Register a project.
