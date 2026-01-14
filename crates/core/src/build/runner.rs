@@ -101,11 +101,95 @@ impl BuildRunner {
     }
 
     /// Run a full build using a Builder.
-    /// 
+    ///
+    /// This method orchestrates the complete build process for a project by executing
+    /// a well-defined sequence of steps. Each step must complete successfully before
+    /// proceeding to the next.
+    ///
+    /// # Build Sequence
+    ///
+    /// ```text
+    /// ┌─────────────────────────────────────────────────────────────┐
+    /// │                    BUILD PROCESS FLOW                       │
+    /// └─────────────────────────────────────────────────────────────┘
+    ///
+    /// 1. VALIDATE VARIANTS
+    ///    │  └─► Ensures requested variants are supported by the builder
+    ///    ▼
+    /// 2. CHECK REQUIRED COMMANDS
+    ///    │  └─► Verifies all required CLI tools are available in PATH
+    ///    ▼
+    /// 3. ENSURE OPTIONAL COMMANDS
+    ///    │  └─► Installs optional tools if missing (e.g., composer plugins)
+    ///    ▼
+    /// 4. CHANGE TO BUILD SUBDIRECTORY (if specified)
+    ///    │  └─► Switches working directory to project-specific build folder
+    ///    ▼
+    /// 5. RUN SETUP COMMANDS
+    ///    │  └─► Executes dependency installation (npm install, composer install)
+    ///    ▼
+    /// 6. PRE-BUILD HOOK
+    ///    │  └─► Builder-specific preparation (modify configs, set versions)
+    ///    ▼
+    /// 7. RUN BUILD COMMANDS
+    ///    │  └─► Executes variant-specific build scripts (compile, bundle)
+    ///    ▼
+    /// 8. BUILD HOOK
+    ///    │  └─► Builder-specific mid-build processing
+    ///    ▼
+    /// 9. POST-BUILD HOOK
+    ///    │  └─► Cleanup, artifact packaging, file organization
+    ///    ▼
+    /// ✓ BUILD COMPLETE
+    /// ```
+    ///
     /// # Arguments
-    /// * `builder` - The project-specific builder
-    /// * `version` - Version string for the build
-    /// * `variants` - Specific variants to build (empty = all variants)
+    ///
+    /// * `builder` - A trait object implementing [`Builder`] that provides project-specific
+    ///   build configuration (commands, hooks, variants)
+    /// * `version` - The semantic version string for this build (e.g., `"3.17.4"`)
+    /// * `variants` - Slice of variant names to build. Pass an empty slice to build all
+    ///   variants defined by the builder
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - All build steps completed successfully
+    /// * `Err(Error::Build)` - A build step failed with details about the failure
+    /// * `Err(Error::Io)` - File system or process execution error
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - An invalid variant is requested (not supported by the builder)
+    /// - A required command is missing from PATH
+    /// - The build subdirectory doesn't exist
+    /// - Any setup, build, or hook command fails
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::path::PathBuf;
+    /// use crate::build::runner::BuildRunner;
+    /// use crate::build::plugins::wp_rocket::WpRocketBuilder;
+    ///
+    /// async fn build_plugin() -> Result<(), Error> {
+    ///     let mut runner = BuildRunner::new(PathBuf::from("/path/to/repo"));
+    ///     let builder = WpRocketBuilder::new();
+    ///     
+    ///     // Build specific variants
+    ///     runner.execute_build(&builder, "3.17.4", &["pro", "starter"]).await?;
+    ///     
+    ///     // Or build all variants
+    ///     runner.execute_build(&builder, "3.17.4", &[]).await?;
+    ///     
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// This method mutates `self` because it may change the `working_dir` if the
+    /// builder specifies a build subdirectory.
     pub async fn execute_build(
         &mut self,
         builder: &dyn Builder,
@@ -113,7 +197,7 @@ impl BuildRunner {
         variants: &[&str],
     ) -> Result<()> {
         // Validate requested variants
-        builder.validate_variants(variants).map_err(Error::Build)?;
+        builder.validate_variants(variants)?;
 
         // Check required commands
         Self::check_required_commands(&builder.required_commands())?;
@@ -138,13 +222,18 @@ impl BuildRunner {
             println!("Running: {}", cmd);
             self.run(&cmd).await?;
         }
+        // Pre-build hook
+        builder.pre_build_hook(&self.working_dir, version, variants)?;
 
         // Run build commands for specified variants
         for cmd in builder.build_commands(version, variants) {
             println!("Running: {}", cmd);
             self.run(&cmd).await?;
         }
-
+        // Build hook
+        builder.build_hook(&self.working_dir, version, variants)?;
+        // Post-build hook
+        builder.post_build_hook(&self.working_dir, version, variants)?;
         println!("Build completed successfully.");
         Ok(())
     }

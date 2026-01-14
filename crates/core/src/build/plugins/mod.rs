@@ -2,7 +2,12 @@
 
 mod bwu;
 
+use std::path::PathBuf;
+
 pub use bwu::BackWPupBuilder;
+
+use crate::Result;
+use crate::error::Error;
 
 /// A buildable variant of a project.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -47,6 +52,21 @@ pub trait Builder: Send + Sync {
     /// Get setup commands (run once before building).
     fn setup_commands(&self) -> Vec<String>;
 
+    /// Hook called before the build starts.
+    fn pre_build_hook(&self, _working_dir: &PathBuf, _version: &str, _variants: &[&str]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Hook called during the build process. Useful if no build commands are defined.
+    fn build_hook(&self, _working_dir: &PathBuf, _version: &str, _variants: &[&str]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Hook called after the build completes.
+    fn post_build_hook(&self, _working_dir: &PathBuf, _version: &str, _variants: &[&str]) -> Result<()> {
+        Ok(())
+    }
+
     /// Get all available build variants.
     /// Returns empty Vec if project has no variants (single output).
     fn variants(&self) -> Vec<BuildVariant> {
@@ -72,7 +92,7 @@ pub trait Builder: Send + Sync {
     }
 
     /// Validate requested variants.
-    fn validate_variants(&self, requested: &[&str]) -> Result<(), String> {
+    fn validate_variants(&self, requested: &[&str]) -> Result<()> {
         if !self.has_variants() {
             // No variants = ignore the request, build everything
             return Ok(());
@@ -81,11 +101,11 @@ pub trait Builder: Send + Sync {
         let available: Vec<&str> = self.variants().iter().map(|v| v.id).collect();
         for variant in requested {
             if !available.contains(variant) {
-                return Err(format!(
+                return Err(Error::Build(format!(
                     "Unknown variant '{}'. Available: {}",
                     variant,
                     available.join(", ")
-                ));
+                )));
             }
         }
         Ok(())

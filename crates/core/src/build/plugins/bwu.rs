@@ -1,5 +1,7 @@
 //! BackWPup project builder.
 
+use std::path::PathBuf;
+use crate::Result;
 use super::{BuildArtifact, BuildVariant, Builder, OptionalCommand};
 
 /// Builder for the BackWPup project.
@@ -51,6 +53,24 @@ impl Builder for BackWPupBuilder {
                 description: "BackWPup Pro English version",
             },
         ]
+    }
+
+    fn pre_build_hook(&self, working_dir: &PathBuf, _version: &str, _variants: &[&str]) -> Result<()> {
+        // Remove previous build artifacts matching backwpup-*.zip pattern
+        let pattern = working_dir.join("backwpup-*.zip");
+        let pattern_str = pattern.to_string_lossy();
+
+        let entries = glob::glob(&pattern_str).map_err(|_| {
+            crate::error::Error::Build(format!("Failed to read glob pattern in backwpup pre_build_hook: {}", pattern_str))
+        })?;
+
+        for entry in entries.flatten() {
+            std::fs::remove_file(&entry).map_err(|e| {
+                crate::error::Error::Build(format!("Failed to remove previous artifact {}: {}", entry.display(), e))
+            })?;
+        }
+
+        Ok(())
     }
 
     fn build_commands(&self, version: &str, variants: &[&str]) -> Vec<String> {

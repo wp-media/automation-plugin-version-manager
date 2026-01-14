@@ -28,4 +28,7 @@ tracing = { workspace = true }
 
 # Platform directories (config, cache, etc.)
 directories = { workspace = true }
+
 which = "8.0.0"
+
+glob = "0.3"
