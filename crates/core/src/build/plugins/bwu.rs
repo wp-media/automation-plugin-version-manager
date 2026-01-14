@@ -1,6 +1,6 @@
 //! BackWPup project builder.
 
-use super::{Builder, BuildVariant, OptionalCommand};
+use super::{BuildArtifact, BuildVariant, Builder, OptionalCommand};
 
 /// Builder for the BackWPup project.
 pub struct BackWPupBuilder;
@@ -33,7 +33,7 @@ impl Builder for BackWPupBuilder {
         ]
     }
 
-    fn available_variants(&self) -> Vec<BuildVariant> {
+    fn variants(&self) -> Vec<BuildVariant> {
         vec![
             BuildVariant {
                 id: Self::VARIANT_FREE,
@@ -55,9 +55,9 @@ impl Builder for BackWPupBuilder {
 
     fn build_commands(&self, version: &str, variants: &[&str]) -> Vec<String> {
         // Determine which variants to build
-        let variants_to_build: Vec<&str> = if variants.is_empty() {
+        let to_build: Vec<&str> = if variants.is_empty() {
             // Build all variants if none specified
-            self.available_variants().iter().map(|v| v.id).collect()
+            self.variants().iter().map(|v| v.id).collect()
         } else {
             variants.to_vec()
         };
@@ -69,7 +69,7 @@ impl Builder for BackWPupBuilder {
         ];
 
         // Add variant-specific commands
-        for variant in variants_to_build {
+        for variant in to_build {
             match variant {
                 Self::VARIANT_FREE => {
                     commands.push(format!(
@@ -94,5 +94,40 @@ impl Builder for BackWPupBuilder {
         }
 
         commands
+    }
+
+    fn artifacts(&self, version: &str, variants: &[&str]) -> Vec<BuildArtifact> {
+        let to_build = if variants.is_empty() {
+            vec![Self::VARIANT_FREE, Self::VARIANT_PRO_DE, Self::VARIANT_PRO_EN]
+        } else {
+            variants.to_vec()
+        };
+
+        to_build
+            .iter()
+            .filter_map(|variant| {
+                let (source, target) = match *variant {
+                    Self::VARIANT_FREE => (
+                        format!("backwpup.{}.zip", version),
+                        format!("backwpup-{}-free.zip", version),
+                    ),
+                    Self::VARIANT_PRO_DE => (
+                        format!("backwpup-pro.{}.de.zip", version),
+                        format!("backwpup-{}-pro-de.zip", version),
+                    ),
+                    Self::VARIANT_PRO_EN => (
+                        format!("backwpup-pro.{}.en.zip", version),
+                        format!("backwpup-{}-pro-en.zip", version),
+                    ),
+                    _ => return None,
+                };
+
+                Some(BuildArtifact {
+                    variant_id: Some(variant.to_string()),
+                    source_path: source,
+                    target_name: target,
+                })
+            })
+            .collect()
     }
 }
