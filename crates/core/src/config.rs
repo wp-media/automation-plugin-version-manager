@@ -14,12 +14,6 @@ static APVM_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
         .unwrap_or_else(|| PathBuf::from(".apvm"))
 });
 
-static  DEFAULT_APVM_BUILDS_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-        BaseDirs::new()
-        .map(|dirs| dirs.home_dir().join("apvm-builds"))
-        .unwrap_or_else(|| PathBuf::from("apvm-builds"))
-});
-
 /// Main application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -28,8 +22,6 @@ pub struct Config {
     /// Cache directory for cloned repositories.
     #[serde(default = "Config::default_cache_dir")]
     pub cache_dir: PathBuf,
-    #[serde(default = "Config::default_builds_dir")]
-    pub builds_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -37,7 +29,6 @@ impl Default for Config {
         Self {
             github_token: None,
             cache_dir: Self::default_cache_dir(),
-            builds_dir: Self::default_builds_dir(),
         }
     }
 }
@@ -77,11 +68,6 @@ impl Config {
     /// Get the default cache directory (~/.apvm/cache).
     pub fn default_cache_dir() -> PathBuf {
         APVM_DIR.join("cache")
-    }
-
-    /// Get the default builds directory (~/apvm-builds).
-    pub fn default_builds_dir() -> PathBuf {
-        DEFAULT_APVM_BUILDS_DIR.clone()
     }
 
     /// Get the APVM directory (~/.apvm).
