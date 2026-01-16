@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal crates
+apvm-config = { workspace = true }
 apvm-core = { workspace = true }
 
 # CLI argument parsing
@@ -16,6 +17,9 @@ clap = { workspace = true }
 
 # Async runtime (needed for #[tokio::main])
 tokio = { workspace = true }
+
+# Serialization (for config file I/O)
+serde_json = { workspace = true }
 
 # Logging and diagnostics (for CLI output)
 tracing = { workspace = true }

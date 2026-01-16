@@ -7,6 +7,9 @@ edition.workspace = true
 crate-type = ["rlib"]
 
 [dependencies]
+# Internal crates
+apvm-config = { workspace = true }
+
 # Async runtime
 tokio = { workspace = true }
 
@@ -25,9 +28,6 @@ thiserror = { workspace = true }
 
 # Logging and diagnostics
 tracing = { workspace = true }
-
-# Platform directories (config, cache, etc.)
-directories = { workspace = true }
 
 which = "8.0.0"
 

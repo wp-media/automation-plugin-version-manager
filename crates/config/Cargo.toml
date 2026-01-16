@@ -1,0 +1,17 @@
+[package]
+name = "apvm-config"
+version.workspace = true
+edition.workspace = true
+description = "Configuration and path management for APVM"
+license = "MIT"
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+
+# Platform directories (home, config, etc.)
+directories = { workspace = true }
+
+[dev-dependencies]
+# For testing serialization
+serde_json = { workspace = true }

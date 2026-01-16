@@ -80,18 +80,29 @@ dependencies = [
 name = "apvm"
 version = "0.1.0"
 dependencies = [
+ "apvm-config",
  "apvm-core",
  "clap",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "apvm-core"
+name = "apvm-config"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "apvm-core"
+version = "0.1.0"
+dependencies = [
+ "apvm-config",
  "gix",
  "glob",
  "octocrab",

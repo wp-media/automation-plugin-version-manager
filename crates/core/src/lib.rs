@@ -5,14 +5,13 @@
 
 pub mod build;
 pub mod commands;
-pub mod config;
 pub mod error;
 pub mod git;
 pub mod github;
 pub mod projects;
 
-// Re-export commonly used types
-pub use config::Config;
+// Re-export config types from apvm-config
+pub use apvm_config::{Config, Paths, PathsBuilder};
 pub use error::{Error, Result};
 
 use git::RepoCache;
