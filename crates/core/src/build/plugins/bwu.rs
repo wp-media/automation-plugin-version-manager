@@ -116,38 +116,77 @@ impl Builder for BackWPupBuilder {
         commands
     }
 
-    fn artifacts(&self, version: &str, variants: &[&str]) -> Vec<BuildArtifact> {
+    fn artifacts(&self, working_dir: &PathBuf, version: &str, variants: &[&str]) -> crate::Result<Vec<BuildArtifact>> {
         let to_build = if variants.is_empty() {
             vec![Self::VARIANT_FREE, Self::VARIANT_PRO_DE, Self::VARIANT_PRO_EN]
         } else {
             variants.to_vec()
         };
 
-        to_build
-            .iter()
-            .filter_map(|variant| {
-                let (source, target) = match *variant {
-                    Self::VARIANT_FREE => (
-                        format!("backwpup.{}.zip", version),
-                        format!("backwpup-{}-free.zip", version),
-                    ),
-                    Self::VARIANT_PRO_DE => (
-                        format!("backwpup-pro.{}.de.zip", version),
-                        format!("backwpup-{}-pro-de.zip", version),
-                    ),
-                    Self::VARIANT_PRO_EN => (
-                        format!("backwpup-pro.{}.en.zip", version),
-                        format!("backwpup-{}-pro-en.zip", version),
-                    ),
-                    _ => return None,
-                };
+        // Actual build output format (includes 8-char commit hash):
+        // - Free:   backwpup-{version}-{commit8}.zip
+        // - Pro DE: backwpup-pro-de-{version}-{commit8}.zip
+        // - Pro EN: backwpup-pro-en-{version}-{commit8}.zip
+        //
+        // We use glob to find the actual files since commit hash is embedded in filename.
+        // pre_build_hook cleans all backwpup-*.zip, so only current build artifacts exist.
+        let mut artifacts = Vec::new();
 
-                Some(BuildArtifact {
-                    variant_id: Some(variant.to_string()),
-                    source_path: source,
-                    target_name: target,
-                })
-            })
-            .collect()
+        for variant in to_build {
+            let pattern = match variant {
+                Self::VARIANT_FREE => format!("backwpup-{}-*.zip", version),
+                Self::VARIANT_PRO_DE => format!("backwpup-pro-de-{}-*.zip", version),
+                Self::VARIANT_PRO_EN => format!("backwpup-pro-en-{}-*.zip", version),
+                _ => continue,
+            };
+
+            let full_pattern = working_dir.join(&pattern);
+            let pattern_str = full_pattern.to_string_lossy();
+
+            let matches: Vec<_> = glob::glob(&pattern_str)
+                .map_err(|e| crate::error::Error::Build(format!(
+                    "Invalid glob pattern '{}': {}", pattern, e
+                )))?
+                .filter_map(|r| r.ok())
+                .filter(|p| p.is_file())
+                .collect();
+
+            match matches.len() {
+                0 => {
+                    return Err(crate::error::Error::Build(format!(
+                        "No artifact found matching '{}'. Build may have failed.",
+                        pattern
+                    )));
+                }
+                1 => {
+                    let path = &matches[0];
+                    let filename = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| pattern.clone());
+
+                    // source_path is relative to working_dir
+                    artifacts.push(BuildArtifact {
+                        variant_id: Some(variant.to_string()),
+                        source_path: filename.clone(),
+                        target_name: filename, // Keep original name with commit hash
+                    });
+                }
+                n => {
+                    return Err(crate::error::Error::Build(format!(
+                        "Pattern '{}' matched {} files (expected 1): {}",
+                        pattern,
+                        n,
+                        matches.iter()
+                            .filter_map(|p| p.file_name())
+                            .map(|s| s.to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        }
+
+        Ok(artifacts)
     }
 }

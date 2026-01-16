@@ -84,7 +84,22 @@ pub trait Builder: Send + Sync {
     fn build_commands(&self, version: &str, variants: &[&str]) -> Vec<String>;
 
     /// Get the artifacts produced by the build.
-    fn artifacts(&self, version: &str, variants: &[&str]) -> Vec<BuildArtifact>;
+    ///
+    /// This method is called after the build completes. Builders should return
+    /// resolved, concrete paths to the produced artifacts. If the builder needs
+    /// to use glob patterns to locate files (e.g., when filenames contain commit
+    /// hashes), it should resolve them internally before returning.
+    ///
+    /// # Arguments
+    ///
+    /// * `working_dir` - The directory where the build ran
+    /// * `version` - The version that was built
+    /// * `variants` - The variants that were built (empty = all)
+    ///
+    /// # Returns
+    ///
+    /// A list of artifacts with resolved source paths.
+    fn artifacts(&self, working_dir: &PathBuf, version: &str, variants: &[&str]) -> Result<Vec<BuildArtifact>>;
 
     /// Get the subdirectory where the build should run.
     fn build_subdirectory(&self) -> Option<&'static str> {

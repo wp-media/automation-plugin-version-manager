@@ -240,8 +240,8 @@ impl BuildRunner {
         // Post-build hook
         builder.post_build_hook(&self.working_dir, version, variants)?;
 
-        // Collect artifacts
-        let build_artifacts = builder.artifacts(version, variants);
+        // Collect artifacts - builder resolves paths internally
+        let build_artifacts = builder.artifacts(&self.working_dir, version, variants)?;
         let artifacts = self.collect_artifacts(&build_artifacts)?;
 
         // Determine which variants were built
