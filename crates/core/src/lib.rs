@@ -51,13 +51,15 @@ impl Apvm {
     }
 
     /// Build a project from a PR.
+    ///
+    /// Returns the build result containing produced artifacts.
     pub async fn build_from_pr(
         &self,
         project: &str,
         version: &str,
         pr_number: u64,
         variants: Option<&[&str]>,
-    ) -> Result<()> {
+    ) -> Result<build::BuildResult> {
         // Now we pass references - no new instances created
         let cmd = commands::BuildCommand::new(
             &self.github,

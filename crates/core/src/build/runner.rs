@@ -7,7 +7,8 @@ use which::which;
 
 use crate::error::{Error, Result};
 
-use super::plugins::{Builder, OptionalCommand};
+use super::plugins::{BuildArtifact, Builder, OptionalCommand};
+use super::result::{BuildResult, ProducedArtifact};
 
 /// Output from a build run.
 #[derive(Debug)]
@@ -153,7 +154,7 @@ impl BuildRunner {
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - All build steps completed successfully
+    /// * `Ok(BuildResult)` - All build steps completed successfully with artifact information
     /// * `Err(Error::Build)` - A build step failed with details about the failure
     /// * `Err(Error::Io)` - File system or process execution error
     ///
@@ -177,10 +178,14 @@ impl BuildRunner {
     ///     let builder = WpRocketBuilder::new();
     ///     
     ///     // Build specific variants
-    ///     runner.execute_build(&builder, "3.17.4", &["pro", "starter"]).await?;
+    ///     let result = runner.execute_build(&builder, "3.17.4", &["pro", "starter"]).await?;
+    ///     println!("Built {} artifacts ({} bytes)", result.artifacts.len(), result.total_size());
     ///     
     ///     // Or build all variants
-    ///     runner.execute_build(&builder, "3.17.4", &[]).await?;
+    ///     let result = runner.execute_build(&builder, "3.17.4", &[]).await?;
+    ///     for artifact in &result.artifacts {
+    ///         println!("  - {} ({} bytes)", artifact.filename, artifact.size);
+    ///     }
     ///     
     ///     Ok(())
     /// }
@@ -195,7 +200,7 @@ impl BuildRunner {
         builder: &dyn Builder,
         version: &str,
         variants: &[&str],
-    ) -> Result<()> {
+    ) -> Result<BuildResult> {
         // Validate requested variants
         builder.validate_variants(variants)?;
 
@@ -234,8 +239,82 @@ impl BuildRunner {
         builder.build_hook(&self.working_dir, version, variants)?;
         // Post-build hook
         builder.post_build_hook(&self.working_dir, version, variants)?;
-        println!("Build completed successfully.");
-        Ok(())
+
+        // Collect artifacts
+        let build_artifacts = builder.artifacts(version, variants);
+        let artifacts = self.collect_artifacts(&build_artifacts)?;
+
+        // Determine which variants were built
+        let variants_built = if builder.has_variants() {
+            if variants.is_empty() {
+                builder.variants().iter().map(|v| v.id.to_string()).collect()
+            } else {
+                variants.iter().map(|v| v.to_string()).collect()
+            }
+        } else {
+            vec![]
+        };
+
+        println!("Build completed successfully. {} artifacts produced.", artifacts.len());
+
+        Ok(BuildResult::new(
+            artifacts,
+            self.working_dir.clone(),
+            version.to_string(),
+            variants_built,
+        ))
+    }
+
+    /// Collect and verify artifacts after build completes.
+    ///
+    /// This method takes the artifact definitions from the builder and verifies
+    /// that each expected file exists. For each verified file, it reads the size
+    /// and creates a `ProducedArtifact` with the full path.
+    ///
+    /// # Arguments
+    ///
+    /// * `build_artifacts` - Artifact definitions from the builder
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<ProducedArtifact>)` - All artifacts collected successfully
+    /// * `Err(Error::Build)` - An expected artifact file was not found
+    ///
+    /// # Example
+    ///
+    /// ```text
+    /// Builder defines:    BuildArtifact { source_path: "dist/plugin.zip", ... }
+    ///                             ↓
+    /// Resolved path:      /path/to/repo/dist/plugin.zip
+    ///                             ↓
+    /// Verified & sized:   ProducedArtifact { path: ..., size: 1234567 }
+    /// ```
+    fn collect_artifacts(&self, build_artifacts: &[BuildArtifact]) -> Result<Vec<ProducedArtifact>> {
+        let mut artifacts = Vec::with_capacity(build_artifacts.len());
+
+        for artifact in build_artifacts {
+            let path = self.working_dir.join(&artifact.source_path);
+
+            if !path.exists() {
+                return Err(Error::Build(format!(
+                    "Expected artifact not found: '{}'. \
+                    The build may have failed silently or the artifact path is incorrect.",
+                    path.display()
+                )));
+            }
+
+            let metadata = std::fs::metadata(&path)?;
+            let size = metadata.len();
+
+            artifacts.push(ProducedArtifact::new(
+                artifact.variant_id.clone(),
+                path,
+                artifact.target_name.clone(),
+                size,
+            ));
+        }
+
+        Ok(artifacts)
     }
 
     /// Get the working directory.

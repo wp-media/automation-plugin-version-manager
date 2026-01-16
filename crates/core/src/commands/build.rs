@@ -1,6 +1,6 @@
 //! Build command implementation.
 
-use crate::build::BuildRunner;
+use crate::build::{BuildResult, BuildRunner};
 use crate::error::Result;
 use crate::git::RepoCache;
 use crate::github::GitHubClient;
@@ -34,13 +34,17 @@ impl<'a> BuildCommand<'a> {
     /// * `version` - Version to build
     /// * `pr_number` - Pull request number
     /// * `variants` - Specific variants to build (empty = all)
+    ///
+    /// # Returns
+    ///
+    /// The build result containing artifact information.
     pub async fn execute(
         &self,
         project: &str,
         version: &str,
         pr_number: u64,
         variants: &[&str],
-    ) -> Result<()> {
+    ) -> Result<BuildResult> {
         // 1. Look up project in registry
         let project_info = self.registry.get(project)?;
 
