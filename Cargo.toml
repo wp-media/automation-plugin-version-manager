@@ -35,6 +35,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Internal crates
 apvm-core = { path = "crates/core" }
+apvm-storage = { path = "crates/storage" }
 
 [profile.release]
 lto = "fat"
