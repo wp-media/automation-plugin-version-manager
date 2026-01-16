@@ -1,15 +1,26 @@
 [package]
 name = "apvm-storage"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Artifact storage management for APVM"
 license = "MIT"
 
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.10"
-thiserror = "2.0"
-tracing = "0.1"
-walkdir = "2.5"
+# Date/time
+chrono = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Hashing
+sha2 = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging and diagnostics
+tracing = { workspace = true }
+
+# File system utilities
+walkdir = { workspace = true }
