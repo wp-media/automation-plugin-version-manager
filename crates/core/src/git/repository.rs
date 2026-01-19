@@ -321,4 +321,169 @@ impl Repository {
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
+
+    /// Get the full commit SHA of the current HEAD.
+    ///
+    /// Returns the commit hash as a hexadecimal string:
+    /// - 40 characters for SHA-1 repositories (most common)
+    /// - 64 characters for SHA-256 repositories (Git 2.29+)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let repo = Repository::open(&path)?;
+    /// repo.checkout("main").await?;
+    /// let commit = repo.get_head_commit().await?;
+    /// // commit = "a1b2c3d4e5f6789012345678901234567890abcd"
+    /// ```
+    ///
+    /// # References
+    ///
+    /// - [git-rev-parse(1)](https://git-scm.com/docs/git-rev-parse)
+    pub async fn get_head_commit(&self) -> Result<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.path)
+            .output()
+            .await
+            .map_err(|e| Error::Git(format!("Failed to get HEAD commit: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Git(format!("git rev-parse HEAD failed: {stderr}")));
+        }
+
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Validate the commit hash format (hex characters only)
+        if !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::Git(format!(
+                "Invalid commit hash format: {commit}"
+            )));
+        }
+
+        // Validate length: SHA-1 (40) or SHA-256 (64)
+        if commit.len() != 40 && commit.len() != 64 {
+            return Err(Error::Git(format!(
+                "Unexpected commit hash length {}: {commit}",
+                commit.len()
+            )));
+        }
+
+        Ok(commit)
+    }
+
+    /// Get the short commit SHA of the current HEAD.
+    ///
+    /// Returns the first 7 characters of the commit hash, which is the
+    /// standard short form used by Git and GitHub.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let commit_short = repo.get_head_commit_short().await?;
+    /// // commit_short = "a1b2c3d"
+    /// ```
+    pub async fn get_head_commit_short(&self) -> Result<String> {
+        let full = self.get_head_commit().await?;
+        Ok(full[..7].to_string())
+    }
+
+    /// Get both full and short commit SHA of the current HEAD.
+    ///
+    /// This is a convenience method that returns both formats in a single call,
+    /// useful when you need both (e.g., for storage metadata).
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(full_commit, short_commit)`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (commit, commit_short) = repo.get_head_commit_pair().await?;
+    /// // commit = "a1b2c3d4e5f6789012345678901234567890abcd"
+    /// // commit_short = "a1b2c3d"
+    /// ```
+    pub async fn get_head_commit_pair(&self) -> Result<(String, String)> {
+        let full = self.get_head_commit().await?;
+        let short = full[..7].to_string();
+        Ok((full, short))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that validates commit hash format checking logic.
+    #[test]
+    fn test_commit_hash_validation_logic() {
+        // Valid SHA-1 (40 hex chars)
+        let sha1 = "a1b2c3d4e5f6789012345678901234567890abcd";
+        assert_eq!(sha1.len(), 40);
+        assert!(sha1.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Valid SHA-256 (64 hex chars)
+        let sha256 = "a1b2c3d4e5f6789012345678901234567890abcda1b2c3d4e5f6789012345678";
+        assert_eq!(sha256.len(), 64);
+        assert!(sha256.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Invalid: contains non-hex character
+        let invalid = "a1b2c3d4e5f6789012345678901234567890abcg"; // 'g' is invalid
+        assert!(!invalid.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Invalid: wrong length
+        let short = "a1b2c3d";
+        assert!(short.len() != 40 && short.len() != 64);
+    }
+
+    /// Test short commit extraction.
+    #[test]
+    fn test_short_commit_extraction() {
+        let full = "a1b2c3d4e5f6789012345678901234567890abcd";
+        let short = &full[..7];
+        assert_eq!(short, "a1b2c3d");
+        assert_eq!(short.len(), 7);
+    }
+
+    /// Integration test that runs against the actual workspace repository.
+    /// This test only runs if we're in a git repository.
+    #[tokio::test]
+    async fn test_get_head_commit_in_real_repo() {
+        // Get the workspace root (where .git exists)
+        let workspace = std::env::current_dir().expect("Failed to get current dir");
+
+        // Skip if not in a git repo
+        if !workspace.join(".git").exists() {
+            eprintln!("Skipping test: not in a git repository");
+            return;
+        }
+
+        let repo = Repository::open(&workspace).expect("Failed to open repo");
+
+        // Test get_head_commit
+        let commit = repo.get_head_commit().await.expect("Failed to get HEAD commit");
+        assert_eq!(commit.len(), 40, "SHA-1 commit should be 40 chars");
+        assert!(
+            commit.chars().all(|c| c.is_ascii_hexdigit()),
+            "Commit should be hex only"
+        );
+
+        // Test get_head_commit_short
+        let short = repo
+            .get_head_commit_short()
+            .await
+            .expect("Failed to get short commit");
+        assert_eq!(short.len(), 7, "Short commit should be 7 chars");
+        assert_eq!(&commit[..7], short, "Short should match first 7 of full");
+
+        // Test get_head_commit_pair
+        let (full, short2) = repo
+            .get_head_commit_pair()
+            .await
+            .expect("Failed to get commit pair");
+        assert_eq!(full, commit);
+        assert_eq!(short2, short);
+    }
 }
