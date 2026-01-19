@@ -82,6 +82,7 @@ version = "0.1.0"
 dependencies = [
  "apvm-config",
  "apvm-core",
+ "apvm-storage",
  "clap",
  "serde_json",
  "tokio",

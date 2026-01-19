@@ -11,6 +11,7 @@ path = "src/main.rs"
 # Internal crates
 apvm-config = { workspace = true }
 apvm-core = { workspace = true }
+apvm-storage = { workspace = true }
 
 # CLI argument parsing
 clap = { workspace = true }
