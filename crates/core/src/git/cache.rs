@@ -7,6 +7,20 @@ use crate::error::Result;
 use super::repository::Repository;
 
 /// Manages a cache of cloned repositories.
+///
+/// # Directory Structure
+///
+/// ```text
+/// {cache_dir}/
+/// └── repos/
+///     └── {project_name}/
+///         ├── {repo_name}/       ← cloned repository
+///         └── artifact.zip       ← artifacts generated via ../
+/// ```
+///
+/// This structure ensures that artifacts generated outside the repo
+/// (via `../` in build scripts) stay within the project directory,
+/// keeping `repos/` clean and organized.
 pub struct RepoCache {
     cache_dir: PathBuf,
 }
@@ -21,8 +35,25 @@ impl RepoCache {
     ///
     /// If the repository already exists in the cache, it will be opened.
     /// Otherwise, it will be cloned from the URL.
-    pub fn get_or_clone(&self, url: &str, name: &str) -> Result<Repository> {
-        let repo_path = self.repo_path(name);
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The repository URL to clone from
+    /// * `project_name` - The project identifier (e.g., "backwpup")
+    /// * `repo_name` - The repository name (e.g., "backwpup-pro")
+    ///
+    /// # Path Structure
+    ///
+    /// ```text
+    /// {cache_dir}/repos/{project_name}/{repo_name}/
+    /// ```
+    pub fn get_or_clone(
+        &self,
+        url: &str,
+        project_name: &str,
+        repo_name: &str,
+    ) -> Result<Repository> {
+        let repo_path = self.repo_path(project_name, repo_name);
 
         if repo_path.exists() {
             Repository::open(&repo_path)
@@ -33,14 +64,46 @@ impl RepoCache {
     }
 
     /// Get the path where a repository would be cached.
-    pub fn repo_path(&self, name: &str) -> PathBuf {
-        self.cache_dir.join("repos").join(name)
+    ///
+    /// # Path Structure
+    ///
+    /// ```text
+    /// {cache_dir}/repos/{project_name}/{repo_name}
+    /// ```
+    pub fn repo_path(&self, project_name: &str, repo_name: &str) -> PathBuf {
+        self.cache_dir
+            .join("repos")
+            .join(project_name)
+            .join(repo_name)
     }
 
-    /// Clear the entire cache.
+    /// Get the project directory path (parent of repo).
+    ///
+    /// # Path Structure
+    ///
+    /// ```text
+    /// {cache_dir}/repos/{project_name}
+    /// ```
+    ///
+    /// This is where artifacts generated with `../` will land.
+    pub fn project_path(&self, project_name: &str) -> PathBuf {
+        self.cache_dir.join("repos").join(project_name)
+    }
+
+    /// Clear the entire repository cache.
     pub fn clear(&self) -> Result<()> {
-        if self.cache_dir.exists() {
-            std::fs::remove_dir_all(&self.cache_dir)?;
+        let repos_dir = self.cache_dir.join("repos");
+        if repos_dir.exists() {
+            std::fs::remove_dir_all(&repos_dir)?;
+        }
+        Ok(())
+    }
+
+    /// Clear cache for a specific project (repo + artifacts).
+    pub fn clear_project(&self, project_name: &str) -> Result<()> {
+        let project_dir = self.project_path(project_name);
+        if project_dir.exists() {
+            std::fs::remove_dir_all(&project_dir)?;
         }
         Ok(())
     }

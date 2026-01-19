@@ -64,7 +64,11 @@ impl<'a> BuildCommand<'a> {
         }
 
         // 3. Get or clone repository
-        let repo = self.cache.get_or_clone(&project_info.repo_url, &project_info.repo)?;
+        let repo = self.cache.get_or_clone(
+            &project_info.repo_url,
+            &project_info.name,
+            &project_info.repo,
+        )?;
 
         // 4. Checkout the PR's head branch
         repo.fetch()?;
