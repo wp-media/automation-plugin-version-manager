@@ -23,18 +23,33 @@ use super::repository::Repository;
 /// keeping `repos/` clean and organized.
 pub struct RepoCache {
     cache_dir: PathBuf,
+    /// GitHub token for private repository access.
+    github_token: Option<String>,
 }
 
 impl RepoCache {
     /// Create a new repository cache.
-    pub fn new(cache_dir: PathBuf) -> Self {
-        Self { cache_dir }
+    ///
+    /// # Arguments
+    ///
+    /// * `cache_dir` - Base directory for cached repositories
+    /// * `github_token` - Optional GitHub token for private repos
+    pub fn new(cache_dir: PathBuf, github_token: Option<String>) -> Self {
+        Self {
+            cache_dir,
+            github_token,
+        }
     }
 
     /// Get or clone a repository.
     ///
     /// If the repository already exists in the cache, it will be opened.
     /// Otherwise, it will be cloned from the URL.
+    ///
+    /// # Authentication
+    ///
+    /// - **With token**: Uses token for HTTPS authentication (private repos)
+    /// - **Without token**: Relies on system git config (SSH keys, credential helpers)
     ///
     /// # Arguments
     ///
@@ -47,7 +62,7 @@ impl RepoCache {
     /// ```text
     /// {cache_dir}/repos/{project_name}/{repo_name}/
     /// ```
-    pub fn get_or_clone(
+    pub async fn get_or_clone(
         &self,
         url: &str,
         project_name: &str,
@@ -59,7 +74,25 @@ impl RepoCache {
             Repository::open(&repo_path)
         } else {
             std::fs::create_dir_all(&repo_path)?;
-            Repository::clone(url, &repo_path)
+            self.clone_repo(url, &repo_path).await
+        }
+    }
+
+    /// Clone a repository, using token if available.
+    async fn clone_repo(&self, url: &str, path: &Path) -> Result<Repository> {
+        match &self.github_token {
+            Some(token) if url.starts_with("https://") => {
+                Repository::clone_with_token(url, token, path).await
+            }
+            _ => Repository::clone(url, path).await,
+        }
+    }
+
+    /// Fetch updates for a repository, using token if available.
+    pub async fn fetch(&self, repo: &Repository) -> Result<()> {
+        match &self.github_token {
+            Some(token) => repo.fetch_with_token(token).await,
+            None => repo.fetch().await,
         }
     }
 

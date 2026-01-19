@@ -68,11 +68,11 @@ impl<'a> BuildCommand<'a> {
             &project_info.repo_url,
             &project_info.name,
             &project_info.repo,
-        )?;
+        ).await?;
 
         // 4. Checkout the PR's head branch
-        repo.fetch()?;
-        repo.checkout(&pr.head_branch)?;
+        repo.fetch().await?;
+        repo.checkout(&pr.head_branch).await?;
 
         // 5. Run the build using the project's builder
         let mut runner = BuildRunner::new(repo.path().to_path_buf());

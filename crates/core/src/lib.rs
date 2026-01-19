@@ -38,7 +38,8 @@ impl Apvm {
             None => GitHubClient::anonymous()?,
         };
 
-        let cache = RepoCache::new(config.cache_dir.clone());
+        // Pass the same token to RepoCache for private repo cloning
+        let cache = RepoCache::new(config.cache_dir.clone(), config.github_token.clone());
         let registry = ProjectRegistry::new();
 
         Ok(Self {
