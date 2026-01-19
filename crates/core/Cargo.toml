@@ -9,6 +9,7 @@ crate-type = ["rlib"]
 [dependencies]
 # Internal crates
 apvm-config = { workspace = true }
+apvm-storage = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
