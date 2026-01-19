@@ -45,7 +45,7 @@ impl Apvm {
 
         let token_source = config.github_token.as_ref().map(|_| git::TokenSource::Config);
         let cache = RepoCache::new(config.cache_dir.clone(), config.github_token.clone());
-        let registry = ProjectRegistry::new();
+        let registry = ProjectRegistry::with_known_projects();
 
         Ok(Self {
             config,
@@ -96,7 +96,7 @@ impl Apvm {
         }
 
         let cache = RepoCache::new(config.cache_dir.clone(), config.github_token.clone());
-        let registry = ProjectRegistry::new();
+        let registry = ProjectRegistry::with_known_projects();
 
         Ok(Self {
             config,
@@ -105,6 +105,58 @@ impl Apvm {
             registry,
             token_source,
         })
+    }
+
+    /// Create an APVM instance with an empty registry.
+    ///
+    /// Use this when you want to inject projects manually via [`Apvm::register_project`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut apvm = Apvm::new_empty(config)?;
+    /// apvm.register_project("my-plugin", my_project_info);
+    /// ```
+    pub fn new_empty(config: Config) -> Result<Self> {
+        let github = match &config.github_token {
+            Some(token) => GitHubClient::new(token)?,
+            None => GitHubClient::anonymous()?,
+        };
+
+        let token_source = config.github_token.as_ref().map(|_| git::TokenSource::Config);
+        let cache = RepoCache::new(config.cache_dir.clone(), config.github_token.clone());
+        let registry = ProjectRegistry::new(); // Empty registry
+
+        Ok(Self {
+            config,
+            github,
+            cache,
+            registry,
+            token_source,
+        })
+    }
+
+    /// Register a project with the registry.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use apvm_core::projects::Project;
+    /// use apvm_core::build::plugins::BackWPupBuilder;
+    ///
+    /// let project = Project {
+    ///     name: "my-plugin".to_string(),
+    ///     repo_url: "https://github.com/org/my-plugin.git".to_string(),
+    ///     owner: "org".to_string(),
+    ///     repo: "my-plugin".to_string(),
+    ///     default_branch: "main".to_string(),
+    ///     builder: Box::new(BackWPupBuilder),
+    /// };
+    ///
+    /// apvm.register_project(project);
+    /// ```
+    pub fn register_project(&mut self, project: projects::Project) {
+        self.registry.register(project);
     }
 
     /// Check if a GitHub token is available.
