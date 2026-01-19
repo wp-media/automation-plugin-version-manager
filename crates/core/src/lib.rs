@@ -28,17 +28,22 @@ pub struct Apvm {
     pub cache: RepoCache,
     /// Project registry.
     pub registry: ProjectRegistry,
+    /// Source of the resolved token (for diagnostics).
+    pub token_source: Option<git::TokenSource>,
 }
 
 impl Apvm {
     /// Create a new APVM instance with the given configuration.
+    ///
+    /// This is the synchronous constructor that uses only the config token.
+    /// For automatic token resolution from gh CLI, use [`Apvm::new_with_token_resolution`].
     pub fn new(config: Config) -> Result<Self> {
         let github = match &config.github_token {
             Some(token) => GitHubClient::new(token)?,
             None => GitHubClient::anonymous()?,
         };
 
-        // Pass the same token to RepoCache for private repo cloning
+        let token_source = config.github_token.as_ref().map(|_| git::TokenSource::Config);
         let cache = RepoCache::new(config.cache_dir.clone(), config.github_token.clone());
         let registry = ProjectRegistry::new();
 
@@ -47,7 +52,69 @@ impl Apvm {
             github,
             cache,
             registry,
+            token_source,
         })
+    }
+
+    /// Create a new APVM instance with automatic token resolution.
+    ///
+    /// This will try to resolve a GitHub token from multiple sources:
+    ///
+    /// 1. Config file token (explicit)
+    /// 2. `GITHUB_TOKEN` environment variable
+    /// 3. `GH_TOKEN` environment variable
+    /// 4. `gh auth token` command (gh CLI >= 2.17.0)
+    /// 5. gh CLI config file (`~/.config/gh/hosts.yml`)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let apvm = Apvm::new_with_token_resolution(config).await?;
+    ///
+    /// if let Some(source) = &apvm.token_source {
+    ///     println!("Using token from: {}", source);
+    /// }
+    /// ```
+    pub async fn new_with_token_resolution(mut config: Config) -> Result<Self> {
+        // Resolve token from multiple sources
+        let resolved = git::resolve_github_token(config.github_token.as_deref()).await;
+
+        let (github, token_source) = match &resolved {
+            Some(rt) => {
+                tracing::info!("Using GitHub token from {}", rt.source);
+                (GitHubClient::new(&rt.token)?, Some(rt.source))
+            }
+            None => {
+                tracing::debug!("No GitHub token found, using anonymous client");
+                (GitHubClient::anonymous()?, None)
+            }
+        };
+
+        // Update config with resolved token (for cache usage)
+        if let Some(rt) = &resolved {
+            config.github_token = Some(rt.token.clone());
+        }
+
+        let cache = RepoCache::new(config.cache_dir.clone(), config.github_token.clone());
+        let registry = ProjectRegistry::new();
+
+        Ok(Self {
+            config,
+            github,
+            cache,
+            registry,
+            token_source,
+        })
+    }
+
+    /// Check if a GitHub token is available.
+    pub fn has_token(&self) -> bool {
+        self.token_source.is_some()
+    }
+
+    /// Get the source of the current token.
+    pub fn token_source(&self) -> Option<git::TokenSource> {
+        self.token_source
     }
 
     /// Build a project from a PR.

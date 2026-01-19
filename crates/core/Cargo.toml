@@ -35,3 +35,6 @@ which = { workspace = true }
 
 # File system utilities
 glob = { workspace = true }
+
+# Platform directories
+directories = { workspace = true }
