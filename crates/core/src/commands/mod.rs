@@ -2,4 +2,4 @@
 
 mod build;
 
-pub use build::{BuildCommand, BuildOutput};
+pub use build::{BuildCommand, BuildMetadata, BuildOutput, SourceArtifact};

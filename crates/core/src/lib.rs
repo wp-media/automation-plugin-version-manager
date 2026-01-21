@@ -2,9 +2,38 @@
 //!
 //! This library provides the core functionality for the Automation Plugin Version Manager.
 //! It can be used by the CLI or external applications.
+//!
+//! # Architecture
+//!
+//! The core library follows a **composition over integration** philosophy:
+//!
+//! - **Core builds artifacts** - handles git, builds, version detection
+//! - **Storage is separate** - consumers compose core + storage as needed
+//! - **Helpers for convenience** - conversion methods eliminate boilerplate
+//!
+//! # Quick Start
+//!
+//! ```ignore
+//! use apvm_core::{Apvm, config_io};
+//! use apvm_storage::ArtifactStore;
+//!
+//! // Initialize with config helpers
+//! let (config, paths) = config_io::init_config(None)?;
+//! let apvm = Apvm::new(config)?;
+//!
+//! // Build a PR
+//! let output = apvm.build_from_pr("wp-media/wp-rocket", 123).await?;
+//!
+//! // Store artifacts (optional - you choose!)
+//! let store = ArtifactStore::new(paths.builds_dir().clone());
+//! for artifact in output.to_source_artifacts_filtered(&store, "wp-rocket")? {
+//!     store.store(&artifact)?;
+//! }
+//! ```
 
 pub mod build;
 pub mod commands;
+pub mod config_io;
 pub mod error;
 pub mod git;
 pub mod github;

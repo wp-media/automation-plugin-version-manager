@@ -9,10 +9,30 @@ use crate::git::{RefResolver, RefSource, RepoCache, ResolvedRef};
 use crate::github::GitHubClient;
 use crate::projects::ProjectRegistry;
 
+// Re-export storage types for convenience (consumers don't need to add apvm-storage)
+pub use apvm_storage::{BuildMetadata, SourceArtifact};
+
 /// Extended build result with git metadata.
 ///
 /// Contains the build artifacts plus all the metadata needed
 /// for storage operations (commit SHA, source type, branch name).
+///
+/// # Storage Integration
+///
+/// This type provides conversion methods to transform build output into
+/// storage-compatible formats. The design follows composition over integration:
+/// core builds, consumer decides whether/how to store.
+///
+/// ```ignore
+/// let output = apvm.build("backwpup", "5.6.0", "pr:123", None).await?;
+///
+/// // Convert for storage (if consumer wants to store)
+/// let store = ArtifactStore::new(config.builds_dir);
+/// store.store(
+///     &output.to_source_artifacts(),
+///     &output.to_build_metadata("backwpup"),
+/// )?;
+/// ```
 #[derive(Debug)]
 pub struct BuildOutput {
     /// The build result containing artifacts.
@@ -40,6 +60,188 @@ impl BuildOutput {
             self.resolved_ref.source.description(),
             &self.commit_short
         )
+    }
+
+    // =========================================================================
+    // Storage Conversion Helpers
+    // =========================================================================
+
+    /// Convert to storage metadata.
+    ///
+    /// Creates a [`BuildMetadata`] struct suitable for passing to
+    /// [`ArtifactStore::store()`].
+    ///
+    /// # Arguments
+    ///
+    /// * `project` - Project name (must match what was passed to `build()`)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let output = apvm.build("backwpup", "5.6.0", "pr:123", None).await?;
+    /// let metadata = output.to_build_metadata("backwpup");
+    ///
+    /// assert_eq!(metadata.project, "backwpup");
+    /// assert_eq!(metadata.version, "5.6.0");
+    /// ```
+    pub fn to_build_metadata(&self, project: &str) -> BuildMetadata {
+        BuildMetadata::new(
+            project.to_string(),
+            self.result.version.clone(),
+            self.resolved_ref.to_build_source(),
+            self.commit.clone(),
+            self.branch.clone(),
+        )
+    }
+
+    /// Convert artifacts to storage format.
+    ///
+    /// Transforms [`ProducedArtifact`]s into [`SourceArtifact`]s suitable
+    /// for passing to [`ArtifactStore::store()`].
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`SourceArtifact`] structs. Returns an empty vector if
+    /// no artifacts were produced.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let output = apvm.build("backwpup", "5.6.0", "pr:123", None).await?;
+    /// let artifacts = output.to_source_artifacts();
+    ///
+    /// for artifact in &artifacts {
+    ///     println!("  {} -> {}", artifact.path.display(), artifact.target_name);
+    /// }
+    /// ```
+    pub fn to_source_artifacts(&self) -> Vec<SourceArtifact> {
+        self.result
+            .artifacts
+            .iter()
+            .map(|a| SourceArtifact {
+                variant_id: a.variant_id.clone(),
+                path: a.path.clone(),
+                target_name: a.filename.clone(),
+            })
+            .collect()
+    }
+
+    /// Check if a build at this commit already exists in storage.
+    ///
+    /// This is a convenience method for implementing "skip if exists" logic.
+    /// Returns `true` if a build with the same commit exists, regardless of
+    /// whether all variants are present.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - The artifact store to check
+    /// * `project` - Project name
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let store = ArtifactStore::new(config.builds_dir);
+    ///
+    /// // Check before building (dry-run or skip logic)
+    /// let exists = output.exists_in_store(&store, "backwpup")?;
+    /// if exists {
+    ///     println!("Build already exists at commit {}", output.commit_short);
+    /// }
+    /// ```
+    pub fn exists_in_store(
+        &self,
+        store: &apvm_storage::ArtifactStore,
+        project: &str,
+    ) -> apvm_storage::Result<bool> {
+        let existing = store.find_by_commit(project, &self.result.version, &self.commit_short)?;
+        Ok(existing.is_some())
+    }
+
+    /// Get missing variants that need to be built.
+    ///
+    /// Compares the variants in this build output against what's already
+    /// stored, returning only those that are missing. Useful for incremental
+    /// builds where some variants may already exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - The artifact store to check
+    /// * `project` - Project name
+    ///
+    /// # Returns
+    ///
+    /// A vector of variant IDs that are NOT yet stored. Returns all variants
+    /// if no build exists for this commit.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let missing = output.missing_variants(&store, "backwpup")?;
+    /// if missing.is_empty() {
+    ///     println!("All variants already built!");
+    /// } else {
+    ///     println!("Need to store: {:?}", missing);
+    /// }
+    /// ```
+    pub fn missing_variants(
+        &self,
+        store: &apvm_storage::ArtifactStore,
+        project: &str,
+    ) -> apvm_storage::Result<Vec<Option<String>>> {
+        let existing =
+            store.get_existing_variants(project, &self.result.version, &self.commit_short)?;
+
+        let missing: Vec<Option<String>> = self
+            .result
+            .artifacts
+            .iter()
+            .map(|a| a.variant_id.clone())
+            .filter(|v| !existing.contains(v))
+            .collect();
+
+        Ok(missing)
+    }
+
+    /// Filter artifacts to only those not yet stored.
+    ///
+    /// Returns [`SourceArtifact`]s for variants that don't exist in storage.
+    /// This enables incremental storage where only new variants are copied.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - The artifact store to check
+    /// * `project` - Project name
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Only store what's new (deduplication)
+    /// let new_artifacts = output.to_source_artifacts_filtered(&store, "backwpup")?;
+    /// if !new_artifacts.is_empty() {
+    ///     store.store(&new_artifacts, &output.to_build_metadata("backwpup"))?;
+    /// }
+    /// ```
+    pub fn to_source_artifacts_filtered(
+        &self,
+        store: &apvm_storage::ArtifactStore,
+        project: &str,
+    ) -> apvm_storage::Result<Vec<SourceArtifact>> {
+        let existing =
+            store.get_existing_variants(project, &self.result.version, &self.commit_short)?;
+
+        let filtered: Vec<SourceArtifact> = self
+            .result
+            .artifacts
+            .iter()
+            .filter(|a| !existing.contains(&a.variant_id))
+            .map(|a| SourceArtifact {
+                variant_id: a.variant_id.clone(),
+                path: a.path.clone(),
+                target_name: a.filename.clone(),
+            })
+            .collect();
+
+        Ok(filtered)
     }
 }
 
