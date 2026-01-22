@@ -1,8 +1,27 @@
 //! BackWPup project builder.
+//!
+//! BackWPup is a WordPress backup plugin that requires the version to be passed
+//! to its build commands (`gulp --packageVersion="{version}"`).
+//!
+//! # Version Handling
+//!
+//! This builder **requires** an explicit version because:
+//! - The gulp tasks embed the version into the output zip filename
+//! - The version is injected into plugin files during build
+//!
+//! Auto-detection is not supported because the version in source files
+//! may not match the intended release version.
+//!
+//! # Variants
+//!
+//! BackWPup produces three variants:
+//! - `free` - Free version for WordPress.org
+//! - `pro-de` - Pro version with German translations
+//! - `pro-en` - Pro version with English translations
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::Result;
-use super::{BuildArtifact, BuildVariant, Builder, OptionalCommand};
+use super::{BuildArtifact, BuildVariant, Builder, OptionalCommand, VersionRequirement};
 
 /// Builder for the BackWPup project.
 pub struct BackWPupBuilder;
@@ -17,6 +36,32 @@ impl BackWPupBuilder {
 }
 
 impl Builder for BackWPupBuilder {
+    // =========================================================================
+    // Version Handling
+    // =========================================================================
+
+    /// BackWPup requires version for building.
+    ///
+    /// The gulp tasks use `--packageVersion` to:
+    /// 1. Name the output zip file (e.g., `backwpup-5.1.0-abc123.zip`)
+    /// 2. Inject version into plugin headers
+    fn version_requirement(&self) -> VersionRequirement {
+        VersionRequirement::Required
+    }
+
+    /// BackWPup does not support version auto-detection.
+    ///
+    /// While the source files contain version headers, the build process
+    /// is designed to receive the version externally to support building
+    /// pre-release versions from branches.
+    fn detect_version(&self, _working_dir: &Path) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    // =========================================================================
+    // Commands and Setup
+    // =========================================================================
+
     fn required_commands(&self) -> Vec<&'static str> {
         vec!["npm", "composer"]
     }
@@ -34,6 +79,10 @@ impl Builder for BackWPupBuilder {
             "npm install".to_string(),
         ]
     }
+
+    // =========================================================================
+    // Variants
+    // =========================================================================
 
     fn variants(&self) -> Vec<BuildVariant> {
         vec![
@@ -55,6 +104,10 @@ impl Builder for BackWPupBuilder {
         ]
     }
 
+    // =========================================================================
+    // Build Hooks
+    // =========================================================================
+
     fn pre_build_hook(&self, working_dir: &PathBuf, _version: &str, _variants: &[&str]) -> Result<()> {
         // Remove previous build artifacts matching backwpup-*.zip pattern
         let pattern = working_dir.join("backwpup-*.zip");
@@ -72,6 +125,10 @@ impl Builder for BackWPupBuilder {
 
         Ok(())
     }
+
+    // =========================================================================
+    // Build Execution
+    // =========================================================================
 
     fn build_commands(&self, version: &str, variants: &[&str]) -> Vec<String> {
         // Determine which variants to build

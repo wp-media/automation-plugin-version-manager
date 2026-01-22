@@ -3,8 +3,9 @@
 //! This module provides the main build command that handles building a project
 //! from any git reference (PR, branch, tag, or commit) with automatic detection.
 
+use crate::build::plugins::VersionRequirement;
 use crate::build::{BuildResult, BuildRunner};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::{RefResolver, RefSource, RepoCache, ResolvedRef};
 use crate::github::GitHubClient;
 use crate::projects::ProjectRegistry;
@@ -283,38 +284,19 @@ impl<'a> BuildCommand<'a> {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build (e.g., "6.1.0")
+    /// * `version` - Version to build, or `None` for auto-detection if builder have it implemented
     /// * `git_ref` - Git reference (PR number, branch, tag, or commit)
     /// * `variants` - Specific variants to build (empty = all)
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // Build from PR #123
-    /// cmd.execute("wp-rocket", "3.17.0", "123", &[]).await?;
-    ///
-    /// // Build from branch
-    /// cmd.execute("wp-rocket", "3.17.0", "develop", &[]).await?;
-    ///
-    /// // Build from tag
-    /// cmd.execute("wp-rocket", "3.17.0", "v3.17.0", &[]).await?;
-    ///
-    /// // Build specific variants from PR
-    /// cmd.execute("wp-rocket", "3.17.0", "pr:456", &["starter", "pro"]).await?;
-    /// ```
-    ///
-    /// # Returns
-    ///
-    /// A `BuildOutput` containing the build result and git metadata.
     pub async fn execute(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         git_ref: &str,
         variants: &[&str],
     ) -> Result<BuildOutput> {
         // 1. Look up project in registry
         let project_info = self.registry.get(project)?;
+        let builder = project_info.builder.as_ref();
 
         // 2. Get or clone repository (need it for ref resolution)
         let repo = self
@@ -330,19 +312,6 @@ impl<'a> BuildCommand<'a> {
             .with_repo_path(repo.path());
 
         let resolved = resolver.resolve(git_ref).await?;
-
-        tracing::info!(
-            "Building {} v{} from {}",
-            project,
-            version,
-            resolved.source.description()
-        );
-
-        if variants.is_empty() {
-            tracing::info!("Building all variants");
-        } else {
-            tracing::info!("Building variants: {}", variants.join(", "));
-        }
 
         // 4. Prepare repository for checkout (clean state)
         // Reset FIRST to avoid checkout failures due to uncommitted changes.
@@ -362,6 +331,27 @@ impl<'a> BuildCommand<'a> {
         // 6. Get the commit SHA after checkout
         let (commit, commit_short) = repo.get_head_commit_pair().await?;
 
+        // 7. Resolve version (AFTER checkout so detect_version sees correct files)
+        let resolved_version = self.resolve_version(
+            project,
+            version,
+            builder,
+            repo.path(),
+        )?;
+
+        tracing::info!(
+            "Building {} v{} from {}",
+            project,
+            resolved_version,
+            resolved.source.description()
+        );
+
+        if variants.is_empty() {
+            tracing::info!("Building all variants");
+        } else {
+            tracing::info!("Building variants: {}", variants.join(", "));
+        }
+
         // Determine branch name based on source type
         let branch = match &resolved.source {
             RefSource::PullRequest(_) | RefSource::Branch(_) => resolved.git_ref.clone(),
@@ -371,10 +361,10 @@ impl<'a> BuildCommand<'a> {
 
         tracing::debug!("Checked out {} at commit {}", resolved.git_ref, commit_short);
 
-        // 7. Run the build using the project's builder
+        // 8. Run the build using the project's builder
         let mut runner = BuildRunner::new(repo.path().to_path_buf());
         let result = runner
-            .execute_build(project_info.builder.as_ref(), version, variants)
+            .execute_build(builder, &resolved_version, variants)
             .await?;
 
         Ok(BuildOutput {
@@ -386,6 +376,82 @@ impl<'a> BuildCommand<'a> {
         })
     }
 
+    /// Resolve the version based on the builder's [`VersionRequirement`].
+    fn resolve_version(
+        &self,
+        project: &str,
+        version: Option<&str>,
+        builder: &dyn crate::build::plugins::Builder,
+        working_dir: &std::path::Path,
+    ) -> Result<String> {
+        let requirement = builder.version_requirement();
+
+        match (requirement, version) {
+            (VersionRequirement::Required, None) => {
+                Err(Error::Build(format!(
+                    "Project '{}' requires a version. Use: build(\"{}\", Some(\"X.Y.Z\"), ...)",
+                    project, project
+                )))
+            }
+            (VersionRequirement::Required, Some(v)) => {
+                tracing::debug!("Using required version: {}", v);
+                Ok(v.to_string())
+            }
+
+            (VersionRequirement::Embedded, Some(v)) => {
+                tracing::warn!(
+                    "Project '{}' has embedded version; ignoring provided '{}' and detecting from source",
+                    project, v
+                );
+                self.detect_or_error(project, builder, working_dir)
+            }
+            (VersionRequirement::Embedded, None) => {
+                tracing::debug!("Detecting embedded version for '{}'", project);
+                self.detect_or_error(project, builder, working_dir)
+            }
+
+            (VersionRequirement::Optional, Some(v)) => {
+                tracing::debug!("Using provided version: {}", v);
+                Ok(v.to_string())
+            }
+            (VersionRequirement::Optional, None) => {
+                tracing::debug!("Auto-detecting version for '{}'", project);
+                self.detect_or_error(project, builder, working_dir)
+            }
+        }
+    }
+
+    /// Try to detect version from source files, or return an error.
+    fn detect_or_error(
+        &self,
+        project: &str,
+        builder: &dyn crate::build::plugins::Builder,
+        working_dir: &std::path::Path,
+    ) -> Result<String> {
+        match builder.detect_version(working_dir) {
+            Ok(Some(detected)) => {
+                tracing::info!("Auto-detected version: {}", detected);
+                Ok(detected)
+            }
+            Ok(None) => {
+                Err(Error::Build(format!(
+                    "Could not auto-detect version for '{}'.\n\n\
+                     The builder does not implement version detection, or the \
+                     version was not found in the expected location.\n\n\
+                     Please provide a version explicitly: build(\"{}\", Some(\"X.Y.Z\"), ...)",
+                    project, project
+                )))
+            }
+            Err(e) => {
+                Err(Error::Build(format!(
+                    "Version detection failed for '{}': {}\n\n\
+                     Please provide a version explicitly: build(\"{}\", Some(\"X.Y.Z\"), ...)",
+                    project, e, project
+                )))
+            }
+        }
+    }
+
     /// Execute a build from a specific PR number.
     ///
     /// This is a convenience method equivalent to `execute(project, version, "pr:{pr_number}", variants)`.
@@ -393,13 +459,13 @@ impl<'a> BuildCommand<'a> {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build
+    /// * `version` - Version to build, or `None` for auto-detection
     /// * `pr_number` - Pull request number
     /// * `variants` - Specific variants to build (empty = all)
     pub async fn execute_pr(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         pr_number: u64,
         variants: &[&str],
     ) -> Result<BuildOutput> {
@@ -412,13 +478,13 @@ impl<'a> BuildCommand<'a> {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build
+    /// * `version` - Version to build, or `None` for auto-detection
     /// * `branch` - Branch name
     /// * `variants` - Specific variants to build (empty = all)
     pub async fn execute_branch(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         branch: &str,
         variants: &[&str],
     ) -> Result<BuildOutput> {
@@ -431,13 +497,13 @@ impl<'a> BuildCommand<'a> {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build
+    /// * `version` - Version to build, or `None` for auto-detection
     /// * `tag` - Tag name (e.g., "v1.0.0")
     /// * `variants` - Specific variants to build (empty = all)
     pub async fn execute_tag(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         tag: &str,
         variants: &[&str],
     ) -> Result<BuildOutput> {
@@ -450,13 +516,13 @@ impl<'a> BuildCommand<'a> {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build
+    /// * `version` - Version to build, or `None` for auto-detection
     /// * `commit` - Commit SHA (minimum 7 characters)
     /// * `variants` - Specific variants to build (empty = all)
     pub async fn execute_commit(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         commit: &str,
         variants: &[&str],
     ) -> Result<BuildOutput> {
@@ -464,4 +530,3 @@ impl<'a> BuildCommand<'a> {
             .await
     }
 }
-

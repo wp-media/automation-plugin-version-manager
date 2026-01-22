@@ -11,6 +11,8 @@
 //! - **Storage is separate** - consumers compose core + storage as needed
 //! - **Helpers for convenience** - conversion methods eliminate boilerplate
 //!
+//! See [`build::plugins::VersionRequirement`] for how different projects handle versions.
+//!
 //! # Quick Start
 //!
 //! ```ignore
@@ -21,8 +23,11 @@
 //! let (config, paths) = config_io::init_config(None)?;
 //! let apvm = Apvm::new(config)?;
 //!
-//! // Build a PR
-//! let output = apvm.build_from_pr("wp-media/wp-rocket", 123).await?;
+//! // BackWPup: version required
+//! let output = apvm.build("backwpup", Some("5.1.0"), "pr:123", None).await?;
+//!
+//! // WP Rocket: version auto-detected from source
+//! let output = apvm.build("wp-rocket", None, "pr:456", None).await?;
 //!
 //! // Store artifacts (optional - you choose!)
 //! let store = ArtifactStore::new(paths.builds_dir().clone());
@@ -219,9 +224,22 @@ impl Apvm {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build
+    /// * `version` - Version to build, or `None` for auto-detection
     /// * `git_ref` - Git reference (PR number, branch, tag, or commit)
     /// * `variants` - Optional specific variants to build (None = all)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // BackWPup: version REQUIRED
+    /// apvm.build("backwpup", Some("5.1.0"), "pr:123", None).await?;
+    ///
+    /// // WP Rocket: version auto-detected from source
+    /// apvm.build("wp-rocket", None, "pr:456", None).await?;
+    ///
+    /// // Other plugin: explicit version override (In case plugin support specific version and auto-detection)
+    /// apvm.build("other-plugin", Some("4.17.0-custom"), "develop", None).await?;
+    /// ```
     ///
     /// # Returns
     ///
@@ -229,7 +247,7 @@ impl Apvm {
     pub async fn build(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         git_ref: &str,
         variants: Option<&[&str]>,
     ) -> Result<commands::BuildOutput> {
@@ -246,13 +264,13 @@ impl Apvm {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build
+    /// * `version` - Version to build, or `None` for auto-detection
     /// * `pr_number` - Pull request number
     /// * `variants` - Optional specific variants to build (None = all)
     pub async fn build_from_pr(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         pr_number: u64,
         variants: Option<&[&str]>,
     ) -> Result<commands::BuildOutput> {
@@ -265,13 +283,13 @@ impl Apvm {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build
+    /// * `version` - Version to build, or `None` for auto-detection
     /// * `branch` - Branch name
     /// * `variants` - Optional specific variants to build (None = all)
     pub async fn build_from_branch(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         branch: &str,
         variants: Option<&[&str]>,
     ) -> Result<commands::BuildOutput> {
@@ -284,13 +302,13 @@ impl Apvm {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build
+    /// * `version` - Version to build, or `None` for auto-detection
     /// * `tag` - Tag name (e.g., "v1.0.0")
     /// * `variants` - Optional specific variants to build (None = all)
     pub async fn build_from_tag(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         tag: &str,
         variants: Option<&[&str]>,
     ) -> Result<commands::BuildOutput> {
@@ -303,13 +321,13 @@ impl Apvm {
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version to build
+    /// * `version` - Version to build, or `None` for auto-detection
     /// * `commit` - Commit SHA (minimum 7 characters)
     /// * `variants` - Optional specific variants to build (None = all)
     pub async fn build_from_commit(
         &self,
         project: &str,
-        version: &str,
+        version: Option<&str>,
         commit: &str,
         variants: Option<&[&str]>,
     ) -> Result<commands::BuildOutput> {
