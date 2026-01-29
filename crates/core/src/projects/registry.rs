@@ -19,6 +19,12 @@ pub struct Project {
     pub repo: String,
     /// Default branch name.
     pub default_branch: String,
+    /// Whether the repository is private (requires authentication).
+    ///
+    /// When `true`, build operations will fail early if no GitHub token
+    /// is available, providing a clear error message instead of failing
+    /// later during clone/fetch with a cryptic git error.
+    pub is_private: bool,
     /// Project-specific builder.
     pub builder: Box<dyn Builder>,
 }
@@ -47,6 +53,7 @@ impl ProjectRegistry {
             owner: "wp-media".to_string(),
             repo: "backwpup-pro".to_string(),
             default_branch: DEFAULT_BRANCH_NAME.to_string(),
+            is_private: true,
             builder: Box::new(BackWPupBuilder),
         });
 

@@ -30,6 +30,31 @@ pub enum Error {
     #[error("Project not found: {0}")]
     ProjectNotFound(String),
 
+    /// Private repository requires authentication.
+    #[error(
+        "Repository '{repo}' is private and requires a GitHub token.\n\
+         \n\
+         To authenticate, do ONE of the following:\n\
+         \n\
+         1. Set GITHUB_TOKEN environment variable:\n\
+            export GITHUB_TOKEN=ghp_xxxxxxxxxxxx\n\
+         \n\
+         2. Set GH_TOKEN environment variable:\n\
+            export GH_TOKEN=ghp_xxxxxxxxxxxx\n\
+         \n\
+         3. Login with GitHub CLI (recommended):\n\
+            gh auth login\n\
+         \n\
+         4. Add token to config file (~/.apvm/config.json):\n\
+            {{\"github_token\": \"ghp_xxxxxxxxxxxx\", ...}}\n\
+         \n\
+         Token needs 'repo' scope for private repositories."
+    )]
+    PrivateRepoNoToken {
+        /// The repository that requires authentication.
+        repo: String,
+    },
+
     /// Build error.
     #[error("Build error: {0}")]
     Build(String),

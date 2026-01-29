@@ -290,6 +290,12 @@ impl<'a> BuildCommand<'a> {
     /// * `git_ref` - Git reference (PR number, branch, tag, or commit)
     /// * `variants` - Specific variants to build (empty = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PrivateRepoNoToken`] if the project's repository is private
+    /// and no GitHub token is configured. This check happens early to provide a
+    /// clear error message before any git operations are attempted.
     pub async fn execute(
         &self,
         project: &str,
@@ -302,9 +308,21 @@ impl<'a> BuildCommand<'a> {
         
         // 1. Look up project in registry
         let project_info = self.registry.get(project)?;
+
+        // 2. Validate authentication for private repositories (fail-fast)
+        //
+        // This check happens BEFORE any git operations to provide a clear,
+        // actionable error message. Without this, users would see cryptic
+        // git errors like "Authentication failed" or "Repository not found".
+        if project_info.is_private && self.config.github_token.is_none() {
+            return Err(Error::PrivateRepoNoToken {
+                repo: format!("{}/{}", project_info.owner, project_info.repo),
+            });
+        }
+
         let builder = project_info.builder.as_ref();
 
-        // 2. Create isolated build workspace (auto-cleaned on drop)
+        // 3. Create isolated build workspace (auto-cleaned on drop)
         let workspace = BuildWorkspace::new(
             &project_info.name,
             &project_info.repo_url,
@@ -320,13 +338,13 @@ impl<'a> BuildCommand<'a> {
         // Get repository handle for local operations
         let repo = workspace.repository();
 
-        // 3. Resolve the git reference
+        // 4. Resolve the git reference
         let resolver = RefResolver::new(self.github, &project_info.owner, &project_info.repo)
             .with_repo_path(repo.path());
 
         let resolved = resolver.resolve(git_ref).await?;
 
-        // 4. Prepare repository for checkout (clean state)
+        // 5. Prepare repository for checkout (clean state)
         // Reset FIRST to avoid checkout failures due to uncommitted changes.
         // See: https://git-scm.com/docs/git-checkout#_description
         // "git checkout refuses to switch branches if there are local modifications"
@@ -339,13 +357,13 @@ impl<'a> BuildCommand<'a> {
         repo.reset_hard().await?;
         workspace.pull().await?;
 
-        // 5. Checkout the resolved ref
+        // 6. Checkout the resolved ref
         repo.checkout(&resolved.git_ref).await?;
 
-        // 6. Get the commit SHA after checkout
+        // 7. Get the commit SHA after checkout
         let (commit, commit_short) = repo.get_head_commit_pair().await?;
 
-        // 7. Resolve version (AFTER checkout so detect_version sees correct files)
+        // 8. Resolve version (AFTER checkout so detect_version sees correct files)
         let resolved_version = self.resolve_version(
             project,
             version,
@@ -375,13 +393,13 @@ impl<'a> BuildCommand<'a> {
 
         tracing::debug!("Checked out {} at commit {}", resolved.git_ref, commit_short);
 
-        // 8. Run the build using the project's builder
+        // 9. Run the build using the project's builder
         let mut runner = BuildRunner::new(repo.path().to_path_buf());
         let result = runner
             .execute_build(builder, &resolved_version, variants)
             .await?;
 
-        // 9. Collect artifacts to output_dir BEFORE workspace cleanup
+        // 10. Collect artifacts to output_dir BEFORE workspace cleanup
         // The workspace will be automatically deleted when it goes out of scope,
         // so we must move artifacts out first.
         let artifact_paths: Vec<_> = result.artifacts.iter().map(|a| a.path.clone()).collect();
@@ -563,5 +581,128 @@ impl<'a> BuildCommand<'a> {
     ) -> Result<BuildOutput> {
         self.execute(project, version, &format!("commit:{commit}"), variants, output_dir)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::plugins::{BuildArtifact, Builder, VersionRequirement};
+    use crate::projects::Project;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Minimal builder for testing purposes.
+    struct TestBuilder;
+
+    impl Builder for TestBuilder {
+        fn version_requirement(&self) -> VersionRequirement {
+            VersionRequirement::Required
+        }
+
+        fn required_commands(&self) -> Vec<&'static str> {
+            vec![]
+        }
+
+        fn setup_commands(&self) -> Vec<String> {
+            vec![]
+        }
+
+        fn build_commands(&self, _version: &str, _variants: &[&str]) -> Vec<String> {
+            vec![]
+        }
+
+        fn artifacts(
+            &self,
+            _working_dir: &PathBuf,
+            _version: &str,
+            _variants: &[&str],
+        ) -> crate::Result<Vec<BuildArtifact>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn test_private_repo_fails_without_token() {
+        // Setup: Create registry with a PRIVATE project
+        let mut registry = ProjectRegistry::new();
+        registry.register(Project {
+            name: "test-private".to_string(),
+            repo_url: "https://github.com/test/private-repo.git".to_string(),
+            owner: "test".to_string(),
+            repo: "private-repo".to_string(),
+            default_branch: "main".to_string(),
+            is_private: true,
+            builder: Box::new(TestBuilder),
+        });
+
+        // Config WITHOUT token
+        let config = Config::new(PathBuf::from("/tmp/builds"));
+
+        // GitHub client (anonymous - no token)
+        let github = GitHubClient::anonymous().unwrap();
+
+        // Create the command
+        let cmd = BuildCommand::new(&github, &registry, &config);
+
+        // Execute should fail IMMEDIATELY with PrivateRepoNoToken error
+        let output_dir = TempDir::new().unwrap();
+        let result = cmd.execute("test-private", Some("1.0.0"), "main", &[], output_dir.path()).await;
+
+        // Verify it's the correct error type
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_string = err.to_string();
+
+        assert!(
+            err_string.contains("private and requires a GitHub token"),
+            "Expected PrivateRepoNoToken error, got: {}",
+            err_string
+        );
+        assert!(
+            err_string.contains("test/private-repo"),
+            "Expected repo name in error, got: {}",
+            err_string
+        );
+    }
+
+    #[tokio::test]
+    async fn test_public_repo_does_not_require_token() {
+        // Setup: Create registry with a PUBLIC project
+        let mut registry = ProjectRegistry::new();
+        registry.register(Project {
+            name: "test-public".to_string(),
+            repo_url: "https://github.com/test/public-repo.git".to_string(),
+            owner: "test".to_string(),
+            repo: "public-repo".to_string(),
+            default_branch: "main".to_string(),
+            is_private: false, // PUBLIC repo
+            builder: Box::new(TestBuilder),
+        });
+
+        // Config WITHOUT token
+        let config = Config::new(PathBuf::from("/tmp/builds"));
+
+        // GitHub client (anonymous - no token)
+        let github = GitHubClient::anonymous().unwrap();
+
+        // Create the command
+        let cmd = BuildCommand::new(&github, &registry, &config);
+
+        // Execute should NOT fail with PrivateRepoNoToken error
+        // (it will fail later because the repo doesn't exist, but that's fine)
+        let output_dir = TempDir::new().unwrap();
+        let result = cmd.execute("test-public", Some("1.0.0"), "main", &[], output_dir.path()).await;
+
+        // The error should NOT be PrivateRepoNoToken
+        if let Err(e) = result {
+            let err_string = e.to_string();
+            assert!(
+                !err_string.contains("private and requires a GitHub token"),
+                "Public repo should not trigger PrivateRepoNoToken error, got: {}",
+                err_string
+            );
+        }
+        // If it somehow succeeds (shouldn't with fake repo), that's also fine
     }
 }
