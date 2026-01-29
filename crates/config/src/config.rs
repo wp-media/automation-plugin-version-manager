@@ -31,8 +31,8 @@ use crate::paths::Paths;
 /// use std::path::PathBuf;
 ///
 /// let config = Config::new(
-///     PathBuf::from("/home/user/.apvm/cache"),
-///     PathBuf::from("/home/user/apvm-builds"),
+///     PathBuf::from("/var/cache/myapp"),
+///     PathBuf::from("/var/lib/myapp/builds"),
 /// );
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,8 +68,8 @@ impl Config {
     /// use std::path::PathBuf;
     ///
     /// let config = Config::new(
-    ///     PathBuf::from("/home/user/.apvm/cache"),
-    ///     PathBuf::from("/home/user/apvm-builds"),
+    ///     PathBuf::from("/var/cache/myapp"),
+    ///     PathBuf::from("/var/lib/myapp/builds"),
     /// );
     /// ```
     pub fn new(cache_dir: PathBuf, builds_dir: PathBuf) -> Self {
@@ -91,12 +91,12 @@ impl Config {
     /// use std::path::PathBuf;
     ///
     /// let paths = Paths::new(
-    ///     PathBuf::from("/home/user/.apvm"),
-    ///     PathBuf::from("/large-hdd/builds"),
+    ///     PathBuf::from("/var/lib/myapp"),
+    ///     PathBuf::from("/var/lib/myapp/builds"),
     /// );
     ///
     /// let config = Config::with_paths(paths);
-    /// assert_eq!(config.builds_dir.to_str(), Some("/large-hdd/builds"));
+    /// assert_eq!(config.builds_dir.to_str(), Some("/var/lib/myapp/builds"));
     /// ```
     pub fn with_paths(paths: Paths) -> Self {
         Self {
@@ -217,13 +217,13 @@ mod tests {
     #[test]
     fn with_paths_copies_paths() {
         let paths = Paths::new(
-            PathBuf::from("/apvm"),
+            PathBuf::from("/base"),
             PathBuf::from("/big/builds"),
         );
 
         let config = Config::with_paths(paths);
 
-        assert_eq!(config.cache_dir, PathBuf::from("/apvm/cache"));
+        assert_eq!(config.cache_dir, PathBuf::from("/base/cache"));
         assert_eq!(config.builds_dir, PathBuf::from("/big/builds"));
     }
 

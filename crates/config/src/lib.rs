@@ -21,14 +21,14 @@
 //!
 //! // Create paths with explicit directories
 //! let paths = Paths::new(
-//!     PathBuf::from("/home/user/.apvm"),
-//!     PathBuf::from("/home/user/apvm-builds"),
+//!     PathBuf::from("/var/lib/myapp"),
+//!     PathBuf::from("/var/lib/myapp/builds"),
 //! );
-//! println!("APVM dir: {:?}", paths.apvm_dir());
+//! println!("Base dir: {:?}", paths.apvm_dir());
 //!
 //! // Or use builder for partial construction
 //! let paths = Paths::builder()
-//!     .apvm_dir("/custom/apvm")
+//!     .apvm_dir("/custom/path")
 //!     .builds_dir("/custom/builds")
 //!     .build();
 //!

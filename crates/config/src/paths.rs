@@ -25,13 +25,13 @@ use std::path::PathBuf;
 ///
 /// // Create with explicit paths
 /// let paths = Paths::new(
-///     PathBuf::from("/home/user/.apvm"),
-///     PathBuf::from("/home/user/apvm-builds"),
+///     PathBuf::from("/var/lib/myapp"),
+///     PathBuf::from("/var/lib/myapp/builds"),
 /// );
 ///
 /// // Or use builder for partial construction
 /// let paths = Paths::builder()
-///     .apvm_dir("/custom/apvm")
+///     .apvm_dir("/custom/path")
 ///     .builds_dir("/custom/builds")
 ///     .build();
 /// ```
@@ -56,8 +56,8 @@ impl Paths {
     ///
     /// # Arguments
     ///
-    /// * `apvm_dir` - Base APVM directory (e.g., `~/.apvm`)
-    /// * `builds_dir` - Directory for built artifacts (e.g., `~/apvm-builds`)
+    /// * `apvm_dir` - Base APVM directory for config and cache
+    /// * `builds_dir` - Directory for built artifacts
     ///
     /// # Example
     ///
@@ -66,8 +66,8 @@ impl Paths {
     /// use std::path::PathBuf;
     ///
     /// let paths = Paths::new(
-    ///     PathBuf::from("/home/user/.apvm"),
-    ///     PathBuf::from("/home/user/apvm-builds"),
+    ///     PathBuf::from("/var/lib/myapp"),
+    ///     PathBuf::from("/var/lib/myapp/builds"),
     /// );
     /// ```
     pub fn new(apvm_dir: PathBuf, builds_dir: PathBuf) -> Self {
@@ -87,7 +87,7 @@ impl Paths {
     /// use apvm_config::Paths;
     ///
     /// let paths = Paths::builder()
-    ///     .apvm_dir("/custom/apvm")
+    ///     .apvm_dir("/custom/path")
     ///     .builds_dir("/custom/builds")
     ///     .build();
     /// ```
@@ -114,8 +114,8 @@ impl Paths {
     /// use apvm_config::Paths;
     /// use std::path::PathBuf;
     ///
-    /// let paths = Paths::with_apvm_dir("/custom/apvm", PathBuf::from("/custom/builds"));
-    /// assert_eq!(paths.config_file().to_str(), Some("/custom/apvm/config.json"));
+    /// let paths = Paths::with_apvm_dir("/custom/path", PathBuf::from("/custom/builds"));
+    /// assert_eq!(paths.config_file().to_str(), Some("/custom/path/config.json"));
     /// ```
     pub fn with_apvm_dir(apvm_dir: impl Into<PathBuf>, builds_dir: PathBuf) -> Self {
         let apvm_dir = apvm_dir.into();
@@ -127,19 +127,19 @@ impl Paths {
         }
     }
 
-    /// Get the APVM directory (`~/.apvm` by default).
+    /// Get the APVM base directory.
     ///
     /// This is the base directory for APVM configuration and cache.
     pub fn apvm_dir(&self) -> &PathBuf {
         &self.apvm_dir
     }
 
-    /// Get the configuration file path (`~/.apvm/config.json` by default).
+    /// Get the configuration file path (`{apvm_dir}/config.json`).
     pub fn config_file(&self) -> &PathBuf {
         &self.config_file
     }
 
-    /// Get the cache directory (`~/.apvm/cache` by default).
+    /// Get the cache directory (`{apvm_dir}/cache`).
     ///
     /// This directory stores cloned repositories.
     pub fn cache_dir(&self) -> &PathBuf {
@@ -164,7 +164,7 @@ impl Paths {
 /// use apvm_config::Paths;
 ///
 /// let paths = Paths::builder()
-///     .apvm_dir("/custom/apvm")
+///     .apvm_dir("/custom/path")
 ///     .builds_dir("/custom/builds")
 ///     .build();
 /// ```
@@ -250,38 +250,38 @@ mod tests {
     #[test]
     fn new_creates_paths_with_derived_values() {
         let paths = Paths::new(
-            PathBuf::from("/home/user/.apvm"),
-            PathBuf::from("/home/user/apvm-builds"),
+            PathBuf::from("/var/lib/myapp"),
+            PathBuf::from("/var/lib/myapp/builds"),
         );
 
-        assert_eq!(paths.apvm_dir(), &PathBuf::from("/home/user/.apvm"));
+        assert_eq!(paths.apvm_dir(), &PathBuf::from("/var/lib/myapp"));
         assert_eq!(
             paths.config_file(),
-            &PathBuf::from("/home/user/.apvm/config.json")
+            &PathBuf::from("/var/lib/myapp/config.json")
         );
         assert_eq!(
             paths.cache_dir(),
-            &PathBuf::from("/home/user/.apvm/cache")
+            &PathBuf::from("/var/lib/myapp/cache")
         );
         assert_eq!(
             paths.builds_dir(),
-            &PathBuf::from("/home/user/apvm-builds")
+            &PathBuf::from("/var/lib/myapp/builds")
         );
     }
 
     #[test]
     fn builder_requires_apvm_dir_and_builds_dir() {
         let paths = Paths::builder()
-            .apvm_dir("/custom/apvm")
+            .apvm_dir("/custom/path")
             .builds_dir("/custom/builds")
             .build();
 
-        assert_eq!(paths.apvm_dir(), &PathBuf::from("/custom/apvm"));
+        assert_eq!(paths.apvm_dir(), &PathBuf::from("/custom/path"));
         assert_eq!(
             paths.config_file(),
-            &PathBuf::from("/custom/apvm/config.json")
+            &PathBuf::from("/custom/path/config.json")
         );
-        assert_eq!(paths.cache_dir(), &PathBuf::from("/custom/apvm/cache"));
+        assert_eq!(paths.cache_dir(), &PathBuf::from("/custom/path/cache"));
         assert_eq!(paths.builds_dir(), &PathBuf::from("/custom/builds"));
     }
 
@@ -302,11 +302,11 @@ mod tests {
 
     #[test]
     fn with_apvm_dir_derives_internal_paths() {
-        let paths = Paths::with_apvm_dir("/my/apvm", PathBuf::from("/my/builds"));
+        let paths = Paths::with_apvm_dir("/my/base", PathBuf::from("/my/builds"));
 
-        assert_eq!(paths.apvm_dir(), &PathBuf::from("/my/apvm"));
-        assert_eq!(paths.config_file(), &PathBuf::from("/my/apvm/config.json"));
-        assert_eq!(paths.cache_dir(), &PathBuf::from("/my/apvm/cache"));
+        assert_eq!(paths.apvm_dir(), &PathBuf::from("/my/base"));
+        assert_eq!(paths.config_file(), &PathBuf::from("/my/base/config.json"));
+        assert_eq!(paths.cache_dir(), &PathBuf::from("/my/base/cache"));
         assert_eq!(paths.builds_dir(), &PathBuf::from("/my/builds"));
     }
 
@@ -319,6 +319,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "builds_dir is required")]
     fn builder_panics_without_builds_dir() {
-        Paths::builder().apvm_dir("/apvm").build();
+        Paths::builder().apvm_dir("/base").build();
     }
 }

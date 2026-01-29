@@ -18,7 +18,7 @@
 //! use apvm_core::config_io::{load_config, save_config};
 //! use std::path::PathBuf;
 //!
-//! let config_path = PathBuf::from("/home/user/.apvm/config.json");
+//! let config_path = PathBuf::from("/etc/myapp/config.json");
 //!
 //! // Load from explicit path
 //! let config = load_config(&config_path)?;
@@ -56,7 +56,7 @@ use crate::error::{Error, Result};
 /// ```ignore
 /// use std::path::PathBuf;
 ///
-/// let path = PathBuf::from("/home/user/.apvm/config.json");
+/// let path = PathBuf::from("/etc/myapp/config.json");
 /// let config = load_config(&path)?;
 /// ```
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
@@ -85,10 +85,10 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
 /// use std::path::PathBuf;
 /// use apvm_config::Config;
 ///
-/// let path = PathBuf::from("/home/user/.apvm/config.json");
+/// let path = PathBuf::from("/etc/myapp/config.json");
 /// let default = Config::new(
-///     PathBuf::from("/home/user/.apvm/cache"),
-///     PathBuf::from("/home/user/apvm-builds"),
+///     PathBuf::from("/var/cache/myapp"),
+///     PathBuf::from("/var/lib/myapp/builds"),
 /// );
 /// let config = load_config_or_default(&path, default)?;
 /// ```
@@ -190,7 +190,7 @@ fn load_config_from_path_with_default(path: &Path, default_config: Config) -> Re
 ///     PathBuf::from("/builds"),
 /// ).set_token("ghp_xxx");
 ///
-/// save_config(&config, PathBuf::from("/home/user/.apvm/config.json"))?;
+/// save_config(&config, PathBuf::from("/etc/myapp/config.json"))?;
 /// ```
 pub fn save_config<P: AsRef<Path>>(config: &Config, path: P) -> Result<PathBuf> {
     let config_path = path.as_ref().to_path_buf();
@@ -266,8 +266,8 @@ fn save_config_to_path(config: &Config, path: &Path) -> Result<()> {
 ///
 /// // Ensure directories exist with explicit paths
 /// let paths = Paths::new(
-///     PathBuf::from("/home/user/.apvm"),
-///     PathBuf::from("/home/user/apvm-builds"),
+///     PathBuf::from("/var/lib/myapp"),
+///     PathBuf::from("/var/lib/myapp/builds"),
 /// );
 /// ensure_directories(&paths)?;
 /// ```
@@ -313,10 +313,10 @@ pub fn ensure_directories(paths: &Paths) -> Result<()> {
 /// use std::path::PathBuf;
 /// use apvm_config::{Config, Paths};
 ///
-/// let config_path = PathBuf::from("/home/user/.apvm/config.json");
+/// let config_path = PathBuf::from("/etc/myapp/config.json");
 /// let default = Config::new(
-///     PathBuf::from("/home/user/.apvm/cache"),
-///     PathBuf::from("/home/user/apvm-builds"),
+///     PathBuf::from("/var/cache/myapp"),
+///     PathBuf::from("/var/lib/myapp/builds"),
 /// );
 /// let (config, paths) = init_config(&config_path, default)?;
 /// ```
@@ -343,7 +343,7 @@ pub fn init_config<P: AsRef<Path>>(config_path: P, default_config: Config) -> Re
 /// ```ignore
 /// use std::path::PathBuf;
 ///
-/// let path = PathBuf::from("/home/user/.apvm/config.json");
+/// let path = PathBuf::from("/etc/myapp/config.json");
 /// if !config_exists(&path) {
 ///     println!("No config file found, will use defaults");
 /// }
