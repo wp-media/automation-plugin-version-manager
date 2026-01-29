@@ -58,7 +58,7 @@ impl Repository {
         tracing::info!("Cloning {} into {}", url, path.display());
 
         let output = Command::new("git")
-            .args(["clone", "--single-branch", url])
+            .args(["clone", url])
             .arg(path)
             .output()
             .await
@@ -119,7 +119,7 @@ impl Repository {
             url.replacen("https://", &format!("https://x-access-token:{token}@"), 1);
 
         let output = Command::new("git")
-            .args(["clone", "--single-branch", &authenticated_url])
+            .args(["clone", &authenticated_url])
             .arg(path)
             .output()
             .await
