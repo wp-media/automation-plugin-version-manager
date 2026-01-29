@@ -86,10 +86,7 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
 /// use apvm_config::Config;
 ///
 /// let path = PathBuf::from("/etc/myapp/config.json");
-/// let default = Config::new(
-///     PathBuf::from("/var/cache/myapp"),
-///     PathBuf::from("/var/lib/myapp/builds"),
-/// );
+/// let default = Config::new(PathBuf::from("/var/lib/myapp/builds"));
 /// let config = load_config_or_default(&path, default)?;
 /// ```
 pub fn load_config_or_default<P: AsRef<Path>>(path: P, default_config: Config) -> Result<Config> {
@@ -185,10 +182,8 @@ fn load_config_from_path_with_default(path: &Path, default_config: Config) -> Re
 /// use std::path::PathBuf;
 /// use apvm_config::Config;
 ///
-/// let config = Config::new(
-///     PathBuf::from("/cache"),
-///     PathBuf::from("/builds"),
-/// ).set_token("ghp_xxx");
+/// let config = Config::new(PathBuf::from("/builds"))
+///     .set_token("ghp_xxx");
 ///
 /// save_config(&config, PathBuf::from("/etc/myapp/config.json"))?;
 /// ```
@@ -309,8 +304,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn test_config(cache: PathBuf, builds: PathBuf) -> Config {
-        Config::new(cache, builds)
+    fn test_config(builds: PathBuf) -> Config {
+        Config::new(builds)
     }
 
     #[test]
@@ -326,14 +321,11 @@ mod tests {
     fn test_load_or_default_nonexistent_returns_default() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("nonexistent.json");
-        let default = test_config(
-            PathBuf::from("/default/cache"),
-            PathBuf::from("/default/builds"),
-        );
+        let default = test_config(PathBuf::from("/default/builds"));
 
         let config = load_config_or_default(&path, default).unwrap();
         assert!(config.github_token.is_none());
-        assert_eq!(config.cache_dir, PathBuf::from("/default/cache"));
+        assert_eq!(config.builds_dir, PathBuf::from("/default/builds"));
     }
 
     #[test]
@@ -342,14 +334,11 @@ mod tests {
         let path = temp.path().join("empty.json");
         fs::write(&path, "").unwrap();
 
-        let default = test_config(
-            PathBuf::from("/default/cache"),
-            PathBuf::from("/default/builds"),
-        );
+        let default = test_config(PathBuf::from("/default/builds"));
 
         let config = load_config_or_default(&path, default).unwrap();
         assert!(config.github_token.is_none());
-        assert_eq!(config.cache_dir, PathBuf::from("/default/cache"));
+        assert_eq!(config.builds_dir, PathBuf::from("/default/builds"));
     }
 
     #[test]
@@ -358,7 +347,7 @@ mod tests {
         let path = temp.path().join("config.json");
         fs::write(
             &path,
-            r#"{"github_token": "test-token", "cache_dir": "/test/cache", "builds_dir": "/test/builds"}"#,
+            r#"{"github_token": "test-token", "builds_dir": "/test/builds"}"#,
         )
         .unwrap();
 
@@ -382,11 +371,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("subdir").join("config.json");
 
-        let config = Config::with_token(
-            "my-token",
-            PathBuf::from("/cache"),
-            PathBuf::from("/builds"),
-        );
+        let config = Config::with_token("my-token", PathBuf::from("/builds"));
         save_config(&config, &path).unwrap();
 
         assert!(path.exists());
@@ -399,19 +384,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("config.json");
 
-        let original = test_config(
-            PathBuf::from("/original/cache"),
-            PathBuf::from("/original/builds"),
-        )
-        .set_token("roundtrip-token")
-        .set_cache_dir("/custom/cache")
-        .set_builds_dir("/custom/builds");
+        let original = test_config(PathBuf::from("/original/builds"))
+            .set_token("roundtrip-token")
+            .set_builds_dir("/custom/builds");
 
         save_config(&original, &path).unwrap();
         let loaded = load_config(&path).unwrap();
 
         assert_eq!(loaded.github_token, original.github_token);
-        assert_eq!(loaded.cache_dir, original.cache_dir);
         assert_eq!(loaded.builds_dir, original.builds_dir);
     }
 

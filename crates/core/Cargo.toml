@@ -39,5 +39,5 @@ glob = { workspace = true }
 # Platform directories
 directories = { workspace = true }
 
-[dev-dependencies]
+# Temporary directories (for build workspaces)
 tempfile = { workspace = true }

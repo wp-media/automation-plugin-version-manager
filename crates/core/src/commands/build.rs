@@ -6,9 +6,11 @@
 use crate::build::plugins::VersionRequirement;
 use crate::build::{BuildResult, BuildRunner};
 use crate::error::{Error, Result};
-use crate::git::{RefResolver, RefSource, RepoCache, ResolvedRef};
+use crate::git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 use crate::github::GitHubClient;
 use crate::projects::ProjectRegistry;
+use apvm_config::Config;
+use std::path::Path;
 
 // Re-export storage types for convenience (consumers don't need to add apvm-storage)
 pub use apvm_storage::{BuildMetadata, SourceArtifact};
@@ -261,21 +263,21 @@ impl BuildOutput {
 /// - `commit:a1b2c3d` → Force commit interpretation
 pub struct BuildCommand<'a> {
     github: &'a GitHubClient,
-    cache: &'a RepoCache,
     registry: &'a ProjectRegistry,
+    config: &'a Config,
 }
 
 impl<'a> BuildCommand<'a> {
     /// Create a new build command.
     pub fn new(
         github: &'a GitHubClient,
-        cache: &'a RepoCache,
         registry: &'a ProjectRegistry,
+        config: &'a Config,
     ) -> Self {
         Self {
             github,
-            cache,
             registry,
+            config,
         }
     }
 
@@ -287,24 +289,33 @@ impl<'a> BuildCommand<'a> {
     /// * `version` - Version to build, or `None` for auto-detection if builder have it implemented
     /// * `git_ref` - Git reference (PR number, branch, tag, or commit)
     /// * `variants` - Specific variants to build (empty = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     pub async fn execute(
         &self,
         project: &str,
         version: Option<&str>,
         git_ref: &str,
         variants: &[&str],
+        output_dir: impl AsRef<Path>,
     ) -> Result<BuildOutput> {
+        let output_dir = output_dir.as_ref();
+        
         // 1. Look up project in registry
         let project_info = self.registry.get(project)?;
         let builder = project_info.builder.as_ref();
 
-        // 2. Get or clone repository (need it for ref resolution)
-        let repo = self
-            .cache
-            .get_or_clone(&project_info.repo_url, &project_info.name, &project_info.repo)
-            .await?;
+        // 2. Create isolated build workspace (auto-cleaned on drop)
+        let workspace = BuildWorkspace::new(
+            &project_info.name,
+            &project_info.repo_url,
+            self.config.github_token.as_deref(),
+        )?;
 
-        // Fetch latest refs before resolution
+        // Clone the repository into the temp workspace
+        workspace.clone_repo().await?;
+
+        // Fetch latest refs
+        let repo = workspace.repository();
         repo.fetch().await?;
 
         // 3. Resolve the git reference
@@ -323,6 +334,7 @@ impl<'a> BuildCommand<'a> {
         );
         repo.reset_hard().await?;
         repo.checkout(&project_info.default_branch).await?;
+        repo.reset_hard().await?;
         repo.pull().await?;
 
         // 5. Checkout the resolved ref
@@ -367,6 +379,19 @@ impl<'a> BuildCommand<'a> {
             .execute_build(builder, &resolved_version, variants)
             .await?;
 
+        // 9. Collect artifacts to output_dir BEFORE workspace cleanup
+        // The workspace will be automatically deleted when it goes out of scope,
+        // so we must move artifacts out first.
+        let artifact_paths: Vec<_> = result.artifacts.iter().map(|a| a.path.clone()).collect();
+        workspace.collect_artifacts(&artifact_paths, output_dir)?;
+
+        // Update artifact paths to point to output_dir
+        let mut result = result;
+        for artifact in &mut result.artifacts {
+            artifact.path = output_dir.join(&artifact.filename);
+        }
+
+        // Workspace is automatically cleaned up here when it goes out of scope
         Ok(BuildOutput {
             result,
             resolved_ref: resolved,
@@ -454,7 +479,7 @@ impl<'a> BuildCommand<'a> {
 
     /// Execute a build from a specific PR number.
     ///
-    /// This is a convenience method equivalent to `execute(project, version, "pr:{pr_number}", variants)`.
+    /// This is a convenience method equivalent to `execute(project, version, "pr:{pr_number}", variants, output_dir)`.
     ///
     /// # Arguments
     ///
@@ -462,14 +487,16 @@ impl<'a> BuildCommand<'a> {
     /// * `version` - Version to build, or `None` for auto-detection
     /// * `pr_number` - Pull request number
     /// * `variants` - Specific variants to build (empty = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     pub async fn execute_pr(
         &self,
         project: &str,
         version: Option<&str>,
         pr_number: u64,
         variants: &[&str],
+        output_dir: impl AsRef<Path>,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("pr:{pr_number}"), variants)
+        self.execute(project, version, &format!("pr:{pr_number}"), variants, output_dir)
             .await
     }
 
@@ -481,14 +508,16 @@ impl<'a> BuildCommand<'a> {
     /// * `version` - Version to build, or `None` for auto-detection
     /// * `branch` - Branch name
     /// * `variants` - Specific variants to build (empty = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     pub async fn execute_branch(
         &self,
         project: &str,
         version: Option<&str>,
         branch: &str,
         variants: &[&str],
+        output_dir: impl AsRef<Path>,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("branch:{branch}"), variants)
+        self.execute(project, version, &format!("branch:{branch}"), variants, output_dir)
             .await
     }
 
@@ -500,14 +529,16 @@ impl<'a> BuildCommand<'a> {
     /// * `version` - Version to build, or `None` for auto-detection
     /// * `tag` - Tag name (e.g., "v1.0.0")
     /// * `variants` - Specific variants to build (empty = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     pub async fn execute_tag(
         &self,
         project: &str,
         version: Option<&str>,
         tag: &str,
         variants: &[&str],
+        output_dir: impl AsRef<Path>,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("tag:{tag}"), variants)
+        self.execute(project, version, &format!("tag:{tag}"), variants, output_dir)
             .await
     }
 
@@ -519,14 +550,16 @@ impl<'a> BuildCommand<'a> {
     /// * `version` - Version to build, or `None` for auto-detection
     /// * `commit` - Commit SHA (minimum 7 characters)
     /// * `variants` - Specific variants to build (empty = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     pub async fn execute_commit(
         &self,
         project: &str,
         version: Option<&str>,
         commit: &str,
         variants: &[&str],
+        output_dir: impl AsRef<Path>,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("commit:{commit}"), variants)
+        self.execute(project, version, &format!("commit:{commit}"), variants, output_dir)
             .await
     }
 }

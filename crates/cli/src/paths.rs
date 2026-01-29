@@ -7,13 +7,15 @@
 //!
 //! ```text
 //! ~/.apvm/                    (apvm_dir)
-//! ├── config.json             (config_file)
-//! └── cache/                  (cache_dir - for cloned repositories)
+//! └── config.json             (config_file)
 //!
 //! ~/apvm-builds/              (builds_dir)
 //! └── {project}/
 //!     └── {artifact}.zip
 //! ```
+//!
+//! Note: Repository cloning uses automatic temp directories that are
+//! cleaned up after builds complete. No persistent cache is needed.
 
 use std::path::PathBuf;
 
@@ -43,8 +45,6 @@ pub struct Paths {
     apvm_dir: PathBuf,
     /// Configuration file path.
     config_file: PathBuf,
-    /// Repository cache directory.
-    cache_dir: PathBuf,
     /// Built artifacts directory.
     builds_dir: PathBuf,
 }
@@ -52,18 +52,16 @@ pub struct Paths {
 impl Paths {
     /// Create paths from an APVM directory and builds directory.
     ///
-    /// Derives `config_file` and `cache_dir` from `apvm_dir`:
+    /// Derives `config_file` from `apvm_dir`:
     /// - `config_file` = `{apvm_dir}/config.json`
-    /// - `cache_dir` = `{apvm_dir}/cache`
     ///
     /// # Arguments
     ///
-    /// * `apvm_dir` - Base APVM directory for config and cache
+    /// * `apvm_dir` - Base APVM directory for config
     /// * `builds_dir` - Directory for built artifacts
     pub fn new(apvm_dir: PathBuf, builds_dir: PathBuf) -> Self {
         Self {
             config_file: apvm_dir.join("config.json"),
-            cache_dir: apvm_dir.join("cache"),
             apvm_dir,
             builds_dir,
         }
@@ -84,11 +82,6 @@ impl Paths {
         &self.config_file
     }
 
-    /// Get the cache directory.
-    pub fn cache_dir(&self) -> &PathBuf {
-        &self.cache_dir
-    }
-
     /// Get the builds directory.
     pub fn builds_dir(&self) -> &PathBuf {
         &self.builds_dir
@@ -98,14 +91,14 @@ impl Paths {
     ///
     /// This creates a Config with the paths needed by the core library.
     pub fn to_config(&self) -> Config {
-        Config::new(self.cache_dir.clone(), self.builds_dir.clone())
+        Config::new(self.builds_dir.clone())
     }
 
     /// Get all directories that should be created.
     ///
     /// Returns paths in creation order (parents first).
     pub fn directories(&self) -> Vec<&PathBuf> {
-        vec![&self.apvm_dir, &self.cache_dir, &self.builds_dir]
+        vec![&self.apvm_dir, &self.builds_dir]
     }
 }
 
@@ -129,7 +122,6 @@ impl Paths {
 pub struct PathsBuilder {
     apvm_dir: Option<PathBuf>,
     config_file: Option<PathBuf>,
-    cache_dir: Option<PathBuf>,
     builds_dir: Option<PathBuf>,
 }
 
@@ -148,14 +140,6 @@ impl PathsBuilder {
     /// If not set, defaults to `{apvm_dir}/config.json`.
     pub fn config_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.config_file = Some(path.into());
-        self
-    }
-
-    /// Set the cache directory.
-    ///
-    /// If not set, defaults to `{apvm_dir}/cache`.
-    pub fn cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.cache_dir = Some(path.into());
         self
     }
 
@@ -184,7 +168,6 @@ impl PathsBuilder {
             config_file: self
                 .config_file
                 .unwrap_or_else(|| apvm_dir.join("config.json")),
-            cache_dir: self.cache_dir.unwrap_or_else(|| apvm_dir.join("cache")),
             apvm_dir,
             builds_dir,
         }
@@ -207,7 +190,6 @@ mod tests {
             paths.config_file(),
             &PathBuf::from("/var/lib/apvm/config.json")
         );
-        assert_eq!(paths.cache_dir(), &PathBuf::from("/var/lib/apvm/cache"));
         assert_eq!(
             paths.builds_dir(),
             &PathBuf::from("/var/lib/apvm/builds")
@@ -226,7 +208,6 @@ mod tests {
             paths.config_file(),
             &PathBuf::from("/custom/path/config.json")
         );
-        assert_eq!(paths.cache_dir(), &PathBuf::from("/custom/path/cache"));
         assert_eq!(paths.builds_dir(), &PathBuf::from("/custom/builds"));
     }
 
@@ -235,13 +216,11 @@ mod tests {
         let paths = Paths::builder()
             .apvm_dir("/base")
             .config_file("/other/config.json")
-            .cache_dir("/fast-ssd/cache")
             .builds_dir("/large-hdd/builds")
             .build();
 
         assert_eq!(paths.apvm_dir(), &PathBuf::from("/base"));
         assert_eq!(paths.config_file(), &PathBuf::from("/other/config.json"));
-        assert_eq!(paths.cache_dir(), &PathBuf::from("/fast-ssd/cache"));
         assert_eq!(paths.builds_dir(), &PathBuf::from("/large-hdd/builds"));
     }
 
@@ -250,7 +229,6 @@ mod tests {
         let paths = Paths::new(PathBuf::from("/base"), PathBuf::from("/builds"));
 
         let config = paths.to_config();
-        assert_eq!(config.cache_dir, PathBuf::from("/base/cache"));
         assert_eq!(config.builds_dir, PathBuf::from("/builds"));
     }
 
@@ -259,9 +237,8 @@ mod tests {
         let paths = Paths::new(PathBuf::from("/base"), PathBuf::from("/builds"));
 
         let dirs = paths.directories();
-        assert_eq!(dirs.len(), 3);
+        assert_eq!(dirs.len(), 2);
         assert!(dirs.contains(&&PathBuf::from("/base")));
-        assert!(dirs.contains(&&PathBuf::from("/base/cache")));
         assert!(dirs.contains(&&PathBuf::from("/builds")));
     }
 

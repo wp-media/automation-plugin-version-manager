@@ -7,6 +7,9 @@
 //!
 //! Libraries should not hardcode default paths. File I/O (load/save) is also
 //! not provided - that's the consumer's responsibility.
+//!
+//! Repository cloning uses temporary directories that are automatically
+//! cleaned up after builds complete. No persistent cache directory is needed.
 
 use std::path::PathBuf;
 
@@ -28,10 +31,7 @@ use serde::{Deserialize, Serialize};
 /// use apvm_config::Config;
 /// use std::path::PathBuf;
 ///
-/// let config = Config::new(
-///     PathBuf::from("/var/cache/myapp"),
-///     PathBuf::from("/var/lib/myapp/builds"),
-/// );
+/// let config = Config::new(PathBuf::from("/var/lib/myapp/builds"));
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -44,9 +44,6 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_token: Option<String>,
 
-    /// Cache directory for cloned repositories.
-    pub cache_dir: PathBuf,
-
     /// Directory for storing built artifacts.
     pub builds_dir: PathBuf,
 }
@@ -56,7 +53,6 @@ impl Config {
     ///
     /// # Arguments
     ///
-    /// * `cache_dir` - Directory for cloned repository cache
     /// * `builds_dir` - Directory for built artifacts
     ///
     /// # Example
@@ -65,15 +61,11 @@ impl Config {
     /// use apvm_config::Config;
     /// use std::path::PathBuf;
     ///
-    /// let config = Config::new(
-    ///     PathBuf::from("/var/cache/myapp"),
-    ///     PathBuf::from("/var/lib/myapp/builds"),
-    /// );
+    /// let config = Config::new(PathBuf::from("/var/lib/myapp/builds"));
     /// ```
-    pub fn new(cache_dir: PathBuf, builds_dir: PathBuf) -> Self {
+    pub fn new(builds_dir: PathBuf) -> Self {
         Self {
             github_token: None,
-            cache_dir,
             builds_dir,
         }
     }
@@ -86,21 +78,12 @@ impl Config {
     /// use apvm_config::Config;
     /// use std::path::PathBuf;
     ///
-    /// let config = Config::with_token(
-    ///     "ghp_xxxxxxxxxxxx",
-    ///     PathBuf::from("/cache"),
-    ///     PathBuf::from("/builds"),
-    /// );
+    /// let config = Config::with_token("ghp_xxxxxxxxxxxx", PathBuf::from("/builds"));
     /// assert!(config.github_token.is_some());
     /// ```
-    pub fn with_token(
-        token: impl Into<String>,
-        cache_dir: PathBuf,
-        builds_dir: PathBuf,
-    ) -> Self {
+    pub fn with_token(token: impl Into<String>, builds_dir: PathBuf) -> Self {
         Self {
             github_token: Some(token.into()),
-            cache_dir,
             builds_dir,
         }
     }
@@ -113,17 +96,11 @@ impl Config {
     /// use apvm_config::Config;
     /// use std::path::PathBuf;
     ///
-    /// let config = Config::new(PathBuf::from("/cache"), PathBuf::from("/builds"))
+    /// let config = Config::new(PathBuf::from("/builds"))
     ///     .set_token("ghp_xxxxxxxxxxxx");
     /// ```
     pub fn set_token(mut self, token: impl Into<String>) -> Self {
         self.github_token = Some(token.into());
-        self
-    }
-
-    /// Set the cache directory.
-    pub fn set_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.cache_dir = path.into();
         self
     }
 
@@ -143,69 +120,52 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn test_paths() -> (PathBuf, PathBuf) {
-        (PathBuf::from("/test/cache"), PathBuf::from("/test/builds"))
-    }
-
     #[test]
     fn new_config_has_no_token() {
-        let (cache, builds) = test_paths();
-        let config = Config::new(cache, builds);
+        let config = Config::new(PathBuf::from("/test/builds"));
         assert!(config.github_token.is_none());
         assert!(!config.has_token());
     }
 
     #[test]
     fn new_config_uses_provided_paths() {
-        let (cache, builds) = test_paths();
-        let config = Config::new(cache.clone(), builds.clone());
-        assert_eq!(config.cache_dir, cache);
-        assert_eq!(config.builds_dir, builds);
+        let config = Config::new(PathBuf::from("/test/builds"));
+        assert_eq!(config.builds_dir, PathBuf::from("/test/builds"));
     }
 
     #[test]
     fn with_token_sets_token_and_paths() {
-        let (cache, builds) = test_paths();
-        let config = Config::with_token("test-token", cache.clone(), builds.clone());
+        let config = Config::with_token("test-token", PathBuf::from("/test/builds"));
         assert_eq!(config.github_token, Some("test-token".to_string()));
         assert!(config.has_token());
-        assert_eq!(config.cache_dir, cache);
-        assert_eq!(config.builds_dir, builds);
+        assert_eq!(config.builds_dir, PathBuf::from("/test/builds"));
     }
 
     #[test]
     fn builder_pattern_works() {
-        let (cache, builds) = test_paths();
-        let config = Config::new(cache, builds)
+        let config = Config::new(PathBuf::from("/builds"))
             .set_token("my-token")
-            .set_cache_dir("/custom/cache")
             .set_builds_dir("/custom/builds");
 
         assert_eq!(config.github_token, Some("my-token".to_string()));
-        assert_eq!(config.cache_dir, PathBuf::from("/custom/cache"));
         assert_eq!(config.builds_dir, PathBuf::from("/custom/builds"));
     }
 
     #[test]
     fn serialization_round_trip() {
-        let (cache, builds) = test_paths();
-        let config = Config::new(cache, builds)
-            .set_token("test-token")
-            .set_cache_dir("/test/cache")
-            .set_builds_dir("/test/builds");
+        let config = Config::new(PathBuf::from("/test/builds"))
+            .set_token("test-token");
 
         let json = serde_json::to_string(&config).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
 
         assert_eq!(config.github_token, restored.github_token);
-        assert_eq!(config.cache_dir, restored.cache_dir);
         assert_eq!(config.builds_dir, restored.builds_dir);
     }
 
     #[test]
     fn serialization_skips_none_token() {
-        let (cache, builds) = test_paths();
-        let config = Config::new(cache, builds);
+        let config = Config::new(PathBuf::from("/builds"));
         let json = serde_json::to_string(&config).unwrap();
 
         // Should not contain "github_token": null

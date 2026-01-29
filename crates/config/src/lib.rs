@@ -12,6 +12,8 @@
 //!   (load/save) are the consumer's responsibility.
 //! - **No path conventions**: Path layout (like `~/.myapp`) is CLI's decision,
 //!   not the library's.
+//! - **Temp dirs for cloning**: Repository cloning uses automatic temp
+//!   directories that are cleaned up after builds complete.
 //!
 //! # Example
 //!
@@ -20,17 +22,10 @@
 //! use std::path::PathBuf;
 //!
 //! // Create config with explicit paths
-//! let config = Config::new(
-//!     PathBuf::from("/var/cache/myapp"),
-//!     PathBuf::from("/var/lib/myapp/builds"),
-//! );
+//! let config = Config::new(PathBuf::from("/var/lib/myapp/builds"));
 //!
 //! // Or with a token
-//! let config = Config::with_token(
-//!     "ghp_xxxxxxxxxxxx",
-//!     PathBuf::from("/cache"),
-//!     PathBuf::from("/builds"),
-//! );
+//! let config = Config::with_token("ghp_xxxxxxxxxxxx", PathBuf::from("/builds"));
 //! ```
 
 mod config;

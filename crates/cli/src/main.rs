@@ -48,7 +48,6 @@ async fn main() -> Result<()> {
     // For now, just show initialization status
     println!("APVM initialized");
     println!("  Projects: {}", apvm.registry.list().count());
-    println!("  Cache dir: {}", apvm.config.cache_dir.display());
     println!("  Builds dir: {}", apvm.config.builds_dir.display());
     if apvm.has_token() {
         println!("  GitHub: authenticated");

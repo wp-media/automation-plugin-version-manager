@@ -22,17 +22,14 @@
 //! use std::path::PathBuf;
 //!
 //! // Create config with explicit paths
-//! let config = Config::new(
-//!     PathBuf::from("/var/cache/myapp"),
-//!     PathBuf::from("/var/lib/myapp/builds"),
-//! );
+//! let config = Config::new(PathBuf::from("/var/lib/myapp/builds"));
 //! let apvm = Apvm::new(config)?;
 //!
-//! // BackWPup: version required
-//! let output = apvm.build("backwpup", Some("5.1.0"), "pr:123", None).await?;
+//! // BackWPup: version required, specify output directory
+//! let output = apvm.build("backwpup", Some("5.1.0"), "pr:123", None, "/output").await?;
 //!
 //! // WP Rocket: version auto-detected from source
-//! let output = apvm.build("wp-rocket", None, "pr:456", None).await?;
+//! let output = apvm.build("wp-rocket", None, "pr:456", None, "/output").await?;
 //!
 //! // Store artifacts (optional - you choose!)
 //! let store = ArtifactStore::new(PathBuf::from("/var/lib/myapp/builds"));
@@ -55,9 +52,8 @@ pub use error::{Error, Result};
 
 // Re-export key types for convenience
 pub use commands::BuildOutput;
-pub use git::{RefResolver, RefSource, ResolvedRef};
+pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 
-use git::RepoCache;
 use github::GitHubClient;
 use projects::ProjectRegistry;
 
@@ -67,8 +63,6 @@ pub struct Apvm {
     pub config: Config,
     /// GitHub API client.
     pub github: GitHubClient,
-    /// Repository cache.
-    pub cache: RepoCache,
     /// Project registry.
     pub registry: ProjectRegistry,
     /// Source of the resolved token (for diagnostics).
@@ -87,13 +81,11 @@ impl Apvm {
         };
 
         let token_source = config.github_token.as_ref().map(|_| git::TokenSource::Config);
-        let cache = RepoCache::new(config.cache_dir.clone(), config.github_token.clone());
         let registry = ProjectRegistry::with_known_projects();
 
         Ok(Self {
             config,
             github,
-            cache,
             registry,
             token_source,
         })
@@ -138,13 +130,11 @@ impl Apvm {
             config.github_token = Some(rt.token.clone());
         }
 
-        let cache = RepoCache::new(config.cache_dir.clone(), config.github_token.clone());
         let registry = ProjectRegistry::with_known_projects();
 
         Ok(Self {
             config,
             github,
-            cache,
             registry,
             token_source,
         })
@@ -167,13 +157,11 @@ impl Apvm {
         };
 
         let token_source = config.github_token.as_ref().map(|_| git::TokenSource::Config);
-        let cache = RepoCache::new(config.cache_dir.clone(), config.github_token.clone());
         let registry = ProjectRegistry::new(); // Empty registry
 
         Ok(Self {
             config,
             github,
-            cache,
             registry,
             token_source,
         })
@@ -232,18 +220,19 @@ impl Apvm {
     /// * `version` - Version to build, or `None` for auto-detection
     /// * `git_ref` - Git reference (PR number, branch, tag, or commit)
     /// * `variants` - Optional specific variants to build (None = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     ///
     /// # Examples
     ///
     /// ```ignore
     /// // BackWPup: version REQUIRED
-    /// apvm.build("backwpup", Some("5.1.0"), "pr:123", None).await?;
+    /// apvm.build("backwpup", Some("5.1.0"), "pr:123", None, "/output").await?;
     ///
     /// // WP Rocket: version auto-detected from source
-    /// apvm.build("wp-rocket", None, "pr:456", None).await?;
+    /// apvm.build("wp-rocket", None, "pr:456", None, "/output").await?;
     ///
     /// // Other plugin: explicit version override (In case plugin support specific version and auto-detection)
-    /// apvm.build("other-plugin", Some("4.17.0-custom"), "develop", None).await?;
+    /// apvm.build("other-plugin", Some("4.17.0-custom"), "develop", None, "/output").await?;
     /// ```
     ///
     /// # Returns
@@ -255,16 +244,17 @@ impl Apvm {
         version: Option<&str>,
         git_ref: &str,
         variants: Option<&[&str]>,
+        output_dir: impl AsRef<std::path::Path>,
     ) -> Result<commands::BuildOutput> {
-        let cmd = commands::BuildCommand::new(&self.github, &self.cache, &self.registry);
+        let cmd = commands::BuildCommand::new(&self.github, &self.registry, &self.config);
         let variants = variants.unwrap_or(&[]);
 
-        cmd.execute(project, version, git_ref, variants).await
+        cmd.execute(project, version, git_ref, variants, output_dir).await
     }
 
     /// Build a project from a PR number.
     ///
-    /// This is a convenience method equivalent to `build(project, version, "{pr_number}", variants)`.
+    /// This is a convenience method equivalent to `build(project, version, "{pr_number}", variants, output_dir)`.
     ///
     /// # Arguments
     ///
@@ -272,14 +262,16 @@ impl Apvm {
     /// * `version` - Version to build, or `None` for auto-detection
     /// * `pr_number` - Pull request number
     /// * `variants` - Optional specific variants to build (None = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     pub async fn build_from_pr(
         &self,
         project: &str,
         version: Option<&str>,
         pr_number: u64,
         variants: Option<&[&str]>,
+        output_dir: impl AsRef<std::path::Path>,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &pr_number.to_string(), variants)
+        self.build(project, version, &pr_number.to_string(), variants, output_dir)
             .await
     }
 
@@ -291,14 +283,16 @@ impl Apvm {
     /// * `version` - Version to build, or `None` for auto-detection
     /// * `branch` - Branch name
     /// * `variants` - Optional specific variants to build (None = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     pub async fn build_from_branch(
         &self,
         project: &str,
         version: Option<&str>,
         branch: &str,
         variants: Option<&[&str]>,
+        output_dir: impl AsRef<std::path::Path>,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("branch:{branch}"), variants)
+        self.build(project, version, &format!("branch:{branch}"), variants, output_dir)
             .await
     }
 
@@ -310,14 +304,16 @@ impl Apvm {
     /// * `version` - Version to build, or `None` for auto-detection
     /// * `tag` - Tag name (e.g., "v1.0.0")
     /// * `variants` - Optional specific variants to build (None = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     pub async fn build_from_tag(
         &self,
         project: &str,
         version: Option<&str>,
         tag: &str,
         variants: Option<&[&str]>,
+        output_dir: impl AsRef<std::path::Path>,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("tag:{tag}"), variants)
+        self.build(project, version, &format!("tag:{tag}"), variants, output_dir)
             .await
     }
 
@@ -329,14 +325,16 @@ impl Apvm {
     /// * `version` - Version to build, or `None` for auto-detection
     /// * `commit` - Commit SHA (minimum 7 characters)
     /// * `variants` - Optional specific variants to build (None = all)
+    /// * `output_dir` - Directory where build artifacts will be placed
     pub async fn build_from_commit(
         &self,
         project: &str,
         version: Option<&str>,
         commit: &str,
         variants: Option<&[&str]>,
+        output_dir: impl AsRef<std::path::Path>,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("commit:{commit}"), variants)
+        self.build(project, version, &format!("commit:{commit}"), variants, output_dir)
             .await
     }
 }
