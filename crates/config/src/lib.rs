@@ -1,7 +1,7 @@
 //! APVM Configuration Library
 //!
-//! Provides path management and configuration types for APVM.
-//! This crate is designed to be used by both the CLI and the core library.
+//! Provides configuration types for APVM.
+//! This crate is designed to be used by the core library and CLI.
 //!
 //! # Design Philosophy
 //!
@@ -10,40 +10,29 @@
 //!   and clear ownership of configuration decisions.
 //! - **No file I/O**: This crate provides types only. File operations
 //!   (load/save) are the consumer's responsibility.
-//! - **Dependency Injection**: All paths must be explicitly provided at
-//!   construction time.
+//! - **No path conventions**: Path layout (like `~/.myapp`) is CLI's decision,
+//!   not the library's.
 //!
 //! # Example
 //!
 //! ```rust
-//! use apvm_config::{Config, Paths};
+//! use apvm_config::Config;
 //! use std::path::PathBuf;
 //!
-//! // Create paths with explicit directories
-//! let paths = Paths::new(
-//!     PathBuf::from("/var/lib/myapp"),
+//! // Create config with explicit paths
+//! let config = Config::new(
+//!     PathBuf::from("/var/cache/myapp"),
 //!     PathBuf::from("/var/lib/myapp/builds"),
 //! );
-//! println!("Base dir: {:?}", paths.apvm_dir());
 //!
-//! // Or use builder for partial construction
-//! let paths = Paths::builder()
-//!     .apvm_dir("/custom/path")
-//!     .builds_dir("/custom/builds")
-//!     .build();
-//!
-//! // Config from paths
-//! let config = Config::with_paths(paths);
-//!
-//! // Or create config directly
-//! let config = Config::new(
+//! // Or with a token
+//! let config = Config::with_token(
+//!     "ghp_xxxxxxxxxxxx",
 //!     PathBuf::from("/cache"),
 //!     PathBuf::from("/builds"),
 //! );
 //! ```
 
-mod paths;
 mod config;
 
-pub use paths::{Paths, PathsBuilder};
 pub use config::Config;

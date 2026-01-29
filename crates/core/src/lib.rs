@@ -9,18 +9,23 @@
 //!
 //! - **Core builds artifacts** - handles git, builds, version detection
 //! - **Storage is separate** - consumers compose core + storage as needed
-//! - **Helpers for convenience** - conversion methods eliminate boilerplate
+//! - **No path conventions** - consumers decide directory layout
 //!
 //! See [`build::plugins::VersionRequirement`] for how different projects handle versions.
 //!
 //! # Quick Start
 //!
 //! ```ignore
-//! use apvm_core::{Apvm, config_io};
+//! use apvm_core::Apvm;
+//! use apvm_config::Config;
 //! use apvm_storage::ArtifactStore;
+//! use std::path::PathBuf;
 //!
-//! // Initialize with config helpers
-//! let (config, paths) = config_io::init_config(None)?;
+//! // Create config with explicit paths
+//! let config = Config::new(
+//!     PathBuf::from("/var/cache/myapp"),
+//!     PathBuf::from("/var/lib/myapp/builds"),
+//! );
 //! let apvm = Apvm::new(config)?;
 //!
 //! // BackWPup: version required
@@ -30,7 +35,7 @@
 //! let output = apvm.build("wp-rocket", None, "pr:456", None).await?;
 //!
 //! // Store artifacts (optional - you choose!)
-//! let store = ArtifactStore::new(paths.builds_dir().clone());
+//! let store = ArtifactStore::new(PathBuf::from("/var/lib/myapp/builds"));
 //! for artifact in output.to_source_artifacts_filtered(&store, "wp-rocket")? {
 //!     store.store(&artifact)?;
 //! }
@@ -44,8 +49,8 @@ pub mod git;
 pub mod github;
 pub mod projects;
 
-// Re-export config types from apvm-config
-pub use apvm_config::{Config, Paths, PathsBuilder};
+// Re-export Config from apvm-config
+pub use apvm_config::Config;
 pub use error::{Error, Result};
 
 // Re-export key types for convenience

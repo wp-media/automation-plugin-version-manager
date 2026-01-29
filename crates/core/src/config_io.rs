@@ -32,7 +32,7 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
-use apvm_config::{Config, Paths};
+use apvm_config::Config;
 
 use crate::error::{Error, Result};
 
@@ -241,16 +241,13 @@ fn save_config_to_path(config: &Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the APVM directory structure exists.
+/// Ensure a list of directories exist.
 ///
-/// Creates all required directories if they don't exist:
-/// - APVM base directory
-/// - Cache directory (under APVM base)
-/// - Builds directory
+/// Creates all directories in the provided list if they don't exist.
 ///
 /// # Arguments
 ///
-/// * `paths` - Paths configuration with explicit directories
+/// * `directories` - List of directories to create
 ///
 /// # Returns
 ///
@@ -260,25 +257,19 @@ fn save_config_to_path(config: &Config, path: &Path) -> Result<()> {
 /// # Example
 ///
 /// ```ignore
-/// use apvm_config::Paths;
 /// use apvm_core::config_io::ensure_directories;
 /// use std::path::PathBuf;
 ///
-/// // Ensure directories exist with explicit paths
-/// let paths = Paths::new(
+/// let dirs = [
 ///     PathBuf::from("/var/lib/myapp"),
+///     PathBuf::from("/var/cache/myapp"),
 ///     PathBuf::from("/var/lib/myapp/builds"),
-/// );
-/// ensure_directories(&paths)?;
+/// ];
+/// ensure_directories(&dirs)?;
 /// ```
-pub fn ensure_directories(paths: &Paths) -> Result<()> {
-    let dirs = [
-        paths.apvm_dir(),
-        paths.cache_dir(),
-        paths.builds_dir(),
-    ];
-
-    for dir in dirs {
+pub fn ensure_directories<P: AsRef<Path>>(directories: &[P]) -> Result<()> {
+    for dir in directories {
+        let dir = dir.as_ref();
         if !dir.exists() {
             fs::create_dir_all(dir).map_err(|e| {
                 Error::Io(io::Error::new(
@@ -291,45 +282,6 @@ pub fn ensure_directories(paths: &Paths) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Load configuration and ensure directories exist.
-///
-/// This is a convenience function that combines `load_config_or_default` and
-/// `ensure_directories` for typical CLI initialization.
-///
-/// # Arguments
-///
-/// * `config_path` - Path to config file
-/// * `default_config` - Config to use if file doesn't exist
-///
-/// # Returns
-///
-/// A tuple of `(Config, Paths)` ready for use.
-///
-/// # Example
-///
-/// ```ignore
-/// use std::path::PathBuf;
-/// use apvm_config::{Config, Paths};
-///
-/// let config_path = PathBuf::from("/etc/myapp/config.json");
-/// let default = Config::new(
-///     PathBuf::from("/var/cache/myapp"),
-///     PathBuf::from("/var/lib/myapp/builds"),
-/// );
-/// let (config, paths) = init_config(&config_path, default)?;
-/// ```
-pub fn init_config<P: AsRef<Path>>(config_path: P, default_config: Config) -> Result<(Config, Paths)> {
-    let config = load_config_or_default(&config_path, default_config)?;
-    let paths = Paths::builder()
-        .cache_dir(&config.cache_dir)
-        .builds_dir(&config.builds_dir)
-        .build();
-
-    ensure_directories(&paths)?;
-
-    Ok((config, paths))
 }
 
 /// Check if a configuration file exists.
@@ -466,16 +418,17 @@ mod tests {
     #[test]
     fn test_ensure_directories_creates_all() {
         let temp = TempDir::new().unwrap();
-        let paths = Paths::new(
-            temp.path().join(".apvm"),
+        let dirs = [
+            temp.path().join("apvm"),
+            temp.path().join("apvm/cache"),
             temp.path().join("builds"),
-        );
+        ];
 
-        ensure_directories(&paths).unwrap();
+        ensure_directories(&dirs).unwrap();
 
-        assert!(paths.apvm_dir().exists());
-        assert!(paths.cache_dir().exists());
-        assert!(paths.builds_dir().exists());
+        assert!(dirs[0].exists());
+        assert!(dirs[1].exists());
+        assert!(dirs[2].exists());
     }
 
     #[test]

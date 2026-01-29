@@ -12,8 +12,6 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::Paths;
-
 /// Main application configuration.
 ///
 /// This struct contains user-configurable settings. Paths must be explicitly
@@ -77,32 +75,6 @@ impl Config {
             github_token: None,
             cache_dir,
             builds_dir,
-        }
-    }
-
-    /// Create a configuration from a `Paths` instance.
-    ///
-    /// This copies the relevant paths from the `Paths` struct.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use apvm_config::{Config, Paths};
-    /// use std::path::PathBuf;
-    ///
-    /// let paths = Paths::new(
-    ///     PathBuf::from("/var/lib/myapp"),
-    ///     PathBuf::from("/var/lib/myapp/builds"),
-    /// );
-    ///
-    /// let config = Config::with_paths(paths);
-    /// assert_eq!(config.builds_dir.to_str(), Some("/var/lib/myapp/builds"));
-    /// ```
-    pub fn with_paths(paths: Paths) -> Self {
-        Self {
-            github_token: None,
-            cache_dir: paths.cache_dir().clone(),
-            builds_dir: paths.builds_dir().clone(),
         }
     }
 
@@ -212,19 +184,6 @@ mod tests {
         assert_eq!(config.github_token, Some("my-token".to_string()));
         assert_eq!(config.cache_dir, PathBuf::from("/custom/cache"));
         assert_eq!(config.builds_dir, PathBuf::from("/custom/builds"));
-    }
-
-    #[test]
-    fn with_paths_copies_paths() {
-        let paths = Paths::new(
-            PathBuf::from("/base"),
-            PathBuf::from("/big/builds"),
-        );
-
-        let config = Config::with_paths(paths);
-
-        assert_eq!(config.cache_dir, PathBuf::from("/base/cache"));
-        assert_eq!(config.builds_dir, PathBuf::from("/big/builds"));
     }
 
     #[test]

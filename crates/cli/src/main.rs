@@ -3,12 +3,15 @@
 //! Command-line interface for building and managing WordPress plugin versions.
 
 mod defaults;
+mod paths;
 
 use std::fs;
 use std::path::Path;
 
-use apvm_config::{Config, Paths};
+use apvm_config::Config;
 use apvm_core::{Apvm, Result};
+
+use crate::paths::Paths;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main Entry Point
@@ -96,7 +99,7 @@ fn init_tracing() {
 fn load_config(path: &Path, paths: &Paths) -> Result<Config> {
     if !path.exists() {
         tracing::debug!("Config file not found, using defaults");
-        return Ok(Config::with_paths(paths.clone()));
+        return Ok(paths.to_config());
     }
 
     let content = fs::read_to_string(path)?;
