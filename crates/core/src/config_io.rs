@@ -1,6 +1,6 @@
 //! Configuration file I/O helpers.
 //!
-//! Provides convenient functions for loading and saving APVM configuration.
+//! Provides functions for loading and saving APVM configuration.
 //! These are thin wrappers around filesystem operations with proper error handling.
 //!
 //! # Design Philosophy
@@ -9,21 +9,23 @@
 //! allow consumers full control. This module provides the "batteries included"
 //! option for consumers who want simple load/save functionality.
 //!
+//! **Note:** This module does NOT provide default paths. Callers must provide
+//! explicit paths for all operations.
+//!
 //! # Example
 //!
 //! ```ignore
 //! use apvm_core::config_io::{load_config, save_config};
-//! use apvm_config::Paths;
+//! use std::path::PathBuf;
 //!
-//! // Load from default location
-//! let config = load_config(None)?;
+//! let config_path = PathBuf::from("/home/user/.apvm/config.json");
 //!
-//! // Or specify a custom path
-//! let config = load_config(Some("/custom/config.json"))?;
+//! // Load from explicit path
+//! let config = load_config(&config_path)?;
 //!
 //! // Save after modifications
 //! config.github_token = Some("ghp_xxx".to_string());
-//! save_config(&config, None)?;
+//! save_config(&config, &config_path)?;
 //! ```
 
 use std::fs;
@@ -36,13 +38,40 @@ use crate::error::{Error, Result};
 
 /// Load configuration from a file.
 ///
-/// If the file doesn't exist, returns a default configuration.
-/// If the file exists but is invalid JSON, returns an error.
+/// If the file doesn't exist, returns an error. Use `load_config_or_default`
+/// if you want to fall back to defaults.
 ///
 /// # Arguments
 ///
-/// * `path` - Optional path to config file. If `None`, uses default
-///   (`~/.apvm/config.json`).
+/// * `path` - Path to config file
+///
+/// # Returns
+///
+/// * `Ok(Config)` - Loaded configuration
+/// * `Err(Error::Config)` - File exists but couldn't be parsed
+/// * `Err(Error::Io)` - File not found or other I/O error
+///
+/// # Example
+///
+/// ```ignore
+/// use std::path::PathBuf;
+///
+/// let path = PathBuf::from("/home/user/.apvm/config.json");
+/// let config = load_config(&path)?;
+/// ```
+pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
+    load_config_from_path(path.as_ref())
+}
+
+/// Load configuration from a file, or create a default if the file doesn't exist.
+///
+/// This is a convenience function for CLI applications that want to use
+/// defaults when no config file exists.
+///
+/// # Arguments
+///
+/// * `path` - Path to config file
+/// * `default_config` - Config to use if file doesn't exist
 ///
 /// # Returns
 ///
@@ -53,31 +82,62 @@ use crate::error::{Error, Result};
 /// # Example
 ///
 /// ```ignore
-/// // Load from default location
-/// let config = load_config(None)?;
+/// use std::path::PathBuf;
+/// use apvm_config::Config;
 ///
-/// // Load from custom location
-/// let config = load_config(Some("/etc/apvm/config.json"))?;
+/// let path = PathBuf::from("/home/user/.apvm/config.json");
+/// let default = Config::new(
+///     PathBuf::from("/home/user/.apvm/cache"),
+///     PathBuf::from("/home/user/apvm-builds"),
+/// );
+/// let config = load_config_or_default(&path, default)?;
 /// ```
-pub fn load_config<P: AsRef<Path>>(path: Option<P>) -> Result<Config> {
-    let config_path = path
-        .map(|p| p.as_ref().to_path_buf())
-        .unwrap_or_else(Paths::default_config_file);
-
-    load_config_from_path(&config_path)
+pub fn load_config_or_default<P: AsRef<Path>>(path: P, default_config: Config) -> Result<Config> {
+    load_config_from_path_with_default(path.as_ref(), default_config)
 }
 
 /// Load configuration from a specific path.
 ///
-/// This is the internal implementation that handles all edge cases.
+/// Internal implementation that handles all edge cases.
 fn load_config_from_path(path: &Path) -> Result<Config> {
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            // File exists, try to parse it
+            if content.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "Config file '{}' is empty. Delete it or add valid JSON.",
+                    path.display()
+                )));
+            }
+
+            serde_json::from_str(&content).map_err(|e| {
+                Error::Config(format!(
+                    "Invalid config file '{}': {}. \
+                     Delete the file to reset to defaults, or fix the JSON syntax.",
+                    path.display(),
+                    e
+                ))
+            })
+        }
+        Err(e) => {
+            // File doesn't exist or I/O error
+            Err(Error::Io(io::Error::new(
+                e.kind(),
+                format!("Failed to read config file '{}': {}", path.display(), e),
+            )))
+        }
+    }
+}
+
+/// Load configuration from a specific path with default fallback.
+fn load_config_from_path_with_default(path: &Path, default_config: Config) -> Result<Config> {
     match fs::read_to_string(path) {
         Ok(content) => {
             // File exists, try to parse it
             if content.trim().is_empty() {
                 // Empty file = use defaults
                 tracing::debug!("Config file is empty, using defaults");
-                return Ok(Config::default());
+                return Ok(default_config);
             }
 
             serde_json::from_str(&content).map_err(|e| {
@@ -92,7 +152,7 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
         Err(e) if e.kind() == ErrorKind::NotFound => {
             // File doesn't exist = use defaults (not an error)
             tracing::debug!("Config file not found, using defaults");
-            Ok(Config::default())
+            Ok(default_config)
         }
         Err(e) => {
             // Other I/O error (permissions, etc.)
@@ -112,8 +172,7 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
 /// # Arguments
 ///
 /// * `config` - Configuration to save
-/// * `path` - Optional path to config file. If `None`, uses default
-///   (`~/.apvm/config.json`).
+/// * `path` - Path to config file
 ///
 /// # Returns
 ///
@@ -123,21 +182,18 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
 /// # Example
 ///
 /// ```ignore
-/// let mut config = Config::default();
-/// config.github_token = Some("ghp_xxx".to_string());
+/// use std::path::PathBuf;
+/// use apvm_config::Config;
 ///
-/// // Save to default location
-/// let saved_path = save_config(&config, None)?;
-/// println!("Config saved to: {}", saved_path.display());
+/// let config = Config::new(
+///     PathBuf::from("/cache"),
+///     PathBuf::from("/builds"),
+/// ).set_token("ghp_xxx");
 ///
-/// // Save to custom location
-/// save_config(&config, Some("/tmp/apvm-config.json"))?;
+/// save_config(&config, PathBuf::from("/home/user/.apvm/config.json"))?;
 /// ```
-pub fn save_config<P: AsRef<Path>>(config: &Config, path: Option<P>) -> Result<PathBuf> {
-    let config_path = path
-        .map(|p| p.as_ref().to_path_buf())
-        .unwrap_or_else(Paths::default_config_file);
-
+pub fn save_config<P: AsRef<Path>>(config: &Config, path: P) -> Result<PathBuf> {
+    let config_path = path.as_ref().to_path_buf();
     save_config_to_path(config, &config_path)?;
     Ok(config_path)
 }
@@ -188,13 +244,13 @@ fn save_config_to_path(config: &Config, path: &Path) -> Result<()> {
 /// Ensure the APVM directory structure exists.
 ///
 /// Creates all required directories if they don't exist:
-/// - `~/.apvm` (or custom base)
-/// - `~/.apvm/cache`
-/// - `~/apvm-builds`
+/// - APVM base directory
+/// - Cache directory (under APVM base)
+/// - Builds directory
 ///
 /// # Arguments
 ///
-/// * `paths` - Paths configuration (use `Paths::default()` for defaults)
+/// * `paths` - Paths configuration with explicit directories
 ///
 /// # Returns
 ///
@@ -206,14 +262,13 @@ fn save_config_to_path(config: &Config, path: &Path) -> Result<()> {
 /// ```ignore
 /// use apvm_config::Paths;
 /// use apvm_core::config_io::ensure_directories;
+/// use std::path::PathBuf;
 ///
-/// // Ensure default directories exist
-/// ensure_directories(&Paths::default())?;
-///
-/// // Or with custom paths
-/// let paths = Paths::builder()
-///     .builds_dir("/mnt/builds")
-///     .build();
+/// // Ensure directories exist with explicit paths
+/// let paths = Paths::new(
+///     PathBuf::from("/home/user/.apvm"),
+///     PathBuf::from("/home/user/apvm-builds"),
+/// );
 /// ensure_directories(&paths)?;
 /// ```
 pub fn ensure_directories(paths: &Paths) -> Result<()> {
@@ -240,12 +295,13 @@ pub fn ensure_directories(paths: &Paths) -> Result<()> {
 
 /// Load configuration and ensure directories exist.
 ///
-/// This is a convenience function that combines `load_config` and
+/// This is a convenience function that combines `load_config_or_default` and
 /// `ensure_directories` for typical CLI initialization.
 ///
 /// # Arguments
 ///
-/// * `config_path` - Optional path to config file
+/// * `config_path` - Path to config file
+/// * `default_config` - Config to use if file doesn't exist
 ///
 /// # Returns
 ///
@@ -254,12 +310,18 @@ pub fn ensure_directories(paths: &Paths) -> Result<()> {
 /// # Example
 ///
 /// ```ignore
-/// let (config, paths) = init_config(None)?;
-/// let apvm = Apvm::new(config)?;
-/// let store = ArtifactStore::new(paths.builds_dir().clone());
+/// use std::path::PathBuf;
+/// use apvm_config::{Config, Paths};
+///
+/// let config_path = PathBuf::from("/home/user/.apvm/config.json");
+/// let default = Config::new(
+///     PathBuf::from("/home/user/.apvm/cache"),
+///     PathBuf::from("/home/user/apvm-builds"),
+/// );
+/// let (config, paths) = init_config(&config_path, default)?;
 /// ```
-pub fn init_config<P: AsRef<Path>>(config_path: Option<P>) -> Result<(Config, Paths)> {
-    let config = load_config(config_path)?;
+pub fn init_config<P: AsRef<Path>>(config_path: P, default_config: Config) -> Result<(Config, Paths)> {
+    let config = load_config_or_default(&config_path, default_config)?;
     let paths = Paths::builder()
         .cache_dir(&config.cache_dir)
         .builds_dir(&config.builds_dir)
@@ -274,28 +336,20 @@ pub fn init_config<P: AsRef<Path>>(config_path: Option<P>) -> Result<(Config, Pa
 ///
 /// # Arguments
 ///
-/// * `path` - Optional path to check. If `None`, uses default location.
+/// * `path` - Path to check
 ///
 /// # Example
 ///
 /// ```ignore
-/// if !config_exists(None) {
+/// use std::path::PathBuf;
+///
+/// let path = PathBuf::from("/home/user/.apvm/config.json");
+/// if !config_exists(&path) {
 ///     println!("No config file found, will use defaults");
 /// }
 /// ```
-pub fn config_exists<P: AsRef<Path>>(path: Option<P>) -> bool {
-    let config_path = path
-        .map(|p| p.as_ref().to_path_buf())
-        .unwrap_or_else(Paths::default_config_file);
-
-    config_path.exists()
-}
-
-/// Get the default config file path.
-///
-/// Convenience function that returns `~/.apvm/config.json`.
-pub fn default_config_path() -> PathBuf {
-    Paths::default_config_file()
+pub fn config_exists<P: AsRef<Path>>(path: P) -> bool {
+    path.as_ref().exists()
 }
 
 #[cfg(test)]
@@ -303,32 +357,60 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_load_nonexistent_returns_default() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("nonexistent.json");
-
-        let config = load_config(Some(&path)).unwrap();
-        assert!(config.github_token.is_none());
+    fn test_config(cache: PathBuf, builds: PathBuf) -> Config {
+        Config::new(cache, builds)
     }
 
     #[test]
-    fn test_load_empty_file_returns_default() {
+    fn test_load_nonexistent_returns_error() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("nonexistent.json");
+
+        let result = load_config(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_or_default_nonexistent_returns_default() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("nonexistent.json");
+        let default = test_config(
+            PathBuf::from("/default/cache"),
+            PathBuf::from("/default/builds"),
+        );
+
+        let config = load_config_or_default(&path, default).unwrap();
+        assert!(config.github_token.is_none());
+        assert_eq!(config.cache_dir, PathBuf::from("/default/cache"));
+    }
+
+    #[test]
+    fn test_load_or_default_empty_file_returns_default() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("empty.json");
         fs::write(&path, "").unwrap();
 
-        let config = load_config(Some(&path)).unwrap();
+        let default = test_config(
+            PathBuf::from("/default/cache"),
+            PathBuf::from("/default/builds"),
+        );
+
+        let config = load_config_or_default(&path, default).unwrap();
         assert!(config.github_token.is_none());
+        assert_eq!(config.cache_dir, PathBuf::from("/default/cache"));
     }
 
     #[test]
     fn test_load_valid_config() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("config.json");
-        fs::write(&path, r#"{"github_token": "test-token"}"#).unwrap();
+        fs::write(
+            &path,
+            r#"{"github_token": "test-token", "cache_dir": "/test/cache", "builds_dir": "/test/builds"}"#,
+        )
+        .unwrap();
 
-        let config = load_config(Some(&path)).unwrap();
+        let config = load_config(&path).unwrap();
         assert_eq!(config.github_token, Some("test-token".to_string()));
     }
 
@@ -338,7 +420,7 @@ mod tests {
         let path = temp.path().join("invalid.json");
         fs::write(&path, "{ invalid json }").unwrap();
 
-        let result = load_config(Some(&path));
+        let result = load_config(&path);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Config(_)));
     }
@@ -348,11 +430,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("subdir").join("config.json");
 
-        let config = Config::with_token("my-token");
-        save_config(&config, Some(&path)).unwrap();
+        let config = Config::with_token(
+            "my-token",
+            PathBuf::from("/cache"),
+            PathBuf::from("/builds"),
+        );
+        save_config(&config, &path).unwrap();
 
         assert!(path.exists());
-        let loaded = load_config(Some(&path)).unwrap();
+        let loaded = load_config(&path).unwrap();
         assert_eq!(loaded.github_token, Some("my-token".to_string()));
     }
 
@@ -361,13 +447,16 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("config.json");
 
-        let original = Config::default()
-            .set_token("roundtrip-token")
-            .set_cache_dir("/custom/cache")
-            .set_builds_dir("/custom/builds");
+        let original = test_config(
+            PathBuf::from("/original/cache"),
+            PathBuf::from("/original/builds"),
+        )
+        .set_token("roundtrip-token")
+        .set_cache_dir("/custom/cache")
+        .set_builds_dir("/custom/builds");
 
-        save_config(&original, Some(&path)).unwrap();
-        let loaded = load_config(Some(&path)).unwrap();
+        save_config(&original, &path).unwrap();
+        let loaded = load_config(&path).unwrap();
 
         assert_eq!(loaded.github_token, original.github_token);
         assert_eq!(loaded.cache_dir, original.cache_dir);
@@ -377,11 +466,10 @@ mod tests {
     #[test]
     fn test_ensure_directories_creates_all() {
         let temp = TempDir::new().unwrap();
-        let paths = Paths::builder()
-            .apvm_dir(temp.path().join(".apvm"))
-            .cache_dir(temp.path().join(".apvm").join("cache"))
-            .builds_dir(temp.path().join("builds"))
-            .build();
+        let paths = Paths::new(
+            temp.path().join(".apvm"),
+            temp.path().join("builds"),
+        );
 
         ensure_directories(&paths).unwrap();
 
@@ -394,7 +482,7 @@ mod tests {
     fn test_config_exists_false_for_nonexistent() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("nope.json");
-        assert!(!config_exists(Some(&path)));
+        assert!(!config_exists(&path));
     }
 
     #[test]
@@ -402,6 +490,6 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("exists.json");
         fs::write(&path, "{}").unwrap();
-        assert!(config_exists(Some(&path)));
+        assert!(config_exists(&path));
     }
 }

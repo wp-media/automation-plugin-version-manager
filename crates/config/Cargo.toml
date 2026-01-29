@@ -9,9 +9,6 @@ license = "MIT"
 # Serialization
 serde = { workspace = true }
 
-# Platform directories (home, config, etc.)
-directories = { workspace = true }
-
 [dev-dependencies]
 # For testing serialization
 serde_json = { workspace = true }

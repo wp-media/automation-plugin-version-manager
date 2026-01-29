@@ -2,6 +2,8 @@
 //!
 //! Command-line interface for building and managing WordPress plugin versions.
 
+mod defaults;
+
 use std::fs;
 use std::path::Path;
 
@@ -22,8 +24,11 @@ async fn main() -> Result<()> {
     init_tracing();
 
     // Load paths and configuration
-    let paths = Paths::default();
-    let config = load_config(paths.config_file())?;
+    let paths = Paths::new(
+        defaults::default_apvm_dir().clone(),
+        defaults::default_builds_dir().clone(),
+    );
+    let config = load_config(paths.config_file(), &paths)?;
 
     // Create APVM instance with automatic token resolution
     // This will try: config → GITHUB_TOKEN → GH_TOKEN → gh CLI
@@ -87,11 +92,11 @@ fn init_tracing() {
 
 /// Load configuration from a file.
 ///
-/// Returns `Config::default()` if the file doesn't exist.
-fn load_config(path: &Path) -> Result<Config> {
+/// Returns a default Config with the provided paths if the file doesn't exist.
+fn load_config(path: &Path, paths: &Paths) -> Result<Config> {
     if !path.exists() {
         tracing::debug!("Config file not found, using defaults");
-        return Ok(Config::default());
+        return Ok(Config::with_paths(paths.clone()));
     }
 
     let content = fs::read_to_string(path)?;

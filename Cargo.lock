@@ -84,6 +84,7 @@ dependencies = [
  "apvm-core",
  "apvm-storage",
  "clap",
+ "directories",
  "serde_json",
  "tokio",
  "tracing",
@@ -94,7 +95,6 @@ dependencies = [
 name = "apvm-config"
 version = "0.1.0"
 dependencies = [
- "directories",
  "serde",
  "serde_json",
 ]

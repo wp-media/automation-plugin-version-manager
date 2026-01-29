@@ -1,7 +1,12 @@
 //! APVM Configuration.
 //!
-//! Contains user-configurable settings separate from paths.
-//! File I/O (load/save) is not provided - that's the consumer's responsibility.
+//! Contains user-configurable settings. This crate does NOT provide default
+//! paths - consumers (like CLI) must provide explicit values.
+//!
+//! # Design Philosophy
+//!
+//! Libraries should not hardcode default paths. File I/O (load/save) is also
+//! not provided - that's the consumer's responsibility.
 
 use std::path::PathBuf;
 
@@ -11,39 +16,24 @@ use crate::paths::Paths;
 
 /// Main application configuration.
 ///
-/// This struct contains user-configurable settings. Path defaults
-/// are provided but can be overridden.
+/// This struct contains user-configurable settings. Paths must be explicitly
+/// provided - there are no defaults.
 ///
 /// # File I/O
 ///
 /// This crate intentionally does NOT provide `load()` or `save()` methods.
-/// File operations are the consumer's responsibility. This keeps the library
-/// pure and allows consumers to choose their own serialization format,
-/// error handling strategy, and storage location.
+/// File operations are the consumer's responsibility.
 ///
-/// # Example (CLI implementation)
+/// # Example
 ///
-/// ```rust,ignore
-/// use std::fs;
+/// ```rust
 /// use apvm_config::Config;
+/// use std::path::PathBuf;
 ///
-/// fn load_config(path: &Path) -> Result<Config, Error> {
-///     if path.exists() {
-///         let content = fs::read_to_string(path)?;
-///         Ok(serde_json::from_str(&content)?)
-///     } else {
-///         Ok(Config::default())
-///     }
-/// }
-///
-/// fn save_config(config: &Config, path: &Path) -> Result<(), Error> {
-///     if let Some(parent) = path.parent() {
-///         fs::create_dir_all(parent)?;
-///     }
-///     let content = serde_json::to_string_pretty(config)?;
-///     fs::write(path, content)?;
-///     Ok(())
-/// }
+/// let config = Config::new(
+///     PathBuf::from("/home/user/.apvm/cache"),
+///     PathBuf::from("/home/user/apvm-builds"),
+/// );
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -57,37 +47,37 @@ pub struct Config {
     pub github_token: Option<String>,
 
     /// Cache directory for cloned repositories.
-    ///
-    /// Default: `~/.apvm/cache`
-    #[serde(default = "Paths::default_cache_dir")]
     pub cache_dir: PathBuf,
 
     /// Directory for storing built artifacts.
-    ///
-    /// Default: `~/apvm-builds`
-    #[serde(default = "default_builds_dir")]
     pub builds_dir: PathBuf,
 }
 
-/// Helper function for serde default (needs to return owned value).
-fn default_builds_dir() -> PathBuf {
-    Paths::default_builds_dir().clone()
-}
-
-impl Default for Config {
-    fn default() -> Self {
+impl Config {
+    /// Create a new configuration with explicit paths.
+    ///
+    /// # Arguments
+    ///
+    /// * `cache_dir` - Directory for cloned repository cache
+    /// * `builds_dir` - Directory for built artifacts
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apvm_config::Config;
+    /// use std::path::PathBuf;
+    ///
+    /// let config = Config::new(
+    ///     PathBuf::from("/home/user/.apvm/cache"),
+    ///     PathBuf::from("/home/user/apvm-builds"),
+    /// );
+    /// ```
+    pub fn new(cache_dir: PathBuf, builds_dir: PathBuf) -> Self {
         Self {
             github_token: None,
-            cache_dir: Paths::default_cache_dir(),
-            builds_dir: Paths::default_builds_dir().clone(),
+            cache_dir,
+            builds_dir,
         }
-    }
-}
-
-impl Config {
-    /// Create a new configuration with default values.
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// Create a configuration from a `Paths` instance.
@@ -98,14 +88,15 @@ impl Config {
     ///
     /// ```rust
     /// use apvm_config::{Config, Paths};
+    /// use std::path::PathBuf;
     ///
-    /// let paths = Paths::builder()
-    ///     .cache_dir("/fast-ssd/cache")
-    ///     .builds_dir("/large-hdd/builds")
-    ///     .build();
+    /// let paths = Paths::new(
+    ///     PathBuf::from("/home/user/.apvm"),
+    ///     PathBuf::from("/large-hdd/builds"),
+    /// );
     ///
     /// let config = Config::with_paths(paths);
-    /// assert_eq!(config.cache_dir.to_str(), Some("/fast-ssd/cache"));
+    /// assert_eq!(config.builds_dir.to_str(), Some("/large-hdd/builds"));
     /// ```
     pub fn with_paths(paths: Paths) -> Self {
         Self {
@@ -115,20 +106,30 @@ impl Config {
         }
     }
 
-    /// Create a configuration with a GitHub token.
+    /// Create a configuration with a GitHub token and paths.
     ///
     /// # Example
     ///
     /// ```rust
     /// use apvm_config::Config;
+    /// use std::path::PathBuf;
     ///
-    /// let config = Config::with_token("ghp_xxxxxxxxxxxx");
+    /// let config = Config::with_token(
+    ///     "ghp_xxxxxxxxxxxx",
+    ///     PathBuf::from("/cache"),
+    ///     PathBuf::from("/builds"),
+    /// );
     /// assert!(config.github_token.is_some());
     /// ```
-    pub fn with_token(token: impl Into<String>) -> Self {
+    pub fn with_token(
+        token: impl Into<String>,
+        cache_dir: PathBuf,
+        builds_dir: PathBuf,
+    ) -> Self {
         Self {
             github_token: Some(token.into()),
-            ..Self::default()
+            cache_dir,
+            builds_dir,
         }
     }
 
@@ -138,8 +139,9 @@ impl Config {
     ///
     /// ```rust
     /// use apvm_config::Config;
+    /// use std::path::PathBuf;
     ///
-    /// let config = Config::default()
+    /// let config = Config::new(PathBuf::from("/cache"), PathBuf::from("/builds"))
     ///     .set_token("ghp_xxxxxxxxxxxx");
     /// ```
     pub fn set_token(mut self, token: impl Into<String>) -> Self {
@@ -169,30 +171,40 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn test_paths() -> (PathBuf, PathBuf) {
+        (PathBuf::from("/test/cache"), PathBuf::from("/test/builds"))
+    }
+
     #[test]
-    fn default_config_has_no_token() {
-        let config = Config::default();
+    fn new_config_has_no_token() {
+        let (cache, builds) = test_paths();
+        let config = Config::new(cache, builds);
         assert!(config.github_token.is_none());
         assert!(!config.has_token());
     }
 
     #[test]
-    fn default_config_has_default_paths() {
-        let config = Config::default();
-        assert!(config.cache_dir.ends_with("cache"));
-        assert!(config.builds_dir.ends_with("apvm-builds"));
+    fn new_config_uses_provided_paths() {
+        let (cache, builds) = test_paths();
+        let config = Config::new(cache.clone(), builds.clone());
+        assert_eq!(config.cache_dir, cache);
+        assert_eq!(config.builds_dir, builds);
     }
 
     #[test]
-    fn with_token_sets_token() {
-        let config = Config::with_token("test-token");
+    fn with_token_sets_token_and_paths() {
+        let (cache, builds) = test_paths();
+        let config = Config::with_token("test-token", cache.clone(), builds.clone());
         assert_eq!(config.github_token, Some("test-token".to_string()));
         assert!(config.has_token());
+        assert_eq!(config.cache_dir, cache);
+        assert_eq!(config.builds_dir, builds);
     }
 
     #[test]
     fn builder_pattern_works() {
-        let config = Config::default()
+        let (cache, builds) = test_paths();
+        let config = Config::new(cache, builds)
             .set_token("my-token")
             .set_cache_dir("/custom/cache")
             .set_builds_dir("/custom/builds");
@@ -204,20 +216,21 @@ mod tests {
 
     #[test]
     fn with_paths_copies_paths() {
-        let paths = Paths::builder()
-            .cache_dir("/fast/cache")
-            .builds_dir("/big/builds")
-            .build();
+        let paths = Paths::new(
+            PathBuf::from("/apvm"),
+            PathBuf::from("/big/builds"),
+        );
 
         let config = Config::with_paths(paths);
 
-        assert_eq!(config.cache_dir, PathBuf::from("/fast/cache"));
+        assert_eq!(config.cache_dir, PathBuf::from("/apvm/cache"));
         assert_eq!(config.builds_dir, PathBuf::from("/big/builds"));
     }
 
     #[test]
     fn serialization_round_trip() {
-        let config = Config::default()
+        let (cache, builds) = test_paths();
+        let config = Config::new(cache, builds)
             .set_token("test-token")
             .set_cache_dir("/test/cache")
             .set_builds_dir("/test/builds");
@@ -231,20 +244,9 @@ mod tests {
     }
 
     #[test]
-    fn deserialization_uses_defaults_for_missing_fields() {
-        // Config with only github_token
-        let json = r#"{"github_token": "my-token"}"#;
-        let config: Config = serde_json::from_str(json).unwrap();
-
-        assert_eq!(config.github_token, Some("my-token".to_string()));
-        // Paths should have defaults
-        assert!(config.cache_dir.ends_with("cache"));
-        assert!(config.builds_dir.ends_with("apvm-builds"));
-    }
-
-    #[test]
     fn serialization_skips_none_token() {
-        let config = Config::default();
+        let (cache, builds) = test_paths();
+        let config = Config::new(cache, builds);
         let json = serde_json::to_string(&config).unwrap();
 
         // Should not contain "github_token": null
