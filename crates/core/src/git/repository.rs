@@ -256,6 +256,37 @@ impl Repository {
         Ok(())
     }
 
+    /// Pull with token authentication.
+    ///
+    /// Temporarily sets the remote URL with the token, pulls, then restores.
+    pub async fn pull_with_token(&self, token: &str) -> Result<()> {
+        // Get current remote URL
+        let original_url = self.get_remote_url("origin").await?;
+
+        if !original_url.starts_with("https://") {
+            return Err(Error::Git(
+                "Token authentication requires HTTPS remote URL".to_string(),
+            ));
+        }
+
+        // Temporarily set authenticated URL
+        let auth_url =
+            original_url.replacen("https://", &format!("https://x-access-token:{token}@"), 1);
+        self.set_remote_url("origin", &auth_url).await?;
+
+        // Pull
+        let result = self.pull().await;
+
+        // ALWAYS restore original URL (even on error)
+        let restore_result = self.set_remote_url("origin", &original_url).await;
+
+        // Return pull error first, then restore error
+        result?;
+        restore_result?;
+
+        Ok(())
+    }
+
     /// Reset the working directory to a clean state.
     pub async fn reset_hard(&self) -> Result<()> {
         tracing::debug!("Resetting repository in {}", self.path.display());

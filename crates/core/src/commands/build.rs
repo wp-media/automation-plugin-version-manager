@@ -314,9 +314,11 @@ impl<'a> BuildCommand<'a> {
         // Clone the repository into the temp workspace
         workspace.clone_repo().await?;
 
-        // Fetch latest refs
+        // Fetch latest refs (uses token if available)
+        workspace.fetch().await?;
+
+        // Get repository handle for local operations
         let repo = workspace.repository();
-        repo.fetch().await?;
 
         // 3. Resolve the git reference
         let resolver = RefResolver::new(self.github, &project_info.owner, &project_info.repo)
@@ -335,7 +337,7 @@ impl<'a> BuildCommand<'a> {
         repo.reset_hard().await?;
         repo.checkout(&project_info.default_branch).await?;
         repo.reset_hard().await?;
-        repo.pull().await?;
+        workspace.pull().await?;
 
         // 5. Checkout the resolved ref
         repo.checkout(&resolved.git_ref).await?;

@@ -161,6 +161,15 @@ impl BuildWorkspace {
         }
     }
 
+    /// Pull latest changes using the workspace's token.
+    pub async fn pull(&self) -> Result<()> {
+        let repo = self.repository();
+        match &self.github_token {
+            Some(token) => repo.pull_with_token(token).await,
+            None => repo.pull().await,
+        }
+    }
+
     /// Get the GitHub token if available.
     pub fn github_token(&self) -> Option<&str> {
         self.github_token.as_deref()
