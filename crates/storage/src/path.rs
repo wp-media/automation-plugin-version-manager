@@ -169,3 +169,180 @@ impl PathBuilder {
         PathBuf::from("../..").join("by-commit").join(commit_short)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // BuildSource Tests
+    // =========================================================================
+
+    #[test]
+    fn test_build_source_to_dir_name_pr() {
+        let source = BuildSource::PullRequest(123);
+        assert_eq!(source.to_dir_name(), "pr-123");
+    }
+
+    #[test]
+    fn test_build_source_to_dir_name_tag() {
+        let source = BuildSource::Tag("v1.0.0".to_string());
+        assert_eq!(source.to_dir_name(), "tag-v1.0.0");
+    }
+
+    #[test]
+    fn test_build_source_to_dir_name_branch() {
+        let source = BuildSource::Branch("feature/test".to_string());
+        assert_eq!(source.to_dir_name(), "branch-feature-test"); // / is sanitized
+    }
+
+    #[test]
+    fn test_build_source_to_dir_name_commit() {
+        let source = BuildSource::Commit("abc1234567890".to_string());
+        assert_eq!(source.to_dir_name(), "commit-abc1234");
+    }
+
+    #[test]
+    fn test_build_source_to_dir_name_commit_short() {
+        let source = BuildSource::Commit("abc12".to_string());
+        assert_eq!(source.to_dir_name(), "commit-abc12");
+    }
+
+    #[test]
+    fn test_build_source_sanitize_special_chars() {
+        let source = BuildSource::Branch("my:branch*name?".to_string());
+        assert_eq!(source.to_dir_name(), "branch-my-branch-name-");
+    }
+
+    #[test]
+    fn test_build_source_from_dir_name_pr() {
+        let source = BuildSource::from_dir_name("pr-456");
+        assert_eq!(source, Some(BuildSource::PullRequest(456)));
+    }
+
+    #[test]
+    fn test_build_source_from_dir_name_tag() {
+        let source = BuildSource::from_dir_name("tag-v2.0.0");
+        assert_eq!(source, Some(BuildSource::Tag("v2.0.0".to_string())));
+    }
+
+    #[test]
+    fn test_build_source_from_dir_name_branch() {
+        let source = BuildSource::from_dir_name("branch-develop");
+        assert_eq!(source, Some(BuildSource::Branch("develop".to_string())));
+    }
+
+    #[test]
+    fn test_build_source_from_dir_name_commit() {
+        let source = BuildSource::from_dir_name("commit-abc1234");
+        assert_eq!(source, Some(BuildSource::Commit("abc1234".to_string())));
+    }
+
+    #[test]
+    fn test_build_source_from_dir_name_invalid() {
+        let source = BuildSource::from_dir_name("invalid-format");
+        assert_eq!(source, None);
+    }
+
+    #[test]
+    fn test_build_source_description() {
+        assert_eq!(BuildSource::PullRequest(99).description(), "PR #99");
+        assert_eq!(BuildSource::Tag("v1.0".to_string()).description(), "Tag v1.0");
+        assert_eq!(BuildSource::Branch("main".to_string()).description(), "Branch main");
+        assert_eq!(BuildSource::Commit("abcdef1234567".to_string()).description(), "Commit abcdef1");
+    }
+
+    #[test]
+    fn test_build_source_display() {
+        let source = BuildSource::PullRequest(42);
+        assert_eq!(format!("{}", source), "PR #42");
+    }
+
+    // =========================================================================
+    // major_minor() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_major_minor_three_parts() {
+        assert_eq!(major_minor("5.6.0"), "5.6");
+        assert_eq!(major_minor("10.20.30"), "10.20");
+    }
+
+    #[test]
+    fn test_major_minor_two_parts() {
+        assert_eq!(major_minor("5.6"), "5.6");
+    }
+
+    #[test]
+    fn test_major_minor_one_part() {
+        assert_eq!(major_minor("5"), "5.0");
+    }
+
+    #[test]
+    fn test_major_minor_empty() {
+        // Empty string results in ".0" because split on "" returns [""]
+        // which matches the single-element case [major] => "{major}.0"
+        assert_eq!(major_minor(""), ".0");
+    }
+
+    #[test]
+    fn test_major_minor_many_parts() {
+        assert_eq!(major_minor("1.2.3.4.5"), "1.2");
+    }
+
+    // =========================================================================
+    // PathBuilder Tests
+    // =========================================================================
+
+    #[test]
+    fn test_path_builder_project_dir() {
+        let builder = PathBuilder::new(PathBuf::from("/builds"));
+        assert_eq!(builder.project_dir("backwpup"), PathBuf::from("/builds/backwpup"));
+    }
+
+    #[test]
+    fn test_path_builder_major_minor_dir() {
+        let builder = PathBuilder::new(PathBuf::from("/builds"));
+        assert_eq!(
+            builder.major_minor_dir("backwpup", "5.6.0"),
+            PathBuf::from("/builds/backwpup/5.6")
+        );
+    }
+
+    #[test]
+    fn test_path_builder_version_dir() {
+        let builder = PathBuilder::new(PathBuf::from("/builds"));
+        assert_eq!(
+            builder.version_dir("backwpup", "5.6.0"),
+            PathBuf::from("/builds/backwpup/5.6/5.6.0")
+        );
+    }
+
+    #[test]
+    fn test_path_builder_commit_dir() {
+        let builder = PathBuilder::new(PathBuf::from("/builds"));
+        assert_eq!(
+            builder.commit_dir("backwpup", "5.6.0", "abc1234"),
+            PathBuf::from("/builds/backwpup/5.6/5.6.0/by-commit/abc1234")
+        );
+    }
+
+    #[test]
+    fn test_path_builder_source_dir() {
+        let builder = PathBuilder::new(PathBuf::from("/builds"));
+        let source = BuildSource::PullRequest(123);
+        assert_eq!(
+            builder.source_dir("backwpup", "5.6.0", &source),
+            PathBuf::from("/builds/backwpup/5.6/5.6.0/by-source/pr-123")
+        );
+    }
+
+    #[test]
+    fn test_path_builder_relative_commit_path() {
+        let builder = PathBuilder::new(PathBuf::from("/builds"));
+        assert_eq!(
+            builder.relative_commit_path("abc1234"),
+            PathBuf::from("../..").join("by-commit").join("abc1234")
+        );
+    }
+}

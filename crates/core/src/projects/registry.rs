@@ -86,3 +86,151 @@ impl Default for ProjectRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::plugins::{BuildArtifact, Builder, VersionRequirement};
+    use std::path::PathBuf;
+
+    /// Minimal test builder.
+    struct TestBuilder;
+
+    impl Builder for TestBuilder {
+        fn version_requirement(&self) -> VersionRequirement {
+            VersionRequirement::Optional
+        }
+
+        fn required_commands(&self) -> Vec<&'static str> {
+            vec![]
+        }
+
+        fn setup_commands(&self) -> Vec<String> {
+            vec![]
+        }
+
+        fn build_commands(&self, _version: &str, _variants: &[&str]) -> Vec<String> {
+            vec![]
+        }
+
+        fn artifacts(
+            &self,
+            _working_dir: &PathBuf,
+            _version: &str,
+            _variants: &[&str],
+        ) -> crate::Result<Vec<BuildArtifact>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn test_registry_new_is_empty() {
+        let registry = ProjectRegistry::new();
+        assert_eq!(registry.list().count(), 0);
+    }
+
+    #[test]
+    fn test_registry_default_is_empty() {
+        let registry = ProjectRegistry::default();
+        assert_eq!(registry.list().count(), 0);
+    }
+
+    #[test]
+    fn test_registry_with_known_projects_has_backwpup() {
+        let registry = ProjectRegistry::with_known_projects();
+        let project = registry.get("backwpup");
+        assert!(project.is_ok());
+        assert_eq!(project.unwrap().name, "backwpup");
+    }
+
+    #[test]
+    fn test_registry_register_and_get() {
+        let mut registry = ProjectRegistry::new();
+        registry.register(Project {
+            name: "test-plugin".to_string(),
+            repo_url: "https://github.com/test/repo.git".to_string(),
+            owner: "test".to_string(),
+            repo: "repo".to_string(),
+            default_branch: "main".to_string(),
+            is_private: false,
+            builder: Box::new(TestBuilder),
+        });
+
+        let project = registry.get("test-plugin").unwrap();
+        assert_eq!(project.owner, "test");
+        assert_eq!(project.repo, "repo");
+        assert!(!project.is_private);
+    }
+
+    #[test]
+    fn test_registry_get_not_found() {
+        let registry = ProjectRegistry::new();
+        let result = registry.get("nonexistent");
+        assert!(result.is_err());
+        
+        let err_string = result.err().unwrap().to_string();
+        assert!(err_string.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_registry_list() {
+        let mut registry = ProjectRegistry::new();
+        
+        registry.register(Project {
+            name: "plugin-a".to_string(),
+            repo_url: "https://github.com/test/a.git".to_string(),
+            owner: "test".to_string(),
+            repo: "a".to_string(),
+            default_branch: "main".to_string(),
+            is_private: false,
+            builder: Box::new(TestBuilder),
+        });
+        
+        registry.register(Project {
+            name: "plugin-b".to_string(),
+            repo_url: "https://github.com/test/b.git".to_string(),
+            owner: "test".to_string(),
+            repo: "b".to_string(),
+            default_branch: "develop".to_string(),
+            is_private: true,
+            builder: Box::new(TestBuilder),
+        });
+
+        let names: Vec<_> = registry.list().map(|p| p.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"plugin-a"));
+        assert!(names.contains(&"plugin-b"));
+    }
+
+    #[test]
+    fn test_registry_register_overwrites() {
+        let mut registry = ProjectRegistry::new();
+        
+        registry.register(Project {
+            name: "plugin".to_string(),
+            repo_url: "https://github.com/test/old.git".to_string(),
+            owner: "test".to_string(),
+            repo: "old".to_string(),
+            default_branch: "main".to_string(),
+            is_private: false,
+            builder: Box::new(TestBuilder),
+        });
+        
+        registry.register(Project {
+            name: "plugin".to_string(),
+            repo_url: "https://github.com/test/new.git".to_string(),
+            owner: "test".to_string(),
+            repo: "new".to_string(),
+            default_branch: "develop".to_string(),
+            is_private: true,
+            builder: Box::new(TestBuilder),
+        });
+
+        // Should only have 1 project (overwritten)
+        assert_eq!(registry.list().count(), 1);
+        
+        let project = registry.get("plugin").unwrap();
+        assert_eq!(project.repo, "new");
+        assert!(project.is_private);
+    }
+}

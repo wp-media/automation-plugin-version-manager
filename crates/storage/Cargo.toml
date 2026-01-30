@@ -24,3 +24,6 @@ tracing = { workspace = true }
 
 # File system utilities
 walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

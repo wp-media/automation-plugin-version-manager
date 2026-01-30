@@ -164,3 +164,168 @@ impl BuildManifest {
         dir.join(Self::FILENAME)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_manifest_new() {
+        let manifest = BuildManifest::new(
+            "backwpup".to_string(),
+            "5.6.0".to_string(),
+            "abc1234567890".to_string(),
+        );
+
+        assert_eq!(manifest.project, "backwpup");
+        assert_eq!(manifest.version, "5.6.0");
+        assert_eq!(manifest.commit, "abc1234567890");
+        assert_eq!(manifest.commit_short, "abc1234");
+        assert_eq!(manifest.schema_version, BuildManifest::CURRENT_SCHEMA);
+        assert!(manifest.sources.is_empty());
+        assert!(manifest.artifacts.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_commit_short_truncation() {
+        let manifest = BuildManifest::new(
+            "test".to_string(),
+            "1.0.0".to_string(),
+            "abcdefghijklmnop".to_string(),
+        );
+        assert_eq!(manifest.commit_short, "abcdefg");
+    }
+
+    #[test]
+    fn test_manifest_add_artifact() {
+        let mut manifest = BuildManifest::new(
+            "test".to_string(),
+            "1.0.0".to_string(),
+            "abc1234".to_string(),
+        );
+
+        manifest.add_artifact(ArtifactEntry {
+            variant_id: Some("free".to_string()),
+            filename: "plugin-free.zip".to_string(),
+            size_bytes: 1024,
+            sha256: "abcdef123456".to_string(),
+        });
+
+        assert_eq!(manifest.artifacts.len(), 1);
+        assert_eq!(manifest.artifacts[0].variant_id, Some("free".to_string()));
+    }
+
+    #[test]
+    fn test_manifest_add_source_no_duplicates() {
+        let mut manifest = BuildManifest::new(
+            "test".to_string(),
+            "1.0.0".to_string(),
+            "abc1234".to_string(),
+        );
+
+        let source = BuildSource::PullRequest(123);
+        manifest.add_source(source.clone(), Some("feature/test".to_string()));
+        manifest.add_source(source.clone(), Some("feature/test".to_string()));
+
+        // Should only have one entry
+        assert_eq!(manifest.sources.len(), 1);
+    }
+
+    #[test]
+    fn test_manifest_existing_variants() {
+        let mut manifest = BuildManifest::new(
+            "test".to_string(),
+            "1.0.0".to_string(),
+            "abc1234".to_string(),
+        );
+
+        manifest.add_artifact(ArtifactEntry {
+            variant_id: Some("free".to_string()),
+            filename: "plugin-free.zip".to_string(),
+            size_bytes: 1024,
+            sha256: "abc".to_string(),
+        });
+        manifest.add_artifact(ArtifactEntry {
+            variant_id: None,
+            filename: "plugin.zip".to_string(),
+            size_bytes: 2048,
+            sha256: "def".to_string(),
+        });
+
+        let variants = manifest.existing_variants();
+        assert_eq!(variants.len(), 2);
+        assert!(variants.contains(&Some("free".to_string())));
+        assert!(variants.contains(&None));
+    }
+
+    #[test]
+    fn test_manifest_has_variant() {
+        let mut manifest = BuildManifest::new(
+            "test".to_string(),
+            "1.0.0".to_string(),
+            "abc1234".to_string(),
+        );
+
+        manifest.add_artifact(ArtifactEntry {
+            variant_id: Some("pro".to_string()),
+            filename: "plugin-pro.zip".to_string(),
+            size_bytes: 1024,
+            sha256: "abc".to_string(),
+        });
+
+        assert!(manifest.has_variant(Some("pro")));
+        assert!(!manifest.has_variant(Some("free")));
+        assert!(!manifest.has_variant(None));
+    }
+
+    #[test]
+    fn test_manifest_save_and_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut manifest = BuildManifest::new(
+            "backwpup".to_string(),
+            "5.6.0".to_string(),
+            "abc1234567890".to_string(),
+        );
+        manifest.add_source(BuildSource::PullRequest(42), Some("develop".to_string()));
+        manifest.add_artifact(ArtifactEntry {
+            variant_id: Some("free".to_string()),
+            filename: "backwpup-free.zip".to_string(),
+            size_bytes: 12345,
+            sha256: "sha256hash".to_string(),
+        });
+
+        // Save
+        manifest.save(dir).unwrap();
+
+        // Verify file exists
+        let manifest_path = dir.join(BuildManifest::FILENAME);
+        assert!(manifest_path.exists());
+
+        // Load and verify
+        let loaded = BuildManifest::load(dir).unwrap();
+        assert_eq!(loaded.project, "backwpup");
+        assert_eq!(loaded.version, "5.6.0");
+        assert_eq!(loaded.commit_short, "abc1234");
+        assert_eq!(loaded.sources.len(), 1);
+        assert_eq!(loaded.artifacts.len(), 1);
+    }
+
+    #[test]
+    fn test_manifest_load_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let result = BuildManifest::load(temp_dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_manifest_path_in() {
+        let dir = std::path::Path::new("/some/dir");
+        assert_eq!(
+            BuildManifest::path_in(dir),
+            std::path::PathBuf::from("/some/dir/build-manifest.json")
+        );
+    }
+}
