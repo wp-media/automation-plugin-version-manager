@@ -75,8 +75,8 @@ impl Builder for BackWPupBuilder {
 
     fn setup_commands(&self) -> Vec<String> {
         vec![
-            "composer install".to_string(),
-            "npm install".to_string(),
+            "composer install --no-dev --prefer-dist --no-progress --no-interaction".to_string(),
+            "npm install --no-audit --no-fund --no-progress".to_string(),
         ]
     }
 
