@@ -423,6 +423,42 @@ pub trait Builder: Send + Sync {
     }
 
     // =========================================================================
+    // Defaults (for CLI convenience)
+    // =========================================================================
+
+    /// Get the default version to use when none is provided.
+    ///
+    /// This is primarily used by CLI tools to provide sensible defaults.
+    /// Returns `None` if the builder requires explicit version input.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn default_version(&self) -> Option<&'static str> {
+    ///     Some("9.99.99")  // Development version
+    /// }
+    /// ```
+    fn default_version(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Get the default variants to build when none are specified.
+    ///
+    /// Returns a subset of available variants that should be built by default.
+    /// Returns empty Vec to build all variants by default.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn default_variants(&self) -> Vec<&'static str> {
+    ///     vec!["free", "pro-en"]  // Skip pro-de by default
+    /// }
+    /// ```
+    fn default_variants(&self) -> Vec<&'static str> {
+        vec![]
+    }
+
+    // =========================================================================
     // Build Execution
     // =========================================================================
 

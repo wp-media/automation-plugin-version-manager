@@ -2,16 +2,42 @@
 //!
 //! Command-line interface for building and managing WordPress plugin versions.
 
+mod commands;
 mod defaults;
 mod paths;
 
 use std::fs;
 use std::path::Path;
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
 
 use apvm_config::Config;
 use apvm_core::{Apvm, Result};
 
+use crate::commands::BuildArgs;
 use crate::paths::Paths;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI Definition
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Automation Plugin Version Manager - Build and manage WordPress plugins
+#[derive(Parser, Debug)]
+#[command(name = "apvm")]
+#[command(version, about, before_help = concat!("Author: ", env!("CARGO_PKG_AUTHORS")))]
+#[command(propagate_version = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+/// Available commands
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Build a plugin from a git reference (PR, branch, tag, commit)
+    Build(BuildArgs),
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main Entry Point
@@ -22,9 +48,25 @@ use crate::paths::Paths;
 /// Uses `tokio::main` for async operations (git, GitHub API, etc.).
 /// The `current_thread` flavor is sufficient for CLI tools and has lower overhead.
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     // Initialize tracing (only if RUST_LOG is set)
     init_tracing();
+
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run the CLI application.
+///
+/// Separated from main() to allow proper error handling with ExitCode.
+async fn run() -> Result<()> {
+    // Parse CLI arguments
+    let cli = Cli::parse();
 
     // Load paths and configuration
     let paths = Paths::new(
@@ -44,15 +86,11 @@ async fn main() -> Result<()> {
         tracing::debug!("No GitHub token found, using anonymous mode");
     }
 
-    // TODO: Parse CLI arguments and dispatch commands
-    // For now, just show initialization status
-    println!("APVM initialized");
-    println!("  Projects: {}", apvm.registry.list().count());
-    println!("  Builds dir: {}", apvm.config.builds_dir.display());
-    if apvm.has_token() {
-        println!("  GitHub: authenticated");
-    } else {
-        println!("  GitHub: anonymous (rate limited)");
+    // Dispatch to the appropriate command
+    match cli.command {
+        Commands::Build(args) => {
+            args.execute(&apvm).await?;
+        }
     }
 
     Ok(())

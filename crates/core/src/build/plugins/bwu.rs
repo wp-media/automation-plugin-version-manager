@@ -105,6 +105,26 @@ impl Builder for BackWPupBuilder {
     }
 
     // =========================================================================
+    // Defaults
+    // =========================================================================
+
+    /// Default version for BackWPup builds.
+    ///
+    /// Uses `9.99.99` as a development version marker to indicate
+    /// this is not an official release.
+    fn default_version(&self) -> Option<&'static str> {
+        Some("9.99.99")
+    }
+
+    /// Default variants for BackWPup builds.
+    ///
+    /// Builds `free` and `pro-en` by default, skipping `pro-de`
+    /// which is rarely needed in QA testing.
+    fn default_variants(&self) -> Vec<&'static str> {
+        vec![Self::VARIANT_FREE, Self::VARIANT_PRO_EN]
+    }
+
+    // =========================================================================
     // Build Hooks
     // =========================================================================
 
