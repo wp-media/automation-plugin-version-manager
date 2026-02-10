@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use apvm_config::Config;
 use apvm_core::{Apvm, Result};
 
-use crate::commands::BuildArgs;
+use crate::commands::{BuildArgs, InfoArgs};
 use crate::paths::Paths;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,6 +37,10 @@ struct Cli {
 enum Commands {
     /// Build a plugin from a git reference (PR, branch, tag, commit)
     Build(BuildArgs),
+    /// List all available plugins
+    List,
+    /// Show detailed information about a plugin
+    Info(InfoArgs),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,6 +94,12 @@ async fn run() -> Result<()> {
     match cli.command {
         Commands::Build(args) => {
             args.execute(&apvm).await?;
+        }
+        Commands::List => {
+            commands::list::execute(&apvm);
+        }
+        Commands::Info(args) => {
+            args.execute(&apvm)?;
         }
     }
 
