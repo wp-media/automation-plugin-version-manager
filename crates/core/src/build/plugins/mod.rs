@@ -172,12 +172,80 @@ pub struct BuildVariant {
     pub description: &'static str,
 }
 
-/// An optional command that can be installed if missing.
-pub struct OptionalCommand {
-    /// Command name to check.
+/// Describes a tool dependency for a build process.
+///
+/// Each dependency has a name (the command to check in PATH), whether it is
+/// required or optional, and a list of shell commands to run in order to
+/// install the tool when it is missing.
+///
+/// # Behavior Matrix
+///
+/// | `required` | `install_commands` | Missing behavior                               |
+/// |------------|--------------------|-------------------------------------------------|
+/// | `true`     | non-empty          | Run install commands, fail if any command fails  |
+/// | `true`     | empty              | Fail immediately with "install it" message       |
+/// | `false`    | non-empty          | Run install commands, warn if any command fails  |
+/// | `false`    | empty              | Warn and continue                                |
+#[derive(Debug, Clone)]
+pub struct ToolDependency {
+    /// Command name to check in PATH.
     pub name: &'static str,
-    /// Installation command if missing.
-    pub install_cmd: &'static str,
+    /// Whether this tool is required for the build to proceed.
+    pub required: bool,
+    /// Shell commands to run (in order) to install the tool if missing.
+    ///
+    /// Multiple commands are useful when installing a tool requires
+    /// intermediate steps (e.g., adding a repository before installing
+    /// a package).
+    pub install_commands: Vec<&'static str>,
+}
+
+impl ToolDependency {
+    /// Create a required dependency with no auto-install commands.
+    ///
+    /// The build will fail if this tool is not found in PATH.
+    pub fn required(name: &'static str) -> Self {
+        Self {
+            name,
+            required: true,
+            install_commands: vec![],
+        }
+    }
+
+    /// Create a required dependency with auto-install commands.
+    ///
+    /// If missing, the install commands are run in order.
+    /// The build fails if any installation command fails.
+    pub fn required_with_install(name: &'static str, install_commands: Vec<&'static str>) -> Self {
+        Self {
+            name,
+            required: true,
+            install_commands,
+        }
+    }
+
+    /// Create an optional dependency with no auto-install commands.
+    ///
+    /// A warning is printed if missing, but the build continues.
+    pub fn optional(name: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+            install_commands: vec![],
+        }
+    }
+
+    /// Create an optional dependency with auto-install commands.
+    ///
+    /// If missing, the install commands are run in order. A warning is
+    /// printed if any installation command fails, but the build continues.
+    pub fn optional_with_install(name: &'static str, install_commands: Vec<&'static str>) -> Self {
+        Self {
+            name,
+            required: false,
+            install_commands,
+        }
+    }
 }
 
 /// Describes a build artifact (output file).
@@ -313,36 +381,25 @@ pub trait Builder: Send + Sync {
     // Commands and Setup
     // =========================================================================
 
-    /// Get required system commands.
+    /// Get all tool dependencies for this builder.
     ///
-    /// These commands must be available in PATH before the build starts.
-    /// The build will fail immediately if any are missing.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// fn required_commands(&self) -> Vec<&'static str> {
-    ///     vec!["npm", "composer", "php"]
-    /// }
-    /// ```
-    fn required_commands(&self) -> Vec<&'static str>;
-
-    /// Get optional commands that will be installed if missing.
-    ///
-    /// Unlike required commands, these will be automatically installed
-    /// using the provided installation command.
+    /// Returns a list of [`ToolDependency`] entries that describe what CLI
+    /// tools are needed and how to handle missing ones. The build runner
+    /// processes each entry according to its `required` and `install_commands`
+    /// fields.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// fn optional_commands(&self) -> Vec<OptionalCommand> {
-    ///     vec![OptionalCommand {
-    ///         name: "gulp",
-    ///         install_cmd: "npm install --global gulp-cli",
-    ///     }]
+    /// fn tool_dependencies(&self) -> Vec<ToolDependency> {
+    ///     vec![
+    ///         ToolDependency::required("npm"),
+    ///         ToolDependency::required("composer"),
+    ///         ToolDependency::required_with_install("gulp", vec!["npm install --global gulp-cli"]),
+    ///     ]
     /// }
     /// ```
-    fn optional_commands(&self) -> Vec<OptionalCommand> {
+    fn tool_dependencies(&self) -> Vec<ToolDependency> {
         vec![]
     }
 

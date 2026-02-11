@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 use crate::Result;
-use super::{BuildArtifact, BuildVariant, Builder, OptionalCommand, VersionRequirement};
+use super::{BuildArtifact, BuildVariant, Builder, ToolDependency, VersionRequirement};
 
 /// Builder for the BackWPup project.
 pub struct BackWPupBuilder;
@@ -62,15 +62,12 @@ impl Builder for BackWPupBuilder {
     // Commands and Setup
     // =========================================================================
 
-    fn required_commands(&self) -> Vec<&'static str> {
-        vec!["npm", "composer"]
-    }
-
-    fn optional_commands(&self) -> Vec<OptionalCommand> {
-        vec![OptionalCommand {
-            name: "gulp",
-            install_cmd: "npm install --global gulp-cli",
-        }]
+    fn tool_dependencies(&self) -> Vec<ToolDependency> {
+        vec![
+            ToolDependency::required("npm"),
+            ToolDependency::required("composer"),
+            ToolDependency::required_with_install("gulp", vec!["npm install --global gulp-cli"]),
+        ]
     }
 
     fn setup_commands(&self) -> Vec<String> {

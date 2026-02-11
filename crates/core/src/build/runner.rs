@@ -7,7 +7,7 @@ use which::which;
 
 use crate::error::{Error, Result};
 
-use super::plugins::{BuildArtifact, Builder, OptionalCommand};
+use super::plugins::{BuildArtifact, Builder, ToolDependency};
 use super::result::{BuildResult, ProducedArtifact};
 
 /// Output from a build run.
@@ -50,33 +50,82 @@ impl BuildRunner {
         which(cmd).is_ok()
     }
 
-    /// Verify all required commands are available.
-    pub fn check_required_commands(commands: &[&str]) -> Result<()> {
-        let missing: Vec<&str> = commands
-            .iter()
-            .filter(|cmd| !Self::command_exists(cmd))
-            .copied()
-            .collect();
+    /// Verify all tool dependencies are available, installing those that have
+    /// an install command when missing.
+    ///
+    /// Each [`ToolDependency`] is processed according to its `required` and
+    /// `install_commands` fields:
+    ///
+    /// | `required` | `install_commands` | Missing behavior                               |
+    /// |------------|--------------------|-------------------------------------------------|
+    /// | `true`     | non-empty          | Run install commands, fail if any command fails  |
+    /// | `true`     | empty              | Fail immediately                                 |
+    /// | `false`    | non-empty          | Run install commands, warn if any command fails  |
+    /// | `false`    | empty              | Warn and continue                                |
+    pub async fn ensure_tool_dependencies(&self, deps: &[ToolDependency]) -> Result<()> {
+        let mut missing_required: Vec<&str> = Vec::new();
 
-        if !missing.is_empty() {
+        for dep in deps {
+            if Self::command_exists(dep.name) {
+                continue;
+            }
+
+            let has_install = !dep.install_commands.is_empty();
+
+            match (dep.required, has_install) {
+                // Required with install commands: run them in order, fail if any fails
+                (true, true) => {
+                    println!(
+                        "Info: required tool '{}' is not installed. Attempting to install...",
+                        dep.name
+                    );
+                    for cmd in &dep.install_commands {
+                        self.run(cmd).await?;
+                    }
+                    println!("Info: '{}' installed successfully.", dep.name);
+                }
+                // Required without install commands: collect for batch error
+                (true, false) => {
+                    missing_required.push(dep.name);
+                }
+                // Optional with install commands: run them, warn on failure
+                (false, true) => {
+                    println!(
+                        "Info: optional tool '{}' is not installed. Attempting to install...",
+                        dep.name
+                    );
+                    let mut ok = true;
+                    for cmd in &dep.install_commands {
+                        if let Err(e) = self.run(cmd).await {
+                            println!(
+                                "Warning: failed to install optional tool '{}': {}",
+                                dep.name, e
+                            );
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        println!("Info: '{}' installed successfully.", dep.name);
+                    }
+                }
+                // Optional without install commands: warn only
+                (false, false) => {
+                    println!(
+                        "Warning: optional tool '{}' is not installed. Some features may not work.",
+                        dep.name
+                    );
+                }
+            }
+        }
+
+        if !missing_required.is_empty() {
             return Err(Error::Build(format!(
                 "Missing required commands: {}. Please install them and ensure they are in PATH.",
-                missing.join(", ")
+                missing_required.join(", ")
             )));
         }
 
-        Ok(())
-    }
-
-    /// Install optional commands if missing.
-    pub async fn ensure_optional_commands(&self, commands: &[OptionalCommand]) -> Result<()> {
-        for cmd in commands {
-            if !Self::command_exists(cmd.name) {
-                println!("Info: '{}' is not installed. Attempting to install...", cmd.name);
-                self.run(cmd.install_cmd).await?;
-                println!("Info: '{}' installed successfully.", cmd.name);
-            }
-        }
         Ok(())
     }
 
@@ -117,28 +166,25 @@ impl BuildRunner {
     /// 1. VALIDATE VARIANTS
     ///    │  └─► Ensures requested variants are supported by the builder
     ///    ▼
-    /// 2. CHECK REQUIRED COMMANDS
-    ///    │  └─► Verifies all required CLI tools are available in PATH
+    /// 2. ENSURE TOOL DEPENDENCIES
+    ///    │  └─► Checks all tools, auto-installs those with install commands
     ///    ▼
-    /// 3. ENSURE OPTIONAL COMMANDS
-    ///    │  └─► Installs optional tools if missing (e.g., composer plugins)
-    ///    ▼
-    /// 4. CHANGE TO BUILD SUBDIRECTORY (if specified)
+    /// 3. CHANGE TO BUILD SUBDIRECTORY (if specified)
     ///    │  └─► Switches working directory to project-specific build folder
     ///    ▼
-    /// 5. RUN SETUP COMMANDS
+    /// 4. RUN SETUP COMMANDS
     ///    │  └─► Executes dependency installation (npm install, composer install)
     ///    ▼
-    /// 6. PRE-BUILD HOOK
+    /// 5. PRE-BUILD HOOK
     ///    │  └─► Builder-specific preparation (modify configs, set versions)
     ///    ▼
-    /// 7. RUN BUILD COMMANDS
+    /// 6. RUN BUILD COMMANDS
     ///    │  └─► Executes variant-specific build scripts (compile, bundle)
     ///    ▼
-    /// 8. BUILD HOOK
+    /// 7. BUILD HOOK
     ///    │  └─► Builder-specific mid-build processing
     ///    ▼
-    /// 9. POST-BUILD HOOK
+    /// 8. POST-BUILD HOOK
     ///    │  └─► Cleanup, artifact packaging, file organization
     ///    ▼
     /// ✓ BUILD COMPLETE
@@ -204,11 +250,8 @@ impl BuildRunner {
         // Validate requested variants
         builder.validate_variants(variants)?;
 
-        // Check required commands
-        Self::check_required_commands(&builder.required_commands())?;
-
-        // Install optional commands if needed
-        self.ensure_optional_commands(&builder.optional_commands()).await?;
+        // Ensure all tool dependencies are met
+        self.ensure_tool_dependencies(&builder.tool_dependencies()).await?;
 
         // Change to build subdirectory if specified
         if let Some(subdir) = builder.build_subdirectory() {

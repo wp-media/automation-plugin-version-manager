@@ -101,10 +101,6 @@ mod tests {
             VersionRequirement::Optional
         }
 
-        fn required_commands(&self) -> Vec<&'static str> {
-            vec![]
-        }
-
         fn setup_commands(&self) -> Vec<String> {
             vec![]
         }

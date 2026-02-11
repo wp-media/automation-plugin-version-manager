@@ -65,11 +65,24 @@ impl InfoArgs {
             }
         }
 
-        // Required commands
-        let required = builder.required_commands();
-        if !required.is_empty() {
+        // Tool dependencies
+        let deps = builder.tool_dependencies();
+        if !deps.is_empty() {
             println!();
-            println!("Required tools: {}", required.join(", "));
+            println!("Tool dependencies:");
+            for dep in &deps {
+                let status = if dep.required { "required" } else { "optional" };
+                if dep.install_commands.is_empty() {
+                    println!("  {:<12} ({})", dep.name, status);
+                } else {
+                    println!(
+                        "  {:<12} ({}, auto-install: {})",
+                        dep.name,
+                        status,
+                        dep.install_commands.join(" && ")
+                    );
+                }
+            }
         }
 
         Ok(())
