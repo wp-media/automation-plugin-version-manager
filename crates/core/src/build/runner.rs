@@ -1,12 +1,13 @@
 //! Build script runner.
 
-use std::path::{Path, PathBuf};
+
 use std::process::Output;
 
 use which::which;
 
 use crate::error::{Error, Result};
 
+use super::BuildContext;
 use super::plugins::{BuildArtifact, Builder, ToolDependency};
 use super::result::{BuildResult, ProducedArtifact};
 
@@ -36,13 +37,13 @@ impl From<Output> for BuildOutput {
 
 /// Runs build scripts.
 pub struct BuildRunner {
-    working_dir: PathBuf,
+    context: BuildContext,
 }
 
 impl BuildRunner {
-    /// Create a new build runner with the given working directory.
-    pub fn new(working_dir: PathBuf) -> Self {
-        Self { working_dir }
+    /// Create a new build runner with the given build context.
+    pub fn new(context: BuildContext) -> Self {
+        Self { context }
     }
 
     /// Check if a command is available in PATH.
@@ -129,12 +130,12 @@ impl BuildRunner {
         Ok(())
     }
 
-    /// Run a shell command.
+    /// Run a shell command with repo dir as working/current directory.
     pub async fn run(&self, command: &str) -> Result<BuildOutput> {
         let output = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
-            .current_dir(&self.working_dir)
+            .current_dir(self.context.repo_dir())
             .output()
             .await?;
 
@@ -216,31 +217,31 @@ impl BuildRunner {
     ///
     /// ```rust,ignore
     /// use std::path::PathBuf;
+    /// use crate::build::BuildContext;
     /// use crate::build::runner::BuildRunner;
-    /// use crate::build::plugins::wp_rocket::WpRocketBuilder;
+    /// use crate::build::plugins::WpRocketBuilder;
     ///
     /// async fn build_plugin() -> Result<(), Error> {
-    ///     let mut runner = BuildRunner::new(PathBuf::from("/path/to/repo"));
-    ///     let builder = WpRocketBuilder::new();
-    ///     
-    ///     // Build specific variants
-    ///     let result = runner.execute_build(&builder, "3.17.4", &["pro", "starter"]).await?;
-    ///     println!("Built {} artifacts ({} bytes)", result.artifacts.len(), result.total_size());
-    ///     
-    ///     // Or build all variants
+    ///     let context = BuildContext::new(
+    ///         PathBuf::from("/tmp/wp-rocket-abc123/wp-rocket"),
+    ///         PathBuf::from("/tmp/wp-rocket-abc123"),
+    ///     );
+    ///     let mut runner = BuildRunner::new(context);
+    ///     let builder = WpRocketBuilder;
+    ///
     ///     let result = runner.execute_build(&builder, "3.17.4", &[]).await?;
     ///     for artifact in &result.artifacts {
     ///         println!("  - {} ({} bytes)", artifact.filename, artifact.size);
     ///     }
-    ///     
+    ///
     ///     Ok(())
     /// }
     /// ```
     ///
     /// # Note
     ///
-    /// This method mutates `self` because it may change the `working_dir` if the
-    /// builder specifies a build subdirectory.
+    /// This method mutates `self` because it may change the repo directory
+    /// in the build context if the builder specifies a build subdirectory.
     pub async fn execute_build(
         &mut self,
         builder: &dyn Builder,
@@ -255,14 +256,14 @@ impl BuildRunner {
 
         // Change to build subdirectory if specified
         if let Some(subdir) = builder.build_subdirectory() {
-            let new_dir = self.working_dir.join(subdir);
+            let new_dir = self.context.repo_dir().join(subdir);
             if !new_dir.exists() {
                 return Err(Error::Build(format!(
                     "Build directory '{}' does not exist. Try cloning the repository first.",
                     new_dir.display()
                 )));
             }
-            self.working_dir = new_dir;
+            self.context.set_repo_dir(new_dir);
         }
 
         // Run setup commands
@@ -271,20 +272,20 @@ impl BuildRunner {
             self.run(&cmd).await?;
         }
         // Pre-build hook
-        builder.pre_build_hook(&self.working_dir, version, variants)?;
+        builder.pre_build_hook(&self.context, version, variants)?;
 
         // Run build commands for specified variants
-        for cmd in builder.build_commands(version, variants) {
+        for cmd in builder.build_commands(&self.context, version, variants) {
             println!("Running: {}", cmd);
             self.run(&cmd).await?;
         }
         // Build hook
-        builder.build_hook(&self.working_dir, version, variants)?;
+        builder.build_hook(&self.context, version, variants)?;
         // Post-build hook
-        builder.post_build_hook(&self.working_dir, version, variants)?;
+        builder.post_build_hook(&self.context, version, variants)?;
 
         // Collect artifacts - builder resolves paths internally
-        let build_artifacts = builder.artifacts(&self.working_dir, version, variants)?;
+        let build_artifacts = builder.artifacts(&self.context, version, variants)?;
         let artifacts = self.collect_artifacts(&build_artifacts)?;
 
         // Determine which variants were built
@@ -302,7 +303,7 @@ impl BuildRunner {
 
         Ok(BuildResult::new(
             artifacts,
-            self.working_dir.clone(),
+            self.context.repo_dir().to_path_buf(),
             version.to_string(),
             variants_built,
         ))
@@ -310,9 +311,14 @@ impl BuildRunner {
 
     /// Collect and verify artifacts after build completes.
     ///
-    /// This method takes the artifact definitions from the builder and verifies
-    /// that each expected file exists. For each verified file, it reads the size
-    /// and creates a `ProducedArtifact` with the full path.
+    /// Takes artifact definitions from the builder, resolves their paths,
+    /// verifies the files exist, and returns sized `ProducedArtifact` entries.
+    ///
+    /// # Path Resolution
+    ///
+    /// - **Absolute** `source_path` — used as-is (for artifacts placed outside
+    ///   the repo directory, e.g., in `workspace_dir`)
+    /// - **Relative** `source_path` — resolved against `repo_dir`
     ///
     /// # Arguments
     ///
@@ -323,20 +329,27 @@ impl BuildRunner {
     /// * `Ok(Vec<ProducedArtifact>)` - All artifacts collected successfully
     /// * `Err(Error::Build)` - An expected artifact file was not found
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```text
-    /// Builder defines:    BuildArtifact { source_path: "dist/plugin.zip", ... }
+    /// Relative path:      BuildArtifact { source_path: "dist/plugin.zip", ... }
     ///                             ↓
-    /// Resolved path:      /path/to/repo/dist/plugin.zip
+    /// Resolved:            /tmp/build-abc/my-plugin/dist/plugin.zip
+    ///
+    /// Absolute path:      BuildArtifact { source_path: "/tmp/build-abc/plugin.zip", ... }
     ///                             ↓
-    /// Verified & sized:   ProducedArtifact { path: ..., size: 1234567 }
+    /// Used as-is:          /tmp/build-abc/plugin.zip
     /// ```
     fn collect_artifacts(&self, build_artifacts: &[BuildArtifact]) -> Result<Vec<ProducedArtifact>> {
         let mut artifacts = Vec::with_capacity(build_artifacts.len());
 
         for artifact in build_artifacts {
-            let path = self.working_dir.join(&artifact.source_path);
+            let source = std::path::Path::new(&artifact.source_path);
+            let path = if source.is_absolute() {
+                source.to_path_buf()
+            } else {
+                self.context.repo_dir().join(source)
+            };
 
             if !path.exists() {
                 return Err(Error::Build(format!(
@@ -360,8 +373,8 @@ impl BuildRunner {
         Ok(artifacts)
     }
 
-    /// Get the working directory.
-    pub fn working_dir(&self) -> &Path {
-        &self.working_dir
+    /// Get the build context.
+    pub fn context(&self) -> &BuildContext {
+        &self.context
     }
 }

@@ -21,10 +21,12 @@
 //! - [`plugins::detect_wordpress_plugin_version`] - Parse PHP plugin headers
 //! - [`plugins::detect_wordpress_readme_version`] - Parse readme.txt stable tag
 
+mod context;
 pub mod plugins;
 mod result;
 mod runner;
 
+pub use context::BuildContext;
 pub use result::{BuildResult, ProducedArtifact};
 pub use runner::{BuildOutput, BuildRunner};
 

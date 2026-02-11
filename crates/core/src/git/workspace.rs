@@ -152,6 +152,29 @@ impl BuildWorkspace {
         self.temp_dir.path().join(&self.repo_name)
     }
 
+    /// Create a [`BuildContext`] from this workspace.
+    ///
+    /// Maps the workspace's directory structure to the build context:
+    /// - `workspace_dir` → the temp directory root ([`path()`](Self::path))
+    /// - `repo_dir` → the cloned repository inside it ([`repo_path()`](Self::repo_path))
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let workspace = BuildWorkspace::new("wp-rocket", "https://...", None)?;
+    /// workspace.clone_repo().await?;
+    ///
+    /// let context = workspace.to_build_context();
+    /// // context.workspace_dir() == /tmp/wp-rocket-XXXXXX/
+    /// // context.repo_dir()      == /tmp/wp-rocket-XXXXXX/wp-rocket/
+    /// ```
+    pub fn to_build_context(&self) -> crate::build::BuildContext {
+        crate::build::BuildContext::new(
+            self.repo_path(),
+            self.temp_dir.path().to_path_buf(),
+        )
+    }
+
     /// Fetch updates for the repository using the workspace's token.
     pub async fn fetch(&self) -> Result<()> {
         let repo = self.repository();

@@ -4,13 +4,17 @@
 //! See [`VersionRequirement`] for how different projects handle versions.
 
 mod bwu;
+mod wpr;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub use bwu::BackWPupBuilder;
+pub use wpr::WpRocketBuilder;
 
 use crate::Result;
 use crate::error::Error;
+
+use super::BuildContext;
 
 // =============================================================================
 // Version Requirement
@@ -253,7 +257,12 @@ impl ToolDependency {
 pub struct BuildArtifact {
     /// Variant ID this artifact belongs to (None if single-variant project).
     pub variant_id: Option<String>,
-    /// Source path (relative to build dir).
+    /// Path to the artifact file.
+    ///
+    /// Can be either:
+    /// - **Relative** — resolved against `repo_dir` by the runner (most common)
+    /// - **Absolute** — used as-is, for artifacts placed outside the repo
+    ///   (e.g., in `workspace_dir`)
     pub source_path: String,
     /// Target filename.
     pub target_name: String,
@@ -430,10 +439,10 @@ pub trait Builder: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `working_dir` - The build directory
+    /// * `context` - The build context with repo and workspace paths
     /// * `version` - The version being built
     /// * `variants` - The variants being built (empty = all)
-    fn pre_build_hook(&self, _working_dir: &PathBuf, _version: &str, _variants: &[&str]) -> Result<()> {
+    fn pre_build_hook(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
         Ok(())
     }
 
@@ -441,14 +450,14 @@ pub trait Builder: Send + Sync {
     ///
     /// Useful if the project doesn't use traditional build commands
     /// but needs custom logic (e.g., file manipulation).
-    fn build_hook(&self, _working_dir: &PathBuf, _version: &str, _variants: &[&str]) -> Result<()> {
+    fn build_hook(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
         Ok(())
     }
 
     /// Hook called after the build completes.
     ///
     /// Use this for post-build cleanup or artifact organization.
-    fn post_build_hook(&self, _working_dir: &PathBuf, _version: &str, _variants: &[&str]) -> Result<()> {
+    fn post_build_hook(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
         Ok(())
     }
 
@@ -526,9 +535,10 @@ pub trait Builder: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `context` - The build context with repo and workspace paths
     /// * `version` - The version being built (may be empty if not required)
     /// * `variants` - The variants to build (empty = all)
-    fn build_commands(&self, version: &str, variants: &[&str]) -> Vec<String>;
+    fn build_commands(&self, context: &BuildContext, version: &str, variants: &[&str]) -> Vec<String>;
 
     /// Get the artifacts produced by the build.
     ///
@@ -539,14 +549,14 @@ pub trait Builder: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `working_dir` - The directory where the build ran
+    /// * `context` - The build context with repo and workspace paths
     /// * `version` - The version that was built
     /// * `variants` - The variants that were built (empty = all)
     ///
     /// # Returns
     ///
     /// A list of artifacts with resolved source paths.
-    fn artifacts(&self, working_dir: &PathBuf, version: &str, variants: &[&str]) -> Result<Vec<BuildArtifact>>;
+    fn artifacts(&self, context: &BuildContext, version: &str, variants: &[&str]) -> Result<Vec<BuildArtifact>>;
 
     /// Get the subdirectory where the build should run.
     ///

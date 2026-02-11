@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::build::plugins::{BackWPupBuilder, Builder};
+use crate::build::plugins::{BackWPupBuilder, Builder, WpRocketBuilder};
 use crate::error::{Error, Result};
 
 pub const DEFAULT_BRANCH_NAME: &str = "develop";
@@ -57,8 +57,15 @@ impl ProjectRegistry {
             builder: Box::new(BackWPupBuilder),
         });
 
-        // Add more projects here as you implement their builders
-        // registry.register(Project { ... });
+        registry.register(Project {
+            name: "wp-rocket".to_string(),
+            repo_url: "https://github.com/wp-media/wp-rocket.git".to_string(),
+            owner: "wp-media".to_string(),
+            repo: "wp-rocket".to_string(),
+            default_branch: DEFAULT_BRANCH_NAME.to_string(),
+            is_private: false,
+            builder: Box::new(WpRocketBuilder),
+        });
 
         registry
     }
@@ -90,8 +97,8 @@ impl Default for ProjectRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::BuildContext;
     use crate::build::plugins::{BuildArtifact, Builder, VersionRequirement};
-    use std::path::PathBuf;
 
     /// Minimal test builder.
     struct TestBuilder;
@@ -105,13 +112,13 @@ mod tests {
             vec![]
         }
 
-        fn build_commands(&self, _version: &str, _variants: &[&str]) -> Vec<String> {
+        fn build_commands(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Vec<String> {
             vec![]
         }
 
         fn artifacts(
             &self,
-            _working_dir: &PathBuf,
+            _context: &BuildContext,
             _version: &str,
             _variants: &[&str],
         ) -> crate::Result<Vec<BuildArtifact>> {

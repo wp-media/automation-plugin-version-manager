@@ -394,7 +394,8 @@ impl<'a> BuildCommand<'a> {
         tracing::debug!("Checked out {} at commit {}", resolved.git_ref, commit_short);
 
         // 9. Run the build using the project's builder
-        let mut runner = BuildRunner::new(repo.path().to_path_buf());
+        let build_context = workspace.to_build_context();
+        let mut runner = BuildRunner::new(build_context);
         let result = runner
             .execute_build(builder, &resolved_version, variants)
             .await?;
@@ -587,6 +588,7 @@ impl<'a> BuildCommand<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::BuildContext;
     use crate::build::plugins::{BuildArtifact, Builder, VersionRequirement};
     use crate::projects::Project;
     use std::path::PathBuf;
@@ -604,13 +606,13 @@ mod tests {
             vec![]
         }
 
-        fn build_commands(&self, _version: &str, _variants: &[&str]) -> Vec<String> {
+        fn build_commands(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Vec<String> {
             vec![]
         }
 
         fn artifacts(
             &self,
-            _working_dir: &PathBuf,
+            _context: &BuildContext,
             _version: &str,
             _variants: &[&str],
         ) -> crate::Result<Vec<BuildArtifact>> {

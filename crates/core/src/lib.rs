@@ -51,6 +51,7 @@ pub use apvm_config::Config;
 pub use error::{Error, Result};
 
 // Re-export key types for convenience
+pub use build::BuildContext;
 pub use commands::BuildOutput;
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 

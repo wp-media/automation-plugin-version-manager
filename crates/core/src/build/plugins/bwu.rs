@@ -19,9 +19,10 @@
 //! - `pro-de` - Pro version with German translations
 //! - `pro-en` - Pro version with English translations
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use crate::Result;
 use super::{BuildArtifact, BuildVariant, Builder, ToolDependency, VersionRequirement};
+use super::super::BuildContext;
 
 /// Builder for the BackWPup project.
 pub struct BackWPupBuilder;
@@ -125,9 +126,9 @@ impl Builder for BackWPupBuilder {
     // Build Hooks
     // =========================================================================
 
-    fn pre_build_hook(&self, working_dir: &PathBuf, _version: &str, _variants: &[&str]) -> Result<()> {
+    fn pre_build_hook(&self, context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
         // Remove previous build artifacts matching backwpup-*.zip pattern
-        let pattern = working_dir.join("backwpup-*.zip");
+        let pattern = context.repo_dir().join("backwpup-*.zip");
         let pattern_str = pattern.to_string_lossy();
 
         let entries = glob::glob(&pattern_str).map_err(|_| {
@@ -147,7 +148,7 @@ impl Builder for BackWPupBuilder {
     // Build Execution
     // =========================================================================
 
-    fn build_commands(&self, version: &str, variants: &[&str]) -> Vec<String> {
+    fn build_commands(&self, _context: &BuildContext, version: &str, variants: &[&str]) -> Vec<String> {
         // Determine which variants to build
         let to_build: Vec<&str> = if variants.is_empty() {
             // Build all variants if none specified
@@ -190,7 +191,7 @@ impl Builder for BackWPupBuilder {
         commands
     }
 
-    fn artifacts(&self, working_dir: &PathBuf, version: &str, variants: &[&str]) -> crate::Result<Vec<BuildArtifact>> {
+    fn artifacts(&self, context: &BuildContext, version: &str, variants: &[&str]) -> crate::Result<Vec<BuildArtifact>> {
         let to_build = if variants.is_empty() {
             vec![Self::VARIANT_FREE, Self::VARIANT_PRO_DE, Self::VARIANT_PRO_EN]
         } else {
@@ -214,7 +215,7 @@ impl Builder for BackWPupBuilder {
                 _ => continue,
             };
 
-            let full_pattern = working_dir.join(&pattern);
+            let full_pattern = context.repo_dir().join(&pattern);
             let pattern_str = full_pattern.to_string_lossy();
 
             let matches: Vec<_> = glob::glob(&pattern_str)
