@@ -27,6 +27,10 @@ use crate::paths::Paths;
 #[command(version, about, before_help = concat!("Author: ", env!("CARGO_PKG_AUTHORS")))]
 #[command(propagate_version = true)]
 struct Cli {
+    /// Enable verbose output (shows commands and full output)
+    #[arg(long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -102,7 +106,7 @@ async fn run() -> Result<()> {
     // Dispatch to the appropriate command
     match cli.command {
         Commands::Build(args) => {
-            args.execute(&apvm).await?;
+            args.execute(&apvm, cli.verbose).await?;
         }
         Commands::List => {
             commands::list::execute(&apvm);
@@ -122,19 +126,22 @@ async fn run() -> Result<()> {
 
 /// Initialize tracing/logging.
 ///
-/// Only enables if `RUST_LOG` environment variable is set.
+/// Enables if `RUST_LOG` environment variable is set OR if `--verbose` flag is used.
 /// This keeps normal CLI output clean while allowing debug output when needed.
 ///
 /// # Examples
 ///
 /// ```bash
-/// # Normal usage (quiet)
+/// # Normal usage (quiet — spinner only)
 /// apvm build backwpup 123
 ///
-/// # Debug mode
+/// # Verbose (shows commands and output)
+/// apvm -v build backwpup 123
+///
+/// # Debug mode (full tracing)
 /// RUST_LOG=debug apvm build backwpup 123
 ///
-/// # Trace mode (verbose)
+/// # Trace mode (maximum verbosity)
 /// RUST_LOG=trace apvm build backwpup 123
 /// ```
 fn init_tracing() {

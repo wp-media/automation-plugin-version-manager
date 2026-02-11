@@ -52,6 +52,7 @@ pub use error::{Error, Result};
 
 // Re-export key types for convenience
 pub use build::BuildContext;
+pub use build::progress::{BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter};
 pub use commands::BuildOutput;
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 
@@ -222,18 +223,20 @@ impl Apvm {
     /// * `git_ref` - Git reference (PR number, branch, tag, or commit)
     /// * `variants` - Optional specific variants to build (None = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events.
+    ///   Use [`NullReporter`] to discard all events.
     ///
     /// # Examples
     ///
     /// ```ignore
     /// // BackWPup: version REQUIRED
-    /// apvm.build("backwpup", Some("5.1.0"), "pr:123", None, "/output").await?;
+    /// apvm.build("backwpup", Some("5.1.0"), "pr:123", None, "/output", &NullReporter).await?;
     ///
     /// // WP Rocket: version auto-detected from source
-    /// apvm.build("wp-rocket", None, "pr:456", None, "/output").await?;
+    /// apvm.build("wp-rocket", None, "pr:456", None, "/output", &NullReporter).await?;
     ///
     /// // Other plugin: explicit version override (In case plugin support specific version and auto-detection)
-    /// apvm.build("other-plugin", Some("4.17.0-custom"), "develop", None, "/output").await?;
+    /// apvm.build("other-plugin", Some("4.17.0-custom"), "develop", None, "/output", &NullReporter).await?;
     /// ```
     ///
     /// # Returns
@@ -246,11 +249,12 @@ impl Apvm {
         git_ref: &str,
         variants: Option<&[&str]>,
         output_dir: impl AsRef<std::path::Path>,
+        reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
         let cmd = commands::BuildCommand::new(&self.github, &self.registry, &self.config);
         let variants = variants.unwrap_or(&[]);
 
-        cmd.execute(project, version, git_ref, variants, output_dir).await
+        cmd.execute(project, version, git_ref, variants, output_dir, reporter).await
     }
 
     /// Build a project from a PR number.
@@ -264,6 +268,8 @@ impl Apvm {
     /// * `pr_number` - Pull request number
     /// * `variants` - Optional specific variants to build (None = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events.
+    ///   Use [`NullReporter`] to discard all events.
     pub async fn build_from_pr(
         &self,
         project: &str,
@@ -271,8 +277,9 @@ impl Apvm {
         pr_number: u64,
         variants: Option<&[&str]>,
         output_dir: impl AsRef<std::path::Path>,
+        reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &pr_number.to_string(), variants, output_dir)
+        self.build(project, version, &pr_number.to_string(), variants, output_dir, reporter)
             .await
     }
 
@@ -285,6 +292,8 @@ impl Apvm {
     /// * `branch` - Branch name
     /// * `variants` - Optional specific variants to build (None = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events.
+    ///   Use [`NullReporter`] to discard all events.
     pub async fn build_from_branch(
         &self,
         project: &str,
@@ -292,8 +301,9 @@ impl Apvm {
         branch: &str,
         variants: Option<&[&str]>,
         output_dir: impl AsRef<std::path::Path>,
+        reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("branch:{branch}"), variants, output_dir)
+        self.build(project, version, &format!("branch:{branch}"), variants, output_dir, reporter)
             .await
     }
 
@@ -306,6 +316,8 @@ impl Apvm {
     /// * `tag` - Tag name (e.g., "v1.0.0")
     /// * `variants` - Optional specific variants to build (None = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events.
+    ///   Use [`NullReporter`] to discard all events.
     pub async fn build_from_tag(
         &self,
         project: &str,
@@ -313,8 +325,9 @@ impl Apvm {
         tag: &str,
         variants: Option<&[&str]>,
         output_dir: impl AsRef<std::path::Path>,
+        reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("tag:{tag}"), variants, output_dir)
+        self.build(project, version, &format!("tag:{tag}"), variants, output_dir, reporter)
             .await
     }
 
@@ -327,6 +340,8 @@ impl Apvm {
     /// * `commit` - Commit SHA (minimum 7 characters)
     /// * `variants` - Optional specific variants to build (None = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events.
+    ///   Use [`NullReporter`] to discard all events.
     pub async fn build_from_commit(
         &self,
         project: &str,
@@ -334,8 +349,9 @@ impl Apvm {
         commit: &str,
         variants: Option<&[&str]>,
         output_dir: impl AsRef<std::path::Path>,
+        reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("commit:{commit}"), variants, output_dir)
+        self.build(project, version, &format!("commit:{commit}"), variants, output_dir, reporter)
             .await
     }
 }

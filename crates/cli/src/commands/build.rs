@@ -1,13 +1,18 @@
 //! Build command implementation.
 //!
 //! Handles building plugins from git references (PR, branch, tag, commit).
+//! Provides visual progress via an indicatif spinner in normal mode, or
+//! full output in verbose mode (`-v`/`--verbose`).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Args;
+use indicatif::{ProgressBar, ProgressStyle};
 
 use apvm_core::{Apvm, Result};
 use apvm_core::build::plugins::VersionRequirement;
+use apvm_core::build::progress::{BuildEvent, ClosureReporter};
 
 /// Arguments for the build command.
 #[derive(Args, Debug)]
@@ -60,8 +65,9 @@ impl BuildArgs {
 
     /// Execute the build command.
     ///
-    /// Returns Ok(()) on success, or an error with user-friendly message.
-    pub async fn execute(&self, apvm: &Apvm) -> Result<()> {
+    /// In normal mode, displays a spinner with step descriptions.
+    /// In verbose mode (`-v`), prints full command details and output.
+    pub async fn execute(&self, apvm: &Apvm, verbose: bool) -> Result<()> {
         // 1. Look up the project to access builder defaults
         let project = apvm.registry.get(&self.plugin)?;
         let builder = project.builder.as_ref();
@@ -111,18 +117,95 @@ impl BuildArgs {
         println!("  Output: {}", output_dir.display());
         println!();
 
-        // 9. Execute the build
+        // 9. Execute the build with appropriate reporter
         let variants_refs: Vec<&str> = variants.iter().map(|s| s.as_str()).collect();
-        let result = apvm.build(
-            &self.plugin,
-            version.as_deref(),
-            &git_ref,
-            if variants_refs.is_empty() { None } else { Some(&variants_refs) },
-            &output_dir,
-        ).await?;
+
+        let result = if verbose {
+            // Verbose mode: print everything, no spinner
+            let reporter = ClosureReporter::new(|event| {
+                match event {
+                    BuildEvent::PhaseStarted { phase, message } => {
+                        eprintln!("[{}] {}", phase, message);
+                    }
+                    BuildEvent::StepStarted { step } => {
+                        eprintln!("  > {} ({})", step.label, step.command);
+                    }
+                    BuildEvent::StepCompleted { step } => {
+                        eprintln!("  ✓ {}", step.label);
+                    }
+                    BuildEvent::CommandOutput { stream, line } => {
+                        eprintln!("  [{}] {}", stream, line);
+                    }
+                    BuildEvent::Warning(msg) => {
+                        eprintln!("  ⚠ {}", msg);
+                    }
+                    BuildEvent::BuildSucceeded { .. } => {
+                        eprintln!("[Done] Build succeeded");
+                    }
+                    BuildEvent::BuildFailed { reason } => {
+                        eprintln!("[FAIL] {}", reason);
+                    }
+                    _ => {}
+                }
+            });
+
+            apvm.build(
+                &self.plugin,
+                version.as_deref(),
+                &git_ref,
+                if variants_refs.is_empty() { None } else { Some(&variants_refs) },
+                &output_dir,
+                &reporter,
+            ).await?
+        } else {
+            // Normal mode: spinner with step descriptions
+            let spinner = ProgressBar::new_spinner();
+            spinner.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                    .unwrap()
+                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+            );
+            spinner.enable_steady_tick(Duration::from_millis(80));
+            spinner.set_message("Starting build...");
+
+            let reporter = ClosureReporter::new({
+                let sp = spinner.clone();
+                move |event| {
+                    match event {
+                        BuildEvent::PhaseStarted { message, .. } => {
+                            sp.set_message(message.clone());
+                        }
+                        BuildEvent::StepStarted { step } => {
+                            sp.set_message(step.label.clone());
+                        }
+                        BuildEvent::Warning(msg) => {
+                            sp.suspend(|| {
+                                eprintln!("⚠ {}", msg);
+                            });
+                        }
+                        BuildEvent::BuildFailed { reason } => {
+                            sp.finish_and_clear();
+                            eprintln!("Build failed: {}", reason);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            let result = apvm.build(
+                &self.plugin,
+                version.as_deref(),
+                &git_ref,
+                if variants_refs.is_empty() { None } else { Some(&variants_refs) },
+                &output_dir,
+                &reporter,
+            ).await;
+
+            spinner.finish_and_clear();
+            result?
+        };
 
         // 10. Show results
-        println!();
         println!("Build complete: {}", result.description());
         println!("  Commit: {}", result.commit_short);
         println!("  Version: {}", result.result.version);

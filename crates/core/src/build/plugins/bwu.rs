@@ -23,6 +23,7 @@ use std::path::Path;
 use crate::Result;
 use super::{BuildArtifact, BuildVariant, Builder, ToolDependency, VersionRequirement};
 use super::super::BuildContext;
+use super::super::progress::{BuildEvent, BuildStep, ProgressReporter};
 
 /// Builder for the BackWPup project.
 pub struct BackWPupBuilder;
@@ -71,10 +72,16 @@ impl Builder for BackWPupBuilder {
         ]
     }
 
-    fn setup_commands(&self) -> Vec<String> {
+    fn setup_commands(&self) -> Vec<BuildStep> {
         vec![
-            "composer install --no-dev --prefer-dist --no-progress --no-interaction".to_string(),
-            "npm install --no-audit --no-fund --no-progress".to_string(),
+            BuildStep::new(
+                "Installing PHP dependencies",
+                "composer install --no-dev --prefer-dist --no-progress --no-interaction",
+            ),
+            BuildStep::new(
+                "Installing JS dependencies",
+                "npm install --no-audit --no-fund --no-progress",
+            ),
         ]
     }
 
@@ -126,8 +133,17 @@ impl Builder for BackWPupBuilder {
     // Build Hooks
     // =========================================================================
 
-    fn pre_build_hook(&self, context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
+    fn pre_build_hook(
+        &self,
+        context: &BuildContext,
+        _version: &str,
+        _variants: &[&str],
+        reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
         // Remove previous build artifacts matching backwpup-*.zip pattern
+        reporter.report(&BuildEvent::StepStarted {
+            step: BuildStep::new("Cleaning previous artifacts", "rm backwpup-*.zip"),
+        });
         let pattern = context.repo_dir().join("backwpup-*.zip");
         let pattern_str = pattern.to_string_lossy();
 
@@ -141,6 +157,10 @@ impl Builder for BackWPupBuilder {
             })?;
         }
 
+        reporter.report(&BuildEvent::StepCompleted {
+            step: BuildStep::new("Cleaning previous artifacts", "rm backwpup-*.zip"),
+        });
+
         Ok(())
     }
 
@@ -148,7 +168,7 @@ impl Builder for BackWPupBuilder {
     // Build Execution
     // =========================================================================
 
-    fn build_commands(&self, _context: &BuildContext, version: &str, variants: &[&str]) -> Vec<String> {
+    fn build_commands(&self, _context: &BuildContext, version: &str, variants: &[&str]) -> Vec<BuildStep> {
         // Determine which variants to build
         let to_build: Vec<&str> = if variants.is_empty() {
             // Build all variants if none specified
@@ -159,29 +179,41 @@ impl Builder for BackWPupBuilder {
 
         // Common asset build commands (always run first)
         let mut commands = vec![
-            "gulp buildAssets".to_string(),
-            "npx tailwindcss -i ./src/input.css -o ./assets/css/backwpup-admin.css".to_string(),
+            BuildStep::new("Building assets", "gulp buildAssets"),
+            BuildStep::new(
+                "Compiling Tailwind CSS",
+                "npx tailwindcss -i ./src/input.css -o ./assets/css/backwpup-admin.css",
+            ),
         ];
 
         // Add variant-specific commands
         for variant in to_build {
             match variant {
                 Self::VARIANT_FREE => {
-                    commands.push(format!(
-                        "gulp free --packageVersion=\"{}\" --compressPath=.",
-                        version
+                    commands.push(BuildStep::new(
+                        "Building Free variant",
+                        format!(
+                            "gulp free --packageVersion=\"{}\" --compressPath=.",
+                            version
+                        ),
                     ));
                 }
                 Self::VARIANT_PRO_DE => {
-                    commands.push(format!(
-                        "gulp pro --packageVersion=\"{}\" --compressPath=. --language=de",
-                        version
+                    commands.push(BuildStep::new(
+                        "Building Pro (German) variant",
+                        format!(
+                            "gulp pro --packageVersion=\"{}\" --compressPath=. --language=de",
+                            version
+                        ),
                     ));
                 }
                 Self::VARIANT_PRO_EN => {
-                    commands.push(format!(
-                        "gulp pro --packageVersion=\"{}\" --compressPath=. --language=en",
-                        version
+                    commands.push(BuildStep::new(
+                        "Building Pro (English) variant",
+                        format!(
+                            "gulp pro --packageVersion=\"{}\" --compressPath=. --language=en",
+                            version
+                        ),
                     ));
                 }
                 _ => {} // Unknown variants are ignored (already validated)

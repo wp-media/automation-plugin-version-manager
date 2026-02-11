@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 
 use super::BuildContext;
 use super::plugins::{BuildArtifact, Builder, ToolDependency};
+use super::progress::{BuildEvent, BuildPhase, BuildStep, NullReporter, ProgressReporter};
 use super::result::{BuildResult, ProducedArtifact};
 
 /// Output from a build run.
@@ -36,14 +37,29 @@ impl From<Output> for BuildOutput {
 }
 
 /// Runs build scripts.
-pub struct BuildRunner {
+pub struct BuildRunner<'r> {
     context: BuildContext,
+    reporter: &'r dyn ProgressReporter,
 }
 
-impl BuildRunner {
+impl<'r> BuildRunner<'r> {
     /// Create a new build runner with the given build context.
-    pub fn new(context: BuildContext) -> Self {
-        Self { context }
+    ///
+    /// Uses [`NullReporter`] by default — all events are discarded.
+    /// Use [`with_reporter`](Self::with_reporter) to attach a consumer.
+    pub fn new(context: BuildContext) -> BuildRunner<'static> {
+        BuildRunner {
+            context,
+            reporter: &NullReporter,
+        }
+    }
+
+    /// Create a new build runner with a progress reporter.
+    ///
+    /// The reporter receives all build events (phase changes, step progress,
+    /// command output). Consumers decide how to render them.
+    pub fn with_reporter(context: BuildContext, reporter: &'r dyn ProgressReporter) -> Self {
+        Self { context, reporter }
     }
 
     /// Check if a command is available in PATH.
@@ -76,14 +92,26 @@ impl BuildRunner {
             match (dep.required, has_install) {
                 // Required with install commands: run them in order, fail if any fails
                 (true, true) => {
-                    println!(
-                        "Info: required tool '{}' is not installed. Attempting to install...",
+                    tracing::info!(
+                        "Required tool '{}' is not installed. Attempting to install...",
                         dep.name
                     );
+                    self.reporter.report(&BuildEvent::StepStarted {
+                        step: BuildStep::new(
+                            format!("Installing required tool '{}'", dep.name),
+                            dep.install_commands.join(" && "),
+                        ),
+                    });
                     for cmd in &dep.install_commands {
                         self.run(cmd).await?;
                     }
-                    println!("Info: '{}' installed successfully.", dep.name);
+                    self.reporter.report(&BuildEvent::StepCompleted {
+                        step: BuildStep::new(
+                            format!("Installing required tool '{}'", dep.name),
+                            dep.install_commands.join(" && "),
+                        ),
+                    });
+                    tracing::info!("'{}' installed successfully.", dep.name);
                 }
                 // Required without install commands: collect for batch error
                 (true, false) => {
@@ -91,15 +119,25 @@ impl BuildRunner {
                 }
                 // Optional with install commands: run them, warn on failure
                 (false, true) => {
-                    println!(
-                        "Info: optional tool '{}' is not installed. Attempting to install...",
+                    tracing::info!(
+                        "Optional tool '{}' is not installed. Attempting to install...",
                         dep.name
                     );
+                    self.reporter.report(&BuildEvent::StepStarted {
+                        step: BuildStep::new(
+                            format!("Installing optional tool '{}'", dep.name),
+                            dep.install_commands.join(" && "),
+                        ),
+                    });
                     let mut ok = true;
                     for cmd in &dep.install_commands {
                         if let Err(e) = self.run(cmd).await {
-                            println!(
-                                "Warning: failed to install optional tool '{}': {}",
+                            self.reporter.report(&BuildEvent::Warning(format!(
+                                "Failed to install optional tool '{}': {}",
+                                dep.name, e
+                            )));
+                            tracing::warn!(
+                                "Failed to install optional tool '{}': {}",
                                 dep.name, e
                             );
                             ok = false;
@@ -107,13 +145,23 @@ impl BuildRunner {
                         }
                     }
                     if ok {
-                        println!("Info: '{}' installed successfully.", dep.name);
+                        self.reporter.report(&BuildEvent::StepCompleted {
+                            step: BuildStep::new(
+                                format!("Installing optional tool '{}'", dep.name),
+                                dep.install_commands.join(" && "),
+                            ),
+                        });
+                        tracing::info!("'{}' installed successfully.", dep.name);
                     }
                 }
                 // Optional without install commands: warn only
                 (false, false) => {
-                    println!(
-                        "Warning: optional tool '{}' is not installed. Some features may not work.",
+                    self.reporter.report(&BuildEvent::Warning(format!(
+                        "Optional tool '{}' is not installed. Some features may not work.",
+                        dep.name
+                    )));
+                    tracing::warn!(
+                        "Optional tool '{}' is not installed. Some features may not work.",
                         dep.name
                     );
                 }
@@ -252,7 +300,14 @@ impl BuildRunner {
         builder.validate_variants(variants)?;
 
         // Ensure all tool dependencies are met
+        self.reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::DependencyCheck,
+            message: "Checking tool dependencies".into(),
+        });
         self.ensure_tool_dependencies(&builder.tool_dependencies()).await?;
+        self.reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::DependencyCheck,
+        });
 
         // Change to build subdirectory if specified
         if let Some(subdir) = builder.build_subdirectory() {
@@ -267,26 +322,81 @@ impl BuildRunner {
         }
 
         // Run setup commands
-        for cmd in builder.setup_commands() {
-            println!("Running: {}", cmd);
-            self.run(&cmd).await?;
+        if !builder.setup_commands().is_empty() {
+            self.reporter.report(&BuildEvent::PhaseStarted {
+                phase: BuildPhase::Setup,
+                message: "Running setup commands".into(),
+            });
+            for step in builder.setup_commands() {
+                tracing::debug!("Running setup: {}", step.command);
+                self.reporter.report(&BuildEvent::StepStarted {
+                    step: step.clone(),
+                });
+                self.run(&step.command).await?;
+                self.reporter.report(&BuildEvent::StepCompleted { step });
+            }
+            self.reporter.report(&BuildEvent::PhaseCompleted {
+                phase: BuildPhase::Setup,
+            });
         }
+
         // Pre-build hook
-        builder.pre_build_hook(&self.context, version, variants)?;
+        self.reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::PreBuild,
+            message: "Running pre-build hook".into(),
+        });
+        builder.pre_build_hook(&self.context, version, variants, self.reporter)?;
+        self.reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::PreBuild,
+        });
 
         // Run build commands for specified variants
-        for cmd in builder.build_commands(&self.context, version, variants) {
-            println!("Running: {}", cmd);
-            self.run(&cmd).await?;
+        self.reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Build,
+            message: "Running build commands".into(),
+        });
+        for step in builder.build_commands(&self.context, version, variants) {
+            tracing::debug!("Running build: {}", step.command);
+            self.reporter.report(&BuildEvent::StepStarted {
+                step: step.clone(),
+            });
+            self.run(&step.command).await?;
+            self.reporter.report(&BuildEvent::StepCompleted { step });
         }
+        self.reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::Build,
+        });
+
         // Build hook
-        builder.build_hook(&self.context, version, variants)?;
+        self.reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::BuildHook,
+            message: "Running build hook".into(),
+        });
+        builder.build_hook(&self.context, version, variants, self.reporter)?;
+        self.reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::BuildHook,
+        });
+
         // Post-build hook
-        builder.post_build_hook(&self.context, version, variants)?;
+        self.reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::PostBuild,
+            message: "Running post-build hook".into(),
+        });
+        builder.post_build_hook(&self.context, version, variants, self.reporter)?;
+        self.reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::PostBuild,
+        });
 
         // Collect artifacts - builder resolves paths internally
+        self.reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::CollectArtifacts,
+            message: "Collecting build artifacts".into(),
+        });
         let build_artifacts = builder.artifacts(&self.context, version, variants)?;
         let artifacts = self.collect_artifacts(&build_artifacts)?;
+        self.reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::CollectArtifacts,
+        });
 
         // Determine which variants were built
         let variants_built = if builder.has_variants() {
@@ -299,7 +409,10 @@ impl BuildRunner {
             vec![]
         };
 
-        println!("Build completed successfully. {} artifacts produced.", artifacts.len());
+        tracing::info!("Build completed successfully. {} artifacts produced.", artifacts.len());
+        self.reporter.report(&BuildEvent::BuildSucceeded {
+            artifacts: artifacts.iter().map(|a| a.path.clone()).collect(),
+        });
 
         Ok(BuildResult::new(
             artifacts,

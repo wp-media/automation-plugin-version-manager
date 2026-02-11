@@ -33,6 +33,7 @@ use crate::error::Error;
 
 use super::{BuildArtifact, Builder, ToolDependency, VersionRequirement, detect_wordpress_plugin_version};
 use super::super::BuildContext;
+use super::super::progress::{BuildEvent, BuildStep, ProgressReporter};
 
 /// Builder for the WP Rocket project.
 pub struct WpRocketBuilder;
@@ -132,7 +133,7 @@ impl Builder for WpRocketBuilder {
 
     /// No setup commands needed — dependencies are installed inside the
     /// staging copy, not in the working directory.
-    fn setup_commands(&self) -> Vec<String> {
+    fn setup_commands(&self) -> Vec<BuildStep> {
         vec![]
     }
 
@@ -144,8 +145,17 @@ impl Builder for WpRocketBuilder {
     ///
     /// 1. Removes any existing `wp-rocket-*.zip` from the workspace dir.
     /// 2. Removes any leftover staging directory from a previous interrupted build.
-    fn pre_build_hook(&self, context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
+    fn pre_build_hook(
+        &self,
+        context: &BuildContext,
+        _version: &str,
+        _variants: &[&str],
+        reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
         // Remove any previous versioned artifacts from workspace dir
+        reporter.report(&BuildEvent::StepStarted {
+            step: BuildStep::new("Cleaning previous artifacts", "rm wp-rocket-*.zip"),
+        });
         let pattern = context.workspace_dir().join(ARTIFACT_GLOB);
         let pattern_str = pattern.to_string_lossy();
 
@@ -176,11 +186,24 @@ impl Builder for WpRocketBuilder {
             })?;
         }
 
+        reporter.report(&BuildEvent::StepCompleted {
+            step: BuildStep::new("Cleaning previous artifacts", "rm wp-rocket-*.zip"),
+        });
+
         Ok(())
     }
 
     /// Clean up the staging directory after the build completes.
-    fn post_build_hook(&self, context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
+    fn post_build_hook(
+        &self,
+        context: &BuildContext,
+        _version: &str,
+        _variants: &[&str],
+        reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
+        reporter.report(&BuildEvent::StepStarted {
+            step: BuildStep::new("Cleaning staging directory", "rm -rf wp-rocket-tmp"),
+        });
         let staging = context.workspace_dir().join(STAGING_DIR);
         if staging.exists() {
             std::fs::remove_dir_all(&staging).map_err(|e| {
@@ -190,6 +213,9 @@ impl Builder for WpRocketBuilder {
                 ))
             })?;
         }
+        reporter.report(&BuildEvent::StepCompleted {
+            step: BuildStep::new("Cleaning staging directory", "rm -rf wp-rocket-tmp"),
+        });
 
         Ok(())
     }
@@ -213,7 +239,7 @@ impl Builder for WpRocketBuilder {
     ///     ├── .git/
     ///     └── wp-rocket.php
     /// ```
-    fn build_commands(&self, context: &BuildContext, version: &str, _variants: &[&str]) -> Vec<String> {
+    fn build_commands(&self, context: &BuildContext, version: &str, _variants: &[&str]) -> Vec<BuildStep> {
         let repo_dir = context.repo_dir().display();
         let workspace_dir = context.workspace_dir().display();
         let artifact = artifact_name(version);
@@ -237,23 +263,35 @@ impl Builder for WpRocketBuilder {
 
         vec![
             // 1. Create staging directory structure
-            format!("mkdir -p {}/", staging_plugin_dir),
+            BuildStep::new(
+                "Creating staging directory",
+                format!("mkdir -p {}/", staging_plugin_dir),
+            ),
 
             // 2. Copy repo contents into staging, excluding dev files
             //    rsync trailing slash on source means "copy contents of"
-            format!(
-                "rsync -av {repo_dir}/ {staging_plugin_dir}/ {rsync_excludes} --quiet",
+            BuildStep::new(
+                "Copying source files to staging",
+                format!(
+                    "rsync -av {repo_dir}/ {staging_plugin_dir}/ {rsync_excludes} --quiet",
+                ),
             ),
 
             // 3. Install production Composer dependencies in the staging copy
-            format!(
-                "cd {staging_plugin_dir} && composer install --no-dev --no-scripts --no-interaction --quiet",
+            BuildStep::new(
+                "Installing production dependencies",
+                format!(
+                    "cd {staging_plugin_dir} && composer install --no-dev --no-scripts --no-interaction --quiet",
+                ),
             ),
 
             // 4. Create the zip archive from the staging directory
             //    Output goes to workspace_dir to keep the repo clean
-            format!(
-                "cd {staging_dir} && zip -r {workspace_dir}/{artifact} {PLUGIN_DIR_NAME} {zip_excludes} --quiet",
+            BuildStep::new(
+                "Creating plugin archive",
+                format!(
+                    "cd {staging_dir} && zip -r {workspace_dir}/{artifact} {PLUGIN_DIR_NAME} {zip_excludes} --quiet",
+                ),
             ),
         ]
     }
@@ -285,6 +323,7 @@ impl Builder for WpRocketBuilder {
 mod tests {
     use super::*;
     use crate::build::BuildContext;
+    use crate::build::progress::NullReporter;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -434,44 +473,45 @@ mod tests {
         assert_eq!(commands.len(), 4);
 
         // 1. mkdir
-        assert!(commands[0].contains("mkdir -p"));
-        assert!(commands[0].contains(STAGING_DIR));
+        assert!(commands[0].command.contains("mkdir -p"));
+        assert!(commands[0].command.contains(STAGING_DIR));
+        assert_eq!(commands[0].label, "Creating staging directory");
 
         // 2. rsync with excludes and absolute paths
-        assert!(commands[1].contains("rsync"));
+        assert!(commands[1].command.contains("rsync"));
         assert!(
-            commands[1].contains(&context.repo_dir().display().to_string()),
+            commands[1].command.contains(&context.repo_dir().display().to_string()),
             "rsync should reference absolute repo dir"
         );
         for exclude in RSYNC_EXCLUDES {
             assert!(
-                commands[1].contains(&format!("--exclude {}", exclude)),
+                commands[1].command.contains(&format!("--exclude {}", exclude)),
                 "rsync command should exclude '{}'",
                 exclude
             );
         }
 
         // 3. composer install in staging copy
-        assert!(commands[2].contains("composer install"));
-        assert!(commands[2].contains("--no-dev"));
-        assert!(commands[2].contains("--no-scripts"));
-        assert!(commands[2].contains(STAGING_DIR));
+        assert!(commands[2].command.contains("composer install"));
+        assert!(commands[2].command.contains("--no-dev"));
+        assert!(commands[2].command.contains("--no-scripts"));
+        assert!(commands[2].command.contains(STAGING_DIR));
 
         // 4. zip with versioned filename, output to workspace dir
         let expected_artifact = artifact_name(version);
-        assert!(commands[3].contains("zip -r"));
+        assert!(commands[3].command.contains("zip -r"));
         assert!(
-            commands[3].contains(&expected_artifact),
+            commands[3].command.contains(&expected_artifact),
             "zip command should contain versioned artifact name '{}'",
             expected_artifact
         );
         assert!(
-            commands[3].contains(&context.workspace_dir().display().to_string()),
+            commands[3].command.contains(&context.workspace_dir().display().to_string()),
             "zip output should reference absolute workspace dir"
         );
         for exclude in ZIP_EXCLUDES {
             assert!(
-                commands[3].contains(exclude),
+                commands[3].command.contains(exclude),
                 "zip command should exclude '{}'",
                 exclude
             );
@@ -485,8 +525,8 @@ mod tests {
         let cmds_b = builder().build_commands(&context, "4.0.0-beta1", &[]);
 
         // Different versions produce different zip filenames
-        assert!(cmds_a[3].contains("wp-rocket-3.17.4.zip"));
-        assert!(cmds_b[3].contains("wp-rocket-4.0.0-beta1.zip"));
+        assert!(cmds_a[3].command.contains("wp-rocket-3.17.4.zip"));
+        assert!(cmds_b[3].command.contains("wp-rocket-4.0.0-beta1.zip"));
         assert_ne!(cmds_a[3], cmds_b[3]);
 
         // But the first 3 commands (mkdir, rsync, composer) are identical
@@ -513,7 +553,7 @@ mod tests {
         std::fs::File::create(&artifact).unwrap();
         assert!(artifact.exists());
 
-        builder().pre_build_hook(&context, "3.17.4", &[]).unwrap();
+        builder().pre_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
         assert!(!artifact.exists());
     }
 
@@ -525,7 +565,7 @@ mod tests {
         std::fs::File::create(&old).unwrap();
         std::fs::File::create(&current).unwrap();
 
-        builder().pre_build_hook(&context, "3.17.4", &[]).unwrap();
+        builder().pre_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
         assert!(!old.exists(), "old version artifact should be removed");
         assert!(!current.exists(), "current version artifact should be removed");
     }
@@ -537,14 +577,14 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         assert!(staging.exists());
 
-        builder().pre_build_hook(&context, "3.17.4", &[]).unwrap();
+        builder().pre_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
         assert!(!staging.exists());
     }
 
     #[test]
     fn test_pre_build_noop_when_clean() {
         let (_ws, context) = test_context();
-        builder().pre_build_hook(&context, "3.17.4", &[]).unwrap();
+        builder().pre_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
     }
 
     // =========================================================================
@@ -558,14 +598,14 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         assert!(staging.exists());
 
-        builder().post_build_hook(&context, "3.17.4", &[]).unwrap();
+        builder().post_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
         assert!(!staging.exists());
     }
 
     #[test]
     fn test_post_build_noop_when_no_staging() {
         let (_ws, context) = test_context();
-        builder().post_build_hook(&context, "3.17.4", &[]).unwrap();
+        builder().post_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
     }
 
     // =========================================================================

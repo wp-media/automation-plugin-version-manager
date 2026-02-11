@@ -99,6 +99,7 @@ mod tests {
     use super::*;
     use crate::build::BuildContext;
     use crate::build::plugins::{BuildArtifact, Builder, VersionRequirement};
+    use crate::build::progress::BuildStep;
 
     /// Minimal test builder.
     struct TestBuilder;
@@ -108,11 +109,11 @@ mod tests {
             VersionRequirement::Optional
         }
 
-        fn setup_commands(&self) -> Vec<String> {
+        fn setup_commands(&self) -> Vec<BuildStep> {
             vec![]
         }
 
-        fn build_commands(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Vec<String> {
+        fn build_commands(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Vec<BuildStep> {
             vec![]
         }
 

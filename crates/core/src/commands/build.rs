@@ -4,6 +4,7 @@
 //! from any git reference (PR, branch, tag, or commit) with automatic detection.
 
 use crate::build::plugins::VersionRequirement;
+use crate::build::progress::{BuildEvent, BuildPhase, ProgressReporter};
 use crate::build::{BuildResult, BuildRunner};
 use crate::error::{Error, Result};
 use crate::git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
@@ -290,6 +291,7 @@ impl<'a> BuildCommand<'a> {
     /// * `git_ref` - Git reference (PR number, branch, tag, or commit)
     /// * `variants` - Specific variants to build (empty = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events
     ///
     /// # Errors
     ///
@@ -303,6 +305,7 @@ impl<'a> BuildCommand<'a> {
         git_ref: &str,
         variants: &[&str],
         output_dir: impl AsRef<Path>,
+        reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
         let output_dir = output_dir.as_ref();
         
@@ -330,10 +333,17 @@ impl<'a> BuildCommand<'a> {
         )?;
 
         // Clone the repository into the temp workspace
+        reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Clone,
+            message: format!("Cloning {}", project_info.repo_url),
+        });
         workspace.clone_repo().await?;
 
         // Fetch latest refs (uses token if available)
         workspace.fetch().await?;
+        reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::Clone,
+        });
 
         // Get repository handle for local operations
         let repo = workspace.repository();
@@ -348,6 +358,10 @@ impl<'a> BuildCommand<'a> {
         // Reset FIRST to avoid checkout failures due to uncommitted changes.
         // See: https://git-scm.com/docs/git-checkout#_description
         // "git checkout refuses to switch branches if there are local modifications"
+        reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Checkout,
+            message: format!("Checking out {}", resolved.source.description()),
+        });
         tracing::debug!(
             "Resetting repository and switching to default branch '{}'",
             project_info.default_branch
@@ -362,6 +376,9 @@ impl<'a> BuildCommand<'a> {
 
         // 7. Get the commit SHA after checkout
         let (commit, commit_short) = repo.get_head_commit_pair().await?;
+        reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::Checkout,
+        });
 
         // 8. Resolve version (AFTER checkout so detect_version sees correct files)
         let resolved_version = self.resolve_version(
@@ -395,7 +412,7 @@ impl<'a> BuildCommand<'a> {
 
         // 9. Run the build using the project's builder
         let build_context = workspace.to_build_context();
-        let mut runner = BuildRunner::new(build_context);
+        let mut runner = BuildRunner::with_reporter(build_context, reporter);
         let result = runner
             .execute_build(builder, &resolved_version, variants)
             .await?;
@@ -500,7 +517,7 @@ impl<'a> BuildCommand<'a> {
 
     /// Execute a build from a specific PR number.
     ///
-    /// This is a convenience method equivalent to `execute(project, version, "pr:{pr_number}", variants, output_dir)`.
+    /// This is a convenience method equivalent to `execute(project, version, "pr:{pr_number}", variants, output_dir, reporter)`.
     ///
     /// # Arguments
     ///
@@ -509,6 +526,7 @@ impl<'a> BuildCommand<'a> {
     /// * `pr_number` - Pull request number
     /// * `variants` - Specific variants to build (empty = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events
     pub async fn execute_pr(
         &self,
         project: &str,
@@ -516,8 +534,9 @@ impl<'a> BuildCommand<'a> {
         pr_number: u64,
         variants: &[&str],
         output_dir: impl AsRef<Path>,
+        reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("pr:{pr_number}"), variants, output_dir)
+        self.execute(project, version, &format!("pr:{pr_number}"), variants, output_dir, reporter)
             .await
     }
 
@@ -530,6 +549,7 @@ impl<'a> BuildCommand<'a> {
     /// * `branch` - Branch name
     /// * `variants` - Specific variants to build (empty = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events
     pub async fn execute_branch(
         &self,
         project: &str,
@@ -537,8 +557,9 @@ impl<'a> BuildCommand<'a> {
         branch: &str,
         variants: &[&str],
         output_dir: impl AsRef<Path>,
+        reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("branch:{branch}"), variants, output_dir)
+        self.execute(project, version, &format!("branch:{branch}"), variants, output_dir, reporter)
             .await
     }
 
@@ -551,6 +572,7 @@ impl<'a> BuildCommand<'a> {
     /// * `tag` - Tag name (e.g., "v1.0.0")
     /// * `variants` - Specific variants to build (empty = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events
     pub async fn execute_tag(
         &self,
         project: &str,
@@ -558,8 +580,9 @@ impl<'a> BuildCommand<'a> {
         tag: &str,
         variants: &[&str],
         output_dir: impl AsRef<Path>,
+        reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("tag:{tag}"), variants, output_dir)
+        self.execute(project, version, &format!("tag:{tag}"), variants, output_dir, reporter)
             .await
     }
 
@@ -572,6 +595,7 @@ impl<'a> BuildCommand<'a> {
     /// * `commit` - Commit SHA (minimum 7 characters)
     /// * `variants` - Specific variants to build (empty = all)
     /// * `output_dir` - Directory where build artifacts will be placed
+    /// * `reporter` - Progress reporter for receiving build events
     pub async fn execute_commit(
         &self,
         project: &str,
@@ -579,8 +603,9 @@ impl<'a> BuildCommand<'a> {
         commit: &str,
         variants: &[&str],
         output_dir: impl AsRef<Path>,
+        reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("commit:{commit}"), variants, output_dir)
+        self.execute(project, version, &format!("commit:{commit}"), variants, output_dir, reporter)
             .await
     }
 }
@@ -590,6 +615,7 @@ mod tests {
     use super::*;
     use crate::build::BuildContext;
     use crate::build::plugins::{BuildArtifact, Builder, VersionRequirement};
+    use crate::build::progress::{BuildStep, NullReporter};
     use crate::projects::Project;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -602,11 +628,11 @@ mod tests {
             VersionRequirement::Required
         }
 
-        fn setup_commands(&self) -> Vec<String> {
+        fn setup_commands(&self) -> Vec<BuildStep> {
             vec![]
         }
 
-        fn build_commands(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Vec<String> {
+        fn build_commands(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Vec<BuildStep> {
             vec![]
         }
 
@@ -645,7 +671,7 @@ mod tests {
 
         // Execute should fail IMMEDIATELY with PrivateRepoNoToken error
         let output_dir = TempDir::new().unwrap();
-        let result = cmd.execute("test-private", Some("1.0.0"), "main", &[], output_dir.path()).await;
+        let result = cmd.execute("test-private", Some("1.0.0"), "main", &[], output_dir.path(), &NullReporter).await;
 
         // Verify it's the correct error type
         assert!(result.is_err());
@@ -690,7 +716,7 @@ mod tests {
         // Execute should NOT fail with PrivateRepoNoToken error
         // (it will fail later because the repo doesn't exist, but that's fine)
         let output_dir = TempDir::new().unwrap();
-        let result = cmd.execute("test-public", Some("1.0.0"), "main", &[], output_dir.path()).await;
+        let result = cmd.execute("test-public", Some("1.0.0"), "main", &[], output_dir.path(), &NullReporter).await;
 
         // The error should NOT be PrivateRepoNoToken
         if let Err(e) = result {

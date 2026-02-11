@@ -15,6 +15,7 @@ use crate::Result;
 use crate::error::Error;
 
 use super::BuildContext;
+use super::progress::{BuildStep, ProgressReporter};
 
 // =============================================================================
 // Version Requirement
@@ -417,17 +418,20 @@ pub trait Builder: Send + Sync {
     /// These run after checkout but before build commands.
     /// Typically used for dependency installation.
     ///
+    /// Each step has a human-readable label (shown to users) and the
+    /// actual shell command (shown in verbose/debug mode).
+    ///
     /// # Example
     ///
     /// ```ignore
-    /// fn setup_commands(&self) -> Vec<String> {
+    /// fn setup_commands(&self) -> Vec<BuildStep> {
     ///     vec![
-    ///         "composer install --no-dev".to_string(),
-    ///         "npm ci".to_string(),
+    ///         BuildStep::new("Installing PHP dependencies", "composer install --no-dev"),
+    ///         BuildStep::new("Installing JS dependencies", "npm ci"),
     ///     ]
     /// }
     /// ```
-    fn setup_commands(&self) -> Vec<String>;
+    fn setup_commands(&self) -> Vec<BuildStep>;
 
     // =========================================================================
     // Build Hooks
@@ -435,14 +439,22 @@ pub trait Builder: Send + Sync {
 
     /// Hook called before the build starts.
     ///
-    /// Use this for pre-build cleanup or preparation.
+    /// Use this for pre-build cleanup or preparation. The reporter is
+    /// provided so hooks can emit fine-grained progress for long operations.
     ///
     /// # Arguments
     ///
     /// * `context` - The build context with repo and workspace paths
     /// * `version` - The version being built
     /// * `variants` - The variants being built (empty = all)
-    fn pre_build_hook(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
+    /// * `reporter` - Progress reporter for emitting step events
+    fn pre_build_hook(
+        &self,
+        _context: &BuildContext,
+        _version: &str,
+        _variants: &[&str],
+        _reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -450,14 +462,40 @@ pub trait Builder: Send + Sync {
     ///
     /// Useful if the project doesn't use traditional build commands
     /// but needs custom logic (e.g., file manipulation).
-    fn build_hook(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - The build context with repo and workspace paths
+    /// * `version` - The version being built
+    /// * `variants` - The variants being built (empty = all)
+    /// * `reporter` - Progress reporter for emitting step events
+    fn build_hook(
+        &self,
+        _context: &BuildContext,
+        _version: &str,
+        _variants: &[&str],
+        _reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
         Ok(())
     }
 
     /// Hook called after the build completes.
     ///
     /// Use this for post-build cleanup or artifact organization.
-    fn post_build_hook(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Result<()> {
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - The build context with repo and workspace paths
+    /// * `version` - The version being built
+    /// * `variants` - The variants being built (empty = all)
+    /// * `reporter` - Progress reporter for emitting step events
+    fn post_build_hook(
+        &self,
+        _context: &BuildContext,
+        _version: &str,
+        _variants: &[&str],
+        _reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -528,17 +566,20 @@ pub trait Builder: Send + Sync {
     // Build Execution
     // =========================================================================
 
-    /// Get build commands.
+    /// Get build commands with human-readable labels.
     ///
     /// If project has variants, only requested ones are built.
     /// If no variants, the `variants` parameter is ignored.
+    ///
+    /// Each step has a human-readable label (shown to users) and the
+    /// actual shell command (shown in verbose/debug mode).
     ///
     /// # Arguments
     ///
     /// * `context` - The build context with repo and workspace paths
     /// * `version` - The version being built (may be empty if not required)
     /// * `variants` - The variants to build (empty = all)
-    fn build_commands(&self, context: &BuildContext, version: &str, variants: &[&str]) -> Vec<String>;
+    fn build_commands(&self, context: &BuildContext, version: &str, variants: &[&str]) -> Vec<BuildStep>;
 
     /// Get the artifacts produced by the build.
     ///
