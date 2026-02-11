@@ -32,7 +32,7 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
-use apvm_config::Config;
+use apvm_config::{Config, ConfigFile};
 
 use crate::error::{Error, Result};
 
@@ -91,6 +91,115 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
 /// ```
 pub fn load_config_or_default<P: AsRef<Path>>(path: P, default_config: Config) -> Result<Config> {
     load_config_from_path_with_default(path.as_ref(), default_config)
+}
+
+/// Load a sparse [`ConfigFile`] from disk and merge it with defaults.
+///
+/// - If the file doesn't exist or is empty, returns the defaults unchanged.
+/// - If the file exists, only the fields it contains override the defaults.
+///
+/// # Arguments
+///
+/// * `path` - Path to config file
+/// * `defaults` - Fallback configuration for fields absent from the file
+///
+/// # Returns
+///
+/// * `Ok(Config)` - Resolved configuration with file overrides applied
+/// * `Err(Error::Config)` - File exists but has invalid JSON
+/// * `Err(Error::Io)` - Other I/O error (permissions, etc.)
+pub fn load_config_file<P: AsRef<Path>>(path: P, defaults: &Config) -> Result<Config> {
+    let path = path.as_ref();
+
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            if content.trim().is_empty() {
+                tracing::debug!("Config file is empty, using defaults");
+                return Ok(defaults.clone());
+            }
+
+            let config_file: ConfigFile = serde_json::from_str(&content).map_err(|e| {
+                Error::Config(format!(
+                    "Invalid config file '{}': {}. \
+                     Delete the file to reset to defaults, or fix the JSON syntax.",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+            tracing::debug!("Loaded config file from {:?}", path);
+            Ok(config_file.merge(defaults))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            tracing::debug!("Config file not found, using defaults");
+            Ok(defaults.clone())
+        }
+        Err(e) => Err(Error::Io(io::Error::new(
+            e.kind(),
+            format!("Failed to read config file '{}': {}", path.display(), e),
+        ))),
+    }
+}
+
+/// Load a raw [`ConfigFile`] from disk without merging with defaults.
+///
+/// Returns `Ok(ConfigFile::default())` if the file doesn't exist or is empty.
+/// This is useful when you need to inspect or modify the file-level values
+/// (e.g., for `config set` / `config unset` commands).
+///
+/// # Arguments
+///
+/// * `path` - Path to config file
+///
+/// # Returns
+///
+/// * `Ok(ConfigFile)` - Parsed file config, or empty default if file is absent
+/// * `Err(Error::Config)` - File exists but has invalid JSON
+/// * `Err(Error::Io)` - Other I/O error (permissions, etc.)
+pub fn load_config_file_raw<P: AsRef<Path>>(path: P) -> Result<ConfigFile> {
+    let path = path.as_ref();
+
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            if content.trim().is_empty() {
+                return Ok(ConfigFile::default());
+            }
+
+            serde_json::from_str(&content).map_err(|e| {
+                Error::Config(format!(
+                    "Invalid config file '{}': {}. \
+                     Delete the file to reset to defaults, or fix the JSON syntax.",
+                    path.display(),
+                    e
+                ))
+            })
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(ConfigFile::default()),
+        Err(e) => Err(Error::Io(io::Error::new(
+            e.kind(),
+            format!("Failed to read config file '{}': {}", path.display(), e),
+        ))),
+    }
+}
+
+/// Save a sparse [`ConfigFile`] to disk.
+///
+/// Creates parent directories if needed. Only fields that are `Some` will
+/// appear in the output JSON.
+///
+/// # Arguments
+///
+/// * `config_file` - Sparse configuration to save
+/// * `path` - Path to config file
+///
+/// # Returns
+///
+/// * `Ok(PathBuf)` - Path where config was saved
+/// * `Err(Error::Io)` - Failed to write file
+pub fn save_config_file<P: AsRef<Path>>(config_file: &ConfigFile, path: P) -> Result<PathBuf> {
+    let config_path = path.as_ref().to_path_buf();
+    save_to_path_impl(config_file, &config_path)?;
+    Ok(config_path)
 }
 
 /// Load configuration from a specific path.
@@ -189,15 +298,15 @@ fn load_config_from_path_with_default(path: &Path, default_config: Config) -> Re
 /// ```
 pub fn save_config<P: AsRef<Path>>(config: &Config, path: P) -> Result<PathBuf> {
     let config_path = path.as_ref().to_path_buf();
-    save_config_to_path(config, &config_path)?;
+    save_to_path_impl(config, &config_path)?;
     Ok(config_path)
 }
 
-/// Save configuration to a specific path.
+/// Save a serializable value to a specific path.
 ///
-/// This is the internal implementation that handles directory creation
-/// and pretty-printing.
-fn save_config_to_path(config: &Config, path: &Path) -> Result<()> {
+/// Internal implementation shared by [`save_config`] and [`save_config_file`].
+/// Handles directory creation and pretty-printing.
+fn save_to_path_impl<T: serde::Serialize>(value: &T, path: &Path) -> Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -216,7 +325,7 @@ fn save_config_to_path(config: &Config, path: &Path) -> Result<()> {
     }
 
     // Serialize with pretty printing
-    let content = serde_json::to_string_pretty(config).map_err(|e| {
+    let content = serde_json::to_string_pretty(value).map_err(|e| {
         Error::Config(format!("Failed to serialize config: {}", e))
     })?;
 
@@ -302,6 +411,7 @@ pub fn config_exists<P: AsRef<Path>>(path: P) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apvm_config::ConfigKey;
     use tempfile::TempDir;
 
     fn test_config(builds: PathBuf) -> Config {
@@ -424,5 +534,85 @@ mod tests {
         let path = temp.path().join("exists.json");
         fs::write(&path, "{}").unwrap();
         assert!(config_exists(&path));
+    }
+
+    // =========================================================================
+    // ConfigFile I/O tests
+    // =========================================================================
+
+    #[test]
+    fn test_load_config_file_nonexistent_returns_defaults() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("nonexistent.json");
+        let defaults = test_config(PathBuf::from("/default/builds"));
+
+        let config = load_config_file(&path, &defaults).unwrap();
+        assert!(config.github_token.is_none());
+        assert_eq!(config.builds_dir, PathBuf::from("/default/builds"));
+    }
+
+    #[test]
+    fn test_load_config_file_sparse_merges_with_defaults() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        // File only has token, no builds_dir
+        fs::write(&path, r#"{"github_token": "ghp_test"}"#).unwrap();
+
+        let defaults = test_config(PathBuf::from("/default/builds"));
+        let config = load_config_file(&path, &defaults).unwrap();
+
+        assert_eq!(config.github_token, Some("ghp_test".to_string()));
+        assert_eq!(config.builds_dir, PathBuf::from("/default/builds"));
+    }
+
+    #[test]
+    fn test_load_config_file_raw_nonexistent_returns_empty() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("nonexistent.json");
+
+        let cf = load_config_file_raw(&path).unwrap();
+        assert!(cf.is_empty());
+    }
+
+    #[test]
+    fn test_load_config_file_raw_returns_only_set_values() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, r#"{"github_token": "ghp_test"}"#).unwrap();
+
+        let cf = load_config_file_raw(&path).unwrap();
+        assert_eq!(cf.github_token, Some("ghp_test".to_string()));
+        assert!(cf.builds_dir.is_none());
+    }
+
+    #[test]
+    fn test_save_config_file_sparse() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+
+        let mut cf = ConfigFile::default();
+        cf.set(ConfigKey::Token, "ghp_sparse".to_string());
+
+        save_config_file(&cf, &path).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("github_token"));
+        assert!(!content.contains("builds_dir"));
+    }
+
+    #[test]
+    fn test_save_and_load_config_file_roundtrip() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+
+        let mut cf = ConfigFile::default();
+        cf.set(ConfigKey::Token, "ghp_roundtrip".to_string());
+        cf.set(ConfigKey::BuildsDir, "/custom/builds".to_string());
+
+        save_config_file(&cf, &path).unwrap();
+        let loaded = load_config_file_raw(&path).unwrap();
+
+        assert_eq!(loaded.github_token, Some("ghp_roundtrip".to_string()));
+        assert_eq!(loaded.builds_dir, Some(PathBuf::from("/custom/builds")));
     }
 }

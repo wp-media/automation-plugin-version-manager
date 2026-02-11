@@ -5,17 +5,16 @@
 mod commands;
 mod defaults;
 mod paths;
+mod sanitize;
 
-use std::fs;
-use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use apvm_config::Config;
 use apvm_core::{Apvm, Result};
+use apvm_core::config_io::load_config_file;
 
-use crate::commands::{BuildArgs, InfoArgs};
+use crate::commands::{BuildArgs, ConfigArgs, InfoArgs};
 use crate::paths::Paths;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -41,6 +40,8 @@ enum Commands {
     List,
     /// Show detailed information about a plugin
     Info(InfoArgs),
+    /// View or change configuration settings
+    Config(ConfigArgs),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,12 +73,20 @@ async fn run() -> Result<()> {
     // Parse CLI arguments
     let cli = Cli::parse();
 
-    // Load paths and configuration
+    // Load paths and default configuration
     let paths = Paths::new(
         defaults::default_apvm_dir().clone(),
         defaults::default_builds_dir().clone(),
     );
-    let config = load_config(paths.config_file(), &paths)?;
+    let default_config = paths.to_config();
+
+    // Config command doesn't need APVM instance — handle it early
+    if let Commands::Config(args) = &cli.command {
+        return args.execute(&paths);
+    }
+
+    // Load config: file values override defaults, missing fields use defaults
+    let config = load_config_file(paths.config_file(), &default_config)?;
 
     // Create APVM instance with automatic token resolution
     // This will try: config → GITHUB_TOKEN → GH_TOKEN → gh CLI
@@ -101,6 +110,7 @@ async fn run() -> Result<()> {
         Commands::Info(args) => {
             args.execute(&apvm)?;
         }
+        Commands::Config(_) => unreachable!("handled above"),
     }
 
     Ok(())
@@ -136,36 +146,3 @@ fn init_tracing() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Config File I/O (CLI's responsibility)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Load configuration from a file.
-///
-/// Returns a default Config with the provided paths if the file doesn't exist.
-fn load_config(path: &Path, paths: &Paths) -> Result<Config> {
-    if !path.exists() {
-        tracing::debug!("Config file not found, using defaults");
-        return Ok(paths.to_config());
-    }
-
-    let content = fs::read_to_string(path)?;
-    let config: Config = serde_json::from_str(&content)?;
-    tracing::debug!("Loaded config from {:?}", path);
-    Ok(config)
-}
-
-/// Save configuration to a file.
-///
-/// Creates parent directories if they don't exist.
-#[allow(dead_code)]
-fn save_config(config: &Config, path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let content = serde_json::to_string_pretty(config)?;
-    fs::write(path, content)?;
-    tracing::debug!("Saved config to {:?}", path);
-    Ok(())
-}
