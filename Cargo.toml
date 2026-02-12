@@ -14,7 +14,7 @@ tokio = { version = "1.49", features = ["rt", "macros", "process"] }
 octocrab = "0.49"
 
 # Git operations (pure Rust)
-gix = { version = "0.77", features = ["blocking-network-client"] }
+gix = { version = "0.79", features = ["blocking-network-client"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6"
 
 # CLI argument parsing
-clap = { version = "4.5.57", features = ["derive", "color"] }
+clap = { version = "4.5.58", features = ["derive", "color"] }
 
 # Date/time
 chrono = { version = "0.4.43", features = ["serde"] }
@@ -47,10 +47,10 @@ glob = "0.3"
 which = "8.0"
 
 # Progress indicators
-indicatif = "0.17"
+indicatif = "0.18"
 
 # Testing utilities
-tempfile = "3.20"
+tempfile = "3.25"
 
 # Internal crates
 apvm-config = { path = "crates/config" }
