@@ -40,6 +40,7 @@ use apvm_config::Config;
 /// let config = paths.to_config();
 /// ```
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Paths {
     /// Base APVM directory (e.g., `~/.apvm`).
     apvm_dir: PathBuf,
@@ -49,6 +50,7 @@ pub struct Paths {
     builds_dir: PathBuf,
 }
 
+#[allow(dead_code)]
 impl Paths {
     /// Create paths from an APVM directory and builds directory.
     ///
@@ -119,12 +121,14 @@ impl Paths {
 ///
 /// Panics if `apvm_dir` or `builds_dir` are not set.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct PathsBuilder {
     apvm_dir: Option<PathBuf>,
     config_file: Option<PathBuf>,
     builds_dir: Option<PathBuf>,
 }
 
+#[allow(dead_code)]
 impl PathsBuilder {
     /// Set the APVM directory.
     ///
