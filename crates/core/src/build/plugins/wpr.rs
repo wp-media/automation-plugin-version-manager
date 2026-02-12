@@ -273,7 +273,7 @@ impl Builder for WpRocketBuilder {
             BuildStep::new(
                 "Copying source files to staging",
                 format!(
-                    "rsync -av {repo_dir}/ {staging_plugin_dir}/ {rsync_excludes} --quiet",
+                    "rsync -av {repo_dir}/ {staging_plugin_dir}/ {rsync_excludes}",
                 ),
             ),
 
@@ -281,7 +281,7 @@ impl Builder for WpRocketBuilder {
             BuildStep::new(
                 "Installing production dependencies",
                 format!(
-                    "cd {staging_plugin_dir} && composer install --no-dev --no-scripts --no-interaction --quiet",
+                    "cd {staging_plugin_dir} && composer install --no-dev --no-scripts --no-interaction",
                 ),
             ),
 
@@ -290,7 +290,7 @@ impl Builder for WpRocketBuilder {
             BuildStep::new(
                 "Creating plugin archive",
                 format!(
-                    "cd {staging_dir} && zip -r {workspace_dir}/{artifact} {PLUGIN_DIR_NAME} {zip_excludes} --quiet",
+                    "cd {staging_dir} && zip -r {workspace_dir}/{artifact} {PLUGIN_DIR_NAME} {zip_excludes}",
                 ),
             ),
         ]
