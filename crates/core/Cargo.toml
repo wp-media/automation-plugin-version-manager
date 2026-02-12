@@ -17,9 +17,6 @@ tokio = { workspace = true }
 # GitHub API client
 octocrab = { workspace = true }
 
-# Git operations (pure Rust)
-gix = { workspace = true }
-
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
