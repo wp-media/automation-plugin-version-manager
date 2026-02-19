@@ -1,6 +1,6 @@
 # APVM — Automation Plugin Version Manager
 
-A Rust CLI tool and library for building and managing multiple versions of WordPress plugins from any git reference (PR, branch, tag, or commit).
+A Rust CLI tool and library for building and managing multiple versions of WordPress plugins from any git reference (branch, tag, commit, or PR).
 
 Built for developers and QA engineers who need to quickly build plugins from specific PRs, switch between versions, and automate version management.
 
