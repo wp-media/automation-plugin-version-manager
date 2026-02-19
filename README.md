@@ -4,6 +4,17 @@ A Rust CLI tool and library for building and managing multiple versions of WordP
 
 Built for developers and QA engineers who need to quickly build plugins from specific PRs, switch between versions, and automate version management.
 
+# Available commands
+
+| Command  | Description                                          |
+|----------|------------------------------------------------------|
+| `build`  | Build a plugin from a git reference (branch, tag, commit, PR) |
+| `list`   | List all available plugins                           |
+| `info`   | Show detailed information about a plugin             |
+| `config` | View or change configuration settings                |
+
+Run `apvm --help` for full usage or `apvm <command> --help` for command-specific options.
+
 ## Features
 
 - **Build from any git ref** — branch, tag, or commit SHA, PR number (PR number is WIP)
