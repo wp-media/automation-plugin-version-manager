@@ -10,7 +10,6 @@
   "scripts": {
     "build": "napi build --release --platform --manifest-path crates/napi/Cargo.toml --output-dir .",
     "build:debug": "napi build --platform --manifest-path crates/napi/Cargo.toml --output-dir .",
-    "prepare": "napi build --release --platform --manifest-path crates/napi/Cargo.toml --output-dir .",
     "test": "vitest run"
   },
   "devDependencies": {
