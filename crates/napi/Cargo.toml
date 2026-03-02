@@ -1,0 +1,25 @@
+[package]
+name = "apvm-napi"
+version.workspace = true
+edition.workspace = true
+description = "Node.js bindings for APVM (Automation Plugin Version Manager)"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Internal crates
+apvm-core = { workspace = true }
+apvm-config = { workspace = true }
+apvm-storage = { workspace = true }
+
+# N-API bindings
+napi = { workspace = true }
+napi-derive = { workspace = true }
+
+# Async runtime (needs rt-multi-thread for napi async)
+tokio = { workspace = true }
+
+[build-dependencies]
+napi-build = { workspace = true }

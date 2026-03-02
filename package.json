@@ -1,0 +1,41 @@
+{
+  "name": "apvm-napi",
+  "version": "0.1.0",
+  "description": "Node.js bindings for APVM (Automation Plugin Version Manager) — build WordPress plugins from PRs, branches, tags, and commits.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "apvm-napi"
+  },
+  "scripts": {
+    "build": "napi build --release --platform --manifest-path crates/napi/Cargo.toml --output-dir .",
+    "build:debug": "napi build --platform --manifest-path crates/napi/Cargo.toml --output-dir .",
+    "prepare": "napi build --release --platform --manifest-path crates/napi/Cargo.toml --output-dir .",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.5.1",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wp-media/automation-plugin-version-manager.git"
+  },
+  "keywords": [
+    "wordpress",
+    "plugin",
+    "build",
+    "version-manager",
+    "napi",
+    "native"
+  ]
+}
