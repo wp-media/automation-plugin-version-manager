@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { Apvm } from '../index.js';
+import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 // =============================================================================
 // Apvm.create() — Async factory
@@ -114,6 +117,48 @@ describe('listProjects()', () => {
   });
 });
 
+// =============================================================================
+// Build process — basic functionality (not error handling)
+// =============================================================================
+describe('build() basic functionality', () => {
+    it('builds wp-rocket from develop and writes artifacts to a unique temp output directory', async () => {
+    let tempRoot = '';
+
+    try {
+      tempRoot = await mkdtemp(join(tmpdir(), 'apvm-build-it-'));
+      const outputDir = join(tempRoot, 'output');
+      const apvm = await Apvm.create({});
+
+      const output = await apvm.buildFromBranch('wp-rocket', 'develop', outputDir);
+
+      expect(output).toBeTruthy();
+      expect(output.result).toBeTruthy();
+      expect(output.result.artifacts.length).toBeGreaterThan(0);
+      expect(output.description.length).toBeGreaterThan(0);
+      expect(output.commit.length).toBeGreaterThan(0);
+      expect(output.commitShort.length).toBeGreaterThan(0);
+
+      const outputDirResolved = resolve(outputDir);
+      const artifactsInOutput = await readdir(outputDir);
+      expect(artifactsInOutput.length).toBeGreaterThan(0);
+
+      for (const artifact of output.result.artifacts) {
+        expect(artifact.filename.length).toBeGreaterThan(0);
+        const expectedOutputPath = join(outputDir, artifact.filename);
+        const expectedOutputPathResolved = resolve(expectedOutputPath);
+        expect(expectedOutputPathResolved.startsWith(outputDirResolved)).toBe(true);
+
+        const fileStat = await stat(expectedOutputPath);
+        expect(fileStat.isFile()).toBe(true);
+        expect(fileStat.size).toBeGreaterThan(0);
+      }
+    } finally {
+      if (tempRoot) {
+        await rm(tempRoot, { recursive: true, force: true });
+      }
+    }
+  }, 10 * 60_000);
+});
 // =============================================================================
 // Build error handling
 // =============================================================================
