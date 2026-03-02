@@ -102,7 +102,8 @@ impl Apvm {
     /// });
     /// ```
     #[napi(factory)]
-    pub async fn create(config: ApvmConfig) -> napi::Result<Self> {
+    pub async fn create(config: Option<ApvmConfig>) -> napi::Result<Self> {
+        let config = config.unwrap_or_default();
         let rust_config: apvm_config::Config = config.into();
         // Octocrab (HTTP client) requires a Tokio runtime during
         // initialization, which is why this factory is async.
@@ -149,7 +150,8 @@ impl Apvm {
     /// console.log('Has token:', apvm.hasToken());
     /// ```
     #[napi(factory)]
-    pub async fn create_with_token_resolution(config: ApvmConfig) -> napi::Result<Self> {
+    pub async fn create_with_token_resolution(config: Option<ApvmConfig>) -> napi::Result<Self> {
+        let config = config.unwrap_or_default();
         let rust_config: apvm_config::Config = config.into();
         let inner = apvm_core::Apvm::new_with_token_resolution(rust_config)
             .await

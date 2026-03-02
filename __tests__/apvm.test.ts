@@ -10,7 +10,10 @@ describe('Apvm.create()', () => {
     const apvm = await Apvm.create({});
     expect(apvm).toBeInstanceOf(Apvm);
   });
-
+  it('creates an instance without passing config (Should create default)', async () => {
+    const apvm = await Apvm.create();
+    expect(apvm).toBeInstanceOf(Apvm);
+  });
   it('creates an instance with explicit buildsDir', async () => {
     const apvm = await Apvm.create({ buildsDir: '/tmp/apvm-test-builds' });
     expect(apvm).toBeInstanceOf(Apvm);

@@ -87,3 +87,12 @@ impl From<ApvmConfig> for apvm_config::Config {
         }
     }
 }
+
+impl Default for ApvmConfig {
+    fn default() -> Self {
+        Self {
+            builds_dir: None,
+            github_token: None,
+        }
+    }
+}
