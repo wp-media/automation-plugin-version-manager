@@ -66,6 +66,75 @@ cargo build
 
 Binary at `target/debug/apvm`.
 
+## Node.js / N-API bindings (`apvm-napi`)
+
+This repository now includes a Node.js package powered by [`napi-rs`](https://napi.rs/), exposed as `apvm-napi`.
+
+### Node.js requirements
+
+- **Node.js >= 18** (enforced via `package.json` `engines.node`)
+- **Rust toolchain** (`cargo`, `rustc`) available in `PATH` for native build
+- Platform build prerequisites for Rust native modules
+
+### Install and build (from source)
+
+When installed from this repository, the package builds the native addon during install via the `prepare` script.
+
+```sh
+# From this repository
+npm install
+
+# Build native addon explicitly (release)
+npm run build
+
+# Run Node.js tests
+npm test
+```
+
+Native outputs are generated at the project root:
+
+- `index.js` (loader)
+- `index.d.ts` (TypeScript declarations)
+- `apvm-napi.<platform>.node` (native module)
+
+### Quick API usage (TypeScript/Node.js)
+
+```ts
+import { Apvm } from 'apvm-napi';
+
+const apvm = await Apvm.create();
+
+const output = await apvm.buildFromBranch('wp-rocket', 'develop', '/tmp/apvm-output');
+
+console.log(output.description);
+console.log(output.result.artifacts.map((a) => a.filename));
+```
+
+### API overview
+
+- `Apvm.create(config?)` → creates an instance (async)
+- `Apvm.createWithTokenResolution(config?)` → resolves token from config/env/gh CLI (async)
+- `apvm.hasToken()` / `apvm.tokenSource()` / `apvm.listProjects()`
+- Build methods:
+	- `apvm.build(options, onProgress?)`
+	- `apvm.buildFromPr(...)`
+	- `apvm.buildFromBranch(...)`
+	- `apvm.buildFromTag(...)`
+	- `apvm.buildFromCommit(...)`
+
+You can pass any gitref (branch, commit or tag) to `apvm.build`
+
+`ApvmConfig` fields are optional:
+
+- `buildsDir?: string`
+- `githubToken?: string`
+
+For full signatures and event/result types, see `index.d.ts`.
+
+### Why is `apvm.create()` async?
+
+This rust project uses tokio runtime (for asynchronous operations in rust), and some dependencies heavily rely on tokio, so, to keep things simple, creating an instance is asynchronous.
+
 ## Usage
 
 ### Build a Plugin
@@ -188,6 +257,9 @@ cargo test -p apvm-core
 cargo test -p apvm-storage
 cargo test -p apvm-config
 cargo test -p apvm
+
+# Node.js tests (Vitest)
+npm test
 ```
 
 ## Key Dependencies
