@@ -33,7 +33,10 @@
  *   project: 'wp-rocket',
  *   gitRef: 'pr:456',
  *   outputDir: '/tmp/output',
- *   onProgress: (event) => console.log(event.type, event.message),
+ *   onProgress: (err, event) => {
+ *     if (err || !event) return;
+ *     console.log(event.type, event.message);
+ *   },
  * });
  * ```
  */
@@ -172,7 +175,8 @@ export declare class Apvm {
    *
    * * `options` - Build configuration (project, gitRef, outputDir, etc.)
    * * `on_progress` - Optional callback for receiving build progress events.
-   *   Called with a [`JsBuildEvent`] object for each build event.
+   *   Called with Node.js error-first callback shape:
+   *   `(err, event) => void`, where `event` is a [`JsBuildEvent`].
    *
    * # Throws
    *
@@ -199,7 +203,8 @@ export declare class Apvm {
    *     variants: ['pro'],
    *     outputDir: '/tmp/output',
    *   },
-   *   (event) => {
+   *   (err, event) => {
+   *     if (err || !event) return;
    *     if (event.type === 'phase_started') {
    *       console.log(`[${event.phase}] ${event.message}`);
    *     }
@@ -207,7 +212,7 @@ export declare class Apvm {
    * );
    * ```
    */
-  build(options: BuildOptions, onProgress?: (event: JsBuildEvent) => void): Promise<JsBuildOutput>
+  build(options: BuildOptions, onProgress?: (err: Error | null, event: JsBuildEvent) => void): Promise<JsBuildOutput>
   /**
    * Build a project from a pull request number.
    *
@@ -228,11 +233,14 @@ export declare class Apvm {
    * const output = await apvm.buildFromPr(
    *   'wp-rocket', 456, '/tmp/output',
    *   undefined, undefined,
-   *   (event) => console.log(event.type),
+   *   (err, event) => {
+   *     if (err || !event) return;
+   *     console.log(event.type);
+   *   },
    * );
    * ```
    */
-  buildFromPr(project: string, prNumber: number, outputDir: string, version?: string, variants?: string[], onProgress?: (event: JsBuildEvent) => void): Promise<JsBuildOutput>
+  buildFromPr(project: string, prNumber: number, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void): Promise<JsBuildOutput>
   /**
    * Build a project from a branch name.
    *
@@ -255,7 +263,7 @@ export declare class Apvm {
    * );
    * ```
    */
-  buildFromBranch(project: string, branch: string, outputDir: string, version?: string, variants?: string[], onProgress?: (event: JsBuildEvent) => void): Promise<JsBuildOutput>
+  buildFromBranch(project: string, branch: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void): Promise<JsBuildOutput>
   /**
    * Build a project from a tag.
    *
@@ -278,7 +286,7 @@ export declare class Apvm {
    * );
    * ```
    */
-  buildFromTag(project: string, tag: string, outputDir: string, version?: string, variants?: string[], onProgress?: (event: JsBuildEvent) => void): Promise<JsBuildOutput>
+  buildFromTag(project: string, tag: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void): Promise<JsBuildOutput>
   /**
    * Build a project from a specific commit SHA.
    *
@@ -301,7 +309,7 @@ export declare class Apvm {
    * );
    * ```
    */
-  buildFromCommit(project: string, commit: string, outputDir: string, version?: string, variants?: string[], onProgress?: (event: JsBuildEvent) => void): Promise<JsBuildOutput>
+  buildFromCommit(project: string, commit: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void): Promise<JsBuildOutput>
 }
 
 /**

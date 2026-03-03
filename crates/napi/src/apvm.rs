@@ -59,7 +59,10 @@ use crate::types::{BuildOptions, JsBuildEvent, JsBuildOutput};
 ///   project: 'wp-rocket',
 ///   gitRef: 'pr:456',
 ///   outputDir: '/tmp/output',
-///   onProgress: (event) => console.log(event.type, event.message),
+///   onProgress: (err, event) => {
+///     if (err || !event) return;
+///     console.log(event.type, event.message);
+///   },
 /// });
 /// ```
 #[napi]
@@ -227,7 +230,8 @@ impl Apvm {
     ///
     /// * `options` - Build configuration (project, gitRef, outputDir, etc.)
     /// * `on_progress` - Optional callback for receiving build progress events.
-    ///   Called with a [`JsBuildEvent`] object for each build event.
+    ///   Called with Node.js error-first callback shape:
+    ///   `(err, event) => void`, where `event` is a [`JsBuildEvent`].
     ///
     /// # Throws
     ///
@@ -254,7 +258,8 @@ impl Apvm {
     ///     variants: ['pro'],
     ///     outputDir: '/tmp/output',
     ///   },
-    ///   (event) => {
+    ///   (err, event) => {
+    ///     if (err || !event) return;
     ///     if (event.type === 'phase_started') {
     ///       console.log(`[${event.phase}] ${event.message}`);
     ///     }
@@ -262,7 +267,7 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "options: BuildOptions, onProgress?: (event: JsBuildEvent) => void"
+        ts_args_type = "options: BuildOptions, onProgress?: (err: Error | null, event: JsBuildEvent) => void"
     )]
     pub async fn build(
         &self,
@@ -331,11 +336,14 @@ impl Apvm {
     /// const output = await apvm.buildFromPr(
     ///   'wp-rocket', 456, '/tmp/output',
     ///   undefined, undefined,
-    ///   (event) => console.log(event.type),
+    ///   (err, event) => {
+    ///     if (err || !event) return;
+    ///     console.log(event.type);
+    ///   },
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, prNumber: number, outputDir: string, version?: string, variants?: string[], onProgress?: (event: JsBuildEvent) => void"
+        ts_args_type = "project: string, prNumber: number, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
     )]
     pub async fn build_from_pr(
         &self,
@@ -380,7 +388,7 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, branch: string, outputDir: string, version?: string, variants?: string[], onProgress?: (event: JsBuildEvent) => void"
+        ts_args_type = "project: string, branch: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
     )]
     pub async fn build_from_branch(
         &self,
@@ -425,7 +433,7 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, tag: string, outputDir: string, version?: string, variants?: string[], onProgress?: (event: JsBuildEvent) => void"
+        ts_args_type = "project: string, tag: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
     )]
     pub async fn build_from_tag(
         &self,
@@ -470,7 +478,7 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, commit: string, outputDir: string, version?: string, variants?: string[], onProgress?: (event: JsBuildEvent) => void"
+        ts_args_type = "project: string, commit: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
     )]
     pub async fn build_from_commit(
         &self,
