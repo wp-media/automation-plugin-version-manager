@@ -248,10 +248,29 @@ impl BuildWorkspace {
 
             let dest = output_dir.join(filename);
 
-            // Try rename first (fast, same filesystem), fall back to copy+delete
+            // Try rename first (fast, same filesystem).
+            // If it fails (e.g., cross-device), fall back to:
+            // 1) copy to a temp file in destination dir
+            // 2) atomically rename temp -> final destination
+            // 3) remove source
             if fs::rename(src, &dest).is_err() {
-                fs::copy(src, &dest)?;
-                fs::remove_file(src)?;
+                let parent = dest.parent().ok_or_else(|| {
+                    Error::Build(format!("Invalid destination path: {}", dest.display()))
+                })?;
+
+                let tmp = tempfile::Builder::new()
+                    .prefix(".apvm-artifact-")
+                    .suffix(".tmp")
+                    .tempfile_in(parent)
+                    .map_err(|e| Error::Io(e.into()))?;
+
+                let tmp_path = tmp.path().to_path_buf();
+
+                fs::copy(src, &tmp_path)?;
+                tmp.as_file().sync_all()?;
+
+                fs::rename(&tmp_path, &dest)?;
+                let _ = fs::remove_file(src);
             }
 
             tracing::debug!("Collected artifact: {}", dest.display());
