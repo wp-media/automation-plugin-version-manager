@@ -70,32 +70,44 @@ Binary at `target/debug/apvm`.
 
 This repository now includes a Node.js package powered by [`napi-rs`](https://napi.rs/), exposed as `apvm-napi`.
 
-### Node.js requirements
+### Node.js and build requirements — short summary
 
-- **Node.js >= 18** (enforced via `package.json` `engines.node`)
-- **Rust toolchain** (`cargo`, `rustc`) available in `PATH` for native build
-- Platform build prerequisites for Rust native modules
+- **Runtime (using the package):** `apvm-napi` supports Node.js 18 and later at runtime. For platforms where a pre-compiled `.node` binary is provided, no native build is required on the consumer machine.
+- **Build-time (only when a prebuilt binary is NOT available):** building the native addon requires a Rust toolchain (`cargo`, `rustc`) and Node.js 20+ for the build scripts. Some helper scripts used during the build process rely on Node 20+ APIs (for example certain `node:util` helpers). The resulting compiled addon can still run on Node.js 18+ provided the addon is built for a compatible N-API level.
 
-### Install and build (from source)
+In short: if your platform/arch matches a prebuilt binary included in this repository you only need Node.js 18+ at runtime; if no prebuilt binary exists for your platform you must build from source, which requires Node.js 20+ and the Rust toolchain.
 
-When installed from this repository, the package builds the native addon during install via the `prepare` script.
+Included pre-compiled binaries in this repository (these are shipped with the package and used automatically by the loader):
 
-```sh
-# From this repository
-npm install
+- `apvm-napi.darwin-arm64.node` — macOS (Apple Silicon / arm64)
+- `apvm-napi.linux-x64-gnu.node` — Linux x86_64 (GNU/glibc)
+- `apvm-napi.linux-arm64-gnu.node` — Linux arm64 (GNU/glibc)
+- `apvm-napi.win32-x64-msvc.node` — Windows x64 (MSVC)
 
-# Build native addon explicitly (release)
+If your platform/arch is not listed above, the package install will attempt to compile the native addon locally.
+
+### Build from source (only required if your platform is not prebuilt)
+
+If a prebuilt `.node` binary for your platform is not present, the package's install step will compile the native addon locally. Building from source requires:
+
+- Node.js 20+ (required during the build step only; runtime can be Node.js 18+)
+- Rust toolchain (`rustup`, `cargo`, `rustc`) installed and available on `PATH`
+- Platform development tools and headers (C compiler, linker). On Debian/Ubuntu, install `build-essential`, `pkg-config`, and `libssl-dev`.
+
+To build locally (release):
+
+```bash
+# ensure Node 20+ is active for the build step
+node -v # should be v20.x or later
+
+# From repository root
+npm i
 npm run build
-
-# Run Node.js tests
-npm test
 ```
 
-Native outputs are generated at the project root:
+Notes:
 
-- `index.js` (loader)
-- `index.d.ts` (TypeScript declarations)
-- `apvm-napi.<platform>.node` (native module)
+- Using Node 20 for the build step does not force runtime Node 20 for users — the compiled addon can be used on Node 18+ when the addon is built against a compatible N-API level.
 
 ### Quick API usage (TypeScript/Node.js)
 
