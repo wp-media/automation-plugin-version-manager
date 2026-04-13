@@ -35,6 +35,9 @@ pub fn core_error_to_napi(err: apvm_core::Error) -> napi::Error {
         | apvm_core::Error::Project(_)
         | apvm_core::Error::Io(_)
         | apvm_core::Error::Json(_) => Status::GenericFailure,
+        apvm_core::Error::ReleaseNotFound { .. }
+        | apvm_core::Error::NoMatchingReleaseAssets { .. } => Status::InvalidArg,
+        apvm_core::Error::ReleasesNotAvailable { .. } => Status::InvalidArg,
     };
     napi::Error::new(status, err.to_string())
 }

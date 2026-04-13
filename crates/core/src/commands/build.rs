@@ -4,14 +4,16 @@
 //! from any git reference (PR, branch, tag, or commit) with automatic detection.
 
 use crate::build::plugins::VersionRequirement;
-use crate::build::progress::{BuildEvent, BuildPhase, ProgressReporter};
-use crate::build::{BuildResult, BuildRunner};
+use crate::build::progress::{BuildEvent, BuildPhase, BuildStep, ProgressReporter};
+use crate::build::{BuildResult, BuildRunner, ProducedArtifact};
 use crate::error::{Error, Result};
 use crate::git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
+use crate::github::client::download_asset_owned;
 use crate::github::GitHubClient;
 use crate::projects::ProjectRegistry;
 use apvm_config::Config;
 use std::path::Path;
+use tokio::task::JoinSet;
 
 // Re-export storage types for convenience (consumers don't need to add apvm-storage)
 pub use apvm_storage::{BuildMetadata, SourceArtifact};
@@ -253,6 +255,65 @@ impl BuildOutput {
     }
 }
 
+/// Extract a clean version string from a release tag name.
+///
+/// Strips common prefixes (`v`, `V`, `release-`, `release/`) used by
+/// GitHub Release tags to get a bare version string suitable for storage
+/// and display.
+///
+/// # Sources
+///
+/// - [`str::strip_prefix`](https://doc.rust-lang.org/std/primitive.str.html#method.strip_prefix)
+///   (stable since Rust 1.45).
+fn version_from_tag(tag: &str) -> String {
+    tag.strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .or_else(|| tag.strip_prefix("release-"))
+        .or_else(|| tag.strip_prefix("release/"))
+        .unwrap_or(tag)
+        .to_string()
+}
+
+/// Check whether an input string looks like a version tag.
+///
+/// This heuristic decides whether to try the GitHub Release API **before**
+/// cloning, avoiding an expensive clone when a pre-built release exists.
+///
+/// # Rules
+///
+/// 1. Optional prefix: `v`, `V`, `release-`, `release/`
+/// 2. After the prefix: only ASCII digits and dots
+/// 3. At least 2 dot-separated segments (e.g., `1.0`)
+/// 4. No empty segments, no leading/trailing dots
+///
+/// # Sources
+///
+/// - [`char::is_ascii_digit`](https://doc.rust-lang.org/std/primitive.char.html#method.is_ascii_digit)
+///   (stable since Rust 1.24).
+fn looks_like_version_tag(input: &str) -> bool {
+    let version_part = input
+        .strip_prefix('v')
+        .or_else(|| input.strip_prefix('V'))
+        .or_else(|| input.strip_prefix("release-"))
+        .or_else(|| input.strip_prefix("release/"))
+        .unwrap_or(input);
+
+    if !version_part.contains('.') {
+        return false;
+    }
+
+    if !version_part.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return false;
+    }
+
+    if version_part.starts_with('.') || version_part.ends_with('.') {
+        return false;
+    }
+
+    version_part.split('.').all(|s| !s.is_empty())
+        && version_part.split('.').count() >= 2
+}
+
 /// Command to build a project from any git reference.
 ///
 /// Supports automatic detection of reference types:
@@ -266,6 +327,11 @@ impl BuildOutput {
 /// - `tag:v1.0.0` → Force tag interpretation
 /// - `branch:main` → Force branch interpretation
 /// - `commit:a1b2c3d` → Force commit interpretation
+/// - `release:5.6.8` → Download pre-built assets from GitHub Release
+///
+/// Version-like bare inputs (e.g., `5.6.8`, `v3.21.1`) are automatically
+/// checked against the GitHub Release API before cloning, if the project
+/// has releases enabled.
 pub struct BuildCommand<'a> {
     github: &'a GitHubClient,
     registry: &'a ProjectRegistry,
@@ -335,17 +401,40 @@ impl<'a> BuildCommand<'a> {
         // we verify the PR exists via the GitHub API BEFORE cloning. This
         // avoids wasting time on a full clone when the PR doesn't exist.
         //
+        // For release references (`release:TAG`), we fetch the release from
+        // the GitHub API and download pre-built assets directly, bypassing
+        // the clone → build pipeline entirely.
+        //
         // - Explicit `pr:123`: fails immediately if PR is not found.
         // - Bare digits `123` (auto-detect): on failure, continues to clone
         //   and falls back to branch/tag/commit resolution.
+        // - Explicit `release:TAG`: fetches release, downloads assets, returns early.
         let early_resolved = self
             .try_early_resolve_github_ref(
                 git_ref,
                 &project_info.owner,
                 &project_info.repo,
+                project_info.has_releases,
                 reporter,
             )
             .await?;
+
+        // 3b. Handle release refs — download pre-built assets, skip clone/build entirely.
+        if let Some(ref resolved) = early_resolved {
+            if let RefSource::Release(ref tag) = resolved.source {
+                return self
+                    .download_release(
+                        project_info,
+                        tag,
+                        git_ref,
+                        version,
+                        variants,
+                        output_dir,
+                        reporter,
+                    )
+                    .await;
+            }
+        }
 
         // 4. Create isolated build workspace (auto-cleaned on drop)
         let workspace = BuildWorkspace::new(
@@ -440,6 +529,7 @@ impl<'a> BuildCommand<'a> {
             RefSource::PullRequest(_) | RefSource::Branch(_) => resolved.git_ref.clone(),
             RefSource::Tag(tag) => format!("tag/{tag}"),
             RefSource::Commit(sha) => format!("commit/{}", &sha[..7.min(sha.len())]),
+            RefSource::Release(tag) => format!("release/{tag}"),
         };
 
         tracing::debug!("Checked out {} at commit {}", resolved.git_ref, commit_short);
@@ -475,36 +565,40 @@ impl<'a> BuildCommand<'a> {
 
     /// Attempt to resolve GitHub-hosted refs before cloning.
     ///
-    /// This performs early validation for references that target pull requests,
-    /// avoiding a full clone when the PR doesn't exist.
+    /// This performs early validation for references that can be resolved
+    /// without a local repository, avoiding expensive clones when possible.
     ///
     /// # Behavior by Input Type
     ///
-    /// | Input         | Early check? | On failure                        |
-    /// |---------------|--------------|-----------------------------------|
-    /// | `pr:123`      | Yes          | Return error immediately          |
-    /// | `123` (bare)  | Yes          | Return `Ok(None)` (fallback)      |
-    /// | `branch:main` | No           | N/A (needs local repo)            |
-    /// | `tag:v1.0.0`  | No           | N/A (needs local repo)            |
-    /// | `develop`     | No           | N/A (needs local repo)            |
+    /// | Input          | Early check? | On failure                        |
+    /// |----------------|--------------|-----------------------------------|
+    /// | `pr:123`       | Yes          | Return error immediately          |
+    /// | `123` (bare)   | Yes          | Return `Ok(None)` (fallback)      |
+    /// | `release:TAG`  | Yes          | Immediate `ResolvedRef`           |
+    /// | `5.6.8` / `v5.6.8` (version-like, `has_releases=true`) | Yes | Return `Ok(None)` (fallback to clone) |
+    /// | `branch:main`  | No           | N/A (needs local repo)            |
+    /// | `tag:v1.0.0`   | No           | N/A (needs local repo)            |
+    /// | `develop`      | No           | N/A (needs local repo)            |
     ///
     /// # Arguments
     ///
     /// * `git_ref` - The raw git reference string from user input
     /// * `owner` - Repository owner (e.g., "wp-media")
     /// * `repo` - Repository name (e.g., "backwpup-pro")
+    /// * `has_releases` - Whether the project supports GitHub Releases
     /// * `reporter` - Progress reporter for build events
     ///
     /// # Returns
     ///
-    /// - `Ok(Some(resolved))` — PR was found, use this `ResolvedRef`
-    /// - `Ok(None)` — Not a PR input, or auto-detect PR lookup failed softly
-    /// - `Err(...)` — Explicit `pr:` prefix and PR was not found (or invalid)
+    /// - `Ok(Some(resolved))` — Ref was resolved (PR, release, or version-like release match)
+    /// - `Ok(None)` — Not resolvable early; needs local repo
+    /// - `Err(...)` — Explicit prefix and lookup failed (e.g., `pr:123` not found)
     async fn try_early_resolve_github_ref(
         &self,
         git_ref: &str,
         owner: &str,
         repo: &str,
+        has_releases: bool,
         reporter: &dyn ProgressReporter,
     ) -> Result<Option<ResolvedRef>> {
         let trimmed = git_ref.trim();
@@ -514,14 +608,27 @@ impl<'a> BuildCommand<'a> {
         // a candidate for early GitHub resolution.
         let (pr_number, is_explicit) = match trimmed.split_once(':') {
             Some((prefix, value)) if !value.is_empty() => {
-                if prefix.to_lowercase() == "pr" {
-                    let num = value.parse::<u64>().map_err(|_| {
-                        Error::Git(format!("Invalid PR number: '{value}'"))
-                    })?;
-                    (num, true)
-                } else {
-                    // Other explicit prefix (branch:, tag:, commit:) — skip
-                    return Ok(None);
+                match prefix.to_lowercase().as_str() {
+                    "pr" => {
+                        let num = value.parse::<u64>().map_err(|_| {
+                            Error::Git(format!("Invalid PR number: '{value}'"))
+                        })?;
+                        (num, true)
+                    }
+                    "release" => {
+                        // Release references are resolved immediately — return as ResolvedRef
+                        // for the caller to handle via download_release().
+                        return Ok(Some(ResolvedRef {
+                            input: trimmed.to_string(),
+                            source: RefSource::Release(value.to_string()),
+                            git_ref: value.to_string(),
+                            commit_sha: None,
+                        }));
+                    }
+                    _ => {
+                        // Other explicit prefix (branch:, tag:, commit:) — skip
+                        return Ok(None);
+                    }
                 }
             }
             _ => {
@@ -531,6 +638,14 @@ impl<'a> BuildCommand<'a> {
                         Ok(num) => (num, false),
                         Err(_) => return Ok(None),
                     }
+                } else if has_releases && looks_like_version_tag(trimmed) {
+                    // Input looks like a version tag (e.g., "v5.6.8", "5.6.8")
+                    // and the project has releases enabled. Try the GitHub
+                    // Release API BEFORE cloning to avoid the expensive
+                    // clone → build pipeline when a pre-built release exists.
+                    return self
+                        .try_resolve_version_as_release(trimmed, owner, repo, reporter)
+                        .await;
                 } else {
                     return Ok(None);
                 }
@@ -580,6 +695,341 @@ impl<'a> BuildCommand<'a> {
                 }
             }
         }
+    }
+
+    /// Attempt to match a version-like input to a GitHub Release.
+    ///
+    /// Tries the exact input first, then a `v`-prefixed or `v`-stripped
+    /// variant. This handles the common case where the user types `5.6.8`
+    /// but the GitHub tag is `v5.6.8`, or vice versa.
+    ///
+    /// Returns `Ok(None)` if no release matches — the caller falls through
+    /// to clone → resolve → build.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - The version-like string (e.g., `"5.6.8"`, `"v3.21.1"`)
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `reporter` - Progress reporter for build events
+    ///
+    /// # Sources
+    ///
+    /// - [`GitHubClient::get_release_by_tag`] returns `Ok(None)` on 404,
+    ///   `Err` on network/auth errors.
+    async fn try_resolve_version_as_release(
+        &self,
+        input: &str,
+        owner: &str,
+        repo: &str,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<Option<ResolvedRef>> {
+        reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Preflight,
+            message: format!("Checking for release matching '{input}'"),
+        });
+
+        // 1. Try exact match (e.g., input="v5.6.8" → tag "v5.6.8")
+        match self.github.get_release_by_tag(owner, repo, input).await {
+            Ok(Some(_release)) => {
+                tracing::info!("Found GitHub Release for tag '{input}'");
+                reporter.report(&BuildEvent::PhaseCompleted {
+                    phase: BuildPhase::Preflight,
+                });
+                return Ok(Some(ResolvedRef {
+                    input: input.to_string(),
+                    source: RefSource::Release(input.to_string()),
+                    git_ref: input.to_string(),
+                    commit_sha: None,
+                }));
+            }
+            Ok(None) => {
+                tracing::debug!("No release for exact tag '{input}', trying variant");
+            }
+            Err(e) => {
+                // API error (network, auth, rate-limit) — don't block the
+                // build pipeline, fall through to clone.
+                tracing::debug!("Release lookup for '{input}' failed: {e}, will try clone");
+                reporter.report(&BuildEvent::PhaseCompleted {
+                    phase: BuildPhase::Preflight,
+                });
+                return Ok(None);
+            }
+        }
+
+        // 2. Try variant: if input starts with 'v'/'V', strip it; otherwise add 'v'.
+        //    This covers the common mismatch where users type "5.6.8" but the
+        //    GitHub Release tag is "v5.6.8", or vice versa.
+        let variant = if input.starts_with('v') || input.starts_with('V') {
+            input[1..].to_string()
+        } else {
+            format!("v{input}")
+        };
+
+        match self.github.get_release_by_tag(owner, repo, &variant).await {
+            Ok(Some(_release)) => {
+                tracing::info!(
+                    "Found GitHub Release for tag '{variant}' (input was '{input}')"
+                );
+                reporter.report(&BuildEvent::PhaseCompleted {
+                    phase: BuildPhase::Preflight,
+                });
+                Ok(Some(ResolvedRef {
+                    input: input.to_string(),
+                    source: RefSource::Release(variant.clone()),
+                    git_ref: variant,
+                    commit_sha: None,
+                }))
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "No release for '{input}' or '{variant}', will clone and build"
+                );
+                reporter.report(&BuildEvent::PhaseCompleted {
+                    phase: BuildPhase::Preflight,
+                });
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::debug!("Release lookup for '{variant}' failed: {e}, will try clone");
+                reporter.report(&BuildEvent::PhaseCompleted {
+                    phase: BuildPhase::Preflight,
+                });
+                Ok(None)
+            }
+        }
+    }
+
+    /// Download pre-built assets from a GitHub Release.
+    ///
+    /// This bypasses the entire clone → build pipeline: the release's
+    /// zip assets are downloaded in parallel directly to `output_dir`.
+    ///
+    /// The version is always derived from the release tag (via [`version_from_tag`]),
+    /// not from the CLI `--ver` argument. If `--ver` was provided, a warning is
+    /// emitted because the release's artifacts are pre-built at a fixed version.
+    ///
+    /// # Arguments
+    ///
+    /// * `project_info` - Project information from registry
+    /// * `tag` - Release tag name (e.g., `"v5.6.8"`)
+    /// * `user_input` - The user's original input string (e.g., `"5.6.8"`, `"release:v5.6.8"`)
+    /// * `version` - User-provided version override (will be ignored with a warning)
+    /// * `variants` - Requested variants (empty = all matching assets)
+    /// * `output_dir` - Directory where downloaded assets will be placed
+    /// * `reporter` - Progress reporter for receiving build events
+    async fn download_release(
+        &self,
+        project_info: &crate::projects::Project,
+        tag: &str,
+        user_input: &str,
+        version: Option<&str>,
+        variants: &[&str],
+        output_dir: &Path,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<BuildOutput> {
+        let owner = &project_info.owner;
+        let repo = &project_info.repo;
+        let builder = project_info.builder.as_ref();
+
+        // Validate that the project supports releases
+        if !project_info.has_releases {
+            return Err(Error::ReleasesNotAvailable {
+                project: project_info.name.clone(),
+                tag: tag.to_string(),
+            });
+        }
+
+        // Fetch the release from GitHub
+        reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Preflight,
+            message: format!("Fetching release '{tag}' from {owner}/{repo}"),
+        });
+
+        let release = self
+            .github
+            .get_release_by_tag(owner, repo, tag)
+            .await?
+            .ok_or_else(|| Error::ReleaseNotFound {
+                tag: tag.to_string(),
+                repo: format!("{owner}/{repo}"),
+            })?;
+
+        reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::Preflight,
+        });
+
+        // Emit info about pre-release / draft status
+        if release.draft {
+            reporter.report(&BuildEvent::Warning(
+                format!("Release '{tag}' is a DRAFT release"),
+            ));
+        }
+        if release.prerelease {
+            reporter.report(&BuildEvent::Warning(
+                format!("Release '{tag}' is a PRE-RELEASE"),
+            ));
+        }
+
+        // Filter assets: only those matching the builder + requested variants
+        let matched_assets: Vec<_> = release
+            .assets
+            .iter()
+            .filter(|a| builder.matches_release_asset(&a.name))
+            .filter(|a| {
+                if variants.is_empty() {
+                    return true;
+                }
+                match builder.variant_from_release_asset(&a.name) {
+                    Some(v) => variants.contains(&v.as_str()),
+                    None => true,
+                }
+            })
+            .collect();
+
+        if matched_assets.is_empty() {
+            let available = release
+                .assets
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::NoMatchingReleaseAssets {
+                tag: tag.to_string(),
+                repo: format!("{owner}/{repo}"),
+                available,
+            });
+        }
+
+        // Download assets in parallel
+        reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::ReleaseDownload,
+            message: format!(
+                "Downloading {} asset(s) from release '{tag}'",
+                matched_assets.len()
+            ),
+        });
+
+        // Create output dir if it doesn't exist
+        std::fs::create_dir_all(output_dir).map_err(|e| {
+            Error::Build(format!(
+                "Failed to create output directory '{}': {e}",
+                output_dir.display()
+            ))
+        })?;
+
+        // Download assets in parallel using tokio::task::JoinSet.
+        //
+        // JoinSet::spawn requires `Future + Send + 'static`, so we use the
+        // standalone `download_asset_owned` function which takes all data by
+        // ownership. Each download runs on its own tokio worker thread.
+        //
+        // On first error, remaining tasks are aborted (JoinSet is dropped).
+        //
+        // Sources:
+        // - JoinSet::spawn: https://docs.rs/tokio/1.49.0/tokio/task/struct.JoinSet.html#method.spawn
+        // - JoinSet::join_next: https://docs.rs/tokio/1.49.0/tokio/task/struct.JoinSet.html#method.join_next
+        let token = self.github.token();
+        let mut download_tasks: JoinSet<Result<(String, Vec<u8>)>> = JoinSet::new();
+
+        for asset in &matched_assets {
+            reporter.report(&BuildEvent::StepStarted {
+                step: BuildStep::new(
+                    format!("Downloading {}", &asset.name),
+                    format!("GET {}", &asset.download_url),
+                ),
+            });
+
+            download_tasks.spawn(download_asset_owned(
+                token.clone(),
+                owner.to_string(),
+                repo.to_string(),
+                (*asset).clone(),
+            ));
+        }
+
+        // Collect results as they complete. Abort all remaining tasks on
+        // first error to avoid wasting bandwidth.
+        let mut artifacts = Vec::new();
+        let mut variants_built = Vec::new();
+
+        while let Some(join_result) = download_tasks.join_next().await {
+            // Handle JoinError (task panic or cancellation).
+            let download_result = join_result.map_err(|e| {
+                Error::Build(format!("Download task failed: {e}"))
+            })?;
+
+            // Handle download errors from the HTTP request.
+            let (asset_name, bytes) = download_result?;
+
+            let dest = output_dir.join(&asset_name);
+            std::fs::write(&dest, &bytes).map_err(|e| {
+                Error::Build(format!("Failed to write asset '{}': {e}", dest.display()))
+            })?;
+
+            let variant_id = builder.variant_from_release_asset(&asset_name);
+            if let Some(ref v) = variant_id {
+                if !variants_built.contains(v) {
+                    variants_built.push(v.clone());
+                }
+            }
+
+            reporter.report(&BuildEvent::StepCompleted {
+                step: BuildStep::new(
+                    format!("Downloaded {asset_name}"),
+                    format!("{} bytes", bytes.len()),
+                ),
+            });
+
+            artifacts.push(ProducedArtifact::new(
+                variant_id,
+                dest,
+                asset_name,
+                bytes.len() as u64,
+            ));
+        }
+
+        reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::ReleaseDownload,
+        });
+
+        // The version is always derived from the release tag, not the CLI --ver arg.
+        // Release assets are pre-built at a specific version embedded in the tag name.
+        let resolved_version = version_from_tag(tag);
+
+        if let Some(provided) = version {
+            reporter.report(&BuildEvent::Warning(format!(
+                "Ignoring provided version '{provided}': \
+                 release '{tag}' already defines version '{resolved_version}'"
+            )));
+        }
+
+        let resolved_ref = ResolvedRef {
+            input: user_input.to_string(),
+            source: RefSource::Release(tag.to_string()),
+            git_ref: tag.to_string(),
+            commit_sha: None,
+        };
+
+        let result = BuildResult::new(
+            artifacts,
+            output_dir.to_path_buf(),
+            resolved_version,
+            variants_built,
+        );
+
+        let filenames: Vec<_> = result.artifacts.iter().map(|a| a.path.clone()).collect();
+        reporter.report(&BuildEvent::BuildSucceeded {
+            artifacts: filenames,
+        });
+
+        Ok(BuildOutput {
+            result,
+            resolved_ref,
+            commit: format!("release-{tag}"),
+            commit_short: tag.to_string(),
+            branch: format!("release/{tag}"),
+        })
     }
 
     /// Resolve the version based on the builder's [`VersionRequirement`].
@@ -800,6 +1250,7 @@ mod tests {
             repo: "private-repo".to_string(),
             default_branch: "main".to_string(),
             is_private: true,
+            has_releases: false,
             builder: Box::new(TestBuilder),
         });
 
@@ -844,6 +1295,7 @@ mod tests {
             repo: "public-repo".to_string(),
             default_branch: "main".to_string(),
             is_private: false, // PUBLIC repo
+            has_releases: false,
             builder: Box::new(TestBuilder),
         });
 
@@ -871,5 +1323,111 @@ mod tests {
             );
         }
         // If it somehow succeeds (shouldn't with fake repo), that's also fine
+    }
+
+    // =========================================================================
+    // version_from_tag tests
+    // =========================================================================
+
+    #[test]
+    fn test_version_from_tag_strips_lowercase_v() {
+        assert_eq!(version_from_tag("v5.6.8"), "5.6.8");
+        assert_eq!(version_from_tag("v3.21.1"), "3.21.1");
+        assert_eq!(version_from_tag("v0.1.0"), "0.1.0");
+    }
+
+    #[test]
+    fn test_version_from_tag_strips_uppercase_v() {
+        assert_eq!(version_from_tag("V5.6.8"), "5.6.8");
+        assert_eq!(version_from_tag("V3.21.1"), "3.21.1");
+    }
+
+    #[test]
+    fn test_version_from_tag_strips_release_dash() {
+        assert_eq!(version_from_tag("release-1.0.0"), "1.0.0");
+        assert_eq!(version_from_tag("release-2.3.4"), "2.3.4");
+    }
+
+    #[test]
+    fn test_version_from_tag_strips_release_slash() {
+        assert_eq!(version_from_tag("release/1.0.0"), "1.0.0");
+        assert_eq!(version_from_tag("release/2.3.4"), "2.3.4");
+    }
+
+    #[test]
+    fn test_version_from_tag_leaves_bare_version() {
+        assert_eq!(version_from_tag("5.6.8"), "5.6.8");
+        assert_eq!(version_from_tag("1.0"), "1.0");
+        assert_eq!(version_from_tag("3.22.3.1"), "3.22.3.1");
+    }
+
+    #[test]
+    fn test_version_from_tag_non_version_strings() {
+        // These don't have a known prefix, so they are returned as-is
+        assert_eq!(version_from_tag("develop"), "develop");
+        assert_eq!(version_from_tag("main"), "main");
+        assert_eq!(version_from_tag("feature/v2"), "feature/v2");
+    }
+
+    // =========================================================================
+    // looks_like_version_tag tests
+    // =========================================================================
+
+    #[test]
+    fn test_looks_like_version_tag_bare_versions() {
+        assert!(looks_like_version_tag("5.6.8"));
+        assert!(looks_like_version_tag("1.0"));
+        assert!(looks_like_version_tag("3.22.3.1"));
+        assert!(looks_like_version_tag("0.0.1"));
+        assert!(looks_like_version_tag("10.20.30"));
+    }
+
+    #[test]
+    fn test_looks_like_version_tag_with_v_prefix() {
+        assert!(looks_like_version_tag("v5.6.8"));
+        assert!(looks_like_version_tag("V3.21.1"));
+        assert!(looks_like_version_tag("v0.1.0"));
+        assert!(looks_like_version_tag("V10.20.30"));
+    }
+
+    #[test]
+    fn test_looks_like_version_tag_with_release_prefix() {
+        assert!(looks_like_version_tag("release-1.0.0"));
+        assert!(looks_like_version_tag("release/2.0.0"));
+    }
+
+    #[test]
+    fn test_looks_like_version_tag_rejects_non_version() {
+        assert!(!looks_like_version_tag("develop"));
+        assert!(!looks_like_version_tag("main"));
+        assert!(!looks_like_version_tag("feature/foo"));
+        assert!(!looks_like_version_tag("abc1234"));
+        assert!(!looks_like_version_tag("123"));
+        assert!(!looks_like_version_tag("v1"));
+        assert!(!looks_like_version_tag(""));
+    }
+
+    #[test]
+    fn test_looks_like_version_tag_rejects_malformed() {
+        // Leading/trailing dots
+        assert!(!looks_like_version_tag(".1.0"));
+        assert!(!looks_like_version_tag("1.0."));
+        assert!(!looks_like_version_tag("v.1.0"));
+        // Empty segments
+        assert!(!looks_like_version_tag("1..0"));
+        // Non-digit characters in version part
+        assert!(!looks_like_version_tag("1.0.0-beta"));
+        assert!(!looks_like_version_tag("v1.0.0-rc1"));
+        assert!(!looks_like_version_tag("1.0.0a"));
+    }
+
+    #[test]
+    fn test_looks_like_version_tag_needs_at_least_two_segments() {
+        assert!(looks_like_version_tag("1.0"));
+        assert!(looks_like_version_tag("1.0.0"));
+        assert!(looks_like_version_tag("1.0.0.0"));
+        // Single segment is not a version
+        assert!(!looks_like_version_tag("v1"));
+        assert!(!looks_like_version_tag("123"));
     }
 }

@@ -20,6 +20,9 @@ pub enum BuildSource {
     /// Built from a specific commit.
     #[serde(rename = "commit")]
     Commit(String),
+    /// Built from a GitHub Release (pre-built assets downloaded).
+    #[serde(rename = "release")]
+    Release(String),
 }
 
 impl BuildSource {
@@ -30,6 +33,7 @@ impl BuildSource {
             Self::Tag(tag) => format!("tag-{}", Self::sanitize(tag)),
             Self::Branch(branch) => format!("branch-{}", Self::sanitize(branch)),
             Self::Commit(sha) => format!("commit-{}", &sha[..7.min(sha.len())]),
+            Self::Release(tag) => format!("release-{}", Self::sanitize(tag)),
         }
     }
 
@@ -54,6 +58,8 @@ impl BuildSource {
             Some(Self::Branch(branch.to_string()))
         } else if let Some(commit) = name.strip_prefix("commit-") {
             Some(Self::Commit(commit.to_string()))
+        } else if let Some(tag) = name.strip_prefix("release-") {
+            Some(Self::Release(tag.to_string()))
         } else {
             None
         }
@@ -66,6 +72,7 @@ impl BuildSource {
             Self::Tag(tag) => format!("Tag {}", tag),
             Self::Branch(branch) => format!("Branch {}", branch),
             Self::Commit(sha) => format!("Commit {}", &sha[..7.min(sha.len())]),
+            Self::Release(tag) => format!("Release {}", tag),
         }
     }
 }

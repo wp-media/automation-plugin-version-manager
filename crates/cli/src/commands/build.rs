@@ -20,13 +20,14 @@ pub struct BuildArgs {
     /// Plugin name (e.g., "backwpup")
     pub plugin: String,
 
-    /// Git reference: PR number (#123 or 123), branch, tag, or commit
+    /// Git reference: PR number (#123 or 123), branch, tag, commit, or release
     ///
     /// Examples:
     ///   #123, 123       → Build from PR #123
     ///   develop         → Build from branch
     ///   tag:v5.0.0      → Build from tag
     ///   abc1234         → Build from commit
+    ///   release:5.6.8   → Download pre-built assets from GitHub Release
     pub git_ref: String,
 
     /// Package version (default: plugin-specific, e.g., 9.99.99 for BackWPup)

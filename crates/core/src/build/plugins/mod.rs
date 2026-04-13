@@ -626,6 +626,38 @@ pub trait Builder: Send + Sync {
         }
         Ok(())
     }
+
+    // =========================================================================
+    // Release Asset Matching
+    // =========================================================================
+
+    /// Check whether a release asset name belongs to this project.
+    ///
+    /// Used to filter release assets during `release:` downloads.
+    /// Only assets that match are downloaded.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset_name` - Filename of the release asset (e.g., `"backwpup-free-5.6.8.zip"`)
+    ///
+    /// # Default
+    ///
+    /// Returns `false` — override when the project has downloadable release assets.
+    fn matches_release_asset(&self, _asset_name: &str) -> bool {
+        false
+    }
+
+    /// Determine which variant a release asset belongs to.
+    ///
+    /// Called for assets that pass [`matches_release_asset`](Self::matches_release_asset).
+    /// Returns `None` for single-variant projects.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset_name` - Filename of the release asset
+    fn variant_from_release_asset(&self, _asset_name: &str) -> Option<String> {
+        None
+    }
 }
 
 // =============================================================================

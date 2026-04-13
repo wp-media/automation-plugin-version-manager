@@ -183,6 +183,8 @@ impl Apvm {
     ///     owner: "org".to_string(),
     ///     repo: "my-plugin".to_string(),
     ///     default_branch: "main".to_string(),
+    ///     is_private: false,
+    ///     has_releases: false,
     ///     builder: Box::new(BackWPupBuilder),
     /// };
     ///
@@ -215,6 +217,7 @@ impl Apvm {
     /// - `tag:v1.0.0` → Force tag interpretation
     /// - `branch:main` → Force branch interpretation
     /// - `commit:a1b2c3d` → Force commit interpretation
+    /// - `release:5.6.8` → Download pre-built assets from GitHub Release
     ///
     /// # Arguments
     ///
@@ -352,6 +355,34 @@ impl Apvm {
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
         self.build(project, version, &format!("commit:{commit}"), variants, output_dir, reporter)
+            .await
+    }
+
+    /// Build a project from a GitHub Release.
+    ///
+    /// Downloads pre-built assets directly from the release, bypassing the
+    /// clone → build pipeline entirely. This is significantly faster when
+    /// a release with the right assets is available.
+    ///
+    /// # Arguments
+    ///
+    /// * `project` - Project name from registry
+    /// * `version` - Version override, or `None` to use tag as version
+    /// * `tag` - Release tag name (e.g., `"5.6.8"`, `"v1.0.0"`)
+    /// * `variants` - Optional specific variants to download (None = all)
+    /// * `output_dir` - Directory where downloaded assets will be placed
+    /// * `reporter` - Progress reporter for receiving build events.
+    ///   Use [`NullReporter`] to discard all events.
+    pub async fn build_from_release(
+        &self,
+        project: &str,
+        version: Option<&str>,
+        tag: &str,
+        variants: Option<&[&str]>,
+        output_dir: impl AsRef<std::path::Path>,
+        reporter: &dyn build::progress::ProgressReporter,
+    ) -> Result<commands::BuildOutput> {
+        self.build(project, version, &format!("release:{tag}"), variants, output_dir, reporter)
             .await
     }
 }

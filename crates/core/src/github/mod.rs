@@ -1,7 +1,7 @@
 //! GitHub API integration.
 
-mod client;
+pub mod client;
 mod models;
 
 pub use client::GitHubClient;
-pub use models::PullRequest;
+pub use models::{PullRequest, Release, ReleaseAsset};

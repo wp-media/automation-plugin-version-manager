@@ -49,6 +49,10 @@ indicatif = "0.18"
 # Testing utilities
 tempfile = "3.25"
 
+# HTTP client (for release asset downloads)
+# Uses native-tls to avoid crypto provider conflict with octocrab's rustls+ring
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
+
 # Internal crates
 apvm-config = { path = "crates/config" }
 apvm-core = { path = "crates/core" }

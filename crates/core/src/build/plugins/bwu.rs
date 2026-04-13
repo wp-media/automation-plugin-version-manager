@@ -296,4 +296,32 @@ impl Builder for BackWPupBuilder {
 
         Ok(artifacts)
     }
+
+    // =========================================================================
+    // Release Asset Matching
+    // =========================================================================
+
+    /// Match BackWPup release assets.
+    ///
+    /// Release assets follow the pattern `backwpup-{variant}-{version}.zip`:
+    /// - `backwpup-free-5.6.8.zip`
+    /// - `backwpup-pro-de-5.6.8.zip`
+    /// - `backwpup-pro-en-5.6.8.zip`
+    fn matches_release_asset(&self, asset_name: &str) -> bool {
+        asset_name.starts_with("backwpup-") && asset_name.ends_with(".zip")
+    }
+
+    /// Determine which variant a BackWPup release asset belongs to.
+    fn variant_from_release_asset(&self, asset_name: &str) -> Option<String> {
+        if asset_name.starts_with("backwpup-pro-de-") {
+            Some(Self::VARIANT_PRO_DE.to_string())
+        } else if asset_name.starts_with("backwpup-pro-en-") {
+            Some(Self::VARIANT_PRO_EN.to_string())
+        } else if asset_name.starts_with("backwpup-free-") || asset_name.starts_with("backwpup-") {
+            // "backwpup-free-X.Y.Z.zip" or legacy "backwpup-X.Y.Z.zip"
+            Some(Self::VARIANT_FREE.to_string())
+        } else {
+            None
+        }
+    }
 }

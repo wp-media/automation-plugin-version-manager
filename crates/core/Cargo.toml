@@ -38,3 +38,6 @@ directories = { workspace = true }
 
 # Temporary directories (for build workspaces)
 tempfile = { workspace = true }
+
+# HTTP client (for release asset downloads)
+reqwest = { workspace = true }

@@ -59,6 +59,43 @@ pub enum Error {
     #[error("Build error: {0}")]
     Build(String),
 
+    /// No release found for a given tag.
+    #[error("No GitHub release found for tag '{tag}' in {repo}")]
+    ReleaseNotFound {
+        /// The tag that was looked up.
+        tag: String,
+        /// The repository (owner/repo).
+        repo: String,
+    },
+
+    /// Releases are not available for this project.
+    #[error(
+        "Project '{project}' does not have GitHub Releases with downloadable assets.\n\
+         \n\
+         Use a git reference instead:\n\
+         \n\
+         - tag:{tag}       → Build from tag\n\
+         - branch:develop  → Build from branch\n\
+         - pr:123          → Build from pull request"
+    )]
+    ReleasesNotAvailable {
+        /// The project name.
+        project: String,
+        /// The tag that was attempted.
+        tag: String,
+    },
+
+    /// No matching release assets found for the requested variants.
+    #[error("No matching release assets found for tag '{tag}' in {repo}.\nAvailable assets: {available}")]
+    NoMatchingReleaseAssets {
+        /// The tag that was looked up.
+        tag: String,
+        /// The repository (owner/repo).
+        repo: String,
+        /// Comma-separated list of available asset names.
+        available: String,
+    },
+
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] io::Error),

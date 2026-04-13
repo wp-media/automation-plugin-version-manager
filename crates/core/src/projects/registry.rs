@@ -25,6 +25,12 @@ pub struct Project {
     /// is available, providing a clear error message instead of failing
     /// later during clone/fetch with a cryptic git error.
     pub is_private: bool,
+    /// Whether this project publishes GitHub Releases with downloadable assets.
+    ///
+    /// When `true`, the `release:` prefix and automatic release detection
+    /// are enabled for this project. When `false`, `release:` returns a
+    /// clear error message suggesting git-based alternatives.
+    pub has_releases: bool,
     /// Project-specific builder.
     pub builder: Box<dyn Builder>,
 }
@@ -54,6 +60,7 @@ impl ProjectRegistry {
             repo: "backwpup-pro".to_string(),
             default_branch: DEFAULT_BRANCH_NAME.to_string(),
             is_private: true,
+            has_releases: true,
             builder: Box::new(BackWPupBuilder),
         });
 
@@ -64,6 +71,7 @@ impl ProjectRegistry {
             repo: "wp-rocket".to_string(),
             default_branch: DEFAULT_BRANCH_NAME.to_string(),
             is_private: false,
+            has_releases: false,
             builder: Box::new(WpRocketBuilder),
         });
 
@@ -157,6 +165,7 @@ mod tests {
             repo: "repo".to_string(),
             default_branch: "main".to_string(),
             is_private: false,
+            has_releases: false,
             builder: Box::new(TestBuilder),
         });
 
@@ -187,6 +196,7 @@ mod tests {
             repo: "a".to_string(),
             default_branch: "main".to_string(),
             is_private: false,
+            has_releases: false,
             builder: Box::new(TestBuilder),
         });
         
@@ -197,6 +207,7 @@ mod tests {
             repo: "b".to_string(),
             default_branch: "develop".to_string(),
             is_private: true,
+            has_releases: false,
             builder: Box::new(TestBuilder),
         });
 
@@ -217,6 +228,7 @@ mod tests {
             repo: "old".to_string(),
             default_branch: "main".to_string(),
             is_private: false,
+            has_releases: false,
             builder: Box::new(TestBuilder),
         });
         
@@ -227,6 +239,7 @@ mod tests {
             repo: "new".to_string(),
             default_branch: "develop".to_string(),
             is_private: true,
+            has_releases: false,
             builder: Box::new(TestBuilder),
         });
 

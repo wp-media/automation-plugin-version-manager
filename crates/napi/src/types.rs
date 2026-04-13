@@ -41,6 +41,8 @@ use napi_derive::napi;
 pub enum JsBuildPhase {
     /// Pre-clone verification of GitHub references (PR existence, etc.).
     Preflight,
+    /// Downloading pre-built assets from a GitHub Release.
+    ReleaseDownload,
     /// Cloning the git repository.
     Clone,
     /// Checking out the target ref (branch, tag, PR, commit).
@@ -65,6 +67,7 @@ impl From<apvm_core::BuildPhase> for JsBuildPhase {
     fn from(phase: apvm_core::BuildPhase) -> Self {
         match phase {
             apvm_core::BuildPhase::Preflight => Self::Preflight,
+            apvm_core::BuildPhase::ReleaseDownload => Self::ReleaseDownload,
             apvm_core::BuildPhase::Clone => Self::Clone,
             apvm_core::BuildPhase::Checkout => Self::Checkout,
             apvm_core::BuildPhase::DependencyCheck => Self::DependencyCheck,
@@ -157,11 +160,12 @@ impl From<&apvm_core::BuildStep> for JsBuildStep {
 ///   case 'branch': console.log(`Branch: ${source.value}`); break;
 ///   case 'tag': console.log(`Tag: ${source.value}`); break;
 ///   case 'commit': console.log(`Commit: ${source.value}`); break;
+///   case 'release': console.log(`Release: ${source.value}`); break;
 /// }
 /// ```
 #[napi(object)]
 pub struct JsRefSource {
-    /// The type of reference: `"pull_request"`, `"branch"`, `"tag"`, or `"commit"`.
+    /// The type of reference: `"pull_request"`, `"branch"`, `"tag"`, `"commit"`, or `"release"`.
     #[napi(js_name = "type")]
     pub kind: String,
     /// The value associated with the reference type.
@@ -170,6 +174,7 @@ pub struct JsRefSource {
     /// - For `branch`: the branch name (e.g., `"develop"`)
     /// - For `tag`: the tag name (e.g., `"v1.0.0"`)
     /// - For `commit`: the commit SHA (e.g., `"a1b2c3d"`)
+    /// - For `release`: the release tag (e.g., `"5.6.8"`)
     pub value: String,
     /// A human-readable description (e.g., `"PR #123"`, `"branch 'develop'"`)
     pub description: String,
@@ -182,6 +187,7 @@ impl From<&apvm_core::RefSource> for JsRefSource {
             apvm_core::RefSource::Branch(s) => ("branch".to_string(), s.clone()),
             apvm_core::RefSource::Tag(s) => ("tag".to_string(), s.clone()),
             apvm_core::RefSource::Commit(s) => ("commit".to_string(), s.clone()),
+            apvm_core::RefSource::Release(s) => ("release".to_string(), s.clone()),
         };
         Self {
             kind,

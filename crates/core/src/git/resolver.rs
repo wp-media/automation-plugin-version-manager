@@ -82,6 +82,8 @@ pub enum RefSource {
     Tag(String),
     /// Commit SHA.
     Commit(String),
+    /// GitHub Release tag (pre-built assets).
+    Release(String),
 }
 
 impl RefSource {
@@ -92,6 +94,7 @@ impl RefSource {
             Self::Tag(tag) => format!("tag '{tag}'"),
             Self::Branch(branch) => format!("branch '{branch}'"),
             Self::Commit(sha) => format!("commit {}", &sha[..7.min(sha.len())]),
+            Self::Release(tag) => format!("release '{tag}'"),
         }
     }
 
@@ -126,6 +129,7 @@ impl From<RefSource> for BuildSource {
             RefSource::Branch(s) => BuildSource::Branch(s),
             RefSource::Tag(s) => BuildSource::Tag(s),
             RefSource::Commit(s) => BuildSource::Commit(s),
+            RefSource::Release(s) => BuildSource::Release(s),
         }
     }
 }
@@ -138,6 +142,7 @@ impl From<&RefSource> for BuildSource {
             RefSource::Branch(s) => BuildSource::Branch(s.clone()),
             RefSource::Tag(s) => BuildSource::Tag(s.clone()),
             RefSource::Commit(s) => BuildSource::Commit(s.clone()),
+            RefSource::Release(s) => BuildSource::Release(s.clone()),
         }
     }
 }
@@ -150,6 +155,7 @@ impl From<BuildSource> for RefSource {
             BuildSource::Branch(s) => RefSource::Branch(s),
             BuildSource::Tag(s) => RefSource::Tag(s),
             BuildSource::Commit(s) => RefSource::Commit(s),
+            BuildSource::Release(s) => RefSource::Release(s),
         }
     }
 }
@@ -162,6 +168,7 @@ impl From<&BuildSource> for RefSource {
             BuildSource::Branch(s) => RefSource::Branch(s.clone()),
             BuildSource::Tag(s) => RefSource::Tag(s.clone()),
             BuildSource::Commit(s) => RefSource::Commit(s.clone()),
+            BuildSource::Release(s) => RefSource::Release(s.clone()),
         }
     }
 }
@@ -259,6 +266,7 @@ impl<'a> RefResolver<'a> {
             "tag" => self.resolve_tag(input, value).await.map(Some),
             "branch" => self.resolve_branch(input, value).await.map(Some),
             "commit" => self.resolve_commit(input, value).await.map(Some),
+            "release" => self.resolve_release(input, value).map(Some),
             _ => Ok(None), // Unknown prefix, try automatic detection
         }
     }
@@ -270,7 +278,7 @@ impl<'a> RefResolver<'a> {
         if input.contains(':') {
             return Err(Error::Git(format!(
                 "Invalid reference '{input}'. Unknown prefix or ':' is not allowed in git refs. \
-                 Valid prefixes are: pr:, tag:, branch:, commit:"
+                 Valid prefixes are: pr:, tag:, branch:, commit:, release:"
             )));
         }
 
@@ -324,8 +332,8 @@ impl<'a> RefResolver<'a> {
         }
 
         Err(Error::Git(format!(
-            "Could not resolve '{input}' as PR, tag, branch, or commit. \
-             Use explicit prefix (pr:, tag:, branch:, commit:) to specify type."
+            "Could not resolve '{input}' as PR, release, tag, branch, or commit. \
+             Use explicit prefix (pr:, tag:, branch:, commit:, release:) to specify type."
         )))
     }
 
@@ -449,6 +457,21 @@ impl<'a> RefResolver<'a> {
                 commit_sha: Some(sha.to_string()),
             })
         }
+    }
+
+    /// Resolve a release tag.
+    ///
+    /// Unlike other resolution methods, this does not require a local repository.
+    /// The actual GitHub API check happens later in the build command's early-resolve phase.
+    fn resolve_release(&self, input: &str, tag: &str) -> Result<ResolvedRef> {
+        tracing::debug!("Resolving release '{tag}'");
+
+        Ok(ResolvedRef {
+            input: input.to_string(),
+            source: RefSource::Release(tag.to_string()),
+            git_ref: tag.to_string(),
+            commit_sha: None,
+        })
     }
 
     /// Check if a ref exists as a tag.

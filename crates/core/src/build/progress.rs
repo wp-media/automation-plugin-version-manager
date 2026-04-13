@@ -220,6 +220,11 @@ pub enum BuildPhase {
     /// This phase runs before cloning to fail fast when an explicit
     /// reference (e.g., `pr:123`) does not exist.
     Preflight,
+    /// Downloading pre-built assets from a GitHub Release.
+    ///
+    /// This phase replaces the entire clone → build pipeline when a release
+    /// is available. Assets are downloaded in parallel directly to the output directory.
+    ReleaseDownload,
     /// Cloning the git repository.
     Clone,
     /// Checking out the target ref (branch, tag, PR, commit).
@@ -244,6 +249,7 @@ impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Preflight => write!(f, "Verifying reference"),
+            Self::ReleaseDownload => write!(f, "Downloading release assets"),
             Self::Clone => write!(f, "Cloning repository"),
             Self::Checkout => write!(f, "Checking out ref"),
             Self::DependencyCheck => write!(f, "Checking dependencies"),
