@@ -39,6 +39,8 @@ use napi_derive::napi;
 /// ```
 #[napi(string_enum)]
 pub enum JsBuildPhase {
+    /// Pre-clone verification of GitHub references (PR existence, etc.).
+    Preflight,
     /// Cloning the git repository.
     Clone,
     /// Checking out the target ref (branch, tag, PR, commit).
@@ -62,6 +64,7 @@ pub enum JsBuildPhase {
 impl From<apvm_core::BuildPhase> for JsBuildPhase {
     fn from(phase: apvm_core::BuildPhase) -> Self {
         match phase {
+            apvm_core::BuildPhase::Preflight => Self::Preflight,
             apvm_core::BuildPhase::Clone => Self::Clone,
             apvm_core::BuildPhase::Checkout => Self::Checkout,
             apvm_core::BuildPhase::DependencyCheck => Self::DependencyCheck,

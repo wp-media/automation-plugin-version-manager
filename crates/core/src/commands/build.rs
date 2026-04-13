@@ -58,10 +58,14 @@ impl BuildOutput {
     }
 
     /// Get a human-readable description of what was built.
+    ///
+    /// For PRs this includes the resolved branch name:
+    /// - `"PR #123 (branch: feature/foo) @ a1b2c3d"`
+    /// - `"branch 'develop' @ e4f5g6h"`
     pub fn description(&self) -> String {
         format!(
             "{} @ {}",
-            self.resolved_ref.source.description(),
+            self.resolved_ref.detailed_description(),
             &self.commit_short
         )
     }
@@ -325,7 +329,25 @@ impl<'a> BuildCommand<'a> {
 
         let builder = project_info.builder.as_ref();
 
-        // 3. Create isolated build workspace (auto-cleaned on drop)
+        // 3. Early-resolve GitHub refs that don't need a local repo.
+        //
+        // For PR references (either explicit `pr:123` or bare digits `123`),
+        // we verify the PR exists via the GitHub API BEFORE cloning. This
+        // avoids wasting time on a full clone when the PR doesn't exist.
+        //
+        // - Explicit `pr:123`: fails immediately if PR is not found.
+        // - Bare digits `123` (auto-detect): on failure, continues to clone
+        //   and falls back to branch/tag/commit resolution.
+        let early_resolved = self
+            .try_early_resolve_github_ref(
+                git_ref,
+                &project_info.owner,
+                &project_info.repo,
+                reporter,
+            )
+            .await?;
+
+        // 4. Create isolated build workspace (auto-cleaned on drop)
         let workspace = BuildWorkspace::new(
             &project_info.name,
             &project_info.repo_url,
@@ -348,19 +370,31 @@ impl<'a> BuildCommand<'a> {
         // Get repository handle for local operations
         let repo = workspace.repository();
 
-        // 4. Resolve the git reference
-        let resolver = RefResolver::new(self.github, &project_info.owner, &project_info.repo)
-            .with_repo_path(repo.path());
+        // 5. Resolve the git reference — skip if already resolved early.
+        let resolved = match early_resolved {
+            Some(r) => {
+                tracing::debug!(
+                    "Using early-resolved ref: {} → {}",
+                    r.source.description(),
+                    r.git_ref
+                );
+                r
+            }
+            None => {
+                let resolver =
+                    RefResolver::new(self.github, &project_info.owner, &project_info.repo)
+                        .with_repo_path(repo.path());
+                resolver.resolve(git_ref).await?
+            }
+        };
 
-        let resolved = resolver.resolve(git_ref).await?;
-
-        // 5. Prepare repository for checkout (clean state)
+        // 6. Prepare repository for checkout (clean state)
         // Reset FIRST to avoid checkout failures due to uncommitted changes.
         // See: https://git-scm.com/docs/git-checkout#_description
         // "git checkout refuses to switch branches if there are local modifications"
         reporter.report(&BuildEvent::PhaseStarted {
             phase: BuildPhase::Checkout,
-            message: format!("Checking out {}", resolved.source.description()),
+            message: format!("Checking out {}", resolved.detailed_description()),
         });
         tracing::debug!(
             "Resetting repository and switching to default branch '{}'",
@@ -371,16 +405,16 @@ impl<'a> BuildCommand<'a> {
         repo.reset_hard().await?;
         workspace.pull().await?;
 
-        // 6. Checkout the resolved ref
+        // 7. Checkout the resolved ref
         repo.checkout(&resolved.git_ref).await?;
 
-        // 7. Get the commit SHA after checkout
+        // 8. Get the commit SHA after checkout
         let (commit, commit_short) = repo.get_head_commit_pair().await?;
         reporter.report(&BuildEvent::PhaseCompleted {
             phase: BuildPhase::Checkout,
         });
 
-        // 8. Resolve version (AFTER checkout so detect_version sees correct files)
+        // 9. Resolve version (AFTER checkout so detect_version sees correct files)
         let resolved_version = self.resolve_version(
             project,
             version,
@@ -392,7 +426,7 @@ impl<'a> BuildCommand<'a> {
             "Building {} v{} from {}",
             project,
             resolved_version,
-            resolved.source.description()
+            resolved.detailed_description()
         );
 
         if variants.is_empty() {
@@ -410,14 +444,14 @@ impl<'a> BuildCommand<'a> {
 
         tracing::debug!("Checked out {} at commit {}", resolved.git_ref, commit_short);
 
-        // 9. Run the build using the project's builder
+        // 10. Run the build using the project's builder
         let build_context = workspace.to_build_context();
         let mut runner = BuildRunner::with_reporter(build_context, reporter);
         let result = runner
             .execute_build(builder, &resolved_version, variants)
             .await?;
 
-        // 10. Collect artifacts to output_dir BEFORE workspace cleanup
+        // 11. Collect artifacts to output_dir BEFORE workspace cleanup
         // The workspace will be automatically deleted when it goes out of scope,
         // so we must move artifacts out first.
         let artifact_paths: Vec<_> = result.artifacts.iter().map(|a| a.path.clone()).collect();
@@ -437,6 +471,115 @@ impl<'a> BuildCommand<'a> {
             commit_short,
             branch,
         })
+    }
+
+    /// Attempt to resolve GitHub-hosted refs before cloning.
+    ///
+    /// This performs early validation for references that target pull requests,
+    /// avoiding a full clone when the PR doesn't exist.
+    ///
+    /// # Behavior by Input Type
+    ///
+    /// | Input         | Early check? | On failure                        |
+    /// |---------------|--------------|-----------------------------------|
+    /// | `pr:123`      | Yes          | Return error immediately          |
+    /// | `123` (bare)  | Yes          | Return `Ok(None)` (fallback)      |
+    /// | `branch:main` | No           | N/A (needs local repo)            |
+    /// | `tag:v1.0.0`  | No           | N/A (needs local repo)            |
+    /// | `develop`     | No           | N/A (needs local repo)            |
+    ///
+    /// # Arguments
+    ///
+    /// * `git_ref` - The raw git reference string from user input
+    /// * `owner` - Repository owner (e.g., "wp-media")
+    /// * `repo` - Repository name (e.g., "backwpup-pro")
+    /// * `reporter` - Progress reporter for build events
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(resolved))` — PR was found, use this `ResolvedRef`
+    /// - `Ok(None)` — Not a PR input, or auto-detect PR lookup failed softly
+    /// - `Err(...)` — Explicit `pr:` prefix and PR was not found (or invalid)
+    async fn try_early_resolve_github_ref(
+        &self,
+        git_ref: &str,
+        owner: &str,
+        repo: &str,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<Option<ResolvedRef>> {
+        let trimmed = git_ref.trim();
+
+        // Determine whether this is an explicit `pr:` prefix or bare digits.
+        // Anything else (branch:, tag:, commit:, or non-digit text) is not
+        // a candidate for early GitHub resolution.
+        let (pr_number, is_explicit) = match trimmed.split_once(':') {
+            Some((prefix, value)) if !value.is_empty() => {
+                if prefix.to_lowercase() == "pr" {
+                    let num = value.parse::<u64>().map_err(|_| {
+                        Error::Git(format!("Invalid PR number: '{value}'"))
+                    })?;
+                    (num, true)
+                } else {
+                    // Other explicit prefix (branch:, tag:, commit:) — skip
+                    return Ok(None);
+                }
+            }
+            _ => {
+                // No prefix — check if bare digits (potential PR number)
+                if trimmed.chars().all(|c| c.is_ascii_digit()) && !trimmed.is_empty() {
+                    match trimmed.parse::<u64>() {
+                        Ok(num) => (num, false),
+                        Err(_) => return Ok(None),
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+
+        // At this point we have a PR number to look up.
+        reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Preflight,
+            message: format!("Verifying PR #{pr_number} exists"),
+        });
+
+        let pr_result = self.github.get_pull_request(owner, repo, pr_number).await;
+
+        reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::Preflight,
+        });
+
+        match pr_result {
+            Ok(pr) => {
+                tracing::info!(
+                    "PR #{} found: '{}' (branch: {})",
+                    pr_number,
+                    pr.title,
+                    pr.head_branch
+                );
+                Ok(Some(ResolvedRef {
+                    input: trimmed.to_string(),
+                    source: RefSource::PullRequest(pr_number),
+                    git_ref: pr.head_branch,
+                    commit_sha: None,
+                }))
+            }
+            Err(e) => {
+                if is_explicit {
+                    // Explicit `pr:123` — the user specifically requested this PR,
+                    // so a failure is a hard error. No clone should happen.
+                    Err(Error::Git(format!("Failed to fetch PR #{pr_number}: {e}")))
+                } else {
+                    // Bare digits (auto-detect) — PR not found is not fatal,
+                    // the resolver will try branch/tag/commit after cloning.
+                    tracing::debug!(
+                        "Early PR #{pr_number} lookup failed ({}), will retry after clone",
+                        e
+                    );
+                    Ok(None)
+                }
+            }
+        }
     }
 
     /// Resolve the version based on the builder's [`VersionRequirement`].

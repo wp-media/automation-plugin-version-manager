@@ -34,6 +34,24 @@ impl ResolvedRef {
     pub fn to_build_source(&self) -> BuildSource {
         BuildSource::from(&self.source)
     }
+
+    /// Human-readable description including the resolved git ref.
+    ///
+    /// For PRs this includes the resolved branch name so users can see
+    /// exactly which branch backs the pull request they requested:
+    ///
+    /// - PR → `"PR #123 (branch: feature/my-feature)"`
+    /// - Branch → `"branch 'develop'"`
+    /// - Tag → `"tag 'v1.0.0'"`
+    /// - Commit → `"commit a1b2c3d"`
+    pub fn detailed_description(&self) -> String {
+        match &self.source {
+            RefSource::PullRequest(num) => {
+                format!("PR #{num} (branch: {})", self.git_ref)
+            }
+            _ => self.source.description(),
+        }
+    }
 }
 
 /// Source type of a git reference.
@@ -640,5 +658,52 @@ mod tests {
         let ref_source: RefSource = original.clone().into();
         let back: BuildSource = ref_source.into();
         assert_eq!(original, back);
+    }
+
+    #[test]
+    fn test_detailed_description_pr() {
+        let resolved = ResolvedRef {
+            input: "pr:42".to_string(),
+            source: RefSource::PullRequest(42),
+            git_ref: "feature/my-feature".to_string(),
+            commit_sha: None,
+        };
+        assert_eq!(
+            resolved.detailed_description(),
+            "PR #42 (branch: feature/my-feature)"
+        );
+    }
+
+    #[test]
+    fn test_detailed_description_branch() {
+        let resolved = ResolvedRef {
+            input: "develop".to_string(),
+            source: RefSource::Branch("develop".to_string()),
+            git_ref: "develop".to_string(),
+            commit_sha: None,
+        };
+        assert_eq!(resolved.detailed_description(), "branch 'develop'");
+    }
+
+    #[test]
+    fn test_detailed_description_tag() {
+        let resolved = ResolvedRef {
+            input: "tag:v1.0.0".to_string(),
+            source: RefSource::Tag("v1.0.0".to_string()),
+            git_ref: "v1.0.0".to_string(),
+            commit_sha: None,
+        };
+        assert_eq!(resolved.detailed_description(), "tag 'v1.0.0'");
+    }
+
+    #[test]
+    fn test_detailed_description_commit() {
+        let resolved = ResolvedRef {
+            input: "commit:a1b2c3d4e5f6".to_string(),
+            source: RefSource::Commit("a1b2c3d4e5f6".to_string()),
+            git_ref: "a1b2c3d4e5f6".to_string(),
+            commit_sha: Some("a1b2c3d4e5f6".to_string()),
+        };
+        assert_eq!(resolved.detailed_description(), "commit a1b2c3d");
     }
 }

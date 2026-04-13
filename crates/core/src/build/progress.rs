@@ -215,6 +215,11 @@ pub enum BuildEvent {
 /// contains zero or more steps (individual commands or operations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuildPhase {
+    /// Pre-clone verification of GitHub references (PR existence, etc.).
+    ///
+    /// This phase runs before cloning to fail fast when an explicit
+    /// reference (e.g., `pr:123`) does not exist.
+    Preflight,
     /// Cloning the git repository.
     Clone,
     /// Checking out the target ref (branch, tag, PR, commit).
@@ -238,6 +243,7 @@ pub enum BuildPhase {
 impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Preflight => write!(f, "Verifying reference"),
             Self::Clone => write!(f, "Cloning repository"),
             Self::Checkout => write!(f, "Checking out ref"),
             Self::DependencyCheck => write!(f, "Checking dependencies"),
@@ -336,6 +342,13 @@ mod tests {
     fn test_null_reporter_accepts_all_events() {
         let reporter = NullReporter;
         reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Preflight,
+            message: "Verifying...".into(),
+        });
+        reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::Preflight,
+        });
+        reporter.report(&BuildEvent::PhaseStarted {
             phase: BuildPhase::Clone,
             message: "Cloning...".into(),
         });
@@ -378,6 +391,7 @@ mod tests {
 
     #[test]
     fn test_build_phase_display() {
+        assert_eq!(BuildPhase::Preflight.to_string(), "Verifying reference");
         assert_eq!(BuildPhase::Clone.to_string(), "Cloning repository");
         assert_eq!(BuildPhase::Build.to_string(), "Building");
         assert_eq!(BuildPhase::CollectArtifacts.to_string(), "Collecting artifacts");
