@@ -1044,10 +1044,23 @@ impl<'a> BuildCommand<'a> {
 
         match (requirement, version) {
             (VersionRequirement::Required, None) => {
-                Err(Error::Build(format!(
-                    "Project '{}' requires a version. Use: build(\"{}\", Some(\"X.Y.Z\"), ...)",
-                    project, project
-                )))
+                // No explicit version provided — try the builder's default before erroring.
+                // This covers builders like BackWPup that define a development version
+                // (e.g., "9.99.99") so CLI users don't have to pass --ver every time
+                // for clone-build flows, while download_release() still sees None
+                // and correctly skips the "ignoring provided version" warning.
+                if let Some(default) = builder.default_version() {
+                    tracing::debug!(
+                        "Using builder default version '{}' for '{}'",
+                        default, project
+                    );
+                    Ok(default.to_string())
+                } else {
+                    Err(Error::Build(format!(
+                        "Project '{}' requires a version. Use: build(\"{}\", Some(\"X.Y.Z\"), ...)",
+                        project, project
+                    )))
+                }
             }
             (VersionRequirement::Required, Some(v)) => {
                 tracing::debug!("Using required version: {}", v);

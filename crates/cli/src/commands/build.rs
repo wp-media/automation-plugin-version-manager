@@ -73,8 +73,10 @@ impl BuildArgs {
         let project = apvm.registry.get(&self.plugin)?;
         let builder = project.builder.as_ref();
 
-        // 2. Determine version (CLI arg > builder default)
-        let version = self.resolve_version(builder);
+        // 2. Determine version: pass only the user's explicit --ver to core.
+        //    Builder defaults (e.g., 9.99.99) are handled by core's resolve_version()
+        //    so that download_release() can distinguish "user provided" from "no version".
+        let version = self.version.clone();
 
         // 3. Check for unnecessary version parameter
         if self.version.is_some() && builder.version_requirement() == VersionRequirement::Embedded {
@@ -218,14 +220,7 @@ impl BuildArgs {
         Ok(())
     }
 
-    /// Resolve version to use.
-    ///
-    /// Priority: CLI argument > builder default > None
-    fn resolve_version(&self, builder: &dyn apvm_core::build::plugins::Builder) -> Option<String> {
-        self.version.clone().or_else(|| {
-            builder.default_version().map(|s| s.to_string())
-        })
-    }
+
 
     /// Resolve variants to use.
     ///
