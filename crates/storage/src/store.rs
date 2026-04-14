@@ -201,7 +201,10 @@ impl ArtifactStore {
     fn calculate_sha256(&self, path: &Path) -> Result<String> {
         let bytes = std::fs::read(path)?;
         let hash = Sha256::digest(&bytes);
-        Ok(format!("{:x}", hash))
+        // sha2 0.11 returns an Array newtype; format each byte as two hex digits.
+        // Source: https://doc.rust-lang.org/std/fmt/trait.LowerHex.html (u8 impl)
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(hex)
     }
 
     /// Find builds by source (PR, tag, branch, commit).

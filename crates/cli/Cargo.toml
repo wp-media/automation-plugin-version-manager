@@ -2,6 +2,7 @@
 name = "apvm"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors = ["Sandy Figueroa <sandy@wp-media.me>"]
 description = "Build and manage WordPress plugin versions"
 

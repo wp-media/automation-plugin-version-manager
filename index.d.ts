@@ -567,6 +567,10 @@ export interface JsBuildOutput {
  * ```
  */
 export declare const enum JsBuildPhase {
+  /** Pre-clone verification of GitHub references (PR existence, etc.). */
+  Preflight = 'Preflight',
+  /** Downloading pre-built assets from a GitHub Release. */
+  ReleaseDownload = 'ReleaseDownload',
   /** Cloning the git repository. */
   Clone = 'Clone',
   /** Checking out the target ref (branch, tag, PR, commit). */
@@ -705,11 +709,12 @@ export interface JsProducedArtifact {
  *   case 'branch': console.log(`Branch: ${source.value}`); break;
  *   case 'tag': console.log(`Tag: ${source.value}`); break;
  *   case 'commit': console.log(`Commit: ${source.value}`); break;
+ *   case 'release': console.log(`Release: ${source.value}`); break;
  * }
  * ```
  */
 export interface JsRefSource {
-  /** The type of reference: `"pull_request"`, `"branch"`, `"tag"`, or `"commit"`. */
+  /** The type of reference: `"pull_request"`, `"branch"`, `"tag"`, `"commit"`, or `"release"`. */
   type: string
   /**
    * The value associated with the reference type.
@@ -718,6 +723,7 @@ export interface JsRefSource {
    * - For `branch`: the branch name (e.g., `"develop"`)
    * - For `tag`: the tag name (e.g., `"v1.0.0"`)
    * - For `commit`: the commit SHA (e.g., `"a1b2c3d"`)
+   * - For `release`: the release tag (e.g., `"5.6.8"`)
    */
   value: string
   /** A human-readable description (e.g., `"PR #123"`, `"branch 'develop'"`) */

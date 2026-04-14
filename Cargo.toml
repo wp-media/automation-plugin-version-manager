@@ -1,56 +1,73 @@
 [workspace]
 members = ["crates/*"]
-resolver = "2"
+# Resolver v3: edition 2024 default, MSRV-aware dep resolution (Rust 1.84+)
+# https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions
+resolver = "3"
 
 [workspace.package]
 version = "1.1.0"
 edition = "2024"
+rust-version = "1.94.1"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "macros", "process"] }
+# https://docs.rs/tokio/1 — SemVer stable since 1.0
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process"] }
 
 # GitHub API client
+# https://crates.io/crates/octocrab — pre-1.0, 0.49.x is compatible range
 octocrab = "0.49"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.149"
+# https://docs.rs/serde/1 — SemVer stable since 1.0
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Error handling
-thiserror = "2.0"
+# https://docs.rs/thiserror/2 — SemVer stable since 2.0
+thiserror = "2"
 
 # Logging and diagnostics
-tracing = "0.1.44"
+# https://docs.rs/tracing/0.1 — pre-1.0, 0.1.x is compatible range
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Platform directories (config, cache, etc.)
+# https://docs.rs/directories/6 — SemVer stable since 6.0
 directories = "6"
 
 # CLI argument parsing
-clap = { version = "4.5.58", features = ["derive", "color"] }
+# https://docs.rs/clap/4 — SemVer stable since 4.0
+clap = { version = "4", features = ["derive", "color"] }
 
 # Date/time
-chrono = { version = "0.4.43", features = ["serde"] }
+# https://docs.rs/chrono/0.4 — pre-1.0, 0.4.x is compatible range
+chrono = { version = "0.4", features = ["serde"] }
 
 # Hashing
-sha2 = "0.10"
+# https://docs.rs/sha2/0.11 — pre-1.0, 0.11.x is compatible range
+sha2 = "0.11"
 
 # File system utilities
-walkdir = "2.5"
+# https://docs.rs/walkdir/2 — SemVer stable since 2.0
+walkdir = "2"
 glob = "0.3"
 
 # Process utilities
-which = "8.0"
+# https://docs.rs/which/8 — SemVer stable since 8.0
+which = "8"
 
 # Progress indicators
+# https://docs.rs/indicatif/0.18 — pre-1.0, 0.18.x is compatible range
 indicatif = "0.18"
 
 # Testing utilities
-tempfile = "3.25"
+# https://docs.rs/tempfile/3 — SemVer stable since 3.0
+tempfile = "3"
 
 # HTTP client (for release asset downloads)
 # Uses native-tls to avoid crypto provider conflict with octocrab's rustls+ring
+# https://docs.rs/reqwest/0.13 — pre-1.0, 0.13.x is compatible range
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
 # Internal crates
@@ -59,9 +76,10 @@ apvm-core = { path = "crates/core" }
 apvm-storage = { path = "crates/storage" }
 
 # N-API bindings
-napi = { version = "3.8.3", default-features = false, features = ["async", "napi8"] }
-napi-derive = "3.5.2"
-napi-build = "2.3.1"
+# https://docs.rs/napi/3 — SemVer stable since 3.0
+napi = { version = "3", default-features = false, features = ["async", "napi8"] }
+napi-derive = "3"
+napi-build = "2"
 
 [profile.release]
 lto = "fat"

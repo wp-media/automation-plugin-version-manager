@@ -2,6 +2,7 @@
 name = "apvm-napi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Node.js bindings for APVM (Automation Plugin Version Manager)"
 license = "MIT"
 
