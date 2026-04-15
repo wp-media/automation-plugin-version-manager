@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  RUST_BACKTRACE: 1
+  NODE_VERSION: "24"
+
+jobs:
+  build-napi:
+    name: Build NAPI (${{ matrix.settings.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: apvm-napi.darwin-arm64.node
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: apvm-napi.darwin-x64.node
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            artifact: apvm-napi.linux-x64-gnu.node
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            artifact: apvm-napi.linux-arm64-gnu.node
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: apvm-napi.win32-x64-msvc.node
+    runs-on: ${{ matrix.settings.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.settings.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - run: npm install
+      - name: Build NAPI
+        run: npx napi build --release --platform --manifest-path crates/napi/Cargo.toml --output-dir . --target ${{ matrix.settings.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Upload .node artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: napi-${{ matrix.settings.target }}
+          path: ${{ matrix.settings.artifact }}
+          if-no-files-found: error
+      - name: Upload JS bindings
+        if: matrix.settings.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: napi-bindings
+          path: |
+            index.js
+            index.d.ts
+          if-no-files-found: error
+
+  test:
+    name: Test (${{ matrix.settings.name }})
+    needs: build-napi
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - name: Linux x64
+            os: ubuntu-22.04
+            napi-artifact: napi-x86_64-unknown-linux-gnu
+          - name: macOS ARM64
+            os: macos-latest
+            napi-artifact: napi-aarch64-apple-darwin
+          - name: Windows x64
+            os: windows-latest
+            napi-artifact: napi-x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.settings.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Plugin build dependencies (composer, gulp)
+      # composer is pre-installed on all runners
+      - name: Install gulp
+        run: npm install --global gulp-cli
+
+      # Rust tests
+      - name: Rust tests
+        run: cargo test --workspace
+
+      # Node tests
+      - name: Download NAPI binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.settings.napi-artifact }}
+      - run: npm install
+      - name: Node tests
+        run: npm test
+
+  commit-artifacts:
+    name: Commit Artifacts
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-napi, test]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download all NAPI artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: napi-*
+          merge-multiple: true
+      - name: Commit and push artifacts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add *.node index.js index.d.ts
+          git diff --staged --quiet && exit 0
+          git commit -m "chore: update NAPI binaries"
+          git pull --rebase
+          git push
+
+  # ── CI gate ──────────────────────────────────────────────────────────────
+  # Single required check for branch protection. With matrix strategies, job
+  # names are dynamic (e.g. "Build NAPI (x86_64-unknown-linux-gnu)"). This
+  # job provides one stable name — "CI" — to configure as a required status
+  # check, so matrix changes never break branch protection rules.
+  ci:
+    name: CI
+    if: always()
+    needs: [build-napi, test, commit-artifacts]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Check results
+        if: >-
+          needs.build-napi.result != 'success' ||
+          needs.test.result != 'success' ||
+          (needs.commit-artifacts.result != 'success' &&
+           needs.commit-artifacts.result != 'skipped')
+        run: exit 1
