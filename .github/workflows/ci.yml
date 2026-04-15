@@ -53,6 +53,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             artifact: apvm-napi.linux-arm64-gnu.node
+            # Vendor OpenSSL from source for cross-compilation (no system libssl-dev:arm64)
+            # https://docs.rs/openssl/latest/openssl/#vendored
+            features: vendored-openssl
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: apvm-napi.win32-x64-msvc.node
@@ -72,9 +75,15 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
       - run: npm install
       - name: Build NAPI
-        run: npx napi build --release --platform --manifest-path crates/napi/Cargo.toml --output-dir . --target ${{ matrix.settings.target }}
+        run: >
+          npx napi build --release --platform
+          --manifest-path crates/napi/Cargo.toml --output-dir .
+          --target ${{ matrix.settings.target }}
+          ${{ matrix.settings.features && format('--features {0}', matrix.settings.features) || '' }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
       - name: Upload .node artifact
         uses: actions/upload-artifact@v7
         with:

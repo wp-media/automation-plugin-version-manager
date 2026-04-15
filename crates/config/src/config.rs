@@ -136,7 +136,7 @@ impl Config {
 /// # Adding a new key
 ///
 /// 1. Add a variant here.
-/// 2. The compiler will guide you to update [`FromStr`], [`Display`],
+/// 2. The compiler will guide you to update [`FromStr`], [`fmt::Display`],
 ///    [`ConfigKey::all`], [`ConfigKey::is_sensitive`], and the
 ///    [`ConfigFile`] methods that match on this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

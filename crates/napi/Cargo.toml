@@ -9,6 +9,13 @@ license = "MIT"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Build OpenSSL from source for cross-compilation (e.g. aarch64-unknown-linux-gnu).
+# Activates the `vendored` feature of the `openssl` crate, which causes `openssl-sys`
+# to compile OpenSSL using the target's C cross-compiler instead of relying on
+# system-installed libraries. Only needed in CI for Linux ARM64 cross-builds.
+vendored-openssl = ["dep:openssl"]
+
 [dependencies]
 # Internal crates
 apvm-core = { workspace = true }
@@ -21,6 +28,9 @@ napi-derive = { workspace = true }
 
 # Async runtime (needs rt-multi-thread for napi async)
 tokio = { workspace = true }
+
+# OpenSSL vendored build — only activated by the `vendored-openssl` feature
+openssl = { workspace = true, optional = true }
 
 [build-dependencies]
 napi-build = { workspace = true }

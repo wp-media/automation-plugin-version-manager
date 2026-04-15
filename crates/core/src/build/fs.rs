@@ -114,7 +114,7 @@ pub fn matches_any_exclusion(filename: &str, patterns: &[ExclusionPattern<'_>]) 
 ///
 /// # Behavior
 ///
-/// - Uses [`WalkDir::filter_entry`] to prevent **descending** into excluded
+/// - Uses [`walkdir::IntoIter::filter_entry`] to prevent **descending** into excluded
 ///   directories entirely (critical for performance — e.g., `node_modules`
 ///   can contain 50,000+ files).
 ///   Source: <https://docs.rs/walkdir/2/walkdir/struct.IntoIter.html#method.filter_entry>

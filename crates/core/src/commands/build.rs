@@ -79,7 +79,7 @@ impl BuildOutput {
     /// Convert to storage metadata.
     ///
     /// Creates a [`BuildMetadata`] struct suitable for passing to
-    /// [`ArtifactStore::store()`].
+    /// [`apvm_storage::ArtifactStore::store()`].
     ///
     /// # Arguments
     ///
@@ -107,7 +107,7 @@ impl BuildOutput {
     /// Convert artifacts to storage format.
     ///
     /// Transforms [`ProducedArtifact`]s into [`SourceArtifact`]s suitable
-    /// for passing to [`ArtifactStore::store()`].
+    /// for passing to [`apvm_storage::ArtifactStore::store()`].
     ///
     /// # Returns
     ///

@@ -152,7 +152,7 @@ impl BuildWorkspace {
         self.temp_dir.path().join(&self.repo_name)
     }
 
-    /// Create a [`BuildContext`] from this workspace.
+    /// Create a [`crate::build::BuildContext`] from this workspace.
     ///
     /// Maps the workspace's directory structure to the build context:
     /// - `workspace_dir` → the temp directory root ([`path()`](Self::path))
