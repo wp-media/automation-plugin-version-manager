@@ -33,6 +33,8 @@ which = { workspace = true }
 
 # File system utilities
 glob = { workspace = true }
+walkdir = { workspace = true }
+zip = { workspace = true }
 
 # Platform directories
 directories = { workspace = true }

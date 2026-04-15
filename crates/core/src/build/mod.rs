@@ -22,6 +22,7 @@
 //! - [`plugins::detect_wordpress_readme_version`] - Parse readme.txt stable tag
 
 mod context;
+pub mod fs;
 pub mod plugins;
 pub mod progress;
 mod result;

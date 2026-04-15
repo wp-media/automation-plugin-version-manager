@@ -179,10 +179,24 @@ impl<'r> BuildRunner<'r> {
     }
 
     /// Run a shell command with repo dir as working/current directory.
+    ///
+    /// On Unix, delegates to `sh -c` (POSIX shell).
+    /// On Windows, delegates to `cmd /C` (Windows command interpreter).
+    ///
+    /// Source (Unix):   <https://pubs.opengroup.org/onlinepubs/9699919799/utilities/sh.html>
+    /// Source (Windows): <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd>
     pub async fn run(&self, command: &str) -> Result<BuildOutput> {
+        #[cfg(unix)]
         let output = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
+            .current_dir(self.context.repo_dir())
+            .output()
+            .await?;
+
+        #[cfg(windows)]
+        let output = tokio::process::Command::new("cmd")
+            .args(["/C", command])
             .current_dir(self.context.repo_dir())
             .output()
             .await?;

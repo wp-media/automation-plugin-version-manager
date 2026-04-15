@@ -33,6 +33,10 @@ use crate::error::Error;
 
 use super::{BuildArtifact, Builder, ToolDependency, VersionRequirement, detect_wordpress_plugin_version};
 use super::super::BuildContext;
+#[cfg(any(windows, test))]
+use super::super::fs::ExclusionPattern;
+#[cfg(windows)]
+use super::super::fs::{copy_dir_with_exclusions, create_zip_archive};
 use super::super::progress::{BuildEvent, BuildStep, ProgressReporter};
 
 /// Builder for the WP Rocket project.
@@ -90,11 +94,30 @@ const RSYNC_EXCLUDES: &[&str] = &[
 ///
 /// These catch any remaining dev/tooling files that made it through
 /// the rsync step (e.g., dotfiles inside subdirectories).
+///
+/// Original shell patterns and their Rust equivalents:
+/// - `*/.*`          → `Prefix(".")`     — dotfiles in any subdirectory
+/// - `*/gulpfile.js` → `Exact("gulpfile.js")` — exact match
+/// - `*/package*`    → `Prefix("package")` — package.json, package-lock.json, etc.
+/// - `*/php*`        → `Prefix("php")`     — phpunit.xml, phpcs.xml, etc.
+#[cfg(unix)]
 const ZIP_EXCLUDES: &[&str] = &[
     "*/.*",
     "*/gulpfile.js",
     "*/package*",
     "*/php*",
+];
+
+/// Filename exclusion patterns for the zip archive (Windows path, pure Rust).
+///
+/// Equivalent to the shell `zip -x` patterns in [`ZIP_EXCLUDES`].
+/// Used by [`create_zip_archive`] from the [`fs`](super::super::fs) module.
+#[cfg(any(windows, test))]
+const ZIP_EXCLUSION_PATTERNS: &[ExclusionPattern<'static>] = &[
+    ExclusionPattern::Prefix("."),
+    ExclusionPattern::Exact("gulpfile.js"),
+    ExclusionPattern::Prefix("package"),
+    ExclusionPattern::Prefix("php"),
 ];
 
 impl Builder for WpRocketBuilder {
@@ -124,11 +147,24 @@ impl Builder for WpRocketBuilder {
     // =========================================================================
 
     fn tool_dependencies(&self) -> Vec<ToolDependency> {
-        vec![
-            ToolDependency::required("rsync"),
-            ToolDependency::required("composer"),
-            ToolDependency::required("zip"),
-        ]
+        // On Unix, rsync and zip are required as external shell tools.
+        // On Windows, they are replaced by pure Rust implementations
+        // (walkdir + std::fs::copy for rsync, zip crate for archiving).
+        #[cfg(unix)]
+        {
+            vec![
+                ToolDependency::required("rsync"),
+                ToolDependency::required("composer"),
+                ToolDependency::required("zip"),
+            ]
+        }
+
+        #[cfg(windows)]
+        {
+            vec![
+                ToolDependency::required("composer"),
+            ]
+        }
     }
 
     /// No setup commands needed — dependencies are installed inside the
@@ -145,6 +181,8 @@ impl Builder for WpRocketBuilder {
     ///
     /// 1. Removes any existing `wp-rocket-*.zip` from the workspace dir.
     /// 2. Removes any leftover staging directory from a previous interrupted build.
+    /// 3. (Windows only) Creates the staging directory and copies source files,
+    ///    replacing the `mkdir -p` + `rsync` shell commands with pure Rust equivalents.
     fn pre_build_hook(
         &self,
         context: &BuildContext,
@@ -190,6 +228,11 @@ impl Builder for WpRocketBuilder {
             step: BuildStep::new("Cleaning previous artifacts", "rm wp-rocket-*.zip"),
         });
 
+        // Windows: create staging directory and copy source files (replaces mkdir + rsync).
+        // Uses pure Rust via build::fs utilities — no external tools needed.
+        #[cfg(windows)]
+        self.prepare_staging(context, reporter)?;
+
         Ok(())
     }
 
@@ -220,80 +263,41 @@ impl Builder for WpRocketBuilder {
         Ok(())
     }
 
+    /// Hook called during the build to create the zip archive (Windows only).
+    ///
+    /// On Unix, the zip is created by a shell command in `build_commands()`.
+    /// On Windows, we use the pure Rust `create_zip_archive` utility.
+    fn build_hook(
+        &self,
+        context: &BuildContext,
+        version: &str,
+        _variants: &[&str],
+        reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
+        #[cfg(windows)]
+        self.create_archive(context, version, reporter)?;
+
+        // Suppress unused parameter warnings on Unix
+        let _ = (context, version, reporter);
+
+        Ok(())
+    }
+
     // =========================================================================
     // Build Execution
     // =========================================================================
 
     /// Generate the build commands that replicate the release script.
     ///
-    /// The original shell script runs from the **parent** of the repository
-    /// directory and references the repo by name. Here we use absolute paths
-    /// derived from the build context to achieve the same layout:
-    ///
-    /// ```text
-    /// workspace_dir/                     ← scratch space (staging + artifact)
-    /// ├── wp-rocket-3.17.4.zip         ← final artifact (outside repo)
-    /// ├── wp-rocket-tmp/
-    /// │   └── wp-rocket/               ← rsync'd copy + composer deps
-    /// └── wp-rocket/                   ← repo_dir (source code)
-    ///     ├── .git/
-    ///     └── wp-rocket.php
-    /// ```
+    /// On **Unix**, generates 4 shell commands (mkdir, rsync, composer, zip).
+    /// On **Windows**, generates only 1 shell command (composer install),
+    /// because mkdir/rsync/zip are handled by pure Rust in hooks.
     fn build_commands(&self, context: &BuildContext, version: &str, _variants: &[&str]) -> Vec<BuildStep> {
-        let repo_dir = context.repo_dir().display();
-        let workspace_dir = context.workspace_dir().display();
-        let artifact = artifact_name(version);
+        #[cfg(unix)]
+        { self.build_commands_unix(context, version) }
 
-        // Build the rsync exclude flags
-        let rsync_excludes: String = RSYNC_EXCLUDES
-            .iter()
-            .map(|e| format!("--exclude {}", e))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Build the zip exclude flags
-        let zip_excludes: String = ZIP_EXCLUDES
-            .iter()
-            .map(|e| format!("-x \"{}\"", e))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let staging_dir = format!("{}/{}", workspace_dir, STAGING_DIR);
-        let staging_plugin_dir = format!("{}/{}", staging_dir, PLUGIN_DIR_NAME);
-
-        vec![
-            // 1. Create staging directory structure
-            BuildStep::new(
-                "Creating staging directory",
-                format!("mkdir -p {}/", staging_plugin_dir),
-            ),
-
-            // 2. Copy repo contents into staging, excluding dev files
-            //    rsync trailing slash on source means "copy contents of"
-            BuildStep::new(
-                "Copying source files to staging",
-                format!(
-                    "rsync -av {repo_dir}/ {staging_plugin_dir}/ {rsync_excludes}",
-                ),
-            ),
-
-            // 3. Install production Composer dependencies in the staging copy
-            BuildStep::new(
-                "Installing production dependencies",
-                format!(
-                    "cd {staging_plugin_dir} && composer install --no-dev --no-scripts --no-interaction",
-                ),
-            ),
-
-            // 4. Create the zip archive from the staging directory
-            //    Output goes to workspace_dir to keep the repo clean
-            BuildStep::new(
-                "Creating plugin archive",
-                format!(
-                    "cd {staging_dir} && zip -r {workspace_dir}/{artifact} {PLUGIN_DIR_NAME} {zip_excludes}",
-                ),
-            ),
-        ]
+        #[cfg(windows)]
+        { self.build_commands_windows(context) }
     }
 
     /// Return the single artifact produced by the build.
@@ -316,6 +320,219 @@ impl Builder for WpRocketBuilder {
             source_path: artifact.to_string_lossy().into_owned(),
             target_name: name,
         }])
+    }
+}
+
+// =============================================================================
+// Platform-Specific Helpers
+// =============================================================================
+
+impl WpRocketBuilder {
+    /// Generate Unix build commands using shell tools (mkdir, rsync, composer, zip).
+    ///
+    /// The original shell script runs from the **parent** of the repository
+    /// directory and references the repo by name. Here we use absolute paths
+    /// derived from the build context to achieve the same layout:
+    ///
+    /// ```text
+    /// workspace_dir/                     ← scratch space (staging + artifact)
+    /// ├── wp-rocket-3.17.4.zip         ← final artifact (outside repo)
+    /// ├── wp-rocket-tmp/
+    /// │   └── wp-rocket/               ← rsync'd copy + composer deps
+    /// └── wp-rocket/                   ← repo_dir (source code)
+    ///     ├── .git/
+    ///     └── wp-rocket.php
+    /// ```
+    #[cfg(unix)]
+    fn build_commands_unix(&self, context: &BuildContext, version: &str) -> Vec<BuildStep> {
+        let repo_dir = context.repo_dir().display();
+        let workspace_dir = context.workspace_dir().display();
+        let artifact = artifact_name(version);
+
+        // Build the rsync exclude flags
+        let rsync_excludes: String = RSYNC_EXCLUDES
+            .iter()
+            .map(|e| format!("--exclude {e}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Build the zip exclude flags
+        let zip_excludes: String = ZIP_EXCLUDES
+            .iter()
+            .map(|e| format!("-x \"{e}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let staging_dir = format!("{workspace_dir}/{STAGING_DIR}");
+        let staging_plugin_dir = format!("{staging_dir}/{PLUGIN_DIR_NAME}");
+
+        vec![
+            // 1. Create staging directory structure
+            BuildStep::new(
+                "Creating staging directory",
+                format!("mkdir -p {staging_plugin_dir}/"),
+            ),
+
+            // 2. Copy repo contents into staging, excluding dev files
+            //    rsync trailing slash on source means "copy contents of"
+            BuildStep::new(
+                "Copying source files to staging",
+                format!("rsync -av {repo_dir}/ {staging_plugin_dir}/ {rsync_excludes}"),
+            ),
+
+            // 3. Install production Composer dependencies in the staging copy
+            BuildStep::new(
+                "Installing production dependencies",
+                format!("cd {staging_plugin_dir} && composer install --no-dev --no-scripts --no-interaction"),
+            ),
+
+            // 4. Create the zip archive from the staging directory
+            //    Output goes to workspace_dir to keep the repo clean
+            BuildStep::new(
+                "Creating plugin archive",
+                format!("cd {staging_dir} && zip -r {workspace_dir}/{artifact} {PLUGIN_DIR_NAME} {zip_excludes}"),
+            ),
+        ]
+    }
+
+    /// Generate Windows build commands.
+    ///
+    /// Only includes the composer install step. The mkdir + rsync equivalent
+    /// is handled by [`prepare_staging`](Self::prepare_staging) in `pre_build_hook`,
+    /// and the zip creation by [`create_archive`](Self::create_archive) in `build_hook`.
+    ///
+    /// `cd /d` is used instead of `cd` to support changing drives on Windows.
+    /// Source: <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cd>
+    #[cfg(windows)]
+    fn build_commands_windows(&self, context: &BuildContext) -> Vec<BuildStep> {
+        let staging_plugin_dir = context
+            .workspace_dir()
+            .join(STAGING_DIR)
+            .join(PLUGIN_DIR_NAME);
+
+        vec![
+            BuildStep::new(
+                "Installing production dependencies",
+                format!(
+                    "cd /d {} && composer install --no-dev --no-scripts --no-interaction",
+                    staging_plugin_dir.display(),
+                ),
+            ),
+        ]
+    }
+
+    /// Create the staging directory and copy repository contents, excluding dev files.
+    ///
+    /// This is the pure Rust equivalent of:
+    /// ```sh
+    /// mkdir -p staging_dir/wp-rocket/
+    /// rsync -av repo_dir/ staging_dir/wp-rocket/ --exclude node_modules ...
+    /// ```
+    ///
+    /// Uses [`copy_dir_with_exclusions`] from the [`fs`](super::super::fs) module
+    /// which relies on [`walkdir::WalkDir::filter_entry`] to skip excluded directories
+    /// entirely (preventing descent into large dirs like `node_modules`).
+    #[cfg(windows)]
+    fn prepare_staging(
+        &self,
+        context: &BuildContext,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
+        let staging_plugin_dir = context
+            .workspace_dir()
+            .join(STAGING_DIR)
+            .join(PLUGIN_DIR_NAME);
+
+        // mkdir -p equivalent
+        reporter.report(&BuildEvent::StepStarted {
+            step: BuildStep::new(
+                "Creating staging directory",
+                staging_plugin_dir.display().to_string(),
+            ),
+        });
+        std::fs::create_dir_all(&staging_plugin_dir).map_err(|e| {
+            Error::Build(format!(
+                "Failed to create staging directory '{}': {e}",
+                staging_plugin_dir.display()
+            ))
+        })?;
+        reporter.report(&BuildEvent::StepCompleted {
+            step: BuildStep::new(
+                "Creating staging directory",
+                staging_plugin_dir.display().to_string(),
+            ),
+        });
+
+        // rsync -av equivalent
+        reporter.report(&BuildEvent::StepStarted {
+            step: BuildStep::new(
+                "Copying source files to staging",
+                "copy with exclusions",
+            ),
+        });
+        let files_copied =
+            copy_dir_with_exclusions(context.repo_dir(), &staging_plugin_dir, RSYNC_EXCLUDES)?;
+        tracing::info!("Copied {} files to staging directory", files_copied);
+        reporter.report(&BuildEvent::StepCompleted {
+            step: BuildStep::new(
+                "Copying source files to staging",
+                "copy with exclusions",
+            ),
+        });
+
+        Ok(())
+    }
+
+    /// Create a zip archive from the staging directory.
+    ///
+    /// This is the pure Rust equivalent of:
+    /// ```sh
+    /// cd staging_dir && zip -r workspace_dir/wp-rocket-3.17.4.zip wp-rocket -x "*/.*" ...
+    /// ```
+    ///
+    /// Uses [`create_zip_archive`] from the [`fs`](super::super::fs) module
+    /// with Deflate compression, matching the default behavior of the `zip`
+    /// command-line tool.
+    #[cfg(windows)]
+    fn create_archive(
+        &self,
+        context: &BuildContext,
+        version: &str,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<()> {
+        let staging_plugin_dir = context
+            .workspace_dir()
+            .join(STAGING_DIR)
+            .join(PLUGIN_DIR_NAME);
+        let archive_path = context.workspace_dir().join(artifact_name(version));
+
+        reporter.report(&BuildEvent::StepStarted {
+            step: BuildStep::new(
+                "Creating plugin archive",
+                archive_path.display().to_string(),
+            ),
+        });
+
+        let entries_written = create_zip_archive(
+            &staging_plugin_dir,
+            &archive_path,
+            PLUGIN_DIR_NAME,
+            ZIP_EXCLUSION_PATTERNS,
+        )?;
+        tracing::info!(
+            "Created archive '{}' with {} entries",
+            archive_path.display(),
+            entries_written
+        );
+
+        reporter.report(&BuildEvent::StepCompleted {
+            step: BuildStep::new(
+                "Creating plugin archive",
+                archive_path.display().to_string(),
+            ),
+        });
+
+        Ok(())
     }
 }
 
@@ -408,7 +625,8 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_tool_dependencies() {
+    #[cfg(unix)]
+    fn test_tool_dependencies_unix() {
         let deps = builder().tool_dependencies();
         assert_eq!(deps.len(), 3);
 
@@ -422,6 +640,21 @@ mod tests {
 
         // None have auto-install commands (system tools)
         assert!(deps.iter().all(|d| d.install_commands.is_empty()));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_tool_dependencies_windows() {
+        let deps = builder().tool_dependencies();
+        assert_eq!(deps.len(), 1);
+
+        let names: Vec<&str> = deps.iter().map(|d| d.name).collect();
+        assert!(names.contains(&"composer"));
+        // rsync and zip are NOT required on Windows (pure Rust replacements)
+        assert!(!names.contains(&"rsync"));
+        assert!(!names.contains(&"zip"));
+
+        assert!(deps.iter().all(|d| d.required));
     }
 
     // =========================================================================
@@ -466,6 +699,7 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[cfg(unix)]
     fn test_build_commands_structure() {
         let (_ws, context) = test_context();
         let version = "3.17.4";
@@ -519,6 +753,22 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn test_build_commands_structure_windows() {
+        let (_ws, context) = test_context();
+        let version = "3.17.4";
+        let commands = builder().build_commands(&context, version, &[]);
+
+        // Windows: only composer install (mkdir + rsync + zip handled by Rust)
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].command.contains("composer install"));
+        assert!(commands[0].command.contains("--no-dev"));
+        assert!(commands[0].command.contains("--no-scripts"));
+        assert!(commands[0].command.contains("cd /d"));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_build_commands_version_affects_artifact_name() {
         let (_ws, context) = test_context();
         let cmds_a = builder().build_commands(&context, "3.17.4", &[]);
@@ -646,5 +896,41 @@ mod tests {
         assert_eq!(artifact_name("3.17.4"), "wp-rocket-3.17.4.zip");
         assert_eq!(artifact_name("4.0.0-beta1"), "wp-rocket-4.0.0-beta1.zip");
         assert_eq!(artifact_name("1.0.0"), "wp-rocket-1.0.0.zip");
+    }
+
+    // =========================================================================
+    // ZIP Exclusion Patterns
+    // =========================================================================
+
+    #[test]
+    fn test_zip_exclusion_patterns_match_expected_files() {
+        use crate::build::fs::matches_any_exclusion;
+
+        // Dotfiles — matches original `*/.*`
+        assert!(matches_any_exclusion(".git", ZIP_EXCLUSION_PATTERNS));
+        assert!(matches_any_exclusion(".env", ZIP_EXCLUSION_PATTERNS));
+        assert!(matches_any_exclusion(".gitignore", ZIP_EXCLUSION_PATTERNS));
+
+        // gulpfile.js — matches original `*/gulpfile.js`
+        assert!(matches_any_exclusion("gulpfile.js", ZIP_EXCLUSION_PATTERNS));
+
+        // package* — matches original `*/package*`
+        assert!(matches_any_exclusion("package.json", ZIP_EXCLUSION_PATTERNS));
+        assert!(matches_any_exclusion("package-lock.json", ZIP_EXCLUSION_PATTERNS));
+
+        // php* — matches original `*/php*`
+        assert!(matches_any_exclusion("phpunit.xml", ZIP_EXCLUSION_PATTERNS));
+        assert!(matches_any_exclusion("phpcs.xml", ZIP_EXCLUSION_PATTERNS));
+    }
+
+    #[test]
+    fn test_zip_exclusion_patterns_do_not_match_production_files() {
+        use crate::build::fs::matches_any_exclusion;
+
+        assert!(!matches_any_exclusion("wp-rocket.php", ZIP_EXCLUSION_PATTERNS));
+        assert!(!matches_any_exclusion("index.php", ZIP_EXCLUSION_PATTERNS));
+        assert!(!matches_any_exclusion("readme.txt", ZIP_EXCLUSION_PATTERNS));
+        assert!(!matches_any_exclusion("style.css", ZIP_EXCLUSION_PATTERNS));
+        assert!(!matches_any_exclusion("inc", ZIP_EXCLUSION_PATTERNS));
     }
 }
