@@ -38,6 +38,7 @@ use napi_derive::napi;
 ///   githubToken: 'ghp_xxxxxxxxxxxx',
 /// };
 /// ```
+#[derive(Default)]
 #[napi(object)]
 pub struct ApvmConfig {
     /// Directory where built artifacts will be stored.
@@ -84,15 +85,6 @@ impl From<ApvmConfig> for apvm_config::Config {
         match js_config.github_token {
             Some(token) => config.set_token(token),
             None => config,
-        }
-    }
-}
-
-impl Default for ApvmConfig {
-    fn default() -> Self {
-        Self {
-            builds_dir: None,
-            github_token: None,
         }
     }
 }

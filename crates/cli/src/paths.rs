@@ -194,10 +194,7 @@ mod tests {
             paths.config_file(),
             &PathBuf::from("/var/lib/apvm/config.json")
         );
-        assert_eq!(
-            paths.builds_dir(),
-            &PathBuf::from("/var/lib/apvm/builds")
-        );
+        assert_eq!(paths.builds_dir(), &PathBuf::from("/var/lib/apvm/builds"));
     }
 
     #[test]

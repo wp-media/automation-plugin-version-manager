@@ -64,11 +64,9 @@ impl ArtifactStore {
         source_artifacts: &[SourceArtifact],
         metadata: &BuildMetadata,
     ) -> Result<StoreResult> {
-        let commit_dir = self.paths.commit_dir(
-            &metadata.project,
-            &metadata.version,
-            &metadata.commit_short,
-        );
+        let commit_dir =
+            self.paths
+                .commit_dir(&metadata.project, &metadata.version, &metadata.commit_short);
 
         // Check for existing manifest
         let existing_manifest = if commit_dir.exists() {
@@ -133,11 +131,7 @@ impl ArtifactStore {
 
             stored_files.push(target_path);
 
-            tracing::debug!(
-                "Stored artifact: {} ({} bytes)",
-                artifact.target_name,
-                size
-            );
+            tracing::debug!("Stored artifact: {} ({} bytes)", artifact.target_name, size);
         }
 
         // Save manifest
@@ -180,11 +174,9 @@ impl ArtifactStore {
         let target = self.paths.relative_commit_path(&metadata.commit_short);
 
         #[cfg(windows)]
-        let target = self.paths.commit_dir(
-            &metadata.project,
-            &metadata.version,
-            &metadata.commit_short,
-        );
+        let target =
+            self.paths
+                .commit_dir(&metadata.project, &metadata.version, &metadata.commit_short);
 
         create_dir_link(&target, &link_path)?;
 
@@ -239,12 +231,11 @@ impl ArtifactStore {
                 None
             };
 
-            if let Some(dir) = commit_dir {
-                if dir.exists() {
-                    if let Ok(Some(build)) = self.load_stored_build(&dir) {
-                        builds.push(build);
-                    }
-                }
+            if let Some(dir) = commit_dir
+                && dir.exists()
+                && let Ok(Some(build)) = self.load_stored_build(&dir)
+            {
+                builds.push(build);
             }
         }
 
@@ -261,7 +252,10 @@ impl ArtifactStore {
         version: &str,
         source: &BuildSource,
     ) -> Result<Option<StoredBuild>> {
-        Ok(self.find_by_source(project, version, source)?.into_iter().next())
+        Ok(self
+            .find_by_source(project, version, source)?
+            .into_iter()
+            .next())
     }
 
     /// Find a build by commit.
@@ -355,12 +349,12 @@ impl ArtifactStore {
 
         for entry in std::fs::read_dir(base)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    // Skip hidden directories
-                    if !name.starts_with('.') {
-                        projects.push(name.to_string());
-                    }
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                // Skip hidden directories
+                if !name.starts_with('.') {
+                    projects.push(name.to_string());
                 }
             }
         }
@@ -385,10 +379,10 @@ impl ArtifactStore {
                 // Walk version directories
                 for v_entry in std::fs::read_dir(mm_entry.path())? {
                     let v_entry = v_entry?;
-                    if v_entry.file_type()?.is_dir() {
-                        if let Some(name) = v_entry.file_name().to_str() {
-                            versions.push(name.to_string());
-                        }
+                    if v_entry.file_type()?.is_dir()
+                        && let Some(name) = v_entry.file_name().to_str()
+                    {
+                        versions.push(name.to_string());
                     }
                 }
             }
@@ -409,10 +403,10 @@ impl ArtifactStore {
 
         for entry in std::fs::read_dir(&source_dir)? {
             let entry = entry?;
-            if let Some(name) = entry.file_name().to_str() {
-                if let Some(source) = BuildSource::from_dir_name(name) {
-                    sources.push(source);
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && let Some(source) = BuildSource::from_dir_name(name)
+            {
+                sources.push(source);
             }
         }
 
@@ -430,10 +424,10 @@ impl ArtifactStore {
 
         for entry in std::fs::read_dir(&commit_dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    commits.push(name.to_string());
-                }
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                commits.push(name.to_string());
             }
         }
 
@@ -442,12 +436,7 @@ impl ArtifactStore {
     }
 
     /// Delete a build by commit.
-    pub fn delete_by_commit(
-        &self,
-        project: &str,
-        version: &str,
-        commit_short: &str,
-    ) -> Result<()> {
+    pub fn delete_by_commit(&self, project: &str, version: &str, commit_short: &str) -> Result<()> {
         let commit_dir = self.paths.commit_dir(project, version, commit_short);
 
         if commit_dir.exists() {
@@ -497,18 +486,18 @@ impl ArtifactStore {
         // Update manifests to remove this source
         for commit_short in &commits_affected {
             let commit_dir = self.paths.commit_dir(project, version, commit_short);
-            if commit_dir.exists() {
-                if let Ok(mut manifest) = BuildManifest::load(&commit_dir) {
-                    // Remove the source from the manifest
-                    manifest.sources.retain(|s| &s.source != source);
-                    manifest.save(&commit_dir)?;
+            if commit_dir.exists()
+                && let Ok(mut manifest) = BuildManifest::load(&commit_dir)
+            {
+                // Remove the source from the manifest
+                manifest.sources.retain(|s| &s.source != source);
+                manifest.save(&commit_dir)?;
 
-                    // Check if commit is now orphaned (no sources reference it)
-                    if delete_orphan_commits && manifest.sources.is_empty() {
-                        std::fs::remove_dir_all(&commit_dir)?;
-                        orphan_commits_deleted.push(commit_short.clone());
-                        tracing::info!("Deleted orphan commit: {}", commit_short);
-                    }
+                // Check if commit is now orphaned (no sources reference it)
+                if delete_orphan_commits && manifest.sources.is_empty() {
+                    std::fs::remove_dir_all(&commit_dir)?;
+                    orphan_commits_deleted.push(commit_short.clone());
+                    tracing::info!("Deleted orphan commit: {}", commit_short);
                 }
             }
         }
@@ -531,7 +520,9 @@ impl ArtifactStore {
         commit_short: &str,
         delete_if_orphan: bool,
     ) -> Result<bool> {
-        let link_path = self.paths.source_link(project, version, source, commit_short);
+        let link_path = self
+            .paths
+            .source_link(project, version, source, commit_short);
 
         if !link_path.exists() && !crate::link::is_link(&link_path) {
             return Ok(false);
@@ -545,17 +536,17 @@ impl ArtifactStore {
         let commit_dir = self.paths.commit_dir(project, version, commit_short);
         let mut is_orphan = false;
 
-        if commit_dir.exists() {
-            if let Ok(mut manifest) = BuildManifest::load(&commit_dir) {
-                manifest.sources.retain(|s| &s.source != source);
-                manifest.save(&commit_dir)?;
+        if commit_dir.exists()
+            && let Ok(mut manifest) = BuildManifest::load(&commit_dir)
+        {
+            manifest.sources.retain(|s| &s.source != source);
+            manifest.save(&commit_dir)?;
 
-                is_orphan = manifest.sources.is_empty();
+            is_orphan = manifest.sources.is_empty();
 
-                if delete_if_orphan && is_orphan {
-                    std::fs::remove_dir_all(&commit_dir)?;
-                    tracing::info!("Deleted orphan commit: {}", commit_short);
-                }
+            if delete_if_orphan && is_orphan {
+                std::fs::remove_dir_all(&commit_dir)?;
+                tracing::info!("Deleted orphan commit: {}", commit_short);
             }
         }
 
@@ -596,11 +587,11 @@ impl ArtifactStore {
                     let target = std::fs::read_link(&link_path);
                     let resolved = target.map(|t| link_path.parent().unwrap().join(t));
 
-                    if let Ok(path) = resolved {
-                        if !path.exists() {
-                            crate::link::remove_dir_link(&link_path)?;
-                            tracing::debug!("Removed dangling link: {}", link_path.display());
-                        }
+                    if let Ok(path) = resolved
+                        && !path.exists()
+                    {
+                        crate::link::remove_dir_link(&link_path)?;
+                        tracing::debug!("Removed dangling link: {}", link_path.display());
                     }
                 }
             }

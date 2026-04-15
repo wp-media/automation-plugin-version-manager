@@ -579,7 +579,12 @@ pub trait Builder: Send + Sync {
     /// * `context` - The build context with repo and workspace paths
     /// * `version` - The version being built (may be empty if not required)
     /// * `variants` - The variants to build (empty = all)
-    fn build_commands(&self, context: &BuildContext, version: &str, variants: &[&str]) -> Vec<BuildStep>;
+    fn build_commands(
+        &self,
+        context: &BuildContext,
+        version: &str,
+        variants: &[&str],
+    ) -> Vec<BuildStep>;
 
     /// Get the artifacts produced by the build.
     ///
@@ -597,7 +602,12 @@ pub trait Builder: Send + Sync {
     /// # Returns
     ///
     /// A list of artifacts with resolved source paths.
-    fn artifacts(&self, context: &BuildContext, version: &str, variants: &[&str]) -> Result<Vec<BuildArtifact>>;
+    fn artifacts(
+        &self,
+        context: &BuildContext,
+        version: &str,
+        variants: &[&str],
+    ) -> Result<Vec<BuildArtifact>>;
 
     /// Get the subdirectory where the build should run.
     ///
@@ -730,7 +740,7 @@ pub fn detect_wordpress_plugin_version(php_file: &Path) -> Result<Option<String>
     // Matches: "Version: 1.2.3", "Version:1.2.3", " * Version: 1.2.3"
     for line in header_section.lines() {
         let line = line.trim();
-        
+
         // Skip if line doesn't contain "version" (case-insensitive quick check)
         if !line.to_lowercase().contains("version") {
             continue;
@@ -771,12 +781,18 @@ fn is_valid_version(s: &str) -> bool {
     }
 
     // Must start with a digit
-    if !s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if !s
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         return false;
     }
 
     // Allow digits, dots, hyphens, and alphanumerics
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
 }
 
 /// Detect version from a readme.txt "Stable tag" header.
@@ -806,7 +822,11 @@ pub fn detect_wordpress_readme_version(readme_file: &Path) -> Result<Option<Stri
         Err(e) => {
             return Err(Error::Io(std::io::Error::new(
                 e.kind(),
-                format!("Failed to read readme file '{}': {}", readme_file.display(), e),
+                format!(
+                    "Failed to read readme file '{}': {}",
+                    readme_file.display(),
+                    e
+                ),
             )));
         }
     };
@@ -838,11 +858,10 @@ mod tests {
         assert!(is_valid_version("1.0.0-beta"));
         assert!(is_valid_version("1.0.0-beta.1"));
         assert!(is_valid_version("1.0.0+build123"));
-        
+
         assert!(!is_valid_version(""));
         assert!(!is_valid_version("   "));
         assert!(!is_valid_version("vX.Y"));
         assert!(!is_valid_version("latest"));
     }
 }
-

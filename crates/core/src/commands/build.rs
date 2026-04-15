@@ -8,8 +8,8 @@ use crate::build::progress::{BuildEvent, BuildPhase, BuildStep, ProgressReporter
 use crate::build::{BuildResult, BuildRunner, ProducedArtifact};
 use crate::error::{Error, Result};
 use crate::git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
-use crate::github::client::download_asset_owned;
 use crate::github::GitHubClient;
+use crate::github::client::download_asset_owned;
 use crate::projects::ProjectRegistry;
 use apvm_config::Config;
 use std::path::Path;
@@ -310,8 +310,7 @@ fn looks_like_version_tag(input: &str) -> bool {
         return false;
     }
 
-    version_part.split('.').all(|s| !s.is_empty())
-        && version_part.split('.').count() >= 2
+    version_part.split('.').all(|s| !s.is_empty()) && version_part.split('.').count() >= 2
 }
 
 /// Command to build a project from any git reference.
@@ -378,7 +377,7 @@ impl<'a> BuildCommand<'a> {
         reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
         let output_dir = output_dir.as_ref();
-        
+
         // 1. Look up project in registry
         let project_info = self.registry.get(project)?;
 
@@ -420,20 +419,20 @@ impl<'a> BuildCommand<'a> {
             .await?;
 
         // 3b. Handle release refs — download pre-built assets, skip clone/build entirely.
-        if let Some(ref resolved) = early_resolved {
-            if let RefSource::Release(ref tag) = resolved.source {
-                return self
-                    .download_release(
-                        project_info,
-                        tag,
-                        git_ref,
-                        version,
-                        variants,
-                        output_dir,
-                        reporter,
-                    )
-                    .await;
-            }
+        if let Some(ref resolved) = early_resolved
+            && let RefSource::Release(ref tag) = resolved.source
+        {
+            return self
+                .download_release(
+                    project_info,
+                    tag,
+                    git_ref,
+                    version,
+                    variants,
+                    output_dir,
+                    reporter,
+                )
+                .await;
         }
 
         // 4. Create isolated build workspace (auto-cleaned on drop)
@@ -504,12 +503,7 @@ impl<'a> BuildCommand<'a> {
         });
 
         // 9. Resolve version (AFTER checkout so detect_version sees correct files)
-        let resolved_version = self.resolve_version(
-            project,
-            version,
-            builder,
-            repo.path(),
-        )?;
+        let resolved_version = self.resolve_version(project, version, builder, repo.path())?;
 
         tracing::info!(
             "Building {} v{} from {}",
@@ -532,7 +526,11 @@ impl<'a> BuildCommand<'a> {
             RefSource::Release(tag) => format!("release/{tag}"),
         };
 
-        tracing::debug!("Checked out {} at commit {}", resolved.git_ref, commit_short);
+        tracing::debug!(
+            "Checked out {} at commit {}",
+            resolved.git_ref,
+            commit_short
+        );
 
         // 10. Run the build using the project's builder
         let build_context = workspace.to_build_context();
@@ -610,9 +608,9 @@ impl<'a> BuildCommand<'a> {
             Some((prefix, value)) if !value.is_empty() => {
                 match prefix.to_lowercase().as_str() {
                     "pr" => {
-                        let num = value.parse::<u64>().map_err(|_| {
-                            Error::Git(format!("Invalid PR number: '{value}'"))
-                        })?;
+                        let num = value
+                            .parse::<u64>()
+                            .map_err(|_| Error::Git(format!("Invalid PR number: '{value}'")))?;
                         (num, true)
                     }
                     "release" => {
@@ -768,9 +766,7 @@ impl<'a> BuildCommand<'a> {
 
         match self.github.get_release_by_tag(owner, repo, &variant).await {
             Ok(Some(_release)) => {
-                tracing::info!(
-                    "Found GitHub Release for tag '{variant}' (input was '{input}')"
-                );
+                tracing::info!("Found GitHub Release for tag '{variant}' (input was '{input}')");
                 reporter.report(&BuildEvent::PhaseCompleted {
                     phase: BuildPhase::Preflight,
                 });
@@ -782,9 +778,7 @@ impl<'a> BuildCommand<'a> {
                 }))
             }
             Ok(None) => {
-                tracing::debug!(
-                    "No release for '{input}' or '{variant}', will clone and build"
-                );
+                tracing::debug!("No release for '{input}' or '{variant}', will clone and build");
                 reporter.report(&BuildEvent::PhaseCompleted {
                     phase: BuildPhase::Preflight,
                 });
@@ -818,6 +812,7 @@ impl<'a> BuildCommand<'a> {
     /// * `variants` - Requested variants (empty = all matching assets)
     /// * `output_dir` - Directory where downloaded assets will be placed
     /// * `reporter` - Progress reporter for receiving build events
+    #[allow(clippy::too_many_arguments)]
     async fn download_release(
         &self,
         project_info: &crate::projects::Project,
@@ -861,14 +856,14 @@ impl<'a> BuildCommand<'a> {
 
         // Emit info about pre-release / draft status
         if release.draft {
-            reporter.report(&BuildEvent::Warning(
-                format!("Release '{tag}' is a DRAFT release"),
-            ));
+            reporter.report(&BuildEvent::Warning(format!(
+                "Release '{tag}' is a DRAFT release"
+            )));
         }
         if release.prerelease {
-            reporter.report(&BuildEvent::Warning(
-                format!("Release '{tag}' is a PRE-RELEASE"),
-            ));
+            reporter.report(&BuildEvent::Warning(format!(
+                "Release '{tag}' is a PRE-RELEASE"
+            )));
         }
 
         // Filter assets: only those matching the builder + requested variants
@@ -955,9 +950,8 @@ impl<'a> BuildCommand<'a> {
 
         while let Some(join_result) = download_tasks.join_next().await {
             // Handle JoinError (task panic or cancellation).
-            let download_result = join_result.map_err(|e| {
-                Error::Build(format!("Download task failed: {e}"))
-            })?;
+            let download_result =
+                join_result.map_err(|e| Error::Build(format!("Download task failed: {e}")))?;
 
             // Handle download errors from the HTTP request.
             let (asset_name, bytes) = download_result?;
@@ -968,10 +962,10 @@ impl<'a> BuildCommand<'a> {
             })?;
 
             let variant_id = builder.variant_from_release_asset(&asset_name);
-            if let Some(ref v) = variant_id {
-                if !variants_built.contains(v) {
-                    variants_built.push(v.clone());
-                }
+            if let Some(ref v) = variant_id
+                && !variants_built.contains(v)
+            {
+                variants_built.push(v.clone());
             }
 
             reporter.report(&BuildEvent::StepCompleted {
@@ -1052,7 +1046,8 @@ impl<'a> BuildCommand<'a> {
                 if let Some(default) = builder.default_version() {
                     tracing::debug!(
                         "Using builder default version '{}' for '{}'",
-                        default, project
+                        default,
+                        project
                     );
                     Ok(default.to_string())
                 } else {
@@ -1070,7 +1065,8 @@ impl<'a> BuildCommand<'a> {
             (VersionRequirement::Embedded, Some(v)) => {
                 tracing::warn!(
                     "Project '{}' has embedded version; ignoring provided '{}' and detecting from source",
-                    project, v
+                    project,
+                    v
                 );
                 self.detect_or_error(project, builder, working_dir)
             }
@@ -1102,22 +1098,18 @@ impl<'a> BuildCommand<'a> {
                 tracing::info!("Auto-detected version: {}", detected);
                 Ok(detected)
             }
-            Ok(None) => {
-                Err(Error::Build(format!(
-                    "Could not auto-detect version for '{}'.\n\n\
+            Ok(None) => Err(Error::Build(format!(
+                "Could not auto-detect version for '{}'.\n\n\
                      The builder does not implement version detection, or the \
                      version was not found in the expected location.\n\n\
                      Please provide a version explicitly: build(\"{}\", Some(\"X.Y.Z\"), ...)",
-                    project, project
-                )))
-            }
-            Err(e) => {
-                Err(Error::Build(format!(
-                    "Version detection failed for '{}': {}\n\n\
+                project, project
+            ))),
+            Err(e) => Err(Error::Build(format!(
+                "Version detection failed for '{}': {}\n\n\
                      Please provide a version explicitly: build(\"{}\", Some(\"X.Y.Z\"), ...)",
-                    project, e, project
-                )))
-            }
+                project, e, project
+            ))),
         }
     }
 
@@ -1142,8 +1134,15 @@ impl<'a> BuildCommand<'a> {
         output_dir: impl AsRef<Path>,
         reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("pr:{pr_number}"), variants, output_dir, reporter)
-            .await
+        self.execute(
+            project,
+            version,
+            &format!("pr:{pr_number}"),
+            variants,
+            output_dir,
+            reporter,
+        )
+        .await
     }
 
     /// Execute a build from a specific branch.
@@ -1165,8 +1164,15 @@ impl<'a> BuildCommand<'a> {
         output_dir: impl AsRef<Path>,
         reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("branch:{branch}"), variants, output_dir, reporter)
-            .await
+        self.execute(
+            project,
+            version,
+            &format!("branch:{branch}"),
+            variants,
+            output_dir,
+            reporter,
+        )
+        .await
     }
 
     /// Execute a build from a specific tag.
@@ -1188,8 +1194,15 @@ impl<'a> BuildCommand<'a> {
         output_dir: impl AsRef<Path>,
         reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("tag:{tag}"), variants, output_dir, reporter)
-            .await
+        self.execute(
+            project,
+            version,
+            &format!("tag:{tag}"),
+            variants,
+            output_dir,
+            reporter,
+        )
+        .await
     }
 
     /// Execute a build from a specific commit SHA.
@@ -1211,8 +1224,15 @@ impl<'a> BuildCommand<'a> {
         output_dir: impl AsRef<Path>,
         reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
-        self.execute(project, version, &format!("commit:{commit}"), variants, output_dir, reporter)
-            .await
+        self.execute(
+            project,
+            version,
+            &format!("commit:{commit}"),
+            variants,
+            output_dir,
+            reporter,
+        )
+        .await
     }
 }
 
@@ -1238,7 +1258,12 @@ mod tests {
             vec![]
         }
 
-        fn build_commands(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Vec<BuildStep> {
+        fn build_commands(
+            &self,
+            _context: &BuildContext,
+            _version: &str,
+            _variants: &[&str],
+        ) -> Vec<BuildStep> {
             vec![]
         }
 
@@ -1278,7 +1303,16 @@ mod tests {
 
         // Execute should fail IMMEDIATELY with PrivateRepoNoToken error
         let output_dir = TempDir::new().unwrap();
-        let result = cmd.execute("test-private", Some("1.0.0"), "main", &[], output_dir.path(), &NullReporter).await;
+        let result = cmd
+            .execute(
+                "test-private",
+                Some("1.0.0"),
+                "main",
+                &[],
+                output_dir.path(),
+                &NullReporter,
+            )
+            .await;
 
         // Verify it's the correct error type
         assert!(result.is_err());
@@ -1324,7 +1358,16 @@ mod tests {
         // Execute should NOT fail with PrivateRepoNoToken error
         // (it will fail later because the repo doesn't exist, but that's fine)
         let output_dir = TempDir::new().unwrap();
-        let result = cmd.execute("test-public", Some("1.0.0"), "main", &[], output_dir.path(), &NullReporter).await;
+        let result = cmd
+            .execute(
+                "test-public",
+                Some("1.0.0"),
+                "main",
+                &[],
+                output_dir.path(),
+                &NullReporter,
+            )
+            .await;
 
         // The error should NOT be PrivateRepoNoToken
         if let Err(e) = result {

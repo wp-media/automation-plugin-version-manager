@@ -303,7 +303,11 @@ pub struct JsBuildResult {
 impl From<&apvm_core::build::BuildResult> for JsBuildResult {
     fn from(result: &apvm_core::build::BuildResult) -> Self {
         Self {
-            artifacts: result.artifacts.iter().map(JsProducedArtifact::from).collect(),
+            artifacts: result
+                .artifacts
+                .iter()
+                .map(JsProducedArtifact::from)
+                .collect(),
             build_dir: result.build_dir.to_string_lossy().to_string(),
             version: result.version.clone(),
             variants_built: result.variants_built.clone(),

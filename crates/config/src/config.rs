@@ -232,7 +232,9 @@ impl ConfigFile {
     pub fn merge(self, defaults: &Config) -> Config {
         Config {
             github_token: self.github_token.or(defaults.github_token.clone()),
-            builds_dir: self.builds_dir.unwrap_or_else(|| defaults.builds_dir.clone()),
+            builds_dir: self
+                .builds_dir
+                .unwrap_or_else(|| defaults.builds_dir.clone()),
         }
     }
 
@@ -312,8 +314,7 @@ mod tests {
 
     #[test]
     fn serialization_round_trip() {
-        let config = Config::new(PathBuf::from("/test/builds"))
-            .set_token("test-token");
+        let config = Config::new(PathBuf::from("/test/builds")).set_token("test-token");
 
         let json = serde_json::to_string(&config).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
@@ -462,7 +463,10 @@ mod tests {
     #[test]
     fn config_key_from_str_valid() {
         assert_eq!("token".parse::<ConfigKey>().unwrap(), ConfigKey::Token);
-        assert_eq!("builds-dir".parse::<ConfigKey>().unwrap(), ConfigKey::BuildsDir);
+        assert_eq!(
+            "builds-dir".parse::<ConfigKey>().unwrap(),
+            ConfigKey::BuildsDir
+        );
     }
 
     #[test]

@@ -61,6 +61,8 @@ impl ProgressReporter for JsProgressReporter {
         // NonBlocking: queue on the event loop, don't wait for JS to process.
         // Ignoring the result is intentional — progress callbacks are
         // best-effort and must not abort the build on JS-side errors.
-        let _ = self.callback.call(Ok(js_event), ThreadsafeFunctionCallMode::NonBlocking);
+        let _ = self
+            .callback
+            .call(Ok(js_event), ThreadsafeFunctionCallMode::NonBlocking);
     }
 }

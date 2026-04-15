@@ -89,7 +89,7 @@ impl BuildWorkspace {
         let temp_dir = Builder::new()
             .prefix(&prefix)
             .tempdir()
-            .map_err(|e: std::io::Error| Error::Io(e.into()))?;
+            .map_err(|e: std::io::Error| Error::Io(e))?;
 
         let repo_name = Self::repo_name_from_url(repo_url);
 
@@ -169,10 +169,7 @@ impl BuildWorkspace {
     /// // context.repo_dir()      == /tmp/wp-rocket-XXXXXX/wp-rocket/
     /// ```
     pub fn to_build_context(&self) -> crate::build::BuildContext {
-        crate::build::BuildContext::new(
-            self.repo_path(),
-            self.temp_dir.path().to_path_buf(),
-        )
+        crate::build::BuildContext::new(self.repo_path(), self.temp_dir.path().to_path_buf())
     }
 
     /// Fetch updates for the repository using the workspace's token.
@@ -262,7 +259,7 @@ impl BuildWorkspace {
                     .prefix(".apvm-artifact-")
                     .suffix(".tmp")
                     .tempfile_in(parent)
-                    .map_err(|e| Error::Io(e.into()))?;
+                    .map_err(Error::Io)?;
 
                 let tmp_path = tmp.path().to_path_buf();
 
@@ -373,7 +370,7 @@ mod tests {
 
         // Collect it
         let collected = workspace
-            .collect_artifacts(&[test_file.clone()], output_dir.path())
+            .collect_artifacts(std::slice::from_ref(&test_file), output_dir.path())
             .unwrap();
 
         // File should be in output, not in workspace

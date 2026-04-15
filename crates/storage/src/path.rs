@@ -58,10 +58,9 @@ impl BuildSource {
             Some(Self::Branch(branch.to_string()))
         } else if let Some(commit) = name.strip_prefix("commit-") {
             Some(Self::Commit(commit.to_string()))
-        } else if let Some(tag) = name.strip_prefix("release-") {
-            Some(Self::Release(tag.to_string()))
         } else {
-            None
+            name.strip_prefix("release-")
+                .map(|tag| Self::Release(tag.to_string()))
         }
     }
 
@@ -167,7 +166,8 @@ impl PathBuilder {
 
     /// Path to a source directory (contains commit links).
     pub fn source_dir(&self, project: &str, version: &str, source: &BuildSource) -> PathBuf {
-        self.by_source_dir(project, version).join(source.to_dir_name())
+        self.by_source_dir(project, version)
+            .join(source.to_dir_name())
     }
 
     /// Get the relative path from source link to commit directory.
@@ -254,9 +254,18 @@ mod tests {
     #[test]
     fn test_build_source_description() {
         assert_eq!(BuildSource::PullRequest(99).description(), "PR #99");
-        assert_eq!(BuildSource::Tag("v1.0".to_string()).description(), "Tag v1.0");
-        assert_eq!(BuildSource::Branch("main".to_string()).description(), "Branch main");
-        assert_eq!(BuildSource::Commit("abcdef1234567".to_string()).description(), "Commit abcdef1");
+        assert_eq!(
+            BuildSource::Tag("v1.0".to_string()).description(),
+            "Tag v1.0"
+        );
+        assert_eq!(
+            BuildSource::Branch("main".to_string()).description(),
+            "Branch main"
+        );
+        assert_eq!(
+            BuildSource::Commit("abcdef1234567".to_string()).description(),
+            "Commit abcdef1"
+        );
     }
 
     #[test]
@@ -304,7 +313,10 @@ mod tests {
     #[test]
     fn test_path_builder_project_dir() {
         let builder = PathBuilder::new(PathBuf::from("/builds"));
-        assert_eq!(builder.project_dir("backwpup"), PathBuf::from("/builds/backwpup"));
+        assert_eq!(
+            builder.project_dir("backwpup"),
+            PathBuf::from("/builds/backwpup")
+        );
     }
 
     #[test]

@@ -1,0 +1,17 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# rustfmt configuration — consistent Rust formatting across the workspace
+# ──────────────────────────────────────────────────────────────────────────────
+# Docs: https://rust-lang.github.io/rustfmt/
+# Applied automatically by the pre-commit hook (via lint-staged) and verified
+# in CI via `cargo fmt --all --check`.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Match the workspace edition declared in Cargo.toml
+edition = "2024"
+
+# Default is 100 — kept explicit so it's visible to contributors
+max_width = 100
+
+# Prefer `Foo { x, y }` over `Foo { x: x, y: y }` when field and variable
+# names match. Reduces noise and is idiomatic Rust.
+use_field_init_shorthand = true

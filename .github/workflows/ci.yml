@@ -16,8 +16,25 @@ permissions:
 env:
   RUST_BACKTRACE: 1
   NODE_VERSION: "24"
+  # Disable husky git hooks in CI — CI runs its own checks
+  # https://typicode.github.io/husky/how-to.html#ci-server-and-docker
+  HUSKY: 0
 
 jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   build-napi:
     name: Build NAPI (${{ matrix.settings.target }})
     strategy:
@@ -146,12 +163,13 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [build-napi, test, commit-artifacts]
+    needs: [check, build-napi, test, commit-artifacts]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
       - name: Check results
         if: >-
+          needs.check.result != 'success' ||
           needs.build-napi.result != 'success' ||
           needs.test.result != 'success' ||
           (needs.commit-artifacts.result != 'success' &&

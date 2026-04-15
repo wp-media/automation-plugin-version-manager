@@ -52,7 +52,9 @@ pub use error::{Error, Result};
 
 // Re-export key types for convenience
 pub use build::BuildContext;
-pub use build::progress::{BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter};
+pub use build::progress::{
+    BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter,
+};
 pub use commands::BuildOutput;
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 
@@ -82,7 +84,10 @@ impl Apvm {
             None => GitHubClient::anonymous()?,
         };
 
-        let token_source = config.github_token.as_ref().map(|_| git::TokenSource::Config);
+        let token_source = config
+            .github_token
+            .as_ref()
+            .map(|_| git::TokenSource::Config);
         let registry = ProjectRegistry::with_known_projects();
 
         Ok(Self {
@@ -158,7 +163,10 @@ impl Apvm {
             None => GitHubClient::anonymous()?,
         };
 
-        let token_source = config.github_token.as_ref().map(|_| git::TokenSource::Config);
+        let token_source = config
+            .github_token
+            .as_ref()
+            .map(|_| git::TokenSource::Config);
         let registry = ProjectRegistry::new(); // Empty registry
 
         Ok(Self {
@@ -257,7 +265,8 @@ impl Apvm {
         let cmd = commands::BuildCommand::new(&self.github, &self.registry, &self.config);
         let variants = variants.unwrap_or(&[]);
 
-        cmd.execute(project, version, git_ref, variants, output_dir, reporter).await
+        cmd.execute(project, version, git_ref, variants, output_dir, reporter)
+            .await
     }
 
     /// Build a project from a PR number.
@@ -282,8 +291,15 @@ impl Apvm {
         output_dir: impl AsRef<std::path::Path>,
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &pr_number.to_string(), variants, output_dir, reporter)
-            .await
+        self.build(
+            project,
+            version,
+            &pr_number.to_string(),
+            variants,
+            output_dir,
+            reporter,
+        )
+        .await
     }
 
     /// Build a project from a branch.
@@ -306,8 +322,15 @@ impl Apvm {
         output_dir: impl AsRef<std::path::Path>,
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("branch:{branch}"), variants, output_dir, reporter)
-            .await
+        self.build(
+            project,
+            version,
+            &format!("branch:{branch}"),
+            variants,
+            output_dir,
+            reporter,
+        )
+        .await
     }
 
     /// Build a project from a tag.
@@ -330,8 +353,15 @@ impl Apvm {
         output_dir: impl AsRef<std::path::Path>,
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("tag:{tag}"), variants, output_dir, reporter)
-            .await
+        self.build(
+            project,
+            version,
+            &format!("tag:{tag}"),
+            variants,
+            output_dir,
+            reporter,
+        )
+        .await
     }
 
     /// Build a project from a specific commit SHA.
@@ -354,8 +384,15 @@ impl Apvm {
         output_dir: impl AsRef<std::path::Path>,
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("commit:{commit}"), variants, output_dir, reporter)
-            .await
+        self.build(
+            project,
+            version,
+            &format!("commit:{commit}"),
+            variants,
+            output_dir,
+            reporter,
+        )
+        .await
     }
 
     /// Build a project from a GitHub Release.
@@ -382,7 +419,14 @@ impl Apvm {
         output_dir: impl AsRef<std::path::Path>,
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        self.build(project, version, &format!("release:{tag}"), variants, output_dir, reporter)
-            .await
+        self.build(
+            project,
+            version,
+            &format!("release:{tag}"),
+            variants,
+            output_dir,
+            reporter,
+        )
+        .await
     }
 }

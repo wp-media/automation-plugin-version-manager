@@ -78,17 +78,13 @@ impl<'a> BuildQuery<'a> {
         // Determine the starting directory based on filters (optimize search)
         let start_dir = match (&self.project, &self.version, &self.major_minor) {
             // Most specific: project + version
-            (Some(project), Some(version), _) => {
-                self.store.paths().version_dir(project, version)
-            }
+            (Some(project), Some(version), _) => self.store.paths().version_dir(project, version),
             // Project + major.minor (walk versions within major.minor)
             (Some(project), None, Some(major_minor)) => {
                 self.store.paths().major_minor_dir(project, major_minor)
             }
             // Project only
-            (Some(project), None, None) => {
-                self.store.paths().project_dir(project)
-            }
+            (Some(project), None, None) => self.store.paths().project_dir(project),
             // No filters, walk everything
             _ => base.to_path_buf(),
         };
@@ -117,16 +113,16 @@ impl<'a> BuildQuery<'a> {
             };
 
             // Apply filters
-            if let Some(ref project) = self.project {
-                if &manifest.project != project {
-                    continue;
-                }
+            if let Some(ref project) = self.project
+                && &manifest.project != project
+            {
+                continue;
             }
 
-            if let Some(ref version) = self.version {
-                if &manifest.version != version {
-                    continue;
-                }
+            if let Some(ref version) = self.version
+                && &manifest.version != version
+            {
+                continue;
             }
 
             if let Some(ref major_minor) = self.major_minor {
@@ -150,10 +146,10 @@ impl<'a> BuildQuery<'a> {
             });
 
             // Check limit
-            if let Some(limit) = self.limit {
-                if results.len() >= limit {
-                    break;
-                }
+            if let Some(limit) = self.limit
+                && results.len() >= limit
+            {
+                break;
             }
         }
 

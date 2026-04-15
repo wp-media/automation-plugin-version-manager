@@ -1,6 +1,5 @@
 //! Build script runner.
 
-
 use std::process::Output;
 
 use which::which;
@@ -136,10 +135,7 @@ impl<'r> BuildRunner<'r> {
                                 "Failed to install optional tool '{}': {}",
                                 dep.name, e
                             )));
-                            tracing::warn!(
-                                "Failed to install optional tool '{}': {}",
-                                dep.name, e
-                            );
+                            tracing::warn!("Failed to install optional tool '{}': {}", dep.name, e);
                             ok = false;
                             break;
                         }
@@ -318,7 +314,8 @@ impl<'r> BuildRunner<'r> {
             phase: BuildPhase::DependencyCheck,
             message: "Checking tool dependencies".into(),
         });
-        self.ensure_tool_dependencies(&builder.tool_dependencies()).await?;
+        self.ensure_tool_dependencies(&builder.tool_dependencies())
+            .await?;
         self.reporter.report(&BuildEvent::PhaseCompleted {
             phase: BuildPhase::DependencyCheck,
         });
@@ -343,9 +340,8 @@ impl<'r> BuildRunner<'r> {
             });
             for step in builder.setup_commands() {
                 tracing::debug!("Running setup: {}", step.command);
-                self.reporter.report(&BuildEvent::StepStarted {
-                    step: step.clone(),
-                });
+                self.reporter
+                    .report(&BuildEvent::StepStarted { step: step.clone() });
                 self.run(&step.command).await?;
                 self.reporter.report(&BuildEvent::StepCompleted { step });
             }
@@ -371,9 +367,8 @@ impl<'r> BuildRunner<'r> {
         });
         for step in builder.build_commands(&self.context, version, variants) {
             tracing::debug!("Running build: {}", step.command);
-            self.reporter.report(&BuildEvent::StepStarted {
-                step: step.clone(),
-            });
+            self.reporter
+                .report(&BuildEvent::StepStarted { step: step.clone() });
             self.run(&step.command).await?;
             self.reporter.report(&BuildEvent::StepCompleted { step });
         }
@@ -415,7 +410,11 @@ impl<'r> BuildRunner<'r> {
         // Determine which variants were built
         let variants_built = if builder.has_variants() {
             if variants.is_empty() {
-                builder.variants().iter().map(|v| v.id.to_string()).collect()
+                builder
+                    .variants()
+                    .iter()
+                    .map(|v| v.id.to_string())
+                    .collect()
             } else {
                 variants.iter().map(|v| v.to_string()).collect()
             }
@@ -423,7 +422,10 @@ impl<'r> BuildRunner<'r> {
             vec![]
         };
 
-        tracing::info!("Build completed successfully. {} artifacts produced.", artifacts.len());
+        tracing::info!(
+            "Build completed successfully. {} artifacts produced.",
+            artifacts.len()
+        );
         self.reporter.report(&BuildEvent::BuildSucceeded {
             artifacts: artifacts.iter().map(|a| a.path.clone()).collect(),
         });
@@ -467,7 +469,10 @@ impl<'r> BuildRunner<'r> {
     ///                             ↓
     /// Used as-is:          /tmp/build-abc/plugin.zip
     /// ```
-    fn collect_artifacts(&self, build_artifacts: &[BuildArtifact]) -> Result<Vec<ProducedArtifact>> {
+    fn collect_artifacts(
+        &self,
+        build_artifacts: &[BuildArtifact],
+    ) -> Result<Vec<ProducedArtifact>> {
         let mut artifacts = Vec::with_capacity(build_artifacts.len());
 
         for artifact in build_artifacts {

@@ -54,14 +54,7 @@ fn sanitize_token(value: &str) -> SanitizeResult {
     }
 
     // Check for known GitHub token prefixes
-    let known_prefixes = [
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "github_pat_",
-    ];
+    let known_prefixes = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
 
     let has_known_prefix = known_prefixes.iter().any(|p| trimmed.starts_with(p));
 
@@ -139,10 +132,10 @@ fn resolve_path(path: &Path) -> PathBuf {
     }
 
     // Path doesn't exist yet — resolve manually
-    if path.is_relative() {
-        if let Ok(cwd) = std::env::current_dir() {
-            return normalize_components(&cwd.join(path));
-        }
+    if path.is_relative()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        return normalize_components(&cwd.join(path));
     }
 
     normalize_components(path)
@@ -280,10 +273,7 @@ mod tests {
                 resolved.ends_with("my-builds"),
                 "Expected to end with 'my-builds', got: {v}"
             );
-            assert!(
-                !v.contains('~'),
-                "Expected ~ to be expanded, got: {v}"
-            );
+            assert!(!v.contains('~'), "Expected ~ to be expanded, got: {v}");
         } else {
             panic!("Expected Ok, got: {result:?}");
         }
@@ -312,10 +302,7 @@ mod tests {
         let result = sanitize_path("some/relative/path");
         if let SanitizeResult::Ok(v) = result {
             let resolved = PathBuf::from(&v);
-            assert!(
-                resolved.is_absolute(),
-                "Expected absolute path, got: {v}"
-            );
+            assert!(resolved.is_absolute(), "Expected absolute path, got: {v}");
         } else {
             panic!("Expected Ok, got: {result:?}");
         }

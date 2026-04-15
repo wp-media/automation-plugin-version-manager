@@ -29,7 +29,9 @@ mod result;
 mod runner;
 
 pub use context::BuildContext;
-pub use progress::{BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter};
+pub use progress::{
+    BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter,
+};
 pub use result::{BuildResult, ProducedArtifact};
 pub use runner::{BuildOutput, BuildRunner};
 

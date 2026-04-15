@@ -19,11 +19,11 @@
 //! - `pro-de` - Pro version with German translations
 //! - `pro-en` - Pro version with English translations
 
-use std::path::Path;
-use crate::Result;
-use super::{BuildArtifact, BuildVariant, Builder, ToolDependency, VersionRequirement};
 use super::super::BuildContext;
 use super::super::progress::{BuildEvent, BuildStep, ProgressReporter};
+use super::{BuildArtifact, BuildVariant, Builder, ToolDependency, VersionRequirement};
+use crate::Result;
+use std::path::Path;
 
 /// Builder for the BackWPup project.
 pub struct BackWPupBuilder;
@@ -148,12 +148,19 @@ impl Builder for BackWPupBuilder {
         let pattern_str = pattern.to_string_lossy();
 
         let entries = glob::glob(&pattern_str).map_err(|_| {
-            crate::error::Error::Build(format!("Failed to read glob pattern in backwpup pre_build_hook: {}", pattern_str))
+            crate::error::Error::Build(format!(
+                "Failed to read glob pattern in backwpup pre_build_hook: {}",
+                pattern_str
+            ))
         })?;
 
         for entry in entries.flatten() {
             std::fs::remove_file(&entry).map_err(|e| {
-                crate::error::Error::Build(format!("Failed to remove previous artifact {}: {}", entry.display(), e))
+                crate::error::Error::Build(format!(
+                    "Failed to remove previous artifact {}: {}",
+                    entry.display(),
+                    e
+                ))
             })?;
         }
 
@@ -168,7 +175,12 @@ impl Builder for BackWPupBuilder {
     // Build Execution
     // =========================================================================
 
-    fn build_commands(&self, _context: &BuildContext, version: &str, variants: &[&str]) -> Vec<BuildStep> {
+    fn build_commands(
+        &self,
+        _context: &BuildContext,
+        version: &str,
+        variants: &[&str],
+    ) -> Vec<BuildStep> {
         // Determine which variants to build
         let to_build: Vec<&str> = if variants.is_empty() {
             // Build all variants if none specified
@@ -223,9 +235,18 @@ impl Builder for BackWPupBuilder {
         commands
     }
 
-    fn artifacts(&self, context: &BuildContext, version: &str, variants: &[&str]) -> crate::Result<Vec<BuildArtifact>> {
+    fn artifacts(
+        &self,
+        context: &BuildContext,
+        version: &str,
+        variants: &[&str],
+    ) -> crate::Result<Vec<BuildArtifact>> {
         let to_build = if variants.is_empty() {
-            vec![Self::VARIANT_FREE, Self::VARIANT_PRO_DE, Self::VARIANT_PRO_EN]
+            vec![
+                Self::VARIANT_FREE,
+                Self::VARIANT_PRO_DE,
+                Self::VARIANT_PRO_EN,
+            ]
         } else {
             variants.to_vec()
         };
@@ -251,9 +272,9 @@ impl Builder for BackWPupBuilder {
             let pattern_str = full_pattern.to_string_lossy();
 
             let matches: Vec<_> = glob::glob(&pattern_str)
-                .map_err(|e| crate::error::Error::Build(format!(
-                    "Invalid glob pattern '{}': {}", pattern, e
-                )))?
+                .map_err(|e| {
+                    crate::error::Error::Build(format!("Invalid glob pattern '{}': {}", pattern, e))
+                })?
                 .filter_map(|r| r.ok())
                 .filter(|p| p.is_file())
                 .collect();
@@ -284,7 +305,8 @@ impl Builder for BackWPupBuilder {
                         "Pattern '{}' matched {} files (expected 1): {}",
                         pattern,
                         n,
-                        matches.iter()
+                        matches
+                            .iter()
                             .filter_map(|p| p.file_name())
                             .map(|s| s.to_string_lossy())
                             .collect::<Vec<_>>()

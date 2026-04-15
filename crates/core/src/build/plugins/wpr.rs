@@ -31,13 +31,15 @@ use std::path::Path;
 use crate::Result;
 use crate::error::Error;
 
-use super::{BuildArtifact, Builder, ToolDependency, VersionRequirement, detect_wordpress_plugin_version};
 use super::super::BuildContext;
 #[cfg(any(windows, test))]
 use super::super::fs::ExclusionPattern;
 #[cfg(windows)]
 use super::super::fs::{copy_dir_with_exclusions, create_zip_archive};
 use super::super::progress::{BuildEvent, BuildStep, ProgressReporter};
+use super::{
+    BuildArtifact, Builder, ToolDependency, VersionRequirement, detect_wordpress_plugin_version,
+};
 
 /// Builder for the WP Rocket project.
 pub struct WpRocketBuilder;
@@ -101,12 +103,7 @@ const RSYNC_EXCLUDES: &[&str] = &[
 /// - `*/package*`    → `Prefix("package")` — package.json, package-lock.json, etc.
 /// - `*/php*`        → `Prefix("php")`     — phpunit.xml, phpcs.xml, etc.
 #[cfg(unix)]
-const ZIP_EXCLUDES: &[&str] = &[
-    "*/.*",
-    "*/gulpfile.js",
-    "*/package*",
-    "*/php*",
-];
+const ZIP_EXCLUDES: &[&str] = &["*/.*", "*/gulpfile.js", "*/package*", "*/php*"];
 
 /// Filename exclusion patterns for the zip archive (Windows path, pure Rust).
 ///
@@ -161,9 +158,7 @@ impl Builder for WpRocketBuilder {
 
         #[cfg(windows)]
         {
-            vec![
-                ToolDependency::required("composer"),
-            ]
+            vec![ToolDependency::required("composer")]
         }
     }
 
@@ -208,7 +203,8 @@ impl Builder for WpRocketBuilder {
             std::fs::remove_file(&entry).map_err(|e| {
                 Error::Build(format!(
                     "Failed to remove previous artifact '{}': {}",
-                    entry.display(), e
+                    entry.display(),
+                    e
                 ))
             })?;
         }
@@ -219,7 +215,8 @@ impl Builder for WpRocketBuilder {
             std::fs::remove_dir_all(&staging).map_err(|e| {
                 Error::Build(format!(
                     "Failed to remove leftover staging directory '{}': {}",
-                    staging.display(), e
+                    staging.display(),
+                    e
                 ))
             })?;
         }
@@ -252,7 +249,8 @@ impl Builder for WpRocketBuilder {
             std::fs::remove_dir_all(&staging).map_err(|e| {
                 Error::Build(format!(
                     "Failed to clean up staging directory '{}': {}",
-                    staging.display(), e
+                    staging.display(),
+                    e
                 ))
             })?;
         }
@@ -292,19 +290,33 @@ impl Builder for WpRocketBuilder {
     /// On **Unix**, generates 4 shell commands (mkdir, rsync, composer, zip).
     /// On **Windows**, generates only 1 shell command (composer install),
     /// because mkdir/rsync/zip are handled by pure Rust in hooks.
-    fn build_commands(&self, context: &BuildContext, version: &str, _variants: &[&str]) -> Vec<BuildStep> {
+    fn build_commands(
+        &self,
+        context: &BuildContext,
+        version: &str,
+        _variants: &[&str],
+    ) -> Vec<BuildStep> {
         #[cfg(unix)]
-        { self.build_commands_unix(context, version) }
+        {
+            self.build_commands_unix(context, version)
+        }
 
         #[cfg(windows)]
-        { self.build_commands_windows(context) }
+        {
+            self.build_commands_windows(context)
+        }
     }
 
     /// Return the single artifact produced by the build.
     ///
     /// The artifact lives in `workspace_dir` (outside the repo), so an
     /// absolute `source_path` is returned for the runner to resolve.
-    fn artifacts(&self, context: &BuildContext, version: &str, _variants: &[&str]) -> Result<Vec<BuildArtifact>> {
+    fn artifacts(
+        &self,
+        context: &BuildContext,
+        version: &str,
+        _variants: &[&str],
+    ) -> Result<Vec<BuildArtifact>> {
         let name = artifact_name(version);
         let artifact = context.workspace_dir().join(&name);
 
@@ -372,25 +384,26 @@ impl WpRocketBuilder {
                 "Creating staging directory",
                 format!("mkdir -p {staging_plugin_dir}/"),
             ),
-
             // 2. Copy repo contents into staging, excluding dev files
             //    rsync trailing slash on source means "copy contents of"
             BuildStep::new(
                 "Copying source files to staging",
                 format!("rsync -av {repo_dir}/ {staging_plugin_dir}/ {rsync_excludes}"),
             ),
-
             // 3. Install production Composer dependencies in the staging copy
             BuildStep::new(
                 "Installing production dependencies",
-                format!("cd {staging_plugin_dir} && composer install --no-dev --no-scripts --no-interaction"),
+                format!(
+                    "cd {staging_plugin_dir} && composer install --no-dev --no-scripts --no-interaction"
+                ),
             ),
-
             // 4. Create the zip archive from the staging directory
             //    Output goes to workspace_dir to keep the repo clean
             BuildStep::new(
                 "Creating plugin archive",
-                format!("cd {staging_dir} && zip -r {workspace_dir}/{artifact} {PLUGIN_DIR_NAME} {zip_excludes}"),
+                format!(
+                    "cd {staging_dir} && zip -r {workspace_dir}/{artifact} {PLUGIN_DIR_NAME} {zip_excludes}"
+                ),
             ),
         ]
     }
@@ -410,15 +423,13 @@ impl WpRocketBuilder {
             .join(STAGING_DIR)
             .join(PLUGIN_DIR_NAME);
 
-        vec![
-            BuildStep::new(
-                "Installing production dependencies",
-                format!(
-                    "cd /d {} && composer install --no-dev --no-scripts --no-interaction",
-                    staging_plugin_dir.display(),
-                ),
+        vec![BuildStep::new(
+            "Installing production dependencies",
+            format!(
+                "cd /d {} && composer install --no-dev --no-scripts --no-interaction",
+                staging_plugin_dir.display(),
             ),
-        ]
+        )]
     }
 
     /// Create the staging directory and copy repository contents, excluding dev files.
@@ -465,19 +476,13 @@ impl WpRocketBuilder {
 
         // rsync -av equivalent
         reporter.report(&BuildEvent::StepStarted {
-            step: BuildStep::new(
-                "Copying source files to staging",
-                "copy with exclusions",
-            ),
+            step: BuildStep::new("Copying source files to staging", "copy with exclusions"),
         });
         let files_copied =
             copy_dir_with_exclusions(context.repo_dir(), &staging_plugin_dir, RSYNC_EXCLUDES)?;
         tracing::info!("Copied {} files to staging directory", files_copied);
         reporter.report(&BuildEvent::StepCompleted {
-            step: BuildStep::new(
-                "Copying source files to staging",
-                "copy with exclusions",
-            ),
+            step: BuildStep::new("Copying source files to staging", "copy with exclusions"),
         });
 
         Ok(())
@@ -565,7 +570,10 @@ mod tests {
 
     #[test]
     fn test_version_requirement_is_embedded() {
-        assert_eq!(builder().version_requirement(), VersionRequirement::Embedded);
+        assert_eq!(
+            builder().version_requirement(),
+            VersionRequirement::Embedded
+        );
     }
 
     #[test]
@@ -714,12 +722,16 @@ mod tests {
         // 2. rsync with excludes and absolute paths
         assert!(commands[1].command.contains("rsync"));
         assert!(
-            commands[1].command.contains(&context.repo_dir().display().to_string()),
+            commands[1]
+                .command
+                .contains(&context.repo_dir().display().to_string()),
             "rsync should reference absolute repo dir"
         );
         for exclude in RSYNC_EXCLUDES {
             assert!(
-                commands[1].command.contains(&format!("--exclude {}", exclude)),
+                commands[1]
+                    .command
+                    .contains(&format!("--exclude {}", exclude)),
                 "rsync command should exclude '{}'",
                 exclude
             );
@@ -740,7 +752,9 @@ mod tests {
             expected_artifact
         );
         assert!(
-            commands[3].command.contains(&context.workspace_dir().display().to_string()),
+            commands[3]
+                .command
+                .contains(&context.workspace_dir().display().to_string()),
             "zip output should reference absolute workspace dir"
         );
         for exclude in ZIP_EXCLUDES {
@@ -803,7 +817,9 @@ mod tests {
         std::fs::File::create(&artifact).unwrap();
         assert!(artifact.exists());
 
-        builder().pre_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
+        builder()
+            .pre_build_hook(&context, "3.17.4", &[], &NullReporter)
+            .unwrap();
         assert!(!artifact.exists());
     }
 
@@ -815,9 +831,14 @@ mod tests {
         std::fs::File::create(&old).unwrap();
         std::fs::File::create(&current).unwrap();
 
-        builder().pre_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
+        builder()
+            .pre_build_hook(&context, "3.17.4", &[], &NullReporter)
+            .unwrap();
         assert!(!old.exists(), "old version artifact should be removed");
-        assert!(!current.exists(), "current version artifact should be removed");
+        assert!(
+            !current.exists(),
+            "current version artifact should be removed"
+        );
     }
 
     #[test]
@@ -827,14 +848,18 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         assert!(staging.exists());
 
-        builder().pre_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
+        builder()
+            .pre_build_hook(&context, "3.17.4", &[], &NullReporter)
+            .unwrap();
         assert!(!staging.exists());
     }
 
     #[test]
     fn test_pre_build_noop_when_clean() {
         let (_ws, context) = test_context();
-        builder().pre_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
+        builder()
+            .pre_build_hook(&context, "3.17.4", &[], &NullReporter)
+            .unwrap();
     }
 
     // =========================================================================
@@ -848,14 +873,18 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         assert!(staging.exists());
 
-        builder().post_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
+        builder()
+            .post_build_hook(&context, "3.17.4", &[], &NullReporter)
+            .unwrap();
         assert!(!staging.exists());
     }
 
     #[test]
     fn test_post_build_noop_when_no_staging() {
         let (_ws, context) = test_context();
-        builder().post_build_hook(&context, "3.17.4", &[], &NullReporter).unwrap();
+        builder()
+            .post_build_hook(&context, "3.17.4", &[], &NullReporter)
+            .unwrap();
     }
 
     // =========================================================================
@@ -915,8 +944,14 @@ mod tests {
         assert!(matches_any_exclusion("gulpfile.js", ZIP_EXCLUSION_PATTERNS));
 
         // package* — matches original `*/package*`
-        assert!(matches_any_exclusion("package.json", ZIP_EXCLUSION_PATTERNS));
-        assert!(matches_any_exclusion("package-lock.json", ZIP_EXCLUSION_PATTERNS));
+        assert!(matches_any_exclusion(
+            "package.json",
+            ZIP_EXCLUSION_PATTERNS
+        ));
+        assert!(matches_any_exclusion(
+            "package-lock.json",
+            ZIP_EXCLUSION_PATTERNS
+        ));
 
         // php* — matches original `*/php*`
         assert!(matches_any_exclusion("phpunit.xml", ZIP_EXCLUSION_PATTERNS));
@@ -927,7 +962,10 @@ mod tests {
     fn test_zip_exclusion_patterns_do_not_match_production_files() {
         use crate::build::fs::matches_any_exclusion;
 
-        assert!(!matches_any_exclusion("wp-rocket.php", ZIP_EXCLUSION_PATTERNS));
+        assert!(!matches_any_exclusion(
+            "wp-rocket.php",
+            ZIP_EXCLUSION_PATTERNS
+        ));
         assert!(!matches_any_exclusion("index.php", ZIP_EXCLUSION_PATTERNS));
         assert!(!matches_any_exclusion("readme.txt", ZIP_EXCLUSION_PATTERNS));
         assert!(!matches_any_exclusion("style.css", ZIP_EXCLUSION_PATTERNS));

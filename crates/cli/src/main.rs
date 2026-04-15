@@ -11,8 +11,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use apvm_core::{Apvm, Result};
 use apvm_core::config_io::load_config_file;
+use apvm_core::{Apvm, Result};
 
 use crate::commands::{BuildArgs, ConfigArgs, InfoArgs};
 use crate::paths::Paths;
@@ -152,4 +152,3 @@ fn init_tracing() {
             .init();
     }
 }
-

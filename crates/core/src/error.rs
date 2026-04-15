@@ -86,7 +86,9 @@ pub enum Error {
     },
 
     /// No matching release assets found for the requested variants.
-    #[error("No matching release assets found for tag '{tag}' in {repo}.\nAvailable assets: {available}")]
+    #[error(
+        "No matching release assets found for tag '{tag}' in {repo}.\nAvailable assets: {available}"
+    )]
     NoMatchingReleaseAssets {
         /// The tag that was looked up.
         tag: String,

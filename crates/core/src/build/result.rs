@@ -100,12 +100,7 @@ impl ProducedArtifact {
     /// * `path` - Full path to the artifact file
     /// * `filename` - Target filename for storage
     /// * `size` - File size in bytes
-    pub fn new(
-        variant_id: Option<String>,
-        path: PathBuf,
-        filename: String,
-        size: u64,
-    ) -> Self {
+    pub fn new(variant_id: Option<String>, path: PathBuf, filename: String, size: u64) -> Self {
         Self {
             variant_id,
             path,
@@ -148,8 +143,18 @@ mod tests {
     fn test_artifacts_for_variant() {
         let result = BuildResult::new(
             vec![
-                ProducedArtifact::new(Some("pro".into()), PathBuf::from("/pro.zip"), "pro.zip".into(), 100),
-                ProducedArtifact::new(Some("free".into()), PathBuf::from("/free.zip"), "free.zip".into(), 50),
+                ProducedArtifact::new(
+                    Some("pro".into()),
+                    PathBuf::from("/pro.zip"),
+                    "pro.zip".into(),
+                    100,
+                ),
+                ProducedArtifact::new(
+                    Some("free".into()),
+                    PathBuf::from("/free.zip"),
+                    "free.zip".into(),
+                    50,
+                ),
             ],
             PathBuf::from("/build"),
             "1.0.0".into(),

@@ -308,26 +308,25 @@ pub fn save_config<P: AsRef<Path>>(config: &Config, path: P) -> Result<PathBuf> 
 /// Handles directory creation and pretty-printing.
 fn save_to_path_impl<T: serde::Serialize>(value: &T, path: &Path) -> Result<()> {
     // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent).map_err(|e| {
-                Error::Io(io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Failed to create config directory '{}': {}",
-                        parent.display(),
-                        e
-                    ),
-                ))
-            })?;
-            tracing::debug!("Created config directory: {}", parent.display());
-        }
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent).map_err(|e| {
+            Error::Io(io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to create config directory '{}': {}",
+                    parent.display(),
+                    e
+                ),
+            ))
+        })?;
+        tracing::debug!("Created config directory: {}", parent.display());
     }
 
     // Serialize with pretty printing
-    let content = serde_json::to_string_pretty(value).map_err(|e| {
-        Error::Config(format!("Failed to serialize config: {}", e))
-    })?;
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|e| Error::Config(format!("Failed to serialize config: {}", e)))?;
 
     // Write atomically (write to temp, then rename) for safety
     // For simplicity, we do a direct write here. Atomic write would be:

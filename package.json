@@ -1,7 +1,7 @@
 {
   "name": "apvm-napi",
-  "version": "1.1.0",
-  "description": "Node.js bindings for APVM (Automation Plugin Version Manager) — build WordPress plugins from PRs, branches, tags, and commits.",
+  "version": "1.2.0",
+  "description": "Node.js bindings for APVM (Automation Plugin Version Manager) — build WordPress plugins from PRs, branches, tags, and commits. And download from releases.",
   "main": "index.js",
   "types": "index.d.ts",
   "napi": {
@@ -10,11 +10,19 @@
   "scripts": {
     "build": "napi build --release --platform --manifest-path crates/napi/Cargo.toml --output-dir .",
     "build:debug": "napi build --platform --manifest-path crates/napi/Cargo.toml --output-dir .",
-    "test": "vitest run"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.rs": "rustfmt"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.6.1",
     "@types/node": "^25.6.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "typescript": "^6.0.2",
     "vitest": "^4.1.4"
   },
   "engines": {

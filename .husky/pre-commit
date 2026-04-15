@@ -1,0 +1,15 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# pre-commit — Auto-format staged Rust files before committing
+# ──────────────────────────────────────────────────────────────────────────────
+# Runs rustfmt on staged .rs files only, via lint-staged. Partial staging
+# (git add -p) is handled correctly: lint-staged stashes unstaged changes,
+# formats the staged files, re-stages the formatted output, then restores the
+# stash — ensuring only intentionally staged content enters the commit.
+#
+# Docs:
+#   husky       — https://typicode.github.io/husky/
+#   lint-staged — https://github.com/lint-staged/lint-staged
+#   rustfmt     — https://rust-lang.github.io/rustfmt/
+# ──────────────────────────────────────────────────────────────────────────────
+
+npx lint-staged

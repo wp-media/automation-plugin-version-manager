@@ -10,8 +10,6 @@
 //! apvm config path                # Show config file path
 //! ```
 
-
-
 use clap::{Args, Subcommand};
 
 use apvm_config::ConfigKey;
@@ -169,7 +167,11 @@ fn unset_value(key: &str, paths: &Paths) -> apvm_core::Result<()> {
     let mut config_file = load_config_file_raw(paths.config_file())?;
 
     if config_file.get(key).is_none() {
-        println!("'{}' is already unset (using default: {})", key, default_for_key(key));
+        println!(
+            "'{}' is already unset (using default: {})",
+            key,
+            default_for_key(key)
+        );
         return Ok(());
     }
 
@@ -187,11 +189,19 @@ fn unset_value(key: &str, paths: &Paths) -> apvm_core::Result<()> {
             })?;
             println!("Unset '{}' (config file removed, using defaults)", key);
         } else {
-            println!("Unset '{}' (reverted to default: {})", key, default_for_key(key));
+            println!(
+                "Unset '{}' (reverted to default: {})",
+                key,
+                default_for_key(key)
+            );
         }
     } else {
         save_config_file(&config_file, paths.config_file())?;
-        println!("Unset '{}' (reverted to default: {})", key, default_for_key(key));
+        println!(
+            "Unset '{}' (reverted to default: {})",
+            key,
+            default_for_key(key)
+        );
     }
 
     Ok(())
@@ -248,14 +258,7 @@ fn mask_token(token: &str) -> String {
         return "***".to_string();
     }
 
-    let known_prefixes = [
-        "github_pat_",
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-    ];
+    let known_prefixes = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
 
     let prefix = known_prefixes
         .iter()

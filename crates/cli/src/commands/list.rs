@@ -18,7 +18,11 @@ pub fn execute(apvm: &Apvm) {
 
     println!("Available plugins:\n");
     for project in &projects {
-        let visibility = if project.is_private { "(private)" } else { "(public)" };
+        let visibility = if project.is_private {
+            "(private)"
+        } else {
+            "(public)"
+        };
         println!(
             "  {:<14} {}/{} {}",
             project.name, project.owner, project.repo, visibility

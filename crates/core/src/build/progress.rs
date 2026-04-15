@@ -358,16 +358,14 @@ mod tests {
             phase: BuildPhase::Clone,
             message: "Cloning...".into(),
         });
-        reporter.report(&BuildEvent::BuildSucceeded {
-            artifacts: vec![],
-        });
+        reporter.report(&BuildEvent::BuildSucceeded { artifacts: vec![] });
         // No panic = success
     }
 
     #[test]
     fn test_closure_reporter_receives_events() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
@@ -400,7 +398,10 @@ mod tests {
         assert_eq!(BuildPhase::Preflight.to_string(), "Verifying reference");
         assert_eq!(BuildPhase::Clone.to_string(), "Cloning repository");
         assert_eq!(BuildPhase::Build.to_string(), "Building");
-        assert_eq!(BuildPhase::CollectArtifacts.to_string(), "Collecting artifacts");
+        assert_eq!(
+            BuildPhase::CollectArtifacts.to_string(),
+            "Collecting artifacts"
+        );
     }
 
     #[test]

@@ -88,7 +88,7 @@ pub fn is_link(path: &Path) -> bool {
 
 /// Read the target of a link.
 pub fn read_link(link: &Path) -> Result<std::path::PathBuf> {
-    std::fs::read_link(link).map_err(|e| Error::Io(e))
+    std::fs::read_link(link).map_err(Error::Io)
 }
 
 /// Create a junction on Windows.

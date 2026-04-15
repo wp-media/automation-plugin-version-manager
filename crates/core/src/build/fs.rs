@@ -25,8 +25,8 @@
 use std::path::Path;
 
 use walkdir::WalkDir;
-use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
+use zip::write::SimpleFileOptions;
 
 use crate::error::{Error, Result};
 
@@ -142,11 +142,7 @@ pub fn matches_any_exclusion(filename: &str, patterns: &[ExclusionPattern<'_>]) 
 /// - The source directory cannot be walked (permissions, missing, etc.)
 /// - A directory cannot be created at the destination
 /// - A file cannot be copied
-pub fn copy_dir_with_exclusions(
-    src: &Path,
-    dst: &Path,
-    exclude_names: &[&str],
-) -> Result<u64> {
+pub fn copy_dir_with_exclusions(src: &Path, dst: &Path, exclude_names: &[&str]) -> Result<u64> {
     let mut files_copied: u64 = 0;
 
     // Create destination root if it doesn't exist
@@ -159,16 +155,17 @@ pub fn copy_dir_with_exclusions(
 
     // WalkDir::filter_entry prevents descending into excluded directories,
     // which is much faster than walking into them and skipping files.
-    let walker = WalkDir::new(src)
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !exclude_names.iter().any(|exc| *exc == name.as_ref())
-        });
+    let walker = WalkDir::new(src).into_iter().filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        !exclude_names.iter().any(|exc| *exc == name.as_ref())
+    });
 
     for entry in walker {
         let entry = entry.map_err(|e| {
-            Error::Build(format!("Failed to walk source directory '{}': {e}", src.display()))
+            Error::Build(format!(
+                "Failed to walk source directory '{}': {e}",
+                src.display()
+            ))
         })?;
 
         // Compute path relative to source root
@@ -278,8 +275,7 @@ pub fn create_zip_archive(
 
     let mut zip_writer = zip::ZipWriter::new(file);
 
-    let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
     for entry in WalkDir::new(content_dir) {
         let entry = entry.map_err(|e| {
@@ -307,9 +303,7 @@ pub fn create_zip_archive(
         let zip_path = format!("{archive_prefix}/{relative_str}");
 
         // Check exclusions against the filename component
-        let filename = entry
-            .file_name()
-            .to_string_lossy();
+        let filename = entry.file_name().to_string_lossy();
         if matches_any_exclusion(&filename, exclusions) {
             continue;
         }
@@ -327,9 +321,7 @@ pub fn create_zip_archive(
             entries_written += 1;
         } else if entry.file_type().is_file() {
             zip_writer.start_file(&zip_path, options).map_err(|e| {
-                Error::Build(format!(
-                    "Failed to start file '{zip_path}' in archive: {e}"
-                ))
+                Error::Build(format!("Failed to start file '{zip_path}' in archive: {e}"))
             })?;
 
             let mut source_file = std::fs::File::open(entry.path()).map_err(|e| {
@@ -352,7 +344,10 @@ pub fn create_zip_archive(
     }
 
     zip_writer.finish().map_err(|e| {
-        Error::Build(format!("Failed to finalize archive '{}': {e}", archive_path.display()))
+        Error::Build(format!(
+            "Failed to finalize archive '{}': {e}",
+            archive_path.display()
+        ))
     })?;
 
     Ok(entries_written)
@@ -455,11 +450,7 @@ mod tests {
         // Create source with excluded directory
         std::fs::write(src.path().join("keep.txt"), "keep").unwrap();
         std::fs::create_dir_all(src.path().join("node_modules")).unwrap();
-        std::fs::write(
-            src.path().join("node_modules/package.json"),
-            "excluded",
-        )
-        .unwrap();
+        std::fs::write(src.path().join("node_modules/package.json"), "excluded").unwrap();
         std::fs::create_dir_all(src.path().join(".git")).unwrap();
         std::fs::write(src.path().join(".git/HEAD"), "ref").unwrap();
 
@@ -517,8 +508,7 @@ mod tests {
         std::fs::write(content.join("sub/nested.txt"), "nested").unwrap();
 
         let archive_path = dir.path().join("output.zip");
-        let count =
-            create_zip_archive(&content, &archive_path, "my-plugin", &[]).unwrap();
+        let count = create_zip_archive(&content, &archive_path, "my-plugin", &[]).unwrap();
 
         // 1 dir ("sub") + 2 files ("file.txt", "sub/nested.txt")
         assert_eq!(count, 3);
@@ -563,8 +553,7 @@ mod tests {
         ];
 
         let archive_path = dir.path().join("output.zip");
-        let count =
-            create_zip_archive(&content, &archive_path, "plugin", exclusions).unwrap();
+        let count = create_zip_archive(&content, &archive_path, "plugin", exclusions).unwrap();
 
         assert_eq!(count, 1); // Only keep.php
 
@@ -613,8 +602,7 @@ mod tests {
         std::fs::create_dir_all(&content).unwrap();
 
         let archive_path = dir.path().join("output.zip");
-        let count =
-            create_zip_archive(&content, &archive_path, "empty", &[]).unwrap();
+        let count = create_zip_archive(&content, &archive_path, "empty", &[]).unwrap();
 
         assert_eq!(count, 0);
         assert!(archive_path.exists());

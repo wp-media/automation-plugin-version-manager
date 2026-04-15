@@ -388,9 +388,7 @@ impl Repository {
 
         // Validate the commit hash format (hex characters only)
         if !commit.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(Error::Git(format!(
-                "Invalid commit hash format: {commit}"
-            )));
+            return Err(Error::Git(format!("Invalid commit hash format: {commit}")));
         }
 
         // Validate length: SHA-1 (40) or SHA-256 (64)
@@ -494,7 +492,10 @@ mod tests {
         let repo = Repository::open(&workspace).expect("Failed to open repo");
 
         // Test get_head_commit
-        let commit = repo.get_head_commit().await.expect("Failed to get HEAD commit");
+        let commit = repo
+            .get_head_commit()
+            .await
+            .expect("Failed to get HEAD commit");
         assert_eq!(commit.len(), 40, "SHA-1 commit should be 40 chars");
         assert!(
             commit.chars().all(|c| c.is_ascii_hexdigit()),

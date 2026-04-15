@@ -121,7 +121,12 @@ mod tests {
             vec![]
         }
 
-        fn build_commands(&self, _context: &BuildContext, _version: &str, _variants: &[&str]) -> Vec<BuildStep> {
+        fn build_commands(
+            &self,
+            _context: &BuildContext,
+            _version: &str,
+            _variants: &[&str],
+        ) -> Vec<BuildStep> {
             vec![]
         }
 
@@ -180,7 +185,7 @@ mod tests {
         let registry = ProjectRegistry::new();
         let result = registry.get("nonexistent");
         assert!(result.is_err());
-        
+
         let err_string = result.err().unwrap().to_string();
         assert!(err_string.contains("nonexistent"));
     }
@@ -188,7 +193,7 @@ mod tests {
     #[test]
     fn test_registry_list() {
         let mut registry = ProjectRegistry::new();
-        
+
         registry.register(Project {
             name: "plugin-a".to_string(),
             repo_url: "https://github.com/test/a.git".to_string(),
@@ -199,7 +204,7 @@ mod tests {
             has_releases: false,
             builder: Box::new(TestBuilder),
         });
-        
+
         registry.register(Project {
             name: "plugin-b".to_string(),
             repo_url: "https://github.com/test/b.git".to_string(),
@@ -220,7 +225,7 @@ mod tests {
     #[test]
     fn test_registry_register_overwrites() {
         let mut registry = ProjectRegistry::new();
-        
+
         registry.register(Project {
             name: "plugin".to_string(),
             repo_url: "https://github.com/test/old.git".to_string(),
@@ -231,7 +236,7 @@ mod tests {
             has_releases: false,
             builder: Box::new(TestBuilder),
         });
-        
+
         registry.register(Project {
             name: "plugin".to_string(),
             repo_url: "https://github.com/test/new.git".to_string(),
@@ -245,7 +250,7 @@ mod tests {
 
         // Should only have 1 project (overwritten)
         assert_eq!(registry.list().count(), 1);
-        
+
         let project = registry.get("plugin").unwrap();
         assert_eq!(project.repo, "new");
         assert!(project.is_private);

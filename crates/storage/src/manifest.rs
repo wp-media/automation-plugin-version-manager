@@ -117,7 +117,10 @@ impl BuildManifest {
 
     /// Get variant IDs of existing artifacts.
     pub fn existing_variants(&self) -> Vec<Option<String>> {
-        self.artifacts.iter().map(|a| a.variant_id.clone()).collect()
+        self.artifacts
+            .iter()
+            .map(|a| a.variant_id.clone())
+            .collect()
     }
 
     /// Check if a variant already exists.
@@ -139,9 +142,8 @@ impl BuildManifest {
         }
 
         let content = std::fs::read_to_string(&path)?;
-        let manifest: Self = serde_json::from_str(&content).map_err(|e| {
-            Error::InvalidManifest(format!("Failed to parse manifest: {}", e))
-        })?;
+        let manifest: Self = serde_json::from_str(&content)
+            .map_err(|e| Error::InvalidManifest(format!("Failed to parse manifest: {}", e)))?;
 
         Ok(manifest)
     }

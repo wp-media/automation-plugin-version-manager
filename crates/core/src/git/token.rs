@@ -97,27 +97,27 @@ impl ResolvedToken {
 /// ```
 pub async fn resolve_github_token(config_token: Option<&str>) -> Option<ResolvedToken> {
     // 1. Explicit config token
-    if let Some(token) = config_token {
-        if !token.is_empty() {
-            debug!("Using GitHub token from config file");
-            return Some(ResolvedToken::new(token.to_string(), TokenSource::Config));
-        }
+    if let Some(token) = config_token
+        && !token.is_empty()
+    {
+        debug!("Using GitHub token from config file");
+        return Some(ResolvedToken::new(token.to_string(), TokenSource::Config));
     }
 
     // 2. GITHUB_TOKEN environment variable
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            debug!("Using GitHub token from GITHUB_TOKEN env");
-            return Some(ResolvedToken::new(token, TokenSource::EnvGithubToken));
-        }
+    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        && !token.is_empty()
+    {
+        debug!("Using GitHub token from GITHUB_TOKEN env");
+        return Some(ResolvedToken::new(token, TokenSource::EnvGithubToken));
     }
 
     // 3. GH_TOKEN environment variable
-    if let Ok(token) = std::env::var("GH_TOKEN") {
-        if !token.is_empty() {
-            debug!("Using GitHub token from GH_TOKEN env");
-            return Some(ResolvedToken::new(token, TokenSource::EnvGhToken));
-        }
+    if let Ok(token) = std::env::var("GH_TOKEN")
+        && !token.is_empty()
+    {
+        debug!("Using GitHub token from GH_TOKEN env");
+        return Some(ResolvedToken::new(token, TokenSource::EnvGhToken));
     }
 
     // 4. Try `gh auth token` command (gh >= 2.17.0)
@@ -270,18 +270,20 @@ fn parse_gh_hosts_yaml(content: &str) -> Option<String> {
         }
 
         // Check if we're entering a different host section (exit github.com)
-        if !trimmed.is_empty() && !trimmed.starts_with('#') && !line.starts_with(' ') && !line.starts_with('\t') {
-            if in_github_com_section && !trimmed.starts_with("oauth_token") {
-                // We hit another top-level key, exit github.com section
-                in_github_com_section = false;
-            }
+        if !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && !line.starts_with(' ')
+            && !line.starts_with('\t')
+            && in_github_com_section
+            && !trimmed.starts_with("oauth_token")
+        {
+            // We hit another top-level key, exit github.com section
+            in_github_com_section = false;
         }
 
         // Look for oauth_token within github.com section
-        if in_github_com_section {
-            if let Some(token) = extract_oauth_token(trimmed) {
-                return Some(token);
-            }
+        if in_github_com_section && let Some(token) = extract_oauth_token(trimmed) {
+            return Some(token);
         }
     }
 
@@ -335,7 +337,9 @@ fn extract_oauth_token(line: &str) -> Option<String> {
 pub fn is_valid_token_format(token: &str) -> bool {
     let valid_prefixes = ["ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_"];
 
-    valid_prefixes.iter().any(|prefix| token.starts_with(prefix))
+    valid_prefixes
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
 }
 
 #[cfg(test)]

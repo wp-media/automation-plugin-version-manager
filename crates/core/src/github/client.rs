@@ -29,10 +29,7 @@ impl GitHubClient {
     /// Create a new GitHub client without authentication (rate-limited).
     pub fn anonymous() -> Result<Self> {
         let inner = Octocrab::builder().build()?;
-        Ok(Self {
-            inner,
-            token: None,
-        })
+        Ok(Self { inner, token: None })
     }
 
     /// Returns a clone of the stored auth token, if any.
@@ -56,9 +53,7 @@ impl GitHubClient {
         let base_branch = pr.base.ref_field.clone();
 
         let head_branch = pr.head.ref_field.clone();
-        let html_url = pr.html_url.map(|url| {
-            url.to_string()
-        });
+        let html_url = pr.html_url.map(|url| url.to_string());
         Ok(PullRequest {
             number: pr_number,
             title,
@@ -66,7 +61,7 @@ impl GitHubClient {
             head_branch,
             owner: owner.to_string(),
             repo: repo.to_string(),
-            html_url
+            html_url,
         })
     }
 
@@ -95,9 +90,7 @@ impl GitHubClient {
                         id: a.id.into_inner(),
                         name: a.name.clone(),
                         size: a.size as u64,
-                        download_url: a
-                            .browser_download_url
-                            .to_string(),
+                        download_url: a.browser_download_url.to_string(),
                         content_type: a.content_type.clone(),
                     })
                     .collect();
@@ -149,12 +142,9 @@ impl GitHubClient {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::Build(
-                format!("Failed to request asset '{}': {e}", asset.name),
-            ))?;
+        let response = request.send().await.map_err(|e| {
+            crate::error::Error::Build(format!("Failed to request asset '{}': {e}", asset.name))
+        })?;
 
         if !response.status().is_success() {
             return Err(crate::error::Error::Build(format!(
@@ -167,9 +157,9 @@ impl GitHubClient {
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| crate::error::Error::Build(
-                format!("Failed to read asset '{}': {e}", asset.name),
-            ))?
+            .map_err(|e| {
+                crate::error::Error::Build(format!("Failed to read asset '{}': {e}", asset.name))
+            })?
             .to_vec();
 
         Ok(bytes)
@@ -210,12 +200,9 @@ pub async fn download_asset_owned(
         request = request.header("Authorization", format!("Bearer {token}"));
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| crate::error::Error::Build(
-            format!("Failed to request asset '{}': {e}", asset.name),
-        ))?;
+    let response = request.send().await.map_err(|e| {
+        crate::error::Error::Build(format!("Failed to request asset '{}': {e}", asset.name))
+    })?;
 
     if !response.status().is_success() {
         return Err(crate::error::Error::Build(format!(
@@ -228,9 +215,9 @@ pub async fn download_asset_owned(
     let bytes = response
         .bytes()
         .await
-        .map_err(|e| crate::error::Error::Build(
-            format!("Failed to read asset '{}': {e}", asset.name),
-        ))?
+        .map_err(|e| {
+            crate::error::Error::Build(format!("Failed to read asset '{}': {e}", asset.name))
+        })?
         .to_vec();
 
     Ok((asset.name, bytes))

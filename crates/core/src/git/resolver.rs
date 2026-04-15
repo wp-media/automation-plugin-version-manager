@@ -258,9 +258,9 @@ impl<'a> RefResolver<'a> {
 
         match prefix.as_str() {
             "pr" => {
-                let pr_number = value.parse::<u64>().map_err(|_| {
-                    Error::Git(format!("Invalid PR number: '{value}'"))
-                })?;
+                let pr_number = value
+                    .parse::<u64>()
+                    .map_err(|_| Error::Git(format!("Invalid PR number: '{value}'")))?;
                 self.resolve_pr(input, pr_number).await.map(Some)
             }
             "tag" => self.resolve_tag(input, value).await.map(Some),
@@ -283,14 +283,14 @@ impl<'a> RefResolver<'a> {
         }
 
         // 1. All digits → likely PR number
-        if input.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(pr_number) = input.parse::<u64>() {
-                // Try PR first, fall back to branch if not found
-                match self.resolve_pr(input, pr_number).await {
-                    Ok(resolved) => return Ok(resolved),
-                    Err(_) => {
-                        tracing::debug!("PR #{pr_number} not found, trying as branch");
-                    }
+        if input.chars().all(|c| c.is_ascii_digit())
+            && let Ok(pr_number) = input.parse::<u64>()
+        {
+            // Try PR first, fall back to branch if not found
+            match self.resolve_pr(input, pr_number).await {
+                Ok(resolved) => return Ok(resolved),
+                Err(_) => {
+                    tracing::debug!("PR #{pr_number} not found, trying as branch");
                 }
             }
         }
@@ -481,7 +481,12 @@ impl<'a> RefResolver<'a> {
         })?;
 
         let output = Command::new("git")
-            .args(["show-ref", "--tags", "--verify", &format!("refs/tags/{name}")])
+            .args([
+                "show-ref",
+                "--tags",
+                "--verify",
+                &format!("refs/tags/{name}"),
+            ])
             .current_dir(repo_path)
             .output()
             .await
@@ -498,7 +503,12 @@ impl<'a> RefResolver<'a> {
 
         // Check local branches
         let local = Command::new("git")
-            .args(["show-ref", "--heads", "--verify", &format!("refs/heads/{name}")])
+            .args([
+                "show-ref",
+                "--heads",
+                "--verify",
+                &format!("refs/heads/{name}"),
+            ])
             .current_dir(repo_path)
             .output()
             .await
@@ -510,7 +520,11 @@ impl<'a> RefResolver<'a> {
 
         // Check remote branches (origin)
         let remote = Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/remotes/origin/{name}")])
+            .args([
+                "show-ref",
+                "--verify",
+                &format!("refs/remotes/origin/{name}"),
+            ])
             .current_dir(repo_path)
             .output()
             .await
@@ -584,7 +598,9 @@ mod tests {
     fn test_looks_like_commit_sha() {
         // Valid SHAs
         assert!(RefResolver::looks_like_commit_sha("a1b2c3d"));
-        assert!(RefResolver::looks_like_commit_sha("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"));
+        assert!(RefResolver::looks_like_commit_sha(
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+        ));
         assert!(RefResolver::looks_like_commit_sha("ABCDEF1"));
 
         // Invalid - too short
@@ -603,7 +619,10 @@ mod tests {
     #[test]
     fn test_ref_source_description() {
         assert_eq!(RefSource::PullRequest(123).description(), "PR #123");
-        assert_eq!(RefSource::Tag("v1.0.0".into()).description(), "tag 'v1.0.0'");
+        assert_eq!(
+            RefSource::Tag("v1.0.0".into()).description(),
+            "tag 'v1.0.0'"
+        );
         assert_eq!(
             RefSource::Branch("develop".into()).description(),
             "branch 'develop'"
