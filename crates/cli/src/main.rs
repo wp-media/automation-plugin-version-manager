@@ -25,7 +25,7 @@ use crate::paths::Paths;
 ///
 /// `CARGO_PKG_VERSION` and `CARGO_PKG_AUTHORS` are set by Cargo at compile time
 /// from `[package]` in `Cargo.toml`.
-/// Source: https://doc.rust-lang.org/cargo/reference/environment-variables.html
+/// Source: <https://doc.rust-lang.org/cargo/reference/environment-variables.html>
 ///
 /// Produces output like:
 /// ```text
