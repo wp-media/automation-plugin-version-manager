@@ -84,7 +84,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "apvm"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "apvm-config",
  "apvm-core",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "apvm-config"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "apvm-core"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "apvm-config",
  "apvm-storage",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "apvm-napi"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "apvm-config",
  "apvm-core",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "apvm-storage"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "chrono",
  "serde",
