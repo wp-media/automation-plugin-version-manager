@@ -1,6 +1,8 @@
 # APVM — Automation Plugin Version Manager
 
-A Rust CLI tool and library for building and managing multiple versions of WordPress plugins from any git reference (branch, tag, commit, or PR).
+[![CI](https://github.com/wp-media/automation-plugin-version-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/wp-media/automation-plugin-version-manager/actions/workflows/ci.yml)
+
+A Rust CLI tool and library for building and managing multiple versions of WordPress plugins from any git reference (branch, tag, commit, PR, or GitHub Release).
 
 Built for developers and QA engineers who need to quickly build plugins from specific PRs, switch between versions, and automate version management.
 
@@ -8,7 +10,7 @@ Built for developers and QA engineers who need to quickly build plugins from spe
 
 | Command  | Description                                          |
 |----------|------------------------------------------------------|
-| `build`  | Build a plugin from a git reference (branch, tag, commit, PR) |
+| `build`  | Build a plugin from a git reference or download from a GitHub Release |
 | `list`   | List all available plugins                           |
 | `info`   | Show detailed information about a plugin             |
 | `config` | View or change configuration settings                |
@@ -17,23 +19,25 @@ Run `apvm --help` for full usage or `apvm <command> --help` for command-specific
 
 ## Features
 
-- **Build from any git ref** — branch, tag, or commit SHA, PR number (PR number is WIP)
-- **Automatic ref detection** — `v1.0.0` to a tag, `develop` to a branch, `123` resolves to PR #123 (when a GitHub token is provided or when this tool auto-detects one)
-- **Multi-variant builds** — e.g., BackWPup produces `free`, `pro-de`, and `pro-en` variants. You can choose which ones you want to build (`free` and `pro-en` are defaults for BackWPup).
-- **Version handling** — required, embedded (auto-detected), or optional per plugin (BackWPup requires version to be specified at build time, and WP Rocket does not require this)
+- **Build from any git ref** — branch, tag, commit SHA, or PR number
+- **Download from GitHub Releases** — skip the build entirely and download pre-built assets from a GitHub Release (e.g., `release:5.6.8`). Currently available for BackWPup
+- **Automatic ref detection** — `v1.0.0` resolves to a tag, `develop` to a branch, `123` to PR #123, and version-like inputs (e.g., `5.6.8`) are checked against GitHub Releases first (when the plugin supports releases)
+- **Multi-variant builds** — e.g., BackWPup produces `free`, `pro-de`, and `pro-en` variants. You can choose which ones to build (`free` and `pro-en` are the defaults for BackWPup)
+- **Version handling** — required, embedded (auto-detected), or optional per plugin (BackWPup requires a version at build time; WP Rocket auto-detects it from source)
+- **GitHub token auto-resolution** — automatically finds tokens from config, `GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token`, or the gh CLI config file
 
 ## Supported Plugins
 
-| Plugin    | Variants             | Version  | Repository |
-|-----------|----------------------|----------|------------|
-| BackWPup  | free, pro-de, pro-en | Required | Private    |
-| WP Rocket | (single)             | Embedded | Public     |
+| Plugin    | Variants             | Version  | Releases | Repository |
+|-----------|----------------------|----------|----------|------------|
+| BackWPup  | free, pro-de, pro-en | Required | Yes      | Private    |
+| WP Rocket | (single)             | Embedded | No       | Public     |
 
 ## Requirements
 
-- [**Rust**](https://www.rust-lang.org/tools/install) ≥ 1.85 (2024 edition)
+- [**Rust**](https://www.rust-lang.org/tools/install) ≥ 1.94.1 (2024 edition)
 - **Git** installed and in `PATH`
-- **GitHub authentication** for private repositories (optional for public). This tool attempts to auto-detect.
+- **GitHub authentication** for private repositories (optional for public). The tool auto-detects tokens from multiple sources (config file, environment variables, `gh` CLI)
 - Plugin-specific build tools (npm, composer, gulp, rsync, zip, etc.) as needed (try `apvm info [plugin-name]` to learn more about a specific plugin)
 
 ## Installation
@@ -134,7 +138,7 @@ console.log(output.result.artifacts.map((a) => a.filename));
 	- `apvm.buildFromTag(...)`
 	- `apvm.buildFromCommit(...)`
 
-You can pass any gitref (branch, commit or tag) to `apvm.build`
+You can pass any git ref (branch, commit, tag, PR, or release) to `apvm.build()` via the `gitRef` field (e.g., `"pr:123"`, `"release:5.6.8"`, `"develop"`).
 
 `ApvmConfig` fields are optional:
 
@@ -170,6 +174,9 @@ apvm build backwpup branch:develop -v 5.1.0
 apvm build backwpup commit:abc1234 -v 5.1.0
 apvm build backwpup pr:123 -v 5.1.0
 
+# Download pre-built assets from a GitHub Release (no build required)
+apvm build backwpup release:5.6.8
+
 # Build specific variants only
 apvm build backwpup 123 -v 5.1.0 --variants free,pro-en
 
@@ -186,9 +193,11 @@ apvm --verbose build backwpup 123 -v 5.1.0
 |-------------|-------------------------|
 | `develop`   | Branch                  |
 | `v1.0.0`    | Tag (if exists), else branch  |
-| `abc1234`   | Commit SHA (7-40 hex)   |
+| `abc1234`   | Commit SHA (7–40 hex)   |
 | `123`       | PR #123                 |
 | `#123`      | PR #123 (`#` stripped)  |
+| `5.6.8`     | GitHub Release (if the plugin has releases), else tag/branch |
+| `release:5.6.8` | GitHub Release (explicit) |
 
 ### List Plugins
 
@@ -217,7 +226,7 @@ apvm config
 # Get a specific value
 apvm config get token
 
-# Set GitHub token (For building from PR numbers)
+# Set GitHub token (required for private repos and PR builds)
 apvm config set token ghp_xxxxxxxxxxxx
 
 # Set custom builds directory
@@ -230,7 +239,17 @@ apvm config unset token
 apvm config path
 ```
 
-NOTE: `builds-dir` is not used/implemented at the moment
+### GitHub Token Resolution
+
+The CLI and NAPI bindings resolve a GitHub token from multiple sources, checked in order:
+
+1. **Config file** — `apvm config set token ghp_xxx`
+2. **`GITHUB_TOKEN`** environment variable
+3. **`GH_TOKEN`** environment variable
+4. **`gh auth token`** command ([gh CLI](https://cli.github.com/) ≥ 2.17.0)
+5. **gh CLI config file** — `~/.config/gh/hosts.yml`
+
+A token is **required** for private repositories (e.g., BackWPup) and for building from PR numbers. It is optional for public repositories but recommended for higher API rate limits (5,000 vs 60 requests/hour).
 
 ### Debug Logging
 
@@ -248,14 +267,16 @@ crates/
 ├── cli/        CLI binary (clap-based), owns defaults and user interaction
 ├── config/     Pure configuration types (no I/O, no defaults)
 ├── core/       Core library: building, git, GitHub API, version detection
-└── storage/    Artifact storage, deduplication, manifests, queries (CURRENTLY NOT USED BY CLI)
+├── napi/       Node.js N-API bindings (napi-rs cdylib)
+└── storage/    Artifact storage, deduplication, manifests, queries
 ```
 
 ### Architecture
 
 - **Config** — pure `serde` types for configuration. No file I/O, no hardcoded paths.
-- **Core** — orchestrates builds (clone → fetch → resolve ref → checkout → detect version → build → collect artifacts), git operations, GitHub API via [octocrab](https://docs.rs/octocrab/0.49), and project registry.
+- **Core** — orchestrates builds (clone → fetch → resolve ref → checkout → detect version → build → collect artifacts), downloads from GitHub Releases, git operations, and GitHub API via [octocrab](https://docs.rs/octocrab/0.49).
 - **Storage** — manages artifacts with commit-based deduplication, cross-platform links (symlinks on Unix, junctions on Windows), and a fluent query API.
+- **NAPI** — Node.js bindings via [napi-rs](https://napi.rs/). Exposes the core library as a native addon with async support on the tokio runtime.
 - **CLI** — owns default paths (`~/.apvm`, `~/apvm-builds`), provides progress display via [indicatif](https://docs.rs/indicatif/0.18), and delegates all logic to core.
 
 ## Running Tests
@@ -278,14 +299,33 @@ npm test
 
 | Crate                | Version | Purpose                        |
 |----------------------|---------|--------------------------------|
-| [clap](https://docs.rs/clap/4.5)         | 4.5     | CLI argument parsing           |
-| [tokio](https://docs.rs/tokio/1.49)       | 1.49    | Async runtime                  |
-| [octocrab](https://docs.rs/octocrab/0.49) | 0.49    | GitHub API client              |
-| [serde](https://docs.rs/serde/1.0)        | 1.0     | Serialization/deserialization  |
-| [indicatif](https://docs.rs/indicatif/0.18)| 0.18   | Progress bars and spinners     |
-| [thiserror](https://docs.rs/thiserror/2.0) | 2.0    | Error type derivation          |
+| [clap](https://docs.rs/clap/4)             | 4       | CLI argument parsing           |
+| [tokio](https://docs.rs/tokio/1)           | 1       | Async runtime                  |
+| [octocrab](https://docs.rs/octocrab/0.49)  | 0.49    | GitHub API client              |
+| [reqwest](https://docs.rs/reqwest/0.13)    | 0.13    | HTTP client (release asset downloads) |
+| [serde](https://docs.rs/serde/1)           | 1       | Serialization/deserialization  |
+| [napi](https://docs.rs/napi/3)             | 3       | Node.js N-API bindings         |
+| [indicatif](https://docs.rs/indicatif/0.18)| 0.18    | Progress bars and spinners     |
+| [thiserror](https://docs.rs/thiserror/2)   | 2       | Error type derivation          |
 | [tracing](https://docs.rs/tracing/0.1)     | 0.1     | Structured logging             |
+| [chrono](https://docs.rs/chrono/0.4)       | 0.4     | Date/time for manifests        |
+| [sha2](https://docs.rs/sha2/0.11)          | 0.11    | Artifact hashing               |
+| [zip](https://docs.rs/zip/8)               | 8       | ZIP archive creation           |
+| [which](https://docs.rs/which/8)           | 8       | Tool dependency checking       |
+| [walkdir](https://docs.rs/walkdir/2)       | 2       | Recursive directory traversal  |
+
+## CI
+
+The project uses GitHub Actions for continuous integration ([ci.yml](.github/workflows/ci.yml)).
+
+| Job | Description |
+|-----|-------------|
+| **Check** | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo doc -D warnings` |
+| **Build NAPI** | Builds native `.node` binaries for 5 targets (macOS ARM64/x64, Linux x64/ARM64, Windows x64) |
+| **Test** | Runs `cargo test --workspace` + `npm test` on Linux, macOS, and Windows |
+| **Commit Artifacts** | Auto-commits updated `.node` binaries on push to `develop` |
+| **CI (gate)** | Single required status check for branch protection |
 
 ## License
 
-Private — WP Media.
+MIT — see [package.json](package.json) and crate manifests.
