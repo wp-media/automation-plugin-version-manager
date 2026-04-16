@@ -42,7 +42,39 @@ Run `apvm --help` for full usage or `apvm <command> --help` for command-specific
 
 ## Installation
 
-Install the `apvm` binary globally via [`cargo install`](https://doc.rust-lang.org/cargo/commands/cargo-install.html):
+### Quick Install (recommended)
+
+Install the latest pre-built binary with a single command — no Rust toolchain required.
+
+If the tool was already installed, executing this again will attempt to update to latest stable version available.
+
+**macOS / Linux:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/wp-media/automation-plugin-version-manager/develop/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/wp-media/automation-plugin-version-manager/develop/install.ps1 | iex
+```
+
+The installer will:
+- Detect your OS and architecture
+- Download the correct binary from the [latest GitHub release](https://github.com/wp-media/automation-plugin-version-manager/releases/latest)
+- Verify its SHA-256 checksum
+- Install it to `~/.apvm/bin/` and add it to your `PATH`
+
+To override the install directory, set `APVM_INSTALL` before running:
+
+```sh
+APVM_INSTALL=/opt/apvm curl -fsSL https://raw.githubusercontent.com/wp-media/automation-plugin-version-manager/develop/install.sh | sh
+```
+
+### Install from Source
+
+If you have the Rust toolchain installed, you can build and install from source via [`cargo install`](https://doc.rust-lang.org/cargo/commands/cargo-install.html):
 
 ```sh
 cargo install --path crates/cli
@@ -50,7 +82,11 @@ cargo install --path crates/cli
 
 This compiles in release mode and places the `apvm` binary in `~/.cargo/bin/`, which should already be in your `PATH`.
 
-### Updating After Changes
+#### Updating to new version (Easy way)
+
+Just execute the same script for quick installation.
+
+#### Updating from source (after code changes)
 
 After pulling changes or switching branches, reinstall with `--force` to overwrite the existing binary:
 
