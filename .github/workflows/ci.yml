@@ -50,10 +50,14 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             artifact: apvm-napi.linux-x64-gnu.node
+            # Vendor OpenSSL to produce a self-contained binary with no runtime libssl dependency.
+            # https://docs.rs/openssl/latest/openssl/#vendored
+            features: vendored-openssl
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             artifact: apvm-napi.linux-arm64-gnu.node
             # Vendor OpenSSL from source for cross-compilation (no system libssl-dev:arm64)
+            # and to produce a self-contained binary with no runtime libssl dependency.
             # https://docs.rs/openssl/latest/openssl/#vendored
             features: vendored-openssl
           - target: x86_64-pc-windows-msvc

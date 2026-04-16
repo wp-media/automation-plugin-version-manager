@@ -1,0 +1,168 @@
+# Builds CLI binaries for all platforms and publishes them as GitHub Release assets.
+#
+# Triggered by pushing a tag matching `cli/v*` (e.g. `cli/v1.2.1`).
+# The tag should be created from a commit where CI has already passed.
+#
+# Usage:
+#   git tag cli/v1.2.1
+#   git push origin cli/v1.2.1
+#
+# This creates a GitHub Release named "apvm v1.2.1" with 5 binaries + checksums.
+
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - 'cli/v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel an in-progress release — unlike CI, partial releases are worse
+  # than waiting for a slow build to finish.
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # required to create releases and upload assets
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Validate ─────────────────────────────────────────────────────────────
+  # Fail fast before any build starts if the tag version doesn't match
+  # the workspace version in Cargo.toml.
+  # e.g. tag `cli/v1.2.1` must match `version = "1.2.1"` in Cargo.toml.
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check tag version matches Cargo.toml
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#cli/v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "Tag version:   v${TAG_VERSION}"
+          echo "Cargo version: ${CARGO_VERSION}"
+          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+            echo "::error::Tag version cli/v${TAG_VERSION} does not match Cargo.toml version ${CARGO_VERSION}"
+            exit 1
+          fi
+
+  # ── Build ────────────────────────────────────────────────────────────────
+  # Build the CLI binary for each target platform.
+  # Artifacts are uploaded for the release job to collect.
+  build:
+    needs: validate
+    name: Build CLI (${{ matrix.settings.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary: apvm
+            artifact: apvm-darwin-arm64
+
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            binary: apvm
+            artifact: apvm-darwin-x64
+
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            binary: apvm
+            artifact: apvm-linux-x64-gnu
+            # Vendor OpenSSL to produce a self-contained binary with no runtime
+            # libssl dependency. https://docs.rs/openssl/latest/openssl/#vendored
+            features: vendored-openssl
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            binary: apvm
+            artifact: apvm-linux-arm64-gnu
+            # Vendor OpenSSL from source for cross-compilation (no system
+            # libssl-dev:arm64) and to produce a self-contained binary.
+            # https://docs.rs/openssl/latest/openssl/#vendored
+            features: vendored-openssl
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: apvm.exe
+            artifact: apvm-win32-x64-msvc.exe
+    runs-on: ${{ matrix.settings.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.settings.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build CLI
+        run: >
+          cargo build --release --locked -p apvm
+          --target ${{ matrix.settings.target }}
+          ${{ matrix.settings.features && format('--features {0}', matrix.settings.features) || '' }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+
+      - name: Rename to platform-specific name
+        shell: bash
+        run: >
+          cp "target/${{ matrix.settings.target }}/release/${{ matrix.settings.binary }}"
+          "${{ matrix.settings.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.settings.target }}
+          path: ${{ matrix.settings.artifact }}
+          if-no-files-found: error
+          # Artifacts are transient — only needed to pass binaries to the
+          # release job. 1 day is sufficient; default is 90 days.
+          # https://github.com/actions/upload-artifact#inputs
+          retention-days: 1
+
+  # ── Release ──────────────────────────────────────────────────────────────
+  # Collect all build artifacts, generate checksums, and create a GitHub Release.
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all CLI artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        working-directory: artifacts
+        run: sha256sum apvm-* > checksums.txt
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#cli/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: apvm ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/apvm-darwin-arm64
+            artifacts/apvm-darwin-x64
+            artifacts/apvm-linux-x64-gnu
+            artifacts/apvm-linux-arm64-gnu
+            artifacts/apvm-win32-x64-msvc.exe
+            artifacts/checksums.txt

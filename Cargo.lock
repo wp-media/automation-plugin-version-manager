@@ -92,6 +92,7 @@ dependencies = [
  "clap",
  "directories",
  "indicatif",
+ "openssl",
  "serde_json",
  "tokio",
  "tracing",

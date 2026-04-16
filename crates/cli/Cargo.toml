@@ -10,6 +10,14 @@ description = "Build and manage WordPress plugin versions"
 name = "apvm"
 path = "src/main.rs"
 
+[features]
+# Build OpenSSL from source instead of linking against system libssl.
+# Required for Linux cross-compilation (aarch64) and recommended for all
+# Linux distribution builds to produce self-contained binaries with no
+# runtime libssl.so dependency.
+# https://docs.rs/openssl/latest/openssl/#vendored
+vendored-openssl = ["dep:openssl"]
+
 [dependencies]
 # Internal crates
 apvm-config = { workspace = true }
@@ -34,3 +42,7 @@ indicatif = { workspace = true }
 
 # Platform directories (home, config, etc.)
 directories = { workspace = true }
+
+# OpenSSL vendored build — only activated by the `vendored-openssl` feature.
+# Compiles OpenSSL from source; statically linked into the binary.
+openssl = { workspace = true, optional = true }
