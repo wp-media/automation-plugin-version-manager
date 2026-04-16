@@ -1486,4 +1486,164 @@ mod tests {
         assert!(!looks_like_version_tag("v1"));
         assert!(!looks_like_version_tag("123"));
     }
+
+    // =========================================================================
+    // BuildOutput tests
+    // =========================================================================
+
+    use crate::git::{RefSource, ResolvedRef};
+
+    /// Helper: create a minimal BuildOutput for testing.
+    fn make_build_output(
+        artifacts: Vec<ProducedArtifact>,
+        version: &str,
+        source: RefSource,
+        commit: &str,
+        branch: &str,
+    ) -> BuildOutput {
+        BuildOutput {
+            result: crate::build::BuildResult::new(
+                artifacts,
+                std::path::PathBuf::from("/build"),
+                version.to_string(),
+                vec![],
+            ),
+            resolved_ref: ResolvedRef {
+                input: "test-input".to_string(),
+                source,
+                git_ref: branch.to_string(),
+                commit_sha: Some(commit.to_string()),
+            },
+            commit: commit.to_string(),
+            commit_short: commit[..7].to_string(),
+            branch: branch.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_build_output_to_build_metadata() {
+        let output = make_build_output(
+            vec![],
+            "3.17.4",
+            RefSource::PullRequest(99),
+            "abc1234567890",
+            "develop",
+        );
+
+        let meta = output.to_build_metadata("wp-rocket");
+        assert_eq!(meta.project, "wp-rocket");
+        assert_eq!(meta.version, "3.17.4");
+        assert_eq!(meta.commit, "abc1234567890");
+        assert_eq!(meta.branch, "develop");
+    }
+
+    #[test]
+    fn test_build_output_to_source_artifacts() {
+        let output = make_build_output(
+            vec![
+                ProducedArtifact::new(
+                    Some("free".into()),
+                    std::path::PathBuf::from("/build/free.zip"),
+                    "free.zip".into(),
+                    100,
+                ),
+                ProducedArtifact::new(
+                    Some("pro".into()),
+                    std::path::PathBuf::from("/build/pro.zip"),
+                    "pro.zip".into(),
+                    200,
+                ),
+            ],
+            "5.1.0",
+            RefSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+
+        let artifacts = output.to_source_artifacts();
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].variant_id, Some("free".to_string()));
+        assert_eq!(artifacts[0].target_name, "free.zip");
+        assert_eq!(artifacts[1].variant_id, Some("pro".to_string()));
+    }
+
+    #[test]
+    fn test_build_output_source() {
+        let output = make_build_output(
+            vec![],
+            "3.17.4",
+            RefSource::PullRequest(42),
+            "abc1234567890",
+            "develop",
+        );
+        assert_eq!(*output.source(), RefSource::PullRequest(42));
+    }
+
+    #[test]
+    fn test_build_output_description_pr() {
+        let output = make_build_output(
+            vec![],
+            "3.17.4",
+            RefSource::PullRequest(42),
+            "abc1234567890",
+            "feature/foo",
+        );
+        let desc = output.description();
+        assert!(desc.contains("PR #42"));
+        assert!(desc.contains("abc1234"));
+    }
+
+    #[test]
+    fn test_build_output_description_branch() {
+        let output = make_build_output(
+            vec![],
+            "3.17.4",
+            RefSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+        let desc = output.description();
+        assert!(desc.contains("develop"));
+        assert!(desc.contains("abc1234"));
+    }
+
+    #[test]
+    fn test_build_output_exists_in_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = apvm_storage::ArtifactStore::new(dir.path().to_path_buf());
+
+        let output = make_build_output(
+            vec![],
+            "3.17.4",
+            RefSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+
+        // Nothing stored yet
+        assert!(!output.exists_in_store(&store, "wp-rocket").unwrap());
+    }
+
+    #[test]
+    fn test_build_output_missing_variants_empty_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = apvm_storage::ArtifactStore::new(dir.path().to_path_buf());
+
+        let output = make_build_output(
+            vec![ProducedArtifact::new(
+                Some("free".into()),
+                std::path::PathBuf::from("/free.zip"),
+                "free.zip".into(),
+                100,
+            )],
+            "5.1.0",
+            RefSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+
+        let missing = output.missing_variants(&store, "backwpup").unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], Some("free".to_string()));
+    }
 }

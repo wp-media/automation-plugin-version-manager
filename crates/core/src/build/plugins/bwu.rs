@@ -347,3 +347,364 @@ impl Builder for BackWPupBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::BuildContext;
+    use crate::build::progress::NullReporter;
+    use tempfile::TempDir;
+
+    fn builder() -> BackWPupBuilder {
+        BackWPupBuilder
+    }
+
+    /// Create a test build context. Returns (TempDir, BuildContext).
+    fn test_context() -> (TempDir, BuildContext) {
+        let workspace = TempDir::new().unwrap();
+        let repo_dir = workspace.path().join("backwpup");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let context = BuildContext::new(repo_dir, workspace.path().to_path_buf());
+        (workspace, context)
+    }
+
+    // =========================================================================
+    // 1.1 – Version Handling
+    // =========================================================================
+
+    #[test]
+    fn test_version_requirement_is_required() {
+        assert_eq!(
+            builder().version_requirement(),
+            VersionRequirement::Required
+        );
+    }
+
+    #[test]
+    fn test_detect_version_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let version = builder().detect_version(dir.path()).unwrap();
+        assert_eq!(version, None);
+    }
+
+    // =========================================================================
+    // 1.3 – Tool Dependencies
+    // =========================================================================
+
+    #[test]
+    fn test_tool_dependencies() {
+        let deps = builder().tool_dependencies();
+        assert_eq!(deps.len(), 3);
+
+        let names: Vec<&str> = deps.iter().map(|d| d.name).collect();
+        assert!(names.contains(&"npm"));
+        assert!(names.contains(&"composer"));
+        assert!(names.contains(&"gulp"));
+
+        // npm and composer are required without install commands
+        let npm = deps.iter().find(|d| d.name == "npm").unwrap();
+        assert!(npm.required);
+        assert!(npm.install_commands.is_empty());
+
+        let composer = deps.iter().find(|d| d.name == "composer").unwrap();
+        assert!(composer.required);
+        assert!(composer.install_commands.is_empty());
+
+        // gulp is required WITH install commands
+        let gulp = deps.iter().find(|d| d.name == "gulp").unwrap();
+        assert!(gulp.required);
+        assert!(!gulp.install_commands.is_empty());
+        assert!(gulp.install_commands[0].contains("npm install --global gulp-cli"));
+    }
+
+    // =========================================================================
+    // 1.4 – Setup Commands
+    // =========================================================================
+
+    #[test]
+    fn test_setup_commands() {
+        let cmds = builder().setup_commands();
+        assert_eq!(cmds.len(), 2);
+
+        // First: composer install
+        assert!(cmds[0].command.contains("composer install"));
+        assert!(cmds[0].command.contains("--no-dev"));
+        assert!(cmds[0].label.contains("PHP"));
+
+        // Second: npm install
+        assert!(cmds[1].command.contains("npm install"));
+        assert!(cmds[1].label.contains("JS"));
+    }
+
+    // =========================================================================
+    // 1.5–1.6 – Variants
+    // =========================================================================
+
+    #[test]
+    fn test_variants() {
+        let variants = builder().variants();
+        assert_eq!(variants.len(), 3);
+
+        let ids: Vec<&str> = variants.iter().map(|v| v.id).collect();
+        assert!(ids.contains(&BackWPupBuilder::VARIANT_FREE));
+        assert!(ids.contains(&BackWPupBuilder::VARIANT_PRO_DE));
+        assert!(ids.contains(&BackWPupBuilder::VARIANT_PRO_EN));
+
+        // Verify names are non-empty
+        for v in &variants {
+            assert!(!v.name.is_empty());
+            assert!(!v.description.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_has_variants_true() {
+        assert!(builder().has_variants());
+    }
+
+    // =========================================================================
+    // 1.7–1.8 – Defaults
+    // =========================================================================
+
+    #[test]
+    fn test_default_version() {
+        assert_eq!(builder().default_version(), Some("9.99.99"));
+    }
+
+    #[test]
+    fn test_default_variants() {
+        let defaults = builder().default_variants();
+        assert_eq!(defaults.len(), 2);
+        assert!(defaults.contains(&BackWPupBuilder::VARIANT_FREE));
+        assert!(defaults.contains(&BackWPupBuilder::VARIANT_PRO_EN));
+        // pro-de excluded by default
+        assert!(!defaults.contains(&BackWPupBuilder::VARIANT_PRO_DE));
+    }
+
+    // =========================================================================
+    // 1.9–1.13 – Build Commands
+    // =========================================================================
+
+    #[test]
+    fn test_build_commands_all_variants() {
+        let (_ws, context) = test_context();
+        let commands = builder().build_commands(&context, "5.1.0", &[]);
+
+        // 2 common (buildAssets + tailwind) + 3 variant commands = 5
+        assert_eq!(commands.len(), 5);
+
+        // First two are always the asset builds
+        assert!(commands[0].command.contains("gulp buildAssets"));
+        assert!(commands[1].command.contains("tailwindcss"));
+
+        // Then one command per variant
+        let cmd_strs: Vec<&str> = commands[2..].iter().map(|c| c.command.as_str()).collect();
+        assert!(cmd_strs.iter().any(|c| c.contains("gulp free")));
+        assert!(
+            cmd_strs
+                .iter()
+                .any(|c| c.contains("gulp pro") && c.contains("--language=de"))
+        );
+        assert!(
+            cmd_strs
+                .iter()
+                .any(|c| c.contains("gulp pro") && c.contains("--language=en"))
+        );
+    }
+
+    #[test]
+    fn test_build_commands_specific_variants() {
+        let (_ws, context) = test_context();
+        let commands = builder().build_commands(&context, "5.1.0", &["free"]);
+
+        // 2 common + 1 variant = 3
+        assert_eq!(commands.len(), 3);
+        assert!(commands[2].command.contains("gulp free"));
+    }
+
+    #[test]
+    fn test_build_commands_version_in_command() {
+        let (_ws, context) = test_context();
+        let commands = builder().build_commands(&context, "5.1.0", &["free"]);
+
+        // Version appears in --packageVersion
+        assert!(commands[2].command.contains("--packageVersion=\"5.1.0\""));
+    }
+
+    #[test]
+    fn test_build_commands_pro_de_language_flag() {
+        let (_ws, context) = test_context();
+        let commands = builder().build_commands(&context, "5.1.0", &["pro-de"]);
+
+        assert!(commands[2].command.contains("--language=de"));
+        assert!(commands[2].command.contains("gulp pro"));
+    }
+
+    #[test]
+    fn test_build_commands_pro_en_language_flag() {
+        let (_ws, context) = test_context();
+        let commands = builder().build_commands(&context, "5.1.0", &["pro-en"]);
+
+        assert!(commands[2].command.contains("--language=en"));
+        assert!(commands[2].command.contains("gulp pro"));
+    }
+
+    // =========================================================================
+    // 1.14–1.15 – Pre-build Hook
+    // =========================================================================
+
+    #[test]
+    fn test_pre_build_hook_removes_artifacts() {
+        let (_ws, context) = test_context();
+
+        // Create dummy artifacts in repo_dir
+        let zip1 = context.repo_dir().join("backwpup-5.1.0-abcd1234.zip");
+        let zip2 = context
+            .repo_dir()
+            .join("backwpup-pro-en-5.1.0-abcd1234.zip");
+        std::fs::File::create(&zip1).unwrap();
+        std::fs::File::create(&zip2).unwrap();
+        assert!(zip1.exists());
+        assert!(zip2.exists());
+
+        builder()
+            .pre_build_hook(&context, "5.1.0", &[], &NullReporter)
+            .unwrap();
+
+        assert!(!zip1.exists());
+        assert!(!zip2.exists());
+    }
+
+    #[test]
+    fn test_pre_build_hook_noop_no_artifacts() {
+        let (_ws, context) = test_context();
+        // No artifacts exist — should not error
+        builder()
+            .pre_build_hook(&context, "5.1.0", &[], &NullReporter)
+            .unwrap();
+    }
+
+    // =========================================================================
+    // 1.16–1.18 – Artifacts
+    // =========================================================================
+
+    #[test]
+    fn test_artifacts_found() {
+        let (_ws, context) = test_context();
+        let version = "5.1.0";
+
+        // Create expected artifact files in repo_dir (simulates gulp output)
+        let free = context
+            .repo_dir()
+            .join(format!("backwpup-{}-abcd1234.zip", version));
+        let pro_en = context
+            .repo_dir()
+            .join(format!("backwpup-pro-en-{}-abcd1234.zip", version));
+        std::fs::File::create(&free).unwrap();
+        std::fs::File::create(&pro_en).unwrap();
+
+        let artifacts = builder()
+            .artifacts(&context, version, &["free", "pro-en"])
+            .unwrap();
+        assert_eq!(artifacts.len(), 2);
+
+        let filenames: Vec<&str> = artifacts.iter().map(|a| a.target_name.as_str()).collect();
+        assert!(
+            filenames
+                .iter()
+                .any(|f| f.starts_with("backwpup-5.1.0-") && !f.contains("pro"))
+        );
+        assert!(
+            filenames
+                .iter()
+                .any(|f| f.starts_with("backwpup-pro-en-5.1.0-"))
+        );
+
+        // All have variant_id set
+        for a in &artifacts {
+            assert!(a.variant_id.is_some());
+        }
+    }
+
+    #[test]
+    fn test_artifacts_not_found_error() {
+        let (_ws, context) = test_context();
+        let result = builder().artifacts(&context, "5.1.0", &["free"]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("No artifact found"));
+    }
+
+    #[test]
+    fn test_artifacts_multiple_matches_error() {
+        let (_ws, context) = test_context();
+        let version = "5.1.0";
+
+        // Create two files matching the same glob pattern
+        let dup1 = context
+            .repo_dir()
+            .join(format!("backwpup-{}-aaaa1111.zip", version));
+        let dup2 = context
+            .repo_dir()
+            .join(format!("backwpup-{}-bbbb2222.zip", version));
+        std::fs::File::create(&dup1).unwrap();
+        std::fs::File::create(&dup2).unwrap();
+
+        let result = builder().artifacts(&context, version, &["free"]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("matched"));
+        assert!(err.contains("2"));
+    }
+
+    // =========================================================================
+    // 1.19–1.22 – Release Asset Matching
+    // =========================================================================
+
+    #[test]
+    fn test_matches_release_asset_valid() {
+        let b = builder();
+        assert!(b.matches_release_asset("backwpup-free-5.6.8.zip"));
+        assert!(b.matches_release_asset("backwpup-pro-de-5.6.8.zip"));
+        assert!(b.matches_release_asset("backwpup-pro-en-5.6.8.zip"));
+        assert!(b.matches_release_asset("backwpup-5.6.8.zip")); // legacy format
+    }
+
+    #[test]
+    fn test_matches_release_asset_invalid() {
+        let b = builder();
+        assert!(!b.matches_release_asset("unrelated.zip"));
+        assert!(!b.matches_release_asset("backwpup-free-5.6.8.tar.gz"));
+        assert!(!b.matches_release_asset("wp-rocket-3.17.4.zip"));
+        assert!(!b.matches_release_asset(""));
+    }
+
+    #[test]
+    fn test_variant_from_release_asset() {
+        let b = builder();
+        assert_eq!(
+            b.variant_from_release_asset("backwpup-free-5.6.8.zip"),
+            Some(BackWPupBuilder::VARIANT_FREE.to_string())
+        );
+        assert_eq!(
+            b.variant_from_release_asset("backwpup-pro-de-5.6.8.zip"),
+            Some(BackWPupBuilder::VARIANT_PRO_DE.to_string())
+        );
+        assert_eq!(
+            b.variant_from_release_asset("backwpup-pro-en-5.6.8.zip"),
+            Some(BackWPupBuilder::VARIANT_PRO_EN.to_string())
+        );
+        // Legacy format (no variant prefix) → mapped to free
+        assert_eq!(
+            b.variant_from_release_asset("backwpup-5.6.8.zip"),
+            Some(BackWPupBuilder::VARIANT_FREE.to_string())
+        );
+    }
+
+    #[test]
+    fn test_variant_from_release_asset_unknown() {
+        let b = builder();
+        assert_eq!(b.variant_from_release_asset("unrelated.zip"), None);
+        assert_eq!(b.variant_from_release_asset(""), None);
+    }
+}

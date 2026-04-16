@@ -731,3 +731,700 @@ pub struct DeleteSourceResult {
     /// Commits that were deleted because they became orphaned.
     pub orphan_commits_deleted: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Helper: create a store backed by a temp directory.
+    fn temp_store() -> (TempDir, ArtifactStore) {
+        let dir = TempDir::new().unwrap();
+        let store = ArtifactStore::new(dir.path().to_path_buf());
+        (dir, store)
+    }
+
+    /// Helper: create a dummy source artifact file. Returns SourceArtifact.
+    fn make_artifact(dir: &std::path::Path, name: &str, variant: Option<&str>) -> SourceArtifact {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("dummy content for {name}")).unwrap();
+        SourceArtifact {
+            variant_id: variant.map(|s| s.to_string()),
+            path,
+            target_name: name.to_string(),
+        }
+    }
+
+    /// Helper: create metadata.
+    fn make_metadata(
+        project: &str,
+        version: &str,
+        source: BuildSource,
+        commit: &str,
+        branch: &str,
+    ) -> BuildMetadata {
+        BuildMetadata::new(
+            project.to_string(),
+            version.to_string(),
+            source,
+            commit.to_string(),
+            branch.to_string(),
+        )
+    }
+
+    // =========================================================================
+    // 2.1 – Basic Store
+    // =========================================================================
+
+    #[test]
+    fn test_store_basic() {
+        let (dir, store) = temp_store();
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            BuildSource::Branch("develop".into()),
+            "abc1234567890abcdef",
+            "develop",
+        );
+
+        let result = store.store(&[artifact], &meta).unwrap();
+
+        assert!(result.commit_dir.exists());
+        assert_eq!(result.stored_files.len(), 1);
+        assert!(result.skipped_variants.is_empty());
+        assert!(!result.was_deduplicated);
+        assert_eq!(result.manifest.project, "wp-rocket");
+        assert_eq!(result.manifest.version, "3.17.4");
+        assert_eq!(result.manifest.artifacts.len(), 1);
+
+        // Source link created
+        let source_dir = store.paths().source_dir(
+            "wp-rocket",
+            "3.17.4",
+            &BuildSource::Branch("develop".into()),
+        );
+        assert!(source_dir.exists());
+    }
+
+    // =========================================================================
+    // 2.2 – Deduplication
+    // =========================================================================
+
+    #[test]
+    fn test_store_deduplication() {
+        let (dir, store) = temp_store();
+        let a1 = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            BuildSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+
+        // First store
+        store.store(&[a1], &meta).unwrap();
+
+        // Second store with same commit, same variant
+        let a2 = make_artifact(dir.path(), "plugin.zip", None);
+        let result = store.store(&[a2], &meta).unwrap();
+
+        assert!(result.was_deduplicated);
+        assert_eq!(result.skipped_variants.len(), 1);
+        assert!(result.stored_files.is_empty());
+    }
+
+    // =========================================================================
+    // 2.3 – Different Variants
+    // =========================================================================
+
+    #[test]
+    fn test_store_different_variants() {
+        let (dir, store) = temp_store();
+        let meta = make_metadata(
+            "backwpup",
+            "5.1.0",
+            BuildSource::PullRequest(42),
+            "abc1234567890",
+            "develop",
+        );
+
+        // Store "free"
+        let a1 = make_artifact(dir.path(), "free.zip", Some("free"));
+        store.store(&[a1], &meta).unwrap();
+
+        // Store "pro" to same commit
+        let a2 = make_artifact(dir.path(), "pro.zip", Some("pro"));
+        let result = store.store(&[a2], &meta).unwrap();
+
+        // "pro" is a new variant — not deduplicated
+        assert!(!result.was_deduplicated);
+        assert_eq!(result.stored_files.len(), 1);
+        assert!(result.skipped_variants.is_empty());
+        assert_eq!(result.manifest.artifacts.len(), 2);
+    }
+
+    // =========================================================================
+    // 2.4 – Artifact Not Found
+    // =========================================================================
+
+    #[test]
+    fn test_store_artifact_not_found() {
+        let (_dir, store) = temp_store();
+        let bad_artifact = SourceArtifact {
+            variant_id: None,
+            path: std::path::PathBuf::from("/nonexistent/path/plugin.zip"),
+            target_name: "plugin.zip".into(),
+        };
+        let meta = make_metadata(
+            "wp-rocket",
+            "1.0.0",
+            BuildSource::Branch("main".into()),
+            "abc1234567890",
+            "main",
+        );
+
+        let result = store.store(&[bad_artifact], &meta);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Artifact not found"));
+    }
+
+    // =========================================================================
+    // 2.5 – Creates Dirs
+    // =========================================================================
+
+    #[test]
+    fn test_store_creates_dirs() {
+        let (dir, store) = temp_store();
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            BuildSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        // Verify nested directory structure
+        let commit_dir = store.paths().commit_dir("wp-rocket", "3.17.4", "abc1234");
+        assert!(commit_dir.exists());
+
+        let by_source_dir = store.paths().by_source_dir("wp-rocket", "3.17.4");
+        assert!(by_source_dir.exists());
+    }
+
+    // =========================================================================
+    // 2.6 – SHA256 Checksum
+    // =========================================================================
+
+    #[test]
+    fn test_store_sha256_checksum() {
+        let (dir, store) = temp_store();
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "1.0.0",
+            BuildSource::Branch("main".into()),
+            "abc1234567890",
+            "main",
+        );
+
+        let result = store.store(&[artifact], &meta).unwrap();
+
+        // Manifest has SHA256
+        let sha = &result.manifest.artifacts[0].sha256;
+        assert!(!sha.is_empty());
+        assert_eq!(sha.len(), 64); // SHA256 = 64 hex chars
+
+        // Verify it matches actual file hash
+        let stored_file = result.commit_dir.join("plugin.zip");
+        let bytes = std::fs::read(&stored_file).unwrap();
+        let hash = sha2::Sha256::digest(&bytes);
+        let expected: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(sha, &expected);
+    }
+
+    // =========================================================================
+    // 2.7–2.8 – Find by Source
+    // =========================================================================
+
+    #[test]
+    fn test_find_by_source() {
+        let (dir, store) = temp_store();
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let source = BuildSource::PullRequest(99);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            source.clone(),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        let builds = store
+            .find_by_source("wp-rocket", "3.17.4", &source)
+            .unwrap();
+        assert_eq!(builds.len(), 1);
+        assert_eq!(builds[0].manifest.commit_short, "abc1234");
+    }
+
+    #[test]
+    fn test_find_by_source_not_found() {
+        let (_dir, store) = temp_store();
+        let source = BuildSource::PullRequest(999);
+        let builds = store.find_by_source("wp-rocket", "1.0.0", &source).unwrap();
+        assert!(builds.is_empty());
+    }
+
+    // =========================================================================
+    // 2.9 – Find Latest by Source
+    // =========================================================================
+
+    #[test]
+    fn test_find_latest_by_source() {
+        let (dir, store) = temp_store();
+        let source = BuildSource::Branch("develop".into());
+
+        // Store two commits for same source
+        let a1 = make_artifact(dir.path(), "p1.zip", None);
+        let m1 = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            source.clone(),
+            "aaa1111111111",
+            "develop",
+        );
+        store.store(&[a1], &m1).unwrap();
+
+        let a2 = make_artifact(dir.path(), "p2.zip", None);
+        let m2 = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            source.clone(),
+            "bbb2222222222",
+            "develop",
+        );
+        store.store(&[a2], &m2).unwrap();
+
+        let latest = store
+            .find_latest_by_source("wp-rocket", "3.17.4", &source)
+            .unwrap();
+        assert!(latest.is_some());
+        // Latest should be the second one (newest built_at)
+        assert_eq!(latest.unwrap().manifest.commit_short, "bbb2222");
+    }
+
+    // =========================================================================
+    // 2.10–2.11 – Find by Commit
+    // =========================================================================
+
+    #[test]
+    fn test_find_by_commit() {
+        let (dir, store) = temp_store();
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            BuildSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        let build = store
+            .find_by_commit("wp-rocket", "3.17.4", "abc1234")
+            .unwrap();
+        assert!(build.is_some());
+        assert_eq!(build.unwrap().manifest.version, "3.17.4");
+    }
+
+    #[test]
+    fn test_find_by_commit_not_found() {
+        let (_dir, store) = temp_store();
+        let build = store
+            .find_by_commit("wp-rocket", "1.0.0", "zzz9999")
+            .unwrap();
+        assert!(build.is_none());
+    }
+
+    // =========================================================================
+    // 2.12–2.13 – List Projects
+    // =========================================================================
+
+    #[test]
+    fn test_list_projects() {
+        let (dir, store) = temp_store();
+
+        // Store in two different projects
+        let a1 = make_artifact(dir.path(), "p1.zip", None);
+        let m1 = make_metadata(
+            "wp-rocket",
+            "1.0.0",
+            BuildSource::Branch("main".into()),
+            "aaa1111111111",
+            "main",
+        );
+        store.store(&[a1], &m1).unwrap();
+
+        let a2 = make_artifact(dir.path(), "p2.zip", None);
+        let m2 = make_metadata(
+            "backwpup",
+            "5.0.0",
+            BuildSource::Branch("main".into()),
+            "bbb2222222222",
+            "main",
+        );
+        store.store(&[a2], &m2).unwrap();
+
+        let projects = store.list_projects().unwrap();
+        assert_eq!(projects.len(), 2);
+        assert!(projects.contains(&"wp-rocket".to_string()));
+        assert!(projects.contains(&"backwpup".to_string()));
+    }
+
+    #[test]
+    fn test_list_projects_empty() {
+        let (_dir, store) = temp_store();
+        let projects = store.list_projects().unwrap();
+        assert!(projects.is_empty());
+    }
+
+    // =========================================================================
+    // 2.14 – List Versions
+    // =========================================================================
+
+    #[test]
+    fn test_list_versions() {
+        let (dir, store) = temp_store();
+
+        for (ver, commit) in [("3.17.4", "aaa1111111111"), ("3.18.0", "bbb2222222222")] {
+            let a = make_artifact(dir.path(), &format!("p-{ver}.zip"), None);
+            let m = make_metadata(
+                "wp-rocket",
+                ver,
+                BuildSource::Branch("main".into()),
+                commit,
+                "main",
+            );
+            store.store(&[a], &m).unwrap();
+        }
+
+        let versions = store.list_versions("wp-rocket").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions.contains(&"3.17.4".to_string()));
+        assert!(versions.contains(&"3.18.0".to_string()));
+    }
+
+    // =========================================================================
+    // 2.15 – List Sources
+    // =========================================================================
+
+    #[test]
+    fn test_list_sources() {
+        let (dir, store) = temp_store();
+
+        // Store with PR source
+        let a1 = make_artifact(dir.path(), "p1.zip", None);
+        let m1 = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            BuildSource::PullRequest(42),
+            "aaa1111111111",
+            "develop",
+        );
+        store.store(&[a1], &m1).unwrap();
+
+        // Store with branch source
+        let a2 = make_artifact(dir.path(), "p2.zip", None);
+        let m2 = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            BuildSource::Branch("develop".into()),
+            "bbb2222222222",
+            "develop",
+        );
+        store.store(&[a2], &m2).unwrap();
+
+        let sources = store.list_sources("wp-rocket", "3.17.4").unwrap();
+        assert_eq!(sources.len(), 2);
+    }
+
+    // =========================================================================
+    // 2.16 – List Commits
+    // =========================================================================
+
+    #[test]
+    fn test_list_commits() {
+        let (dir, store) = temp_store();
+
+        for (commit, name) in [("aaa1111111111", "p1.zip"), ("bbb2222222222", "p2.zip")] {
+            let a = make_artifact(dir.path(), name, None);
+            let m = make_metadata(
+                "wp-rocket",
+                "3.17.4",
+                BuildSource::Branch("develop".into()),
+                commit,
+                "develop",
+            );
+            store.store(&[a], &m).unwrap();
+        }
+
+        let commits = store.list_commits("wp-rocket", "3.17.4").unwrap();
+        assert_eq!(commits.len(), 2);
+    }
+
+    // =========================================================================
+    // 2.17–2.18 – Delete by Commit
+    // =========================================================================
+
+    #[test]
+    fn test_delete_by_commit() {
+        let (dir, store) = temp_store();
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            BuildSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+        let commit_dir = store.paths().commit_dir("wp-rocket", "3.17.4", "abc1234");
+        assert!(commit_dir.exists());
+
+        store
+            .delete_by_commit("wp-rocket", "3.17.4", "abc1234")
+            .unwrap();
+        assert!(!commit_dir.exists());
+    }
+
+    #[test]
+    fn test_delete_by_commit_cleans_dangling_links() {
+        let (dir, store) = temp_store();
+        let source = BuildSource::Branch("develop".into());
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            source.clone(),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        store
+            .delete_by_commit("wp-rocket", "3.17.4", "abc1234")
+            .unwrap();
+
+        // Source link should be cleaned up since commit is gone
+        let source_dir = store.paths().source_dir("wp-rocket", "3.17.4", &source);
+        // Source dir may be entirely removed by cleanup, or its link is dangling-removed
+        if source_dir.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&source_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(entries.is_empty());
+        }
+    }
+
+    // =========================================================================
+    // 2.19–2.21 – Delete Source
+    // =========================================================================
+
+    #[test]
+    fn test_delete_source() {
+        let (dir, store) = temp_store();
+        let source = BuildSource::PullRequest(42);
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            source.clone(),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        let result = store
+            .delete_source("wp-rocket", "3.17.4", &source, false)
+            .unwrap();
+        assert!(!result.commits_affected.is_empty());
+
+        let source_dir = store.paths().source_dir("wp-rocket", "3.17.4", &source);
+        assert!(!source_dir.exists());
+    }
+
+    #[test]
+    fn test_delete_source_with_orphan_cleanup() {
+        let (dir, store) = temp_store();
+        let source = BuildSource::PullRequest(42);
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            source.clone(),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        let result = store
+            .delete_source("wp-rocket", "3.17.4", &source, true)
+            .unwrap();
+
+        // Commit had only this source, so it's now orphaned and should be deleted
+        assert!(!result.orphan_commits_deleted.is_empty());
+        let commit_dir = store.paths().commit_dir("wp-rocket", "3.17.4", "abc1234");
+        assert!(!commit_dir.exists());
+    }
+
+    #[test]
+    fn test_delete_source_without_orphan_cleanup() {
+        let (dir, store) = temp_store();
+        let source = BuildSource::PullRequest(42);
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            source.clone(),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        let result = store
+            .delete_source("wp-rocket", "3.17.4", &source, false)
+            .unwrap();
+
+        // Commit preserved (orphan cleanup off)
+        assert!(result.orphan_commits_deleted.is_empty());
+        let commit_dir = store.paths().commit_dir("wp-rocket", "3.17.4", "abc1234");
+        assert!(commit_dir.exists());
+    }
+
+    // =========================================================================
+    // 2.22 – Delete Source Commit
+    // =========================================================================
+
+    #[test]
+    fn test_delete_source_commit() {
+        let (dir, store) = temp_store();
+        let source = BuildSource::Branch("develop".into());
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            source.clone(),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        let is_orphan = store
+            .delete_source_commit("wp-rocket", "3.17.4", &source, "abc1234", false)
+            .unwrap();
+
+        assert!(is_orphan); // Last source removed → orphan
+    }
+
+    // =========================================================================
+    // 2.23 – Cleanup Empty Dirs
+    // =========================================================================
+
+    #[test]
+    fn test_cleanup_empty_dirs() {
+        let (dir, store) = temp_store();
+        let source = BuildSource::PullRequest(42);
+        let artifact = make_artifact(dir.path(), "plugin.zip", None);
+        let meta = make_metadata(
+            "wp-rocket",
+            "3.17.4",
+            source.clone(),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        // Delete everything
+        store
+            .delete_source("wp-rocket", "3.17.4", &source, true)
+            .unwrap();
+
+        // Project dir should be cleaned up
+        let project_dir = store.paths().project_dir("wp-rocket");
+        assert!(!project_dir.exists());
+    }
+
+    // =========================================================================
+    // 2.24–2.25 – Get Existing Variants / Has Variant
+    // =========================================================================
+
+    #[test]
+    fn test_get_existing_variants() {
+        let (dir, store) = temp_store();
+        let a1 = make_artifact(dir.path(), "free.zip", Some("free"));
+        let a2 = make_artifact(dir.path(), "pro.zip", Some("pro"));
+        let meta = make_metadata(
+            "backwpup",
+            "5.1.0",
+            BuildSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[a1, a2], &meta).unwrap();
+
+        let variants = store
+            .get_existing_variants("backwpup", "5.1.0", "abc1234")
+            .unwrap();
+        assert_eq!(variants.len(), 2);
+        assert!(variants.contains(&Some("free".to_string())));
+        assert!(variants.contains(&Some("pro".to_string())));
+    }
+
+    #[test]
+    fn test_has_variant() {
+        let (dir, store) = temp_store();
+        let artifact = make_artifact(dir.path(), "free.zip", Some("free"));
+        let meta = make_metadata(
+            "backwpup",
+            "5.1.0",
+            BuildSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+
+        store.store(&[artifact], &meta).unwrap();
+
+        assert!(
+            store
+                .has_variant("backwpup", "5.1.0", "abc1234", Some("free"))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_variant("backwpup", "5.1.0", "abc1234", Some("pro"))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_variant("backwpup", "5.1.0", "abc1234", None)
+                .unwrap()
+        );
+    }
+}

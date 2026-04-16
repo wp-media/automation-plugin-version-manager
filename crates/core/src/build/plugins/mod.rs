@@ -850,6 +850,12 @@ pub fn detect_wordpress_readme_version(readme_file: &Path) -> Result<Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    // =========================================================================
+    // 5.1–5.6 – VersionRequirement
+    // =========================================================================
 
     #[test]
     fn test_is_valid_version() {
@@ -863,5 +869,226 @@ mod tests {
         assert!(!is_valid_version("   "));
         assert!(!is_valid_version("vX.Y"));
         assert!(!is_valid_version("latest"));
+    }
+
+    #[test]
+    fn test_version_requirement_is_required() {
+        assert!(VersionRequirement::Required.is_required());
+        assert!(!VersionRequirement::Embedded.is_required());
+        assert!(!VersionRequirement::Optional.is_required());
+    }
+
+    #[test]
+    fn test_version_requirement_is_embedded() {
+        assert!(VersionRequirement::Embedded.is_embedded());
+        assert!(!VersionRequirement::Required.is_embedded());
+        assert!(!VersionRequirement::Optional.is_embedded());
+    }
+
+    #[test]
+    fn test_version_requirement_is_optional() {
+        assert!(VersionRequirement::Optional.is_optional());
+        assert!(!VersionRequirement::Required.is_optional());
+        assert!(!VersionRequirement::Embedded.is_optional());
+    }
+
+    #[test]
+    fn test_version_requirement_description() {
+        assert!(!VersionRequirement::Required.description().is_empty());
+        assert!(!VersionRequirement::Embedded.description().is_empty());
+        assert!(!VersionRequirement::Optional.description().is_empty());
+    }
+
+    #[test]
+    fn test_version_requirement_display() {
+        assert_eq!(format!("{}", VersionRequirement::Required), "Required");
+        assert_eq!(format!("{}", VersionRequirement::Embedded), "Embedded");
+        assert_eq!(format!("{}", VersionRequirement::Optional), "Optional");
+    }
+
+    #[test]
+    fn test_version_requirement_default() {
+        assert_eq!(VersionRequirement::default(), VersionRequirement::Optional);
+    }
+
+    // =========================================================================
+    // 5.7–5.10 – ToolDependency
+    // =========================================================================
+
+    #[test]
+    fn test_tool_dependency_required() {
+        let dep = ToolDependency::required("npm");
+        assert_eq!(dep.name, "npm");
+        assert!(dep.required);
+        assert!(dep.install_commands.is_empty());
+    }
+
+    #[test]
+    fn test_tool_dependency_required_with_install() {
+        let dep = ToolDependency::required_with_install("gulp", vec!["npm install -g gulp-cli"]);
+        assert_eq!(dep.name, "gulp");
+        assert!(dep.required);
+        assert_eq!(dep.install_commands.len(), 1);
+        assert!(dep.install_commands[0].contains("gulp-cli"));
+    }
+
+    #[test]
+    fn test_tool_dependency_optional() {
+        let dep = ToolDependency::optional("rsync");
+        assert_eq!(dep.name, "rsync");
+        assert!(!dep.required);
+        assert!(dep.install_commands.is_empty());
+    }
+
+    #[test]
+    fn test_tool_dependency_optional_with_install() {
+        let dep = ToolDependency::optional_with_install("jq", vec!["apt-get install jq"]);
+        assert_eq!(dep.name, "jq");
+        assert!(!dep.required);
+        assert_eq!(dep.install_commands.len(), 1);
+    }
+
+    // =========================================================================
+    // 5.11–5.16 – detect_wordpress_plugin_version
+    // =========================================================================
+
+    #[test]
+    fn test_detect_wordpress_plugin_version() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("plugin.php");
+        let mut f = std::fs::File::create(&file).unwrap();
+        writeln!(f, "<?php").unwrap();
+        writeln!(f, "/**").unwrap();
+        writeln!(f, " * Plugin Name: My Plugin").unwrap();
+        writeln!(f, " * Version: 2.3.4").unwrap();
+        writeln!(f, " */").unwrap();
+
+        let version = detect_wordpress_plugin_version(&file).unwrap();
+        assert_eq!(version, Some("2.3.4".to_string()));
+    }
+
+    #[test]
+    fn test_detect_wordpress_plugin_version_beta() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("plugin.php");
+        let mut f = std::fs::File::create(&file).unwrap();
+        writeln!(f, "<?php").unwrap();
+        writeln!(f, " * Version: 1.0.0-beta").unwrap();
+
+        let version = detect_wordpress_plugin_version(&file).unwrap();
+        assert_eq!(version, Some("1.0.0-beta".to_string()));
+    }
+
+    #[test]
+    fn test_detect_wordpress_plugin_version_with_star_prefix() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("plugin.php");
+        let mut f = std::fs::File::create(&file).unwrap();
+        writeln!(f, "<?php").unwrap();
+        writeln!(f, "/**").unwrap();
+        writeln!(f, " * Plugin Name: WP Rocket").unwrap();
+        writeln!(f, " * Version: 3.17.4").unwrap();
+        writeln!(f, " */").unwrap();
+
+        let version = detect_wordpress_plugin_version(&file).unwrap();
+        assert_eq!(version, Some("3.17.4".to_string()));
+    }
+
+    #[test]
+    fn test_detect_wordpress_plugin_version_no_header() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("plugin.php");
+        std::fs::write(&file, "<?php\n// No header here\n").unwrap();
+
+        let version = detect_wordpress_plugin_version(&file).unwrap();
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn test_detect_wordpress_plugin_version_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("nonexistent.php");
+
+        let version = detect_wordpress_plugin_version(&file).unwrap();
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn test_detect_wordpress_plugin_version_over_8kb() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("big.php");
+
+        // Write version AFTER 8KB — should NOT be found
+        let mut content = "<?php\n".to_string();
+        // Fill with 8200 bytes of comments
+        while content.len() < 8200 {
+            content.push_str("// padding line\n");
+        }
+        content.push_str(" * Version: 9.9.9\n");
+        std::fs::write(&file, &content).unwrap();
+
+        let version = detect_wordpress_plugin_version(&file).unwrap();
+        assert_eq!(version, None);
+    }
+
+    // =========================================================================
+    // 5.17–5.19 – detect_wordpress_readme_version
+    // =========================================================================
+
+    #[test]
+    fn test_detect_wordpress_readme_version() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("readme.txt");
+        std::fs::write(&file, "=== My Plugin ===\nStable tag: 1.2.3\n").unwrap();
+
+        let version = detect_wordpress_readme_version(&file).unwrap();
+        assert_eq!(version, Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn test_detect_wordpress_readme_version_not_found() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("readme.txt");
+        std::fs::write(&file, "=== My Plugin ===\nNo version here\n").unwrap();
+
+        let version = detect_wordpress_readme_version(&file).unwrap();
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn test_detect_wordpress_readme_version_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("nonexistent.txt");
+
+        let version = detect_wordpress_readme_version(&file).unwrap();
+        assert_eq!(version, None);
+    }
+
+    // =========================================================================
+    // 5.20–5.22 – validate_variants
+    // =========================================================================
+
+    #[test]
+    fn test_validate_variants_valid() {
+        let b = BackWPupBuilder;
+        assert!(b.validate_variants(&["free", "pro-en"]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_variants_invalid() {
+        let b = BackWPupBuilder;
+        let result = b.validate_variants(&["nonexistent"]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unknown variant"));
+        assert!(err.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_validate_variants_no_variants_builder() {
+        // WP Rocket has no variants — any input should be accepted
+        let b = WpRocketBuilder;
+        assert!(b.validate_variants(&["anything"]).is_ok());
+        assert!(b.validate_variants(&[]).is_ok());
     }
 }

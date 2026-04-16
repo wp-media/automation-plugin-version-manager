@@ -165,4 +165,91 @@ mod tests {
         assert_eq!(result.artifacts_for_variant("free").len(), 1);
         assert_eq!(result.artifacts_for_variant("unknown").len(), 0);
     }
+
+    // =========================================================================
+    // 6.1 – has_artifacts
+    // =========================================================================
+
+    #[test]
+    fn test_has_artifacts_true() {
+        let result = BuildResult::new(
+            vec![ProducedArtifact::new(
+                None,
+                PathBuf::from("/a.zip"),
+                "a.zip".into(),
+                100,
+            )],
+            PathBuf::from("/build"),
+            "1.0.0".into(),
+            vec![],
+        );
+        assert!(result.has_artifacts());
+    }
+
+    #[test]
+    fn test_has_artifacts_false() {
+        let result = BuildResult::new(vec![], PathBuf::from("/build"), "1.0.0".into(), vec![]);
+        assert!(!result.has_artifacts());
+    }
+
+    // =========================================================================
+    // 6.2 – unvariant_artifacts
+    // =========================================================================
+
+    #[test]
+    fn test_unvariant_artifacts() {
+        let result = BuildResult::new(
+            vec![
+                ProducedArtifact::new(None, PathBuf::from("/a.zip"), "a.zip".into(), 100),
+                ProducedArtifact::new(
+                    Some("pro".into()),
+                    PathBuf::from("/pro.zip"),
+                    "pro.zip".into(),
+                    200,
+                ),
+                ProducedArtifact::new(None, PathBuf::from("/b.zip"), "b.zip".into(), 50),
+            ],
+            PathBuf::from("/build"),
+            "1.0.0".into(),
+            vec![],
+        );
+
+        let unvariant = result.unvariant_artifacts();
+        assert_eq!(unvariant.len(), 2);
+        assert!(unvariant.iter().all(|a| a.variant_id.is_none()));
+    }
+
+    // =========================================================================
+    // 6.3 – is_variant / is_unvariant
+    // =========================================================================
+
+    #[test]
+    fn test_is_variant() {
+        let artifact = ProducedArtifact::new(
+            Some("pro".into()),
+            PathBuf::from("/pro.zip"),
+            "pro.zip".into(),
+            100,
+        );
+        assert!(artifact.is_variant("pro"));
+        assert!(!artifact.is_variant("free"));
+        assert!(!artifact.is_unvariant());
+    }
+
+    #[test]
+    fn test_is_unvariant() {
+        let artifact = ProducedArtifact::new(None, PathBuf::from("/a.zip"), "a.zip".into(), 100);
+        assert!(artifact.is_unvariant());
+        assert!(!artifact.is_variant("pro"));
+    }
+
+    // =========================================================================
+    // 6.4 – total_size with empty artifacts
+    // =========================================================================
+
+    #[test]
+    fn test_total_size_empty() {
+        let result = BuildResult::new(vec![], PathBuf::from("/build"), "1.0.0".into(), vec![]);
+        assert_eq!(result.total_size(), 0);
+    }
 }

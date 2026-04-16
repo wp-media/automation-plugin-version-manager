@@ -614,4 +614,47 @@ mod tests {
         assert_eq!(loaded.github_token, Some("ghp_roundtrip".to_string()));
         assert_eq!(loaded.builds_dir, Some(PathBuf::from("/custom/builds")));
     }
+
+    // =========================================================================
+    // Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn test_ensure_directories_already_exist() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("existing");
+        fs::create_dir(&dir).unwrap();
+
+        // Should not error if directories already exist
+        ensure_directories(&[&dir]).unwrap();
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn test_load_config_or_default_with_invalid_json_returns_error() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("bad.json");
+        fs::write(&path, "not json at all {{{").unwrap();
+
+        let default = test_config(PathBuf::from("/builds"));
+        let result = load_config_or_default(&path, default);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_config_overwrites_existing() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+
+        // First save
+        let config1 = Config::with_token("token-1", PathBuf::from("/builds"));
+        save_config(&config1, &path).unwrap();
+
+        // Second save overwrites
+        let config2 = Config::with_token("token-2", PathBuf::from("/builds"));
+        save_config(&config2, &path).unwrap();
+
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(loaded.github_token, Some("token-2".to_string()));
+    }
 }

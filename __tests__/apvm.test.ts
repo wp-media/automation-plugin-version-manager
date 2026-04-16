@@ -220,3 +220,144 @@ describe('Convenience build methods error handling', () => {
     ).rejects.toThrow();
   });
 });
+
+// =============================================================================
+// Build options validation — edge cases
+// =============================================================================
+
+describe('build() options validation', () => {
+  it('rejects with error for empty outputDir', async () => {
+    const apvm = await Apvm.create({});
+    await expect(
+      apvm.build({
+        project: 'wp-rocket',
+        gitRef: 'pr:1',
+        outputDir: '',
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('rejects with error for empty gitRef', async () => {
+    const apvm = await Apvm.create({});
+    await expect(
+      apvm.build({
+        project: 'wp-rocket',
+        gitRef: '',
+        outputDir: '/tmp/output',
+      }),
+    ).rejects.toThrow();
+  });
+});
+
+// =============================================================================
+// Convenience build methods — argument types
+// =============================================================================
+
+describe('Convenience build methods accept optional params', () => {
+  it('buildFromPr() accepts version and variants', async () => {
+    const apvm = await Apvm.create({});
+    // Should fail because project doesn't exist, but shows the signature works
+    await expect(
+      apvm.buildFromPr('nonexistent-plugin', 1, '/tmp/output', '5.1.0', ['free']),
+    ).rejects.toThrow();
+  });
+
+  it('buildFromBranch() accepts version and variants', async () => {
+    const apvm = await Apvm.create({});
+    await expect(
+      apvm.buildFromBranch('nonexistent-plugin', 'main', '/tmp/output', '5.1.0', ['free']),
+    ).rejects.toThrow();
+  });
+
+  it('buildFromTag() accepts version and variants', async () => {
+    const apvm = await Apvm.create({});
+    await expect(
+      apvm.buildFromTag('nonexistent-plugin', 'v1.0.0', '/tmp/output', '5.1.0', ['free']),
+    ).rejects.toThrow();
+  });
+
+  it('buildFromCommit() accepts version and variants', async () => {
+    const apvm = await Apvm.create({});
+    await expect(
+      apvm.buildFromCommit('nonexistent-plugin', 'abc1234', '/tmp/output', '5.1.0', ['free']),
+    ).rejects.toThrow();
+  });
+});
+
+// =============================================================================
+// Project listing — structure validation
+// =============================================================================
+
+describe('listProjects() structure', () => {
+  it('returns at least 2 known projects', async () => {
+    const apvm = await Apvm.create({});
+    const projects = apvm.listProjects();
+    expect(projects.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('project names are non-empty strings', async () => {
+    const apvm = await Apvm.create({});
+    const projects = apvm.listProjects();
+    for (const p of projects) {
+      expect(p.length).toBeGreaterThan(0);
+      expect(p.trim()).toBe(p);
+    }
+  });
+});
+
+// =============================================================================
+// Token resolution — environment variables
+// =============================================================================
+
+describe('createWithTokenResolution() token sources', () => {
+  it('picks up GITHUB_TOKEN env var', async () => {
+    const original = process.env.GITHUB_TOKEN;
+    try {
+      process.env.GITHUB_TOKEN = 'ghp_env_test_token';
+      // Pass no config token so env var resolution is reached
+      const apvm = await Apvm.createWithTokenResolution({});
+      expect(apvm.hasToken()).toBe(true);
+      expect(apvm.tokenSource()).toBe('GITHUB_TOKEN env');
+    } finally {
+      if (original !== undefined) {
+        process.env.GITHUB_TOKEN = original;
+      } else {
+        delete process.env.GITHUB_TOKEN;
+      }
+    }
+  });
+
+  it('explicit token overrides env var', async () => {
+    const original = process.env.GITHUB_TOKEN;
+    try {
+      process.env.GITHUB_TOKEN = 'ghp_env_token';
+      const apvm = await Apvm.createWithTokenResolution({
+        githubToken: 'ghp_explicit_token',
+      });
+      expect(apvm.hasToken()).toBe(true);
+      expect(apvm.tokenSource()).toBe('config file');
+    } finally {
+      if (original !== undefined) {
+        process.env.GITHUB_TOKEN = original;
+      } else {
+        delete process.env.GITHUB_TOKEN;
+      }
+    }
+  });
+});
+
+// =============================================================================
+// Apvm.create() — config edge cases
+// =============================================================================
+
+describe('Apvm.create() config edge cases', () => {
+  it('creates with undefined config', async () => {
+    const apvm = await Apvm.create(undefined);
+    expect(apvm).toBeInstanceOf(Apvm);
+  });
+
+  it('creates with null config', async () => {
+    const apvm = await Apvm.create(null);
+    expect(apvm).toBeInstanceOf(Apvm);
+  });
+});

@@ -122,4 +122,16 @@ mod tests {
         // workspace_dir unchanged
         assert_eq!(context.workspace_dir(), Path::new("/tmp/build"));
     }
+
+    #[test]
+    fn test_build_context_clone() {
+        let original = BuildContext::new(
+            PathBuf::from("/tmp/build/repo"),
+            PathBuf::from("/tmp/build"),
+        );
+        let cloned = original.clone();
+
+        assert_eq!(original.repo_dir(), cloned.repo_dir());
+        assert_eq!(original.workspace_dir(), cloned.workspace_dir());
+    }
 }
