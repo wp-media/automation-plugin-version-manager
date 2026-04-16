@@ -67,6 +67,14 @@ which = "8"
 # https://docs.rs/indicatif/0.18 — pre-1.0, 0.18.x is compatible range
 indicatif = "0.18"
 
+# Semantic versioning parser and comparator
+# https://docs.rs/semver/1 — SemVer stable since 1.0
+semver = "1"
+
+# Cross-platform atomic binary self-replacement
+# https://docs.rs/self-replace/1 — SemVer stable since 1.0
+self-replace = "1"
+
 # Testing utilities
 # https://docs.rs/tempfile/3 — SemVer stable since 3.0
 tempfile = "3"

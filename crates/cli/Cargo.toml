@@ -43,6 +43,21 @@ indicatif = { workspace = true }
 # Platform directories (home, config, etc.)
 directories = { workspace = true }
 
+# Semantic versioning (for update version comparison)
+semver = { workspace = true }
+
+# Cross-platform atomic binary self-replacement
+self-replace = { workspace = true }
+
+# SHA-256 checksums (for update integrity verification)
+sha2 = { workspace = true }
+
+# HTTP client (for downloading release assets during update)
+reqwest = { workspace = true }
+
+# Temporary files (for staging downloaded binaries)
+tempfile = { workspace = true }
+
 # OpenSSL vendored build — only activated by the `vendored-openssl` feature.
 # Compiles OpenSSL from source; statically linked into the binary.
 openssl = { workspace = true, optional = true }

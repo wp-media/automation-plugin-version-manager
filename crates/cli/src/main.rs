@@ -59,6 +59,8 @@ enum Commands {
     Info(InfoArgs),
     /// View or change configuration settings
     Config(ConfigArgs),
+    /// Update apvm to the latest version
+    Update,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +104,11 @@ async fn run() -> Result<()> {
         return args.execute(&paths);
     }
 
+    // Update command has its own GitHub client — handle it early
+    if matches!(cli.command, Commands::Update) {
+        return commands::update::execute().await;
+    }
+
     // Load config: file values override defaults, missing fields use defaults
     let config = load_config_file(paths.config_file(), &default_config)?;
 
@@ -128,6 +135,7 @@ async fn run() -> Result<()> {
             args.execute(&apvm)?;
         }
         Commands::Config(_) => unreachable!("handled above"),
+        Commands::Update => unreachable!("handled above"),
     }
 
     Ok(())

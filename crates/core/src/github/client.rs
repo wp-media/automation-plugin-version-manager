@@ -112,6 +112,51 @@ impl GitHubClient {
         }
     }
 
+    /// Fetch the latest published release (non-draft, non-prerelease).
+    ///
+    /// Uses GitHub's "Get the latest release" API endpoint which returns the
+    /// most recent release that is not a draft and not a prerelease.
+    ///
+    /// # Sources
+    ///
+    /// - GitHub REST API:
+    ///   <https://docs.github.com/en/rest/releases/releases#get-the-latest-release>
+    /// - octocrab `get_latest()`:
+    ///   <https://docs.rs/octocrab/0.49/octocrab/repos/struct.ReleasesHandler.html#method.get_latest>
+    pub async fn get_latest_release(&self, owner: &str, repo: &str) -> Result<Option<Release>> {
+        let result = self.inner.repos(owner, repo).releases().get_latest().await;
+
+        match result {
+            Ok(release) => {
+                let assets = release
+                    .assets
+                    .iter()
+                    .map(|a| ReleaseAsset {
+                        id: a.id.into_inner(),
+                        name: a.name.clone(),
+                        size: a.size as u64,
+                        download_url: a.browser_download_url.to_string(),
+                        content_type: a.content_type.clone(),
+                    })
+                    .collect();
+
+                Ok(Some(Release {
+                    id: release.id.into_inner(),
+                    tag_name: release.tag_name.clone(),
+                    name: release.name.clone().unwrap_or_default(),
+                    prerelease: release.prerelease,
+                    draft: release.draft,
+                    assets,
+                    html_url: Some(release.html_url.to_string()),
+                }))
+            }
+            Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Download a release asset's bytes.
     ///
     /// Uses the browser download URL for public repos. For private repos,

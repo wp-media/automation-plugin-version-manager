@@ -105,6 +105,10 @@ pub enum Error {
     /// JSON serialization error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// Self-update error (only CLI).
+    #[error("Update error: {0}")]
+    Update(String),
 }
 
 /// Result type alias using our Error type.
