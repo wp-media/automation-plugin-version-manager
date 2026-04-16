@@ -842,7 +842,11 @@ mod tests {
         );
     }
 
+    /// On Unix, `pre_build_hook` only cleans artifacts and removes leftover staging.
+    /// On Windows, it additionally calls `prepare_staging` which recreates the staging
+    /// directory — so after the hook, staging **exists** on Windows but not on Unix.
     #[test]
+    #[cfg(unix)]
     fn test_pre_build_removes_leftover_staging() {
         let (_ws, context) = test_context();
         let staging = context.workspace_dir().join(STAGING_DIR);
@@ -853,6 +857,28 @@ mod tests {
             .pre_build_hook(&context, "3.17.4", &[], &NullReporter)
             .unwrap();
         assert!(!staging.exists());
+    }
+
+    /// Windows: `pre_build_hook` removes leftovers then calls `prepare_staging`,
+    /// which recreates the staging directory with the plugin subdirectory.
+    #[test]
+    #[cfg(windows)]
+    fn test_pre_build_removes_leftover_staging() {
+        let (_ws, context) = test_context();
+        let staging = context.workspace_dir().join(STAGING_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+        assert!(staging.exists());
+
+        builder()
+            .pre_build_hook(&context, "3.17.4", &[], &NullReporter)
+            .unwrap();
+
+        // On Windows, prepare_staging recreates the staging directory structure
+        let staging_plugin = staging.join(PLUGIN_DIR_NAME);
+        assert!(
+            staging_plugin.exists(),
+            "prepare_staging should recreate staging/wp-rocket"
+        );
     }
 
     #[test]

@@ -157,6 +157,10 @@ jobs:
           # Prevent PHP OOM during Composer autoload generation (wp-rocket has 95+ deps)
           # https://getcomposer.org/doc/articles/troubleshooting.md#memory-limit-errors
           COMPOSER_MEMORY_LIMIT: "-1"
+          # Work around PHP 8.1 zend_mm_heap corruption (SIGABRT/exit 134) on ubuntu-22.04.
+          # Disables Zend Memory Manager in favor of system malloc.
+          # https://www.php.net/manual/en/internals2.memory.management.php
+          USE_ZEND_ALLOC: "0"
 
   commit-artifacts:
     name: Commit Artifacts
