@@ -407,8 +407,10 @@ export interface BuildOptions {
    * - `"branch:develop"` → Force branch interpretation
    * - `"tag:v1.0.0"` → Force tag interpretation
    * - `"commit:a1b2c3d"` → Force commit interpretation
+   * - `"release:5.6.8"` → Download from GitHub Release
    * - `"develop"` → Branch name
    * - `"v1.0.0"` → Tag (if exists) or branch
+   * - `"5.6.8"` → GitHub Release (if project has releases), else tag/branch
    */
   gitRef: string
   /**
@@ -421,9 +423,9 @@ export interface BuildOptions {
   /**
    * Specific variants to build.
    *
-   * When `null` or omitted, all variants are built.
+   * When `null` or omitted, default variants are built.
    *
-   * - **BackWPup**: Supports `["pro", "free"]`
+   * - **BackWPup**: Supports `["free", "pro-de", "pro-en"]`
    * - **WP Rocket**: Has no variants (this field is ignored)
    */
   variants?: Array<string>
