@@ -133,6 +133,9 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
+          # fileinfo: required by league/flysystem (transitive dep of wp-rocket via coenjacobs/mozart).
+          #           Bundled by default on Linux/macOS but must be explicitly enabled on Windows.
+          extensions: fileinfo
           tools: composer
           coverage: none
         env:
