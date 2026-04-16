@@ -241,9 +241,17 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[cfg(unix)]
     fn path_absolute_stays_absolute() {
         let result = sanitize_path("/var/lib/builds");
         assert!(matches!(result, SanitizeResult::Ok(v) if v == "/var/lib/builds"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn path_absolute_stays_absolute() {
+        let result = sanitize_path(r"C:\var\lib\builds");
+        assert!(matches!(result, SanitizeResult::Ok(v) if v == r"C:\var\lib\builds"));
     }
 
     #[test]
@@ -258,9 +266,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn path_dotdot_resolves() {
         let result = sanitize_path("/var/lib/../cache/builds");
         assert!(matches!(result, SanitizeResult::Ok(v) if v == "/var/cache/builds"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn path_dotdot_resolves() {
+        let result = sanitize_path(r"C:\var\lib\..\cache\builds");
+        assert!(matches!(result, SanitizeResult::Ok(v) if v == r"C:\var\cache\builds"));
     }
 
     #[test]
@@ -292,9 +308,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn path_trims_whitespace() {
         let result = sanitize_path("  /var/lib/builds  ");
         assert!(matches!(result, SanitizeResult::Ok(v) if v == "/var/lib/builds"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn path_trims_whitespace() {
+        let result = sanitize_path(r"  C:\var\lib\builds  ");
+        assert!(matches!(result, SanitizeResult::Ok(v) if v == r"C:\var\lib\builds"));
     }
 
     #[test]

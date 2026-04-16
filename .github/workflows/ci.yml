@@ -125,7 +125,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # Plugin build dependencies (composer, gulp)
-      # composer is pre-installed on all runners
+      # PHP + Composer: pre-installed on all 3 runners:
+      #   - ubuntu-22.04:   PHP 8.1, Composer 2.9
+      #   - macos-latest:   PHP 8.5, Composer 2.9 (via Homebrew)
+      #   - windows-latest: PHP 8.5, Composer 2.9 (via Chocolatey)
+      # Sources:
+      #   https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2204-Readme.md
+      #   https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md
+      #   https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md
+      # Homebrew is available on macOS by default (in PATH).
+      # The brew install step below is a safety net in case a future image drops PHP/Composer.
+      - name: Install PHP + Composer (macOS)
+        if: runner.os == 'macOS'
+        run: brew install php composer
       - name: Install gulp
         run: npm install --global gulp-cli
 
@@ -141,6 +153,10 @@ jobs:
       - run: npm install
       - name: Node tests
         run: npm test
+        env:
+          # Prevent PHP OOM during Composer autoload generation (wp-rocket has 95+ deps)
+          # https://getcomposer.org/doc/articles/troubleshooting.md#memory-limit-errors
+          COMPOSER_MEMORY_LIMIT: "-1"
 
   commit-artifacts:
     name: Commit Artifacts
