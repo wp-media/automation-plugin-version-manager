@@ -240,7 +240,7 @@ impl ArtifactStore {
         }
 
         // Sort by build date (newest first)
-        builds.sort_by(|a, b| b.manifest.built_at.cmp(&a.manifest.built_at));
+        builds.sort_by_key(|b| std::cmp::Reverse(b.manifest.built_at));
 
         Ok(builds)
     }

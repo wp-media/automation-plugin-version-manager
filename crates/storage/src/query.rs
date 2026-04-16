@@ -154,7 +154,7 @@ impl<'a> BuildQuery<'a> {
         }
 
         // Sort by build date (newest first)
-        results.sort_by(|a, b| b.manifest.built_at.cmp(&a.manifest.built_at));
+        results.sort_by_key(|b| std::cmp::Reverse(b.manifest.built_at));
 
         // Apply limit after sorting
         if let Some(limit) = self.limit {
