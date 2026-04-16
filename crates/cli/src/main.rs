@@ -21,10 +21,23 @@ use crate::paths::Paths;
 // CLI Definition
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Combined version string used by `--version`.
+///
+/// `CARGO_PKG_VERSION` and `CARGO_PKG_AUTHORS` are set by Cargo at compile time
+/// from `[package]` in `Cargo.toml`.
+/// Source: https://doc.rust-lang.org/cargo/reference/environment-variables.html
+///
+/// Produces output like:
+/// ```text
+/// apvm 1.2.1
+/// Sandy Figueroa <sandy@wp-media.me>
+/// ```
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\n", env!("CARGO_PKG_AUTHORS"));
+
 /// Automation Plugin Version Manager - Build and manage WordPress plugins
 #[derive(Parser, Debug)]
 #[command(name = "apvm")]
-#[command(version, about, before_help = concat!("Author: ", env!("CARGO_PKG_AUTHORS")))]
+#[command(version = VERSION, about, before_help = concat!("Author: ", env!("CARGO_PKG_AUTHORS")))]
 #[command(propagate_version = true)]
 struct Cli {
     /// Enable verbose output (shows commands and full output)
