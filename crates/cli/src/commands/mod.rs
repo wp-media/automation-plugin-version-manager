@@ -6,6 +6,7 @@ mod build;
 mod config;
 mod info;
 pub mod list;
+pub mod uninstall;
 pub mod update;
 
 pub use build::BuildArgs;

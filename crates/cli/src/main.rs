@@ -61,6 +61,12 @@ enum Commands {
     Config(ConfigArgs),
     /// Update apvm to the latest version
     Update,
+    /// Uninstall apvm from this system
+    Uninstall {
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +115,11 @@ async fn run() -> Result<()> {
         return commands::update::execute().await;
     }
 
+    // Uninstall command is self-contained — handle it early
+    if let Commands::Uninstall { yes } = &cli.command {
+        return commands::uninstall::execute(*yes);
+    }
+
     // Load config: file values override defaults, missing fields use defaults
     let config = load_config_file(paths.config_file(), &default_config)?;
 
@@ -136,6 +147,7 @@ async fn run() -> Result<()> {
         }
         Commands::Config(_) => unreachable!("handled above"),
         Commands::Update => unreachable!("handled above"),
+        Commands::Uninstall { .. } => unreachable!("handled above"),
     }
 
     Ok(())

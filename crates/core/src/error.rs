@@ -109,6 +109,10 @@ pub enum Error {
     /// Self-update error (only CLI).
     #[error("Update error: {0}")]
     Update(String),
+
+    /// Self-uninstall error (only CLI).
+    #[error("Uninstall error: {0}")]
+    Uninstall(String),
 }
 
 /// Result type alias using our Error type.
