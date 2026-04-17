@@ -8,22 +8,29 @@ Built for developers and QA engineers who need to quickly build plugins from spe
 
 # Available commands
 
-| Command  | Description                                          |
-|----------|------------------------------------------------------|
-| `build`  | Build a plugin from a git reference or download from a GitHub Release |
-| `list`   | List all available plugins                           |
-| `info`   | Show detailed information about a plugin             |
-| `config` | View or change configuration settings                |
+| Command     | Description                                          |
+|-------------|------------------------------------------------------|
+| `build`     | Build a plugin from a git reference (PR, branch, tag, commit, release) |
+| `list`      | List all available plugins                           |
+| `info`      | Show detailed information about a plugin             |
+| `config`    | View or change configuration settings                |
+| `update`    | Update apvm to the latest version                    |
+| `uninstall` | Uninstall apvm from this system                      |
 
 Run `apvm --help` for full usage or `apvm <command> --help` for command-specific options.
+
+For extended CLI documentation, see the [CLI crate README](crates/cli/README.md).
 
 ## Features
 
 - **Build from any git ref** — branch, tag, commit SHA, or PR number
 - **Download from GitHub Releases** — skip the build entirely and download pre-built assets from a GitHub Release (e.g., `release:5.6.8`). Currently available for BackWPup
+- **Special keyword refs** — use `tag:latest-stable`, `tag:latest`, `release:latest-stable`, `release:latest` (and their `previous-*` variants) to dynamically resolve the most recent tags or releases without knowing the exact version
 - **Automatic ref detection** — `v1.0.0` resolves to a tag, `develop` to a branch, `123` to PR #123, and version-like inputs (e.g., `5.6.8`) are checked against GitHub Releases first (when the plugin supports releases)
 - **Multi-variant builds** — e.g., BackWPup produces `free`, `pro-de`, and `pro-en` variants. You can choose which ones to build (`free` and `pro-en` are the defaults for BackWPup)
 - **Version handling** — required, embedded (auto-detected), or optional per plugin (BackWPup requires a version at build time; WP Rocket auto-detects it from source)
+- **Self-update** — `apvm update` downloads and replaces the binary with the latest release, verifying SHA-256 checksums
+- **Self-uninstall** — `apvm uninstall` cleanly removes the binary and its directory (with `-y`/`--yes` to skip confirmation)
 - **GitHub token auto-resolution** — automatically finds tokens from config, `GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token`, or the gh CLI config file
 
 ## Supported Plugins
@@ -106,88 +113,21 @@ cargo build
 
 Binary at `target/debug/apvm`.
 
-## Node.js / N-API bindings (`apvm-napi`)
+## Node.js / N-API Bindings (`apvm-napi`)
 
-This repository now includes a Node.js package powered by [`napi-rs`](https://napi.rs/), exposed as `apvm-napi`.
-
-### Node.js and build requirements — short summary
-
-- **Runtime (using the package):** `apvm-napi` supports Node.js 18 and later at runtime. For platforms where a pre-compiled `.node` binary is provided, no native build is required on the consumer machine.
-- **Build-time (only when a prebuilt binary is NOT available):** building the native addon requires a Rust toolchain (`cargo`, `rustc`) and Node.js 20+ for the build scripts. Some helper scripts used during the build process rely on Node 20+ APIs (for example certain `node:util` helpers). The resulting compiled addon can still run on Node.js 18+ provided the addon is built for a compatible N-API level.
-
-In short: if your platform/arch matches a prebuilt binary included in this repository you only need Node.js 18+ at runtime; if no prebuilt binary exists for your platform you must build from source, which requires Node.js 20+ and the Rust toolchain.
-
-Included pre-compiled binaries in this repository (these are shipped with the package and used automatically by the loader):
-
-- `apvm-napi.darwin-arm64.node` — macOS (Apple Silicon / arm64)
-- `apvm-napi.linux-x64-gnu.node` — Linux x86_64 (GNU/glibc)
-- `apvm-napi.linux-arm64-gnu.node` — Linux arm64 (GNU/glibc)
-- `apvm-napi.win32-x64-msvc.node` — Windows x64 (MSVC)
-
-If your platform/arch is not listed above, the package install will attempt to compile the native addon locally.
-
-### Build from source (only required if your platform is not prebuilt)
-
-If a prebuilt `.node` binary for your platform is not present, the package's install step will compile the native addon locally. Building from source requires:
-
-- Node.js 20+ (required during the build step only; runtime can be Node.js 18+)
-- Rust toolchain (`rustup`, `cargo`, `rustc`) installed and available on `PATH`
-- Platform development tools and headers (C compiler, linker). On Debian/Ubuntu, install `build-essential`, `pkg-config`, and `libssl-dev`.
-
-To build locally (release):
-
-```bash
-# ensure Node 20+ is active for the build step
-node -v # should be v20.x or later
-
-# From repository root
-npm i
-npm run build
-```
-
-Notes:
-
-- Using Node 20 for the build step does not force runtime Node 20 for users — the compiled addon can be used on Node 18+ when the addon is built against a compatible N-API level.
-
-### Quick API usage (TypeScript/Node.js)
+This repository includes a Node.js package powered by [`napi-rs`](https://napi.rs/), exposed as `apvm-napi`.
 
 ```ts
 import { Apvm } from 'apvm-napi';
 
 const apvm = await Apvm.create();
-
 const output = await apvm.buildFromBranch('wp-rocket', 'develop', '/tmp/apvm-output');
-
-console.log(output.description);
 console.log(output.result.artifacts.map((a) => a.filename));
 ```
 
-### API overview
+For extended documentation about the Node.js bindings, see the [NAPI crate README](crates/napi/README.md).
 
-- `Apvm.create(config?)` → creates an instance (async)
-- `Apvm.createWithTokenResolution(config?)` → resolves token from config/env/gh CLI (async)
-- `apvm.hasToken()` / `apvm.tokenSource()` / `apvm.listProjects()`
-- Build methods:
-	- `apvm.build(options, onProgress?)`
-	- `apvm.buildFromPr(...)`
-	- `apvm.buildFromBranch(...)`
-	- `apvm.buildFromTag(...)`
-	- `apvm.buildFromCommit(...)`
-
-You can pass any git ref (branch, commit, tag, PR, or release) to `apvm.build()` via the `gitRef` field (e.g., `"pr:123"`, `"release:5.6.8"`, `"develop"`).
-
-`ApvmConfig` fields are optional:
-
-- `buildsDir?: string`
-- `githubToken?: string`
-
-For full signatures and event/result types, see `index.d.ts`.
-
-### Why is `apvm.create()` async?
-
-This rust project uses tokio runtime (for asynchronous operations in rust), and some dependencies heavily rely on tokio, so, to keep things simple, creating an instance is asynchronous.
-
-## Usage
+## CLI Usage
 
 ### Build a Plugin
 
@@ -213,6 +153,12 @@ apvm build backwpup pr:123 -v 5.1.0
 # Download pre-built assets from a GitHub Release (no build required)
 apvm build backwpup release:5.6.8
 
+# Special keyword refs — latest/previous tags and releases
+apvm build backwpup tag:latest-stable -v 5.1.0
+apvm build backwpup tag:latest -v 5.1.0
+apvm build backwpup release:latest-stable
+apvm build backwpup release:latest
+
 # Build specific variants only
 apvm build backwpup 123 -v 5.1.0 --variants free,pro-en
 
@@ -235,6 +181,21 @@ apvm --verbose build backwpup 123 -v 5.1.0
 | `5.6.8`     | GitHub Release (if the plugin has releases), else tag/branch |
 | `release:5.6.8` | GitHub Release (explicit) |
 
+**Special keyword refs:**
+
+| Keyword                  | Resolves to                                              |
+|--------------------------|----------------------------------------------------------|
+| `tag:latest-stable`      | Latest tag excluding `-alpha`, `-beta`, `-rc` suffixes   |
+| `tag:previous-stable`    | Previous stable tag                                      |
+| `tag:latest`             | Very latest tag (including prereleases)                   |
+| `tag:previous-latest`    | Tag right before the latest                              |
+| `release:latest-stable`  | Latest stable GitHub Release (non-prerelease, non-draft) |
+| `release:previous-stable`| Previous stable release                                  |
+| `release:latest`         | Very latest non-draft release (including prereleases)     |
+| `release:previous-latest`| Previous non-draft release                               |
+
+Tags are sorted by creation date (most recent first). Releases are fetched from the [GitHub Releases API](https://docs.github.com/en/rest/releases/releases). Drafts are always excluded from release keywords.
+
 ### List Plugins
 
 ```sh
@@ -245,9 +206,6 @@ apvm list
 
 ```sh
 apvm info backwpup
-```
-
-```sh
 apvm info wp-rocket
 ```
 
@@ -274,6 +232,26 @@ apvm config unset token
 # Show config file path
 apvm config path
 ```
+
+### Update
+
+```sh
+apvm update
+```
+
+Downloads the latest release from GitHub, verifies the SHA-256 checksum, and atomically replaces the running binary. Supports macOS (arm64/x64), Linux (x64/arm64), and Windows (x64).
+
+### Uninstall
+
+```sh
+# Interactive (asks for confirmation)
+apvm uninstall
+
+# Skip confirmation
+apvm uninstall -y
+```
+
+Removes the `apvm` binary and its `bin/` directory. Does not remove configuration or build artifacts.
 
 ### GitHub Token Resolution
 
@@ -310,10 +288,10 @@ crates/
 ### Architecture
 
 - **Config** — pure `serde` types for configuration. No file I/O, no hardcoded paths.
-- **Core** — orchestrates builds (clone → fetch → resolve ref → checkout → detect version → build → collect artifacts), downloads from GitHub Releases, git operations, and GitHub API via [octocrab](https://docs.rs/octocrab/0.49).
+- **Core** — orchestrates builds (clone → fetch → resolve ref → checkout → detect version → build → collect artifacts), downloads from GitHub Releases, git operations, and GitHub API via [octocrab](https://docs.rs/octocrab/0.49). For extended documentation, see the [Core crate README](crates/core/README.md).
 - **Storage** — manages artifacts with commit-based deduplication, cross-platform links (symlinks on Unix, junctions on Windows), and a fluent query API.
-- **NAPI** — Node.js bindings via [napi-rs](https://napi.rs/). Exposes the core library as a native addon with async support on the tokio runtime.
-- **CLI** — owns default paths (`~/.apvm`, `~/apvm-builds`), provides progress display via [indicatif](https://docs.rs/indicatif/0.18), and delegates all logic to core.
+- **NAPI** — Node.js bindings via [napi-rs](https://napi.rs/). Exposes the core library as a native addon with async support on the tokio runtime. For extended documentation, see the [NAPI crate README](crates/napi/README.md).
+- **CLI** — owns default paths (`~/.apvm`, `~/apvm-builds`), provides progress display via [indicatif](https://docs.rs/indicatif/0.18), and delegates all logic to core. For extended documentation, see the [CLI crate README](crates/cli/README.md).
 
 ## Running Tests
 
@@ -349,6 +327,8 @@ npm test
 | [zip](https://docs.rs/zip/8)               | 8       | ZIP archive creation           |
 | [which](https://docs.rs/which/8)           | 8       | Tool dependency checking       |
 | [walkdir](https://docs.rs/walkdir/2)       | 2       | Recursive directory traversal  |
+| [self-replace](https://docs.rs/self-replace/1) | 1   | Atomic binary self-replacement |
+| [semver](https://docs.rs/semver/1)         | 1       | Semantic version parsing       |
 
 ## CI
 

@@ -106,6 +106,50 @@ impl From<apvm_core::build::progress::OutputStream> for JsOutputStream {
 }
 
 // =============================================================================
+// Release Selector (String Enum)
+// =============================================================================
+
+/// Selects which GitHub Release to download.
+///
+/// Use with [`Apvm.downloadReleaseBySelector()`] to dynamically resolve
+/// the latest or previous release without knowing the exact tag.
+/// Drafts are always excluded.
+///
+/// | Variant          | Resolves to                                                |
+/// |------------------|------------------------------------------------------------|
+/// | `LatestStable`   | Latest non-prerelease, non-draft release                   |
+/// | `PreviousStable` | Previous non-prerelease, non-draft release                 |
+/// | `Latest`         | Very latest non-draft release (including prereleases)      |
+/// | `PreviousLatest` | Previous non-draft release                                 |
+///
+/// References:
+/// - <https://docs.github.com/en/rest/releases/releases#get-the-latest-release>
+/// - <https://docs.github.com/en/rest/releases/releases#list-releases>
+///
+/// # TypeScript
+///
+/// ```typescript
+/// import { Apvm, JsReleaseSelector } from 'apvm-napi';
+///
+/// const output = await apvm.downloadReleaseBySelector(
+///   'backwpup',
+///   JsReleaseSelector.LatestStable,
+///   '/tmp/output',
+/// );
+/// ```
+#[napi(string_enum)]
+pub enum JsReleaseSelector {
+    /// Latest stable release (non-prerelease, non-draft).
+    LatestStable,
+    /// Previous stable release.
+    PreviousStable,
+    /// Very latest non-draft release (including prereleases).
+    Latest,
+    /// Previous non-draft release.
+    PreviousLatest,
+}
+
+// =============================================================================
 // Build Step (Plain Object)
 // =============================================================================
 

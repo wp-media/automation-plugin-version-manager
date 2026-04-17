@@ -61,6 +61,74 @@ pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 use github::GitHubClient;
 use projects::ProjectRegistry;
 
+/// Selects which GitHub Release to download.
+///
+/// Used with [`Apvm::download_release`] to specify a concrete release tag
+/// or a dynamic keyword that resolves to the latest/previous release.
+///
+/// # Keyword resolution
+///
+/// | Variant            | GitHub API endpoint                                       |
+/// |--------------------|-----------------------------------------------------------|
+/// | `LatestStable`     | `GET /repos/{owner}/{repo}/releases/latest`               |
+/// | `PreviousStable`   | Second non-prerelease, non-draft from list releases       |
+/// | `Latest`           | First non-draft from list releases (includes prereleases) |
+/// | `PreviousLatest`   | Second non-draft from list releases                       |
+///
+/// References:
+/// - <https://docs.github.com/en/rest/releases/releases#get-the-latest-release>
+/// - <https://docs.github.com/en/rest/releases/releases#list-releases>
+///
+/// # Examples
+///
+/// ```ignore
+/// use apvm_core::{Apvm, ReleaseSelector, NullReporter};
+///
+/// // Download a specific release by tag
+/// apvm.download_release("backwpup", ReleaseSelector::Tag("5.6.8"), None, "/output", &NullReporter).await?;
+///
+/// // Download the latest stable release
+/// apvm.download_release("backwpup", ReleaseSelector::LatestStable, None, "/output", &NullReporter).await?;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseSelector<'a> {
+    /// A specific release tag (e.g., `"v5.6.8"`, `"5.6.8"`).
+    Tag(&'a str),
+    /// The latest stable release (non-prerelease, non-draft).
+    LatestStable,
+    /// The previous stable release (second non-prerelease, non-draft).
+    PreviousStable,
+    /// The very latest non-draft release, including prereleases.
+    Latest,
+    /// The previous non-draft release (second in the list).
+    PreviousLatest,
+}
+
+impl<'a> ReleaseSelector<'a> {
+    /// Convert to the `release:xxx` git ref string understood by the build pipeline.
+    fn to_git_ref(self) -> String {
+        match self {
+            Self::Tag(tag) => format!("release:{tag}"),
+            Self::LatestStable => "release:latest-stable".to_string(),
+            Self::PreviousStable => "release:previous-stable".to_string(),
+            Self::Latest => "release:latest".to_string(),
+            Self::PreviousLatest => "release:previous-latest".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ReleaseSelector<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tag(tag) => write!(f, "release tag '{tag}'"),
+            Self::LatestStable => write!(f, "latest stable release"),
+            Self::PreviousStable => write!(f, "previous stable release"),
+            Self::Latest => write!(f, "latest release"),
+            Self::PreviousLatest => write!(f, "previous latest release"),
+        }
+    }
+}
+
 /// Main APVM instance that orchestrates all operations.
 pub struct Apvm {
     /// Application configuration.
@@ -403,38 +471,125 @@ impl Apvm {
         .await
     }
 
-    /// Build a project from a GitHub Release.
+    /// Download pre-built assets from a GitHub Release.
     ///
-    /// Downloads pre-built assets directly from the release, bypassing the
-    /// clone → build pipeline entirely. This is significantly faster when
-    /// a release with the right assets is available.
+    /// This bypasses the clone → build pipeline entirely: release assets are
+    /// downloaded directly from GitHub. Use [`ReleaseSelector`] to specify
+    /// an exact tag or a dynamic keyword (latest, previous, etc.).
+    ///
+    /// The version is always derived from the release tag — there is no
+    /// version parameter because release assets are pre-built at a fixed
+    /// version embedded in the tag name.
     ///
     /// # Arguments
     ///
     /// * `project` - Project name from registry
-    /// * `version` - Version override, or `None` to use tag as version
-    /// * `tag` - Release tag name (e.g., `"5.6.8"`, `"v1.0.0"`)
+    /// * `selector` - Which release to download (specific tag or keyword)
     /// * `variants` - Optional specific variants to download (None = all)
     /// * `output_dir` - Directory where downloaded assets will be placed
-    /// * `reporter` - Progress reporter for receiving build events.
+    /// * `reporter` - Progress reporter for receiving download events.
     ///   Use [`NullReporter`] to discard all events.
-    pub async fn build_from_release(
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use apvm_core::{Apvm, ReleaseSelector, NullReporter};
+    ///
+    /// // Download a specific release
+    /// apvm.download_release("backwpup", ReleaseSelector::Tag("5.6.8"), None, "/output", &NullReporter).await?;
+    ///
+    /// // Download the latest stable release
+    /// apvm.download_release("backwpup", ReleaseSelector::LatestStable, None, "/output", &NullReporter).await?;
+    ///
+    /// // Download the latest release (including prereleases)
+    /// apvm.download_release("backwpup", ReleaseSelector::Latest, None, "/output", &NullReporter).await?;
+    ///
+    /// // Download specific variants only
+    /// apvm.download_release("backwpup", ReleaseSelector::LatestStable, Some(&["free", "pro-en"]), "/output", &NullReporter).await?;
+    /// ```
+    pub async fn download_release(
         &self,
         project: &str,
-        version: Option<&str>,
-        tag: &str,
+        selector: ReleaseSelector<'_>,
         variants: Option<&[&str]>,
         output_dir: impl AsRef<std::path::Path>,
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
         self.build(
             project,
-            version,
-            &format!("release:{tag}"),
+            None,
+            &selector.to_git_ref(),
             variants,
             output_dir,
             reporter,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_selector_tag_to_git_ref() {
+        assert_eq!(ReleaseSelector::Tag("5.6.8").to_git_ref(), "release:5.6.8");
+        assert_eq!(
+            ReleaseSelector::Tag("v1.0.0").to_git_ref(),
+            "release:v1.0.0"
+        );
+    }
+
+    #[test]
+    fn release_selector_keywords_to_git_ref() {
+        assert_eq!(
+            ReleaseSelector::LatestStable.to_git_ref(),
+            "release:latest-stable"
+        );
+        assert_eq!(
+            ReleaseSelector::PreviousStable.to_git_ref(),
+            "release:previous-stable"
+        );
+        assert_eq!(ReleaseSelector::Latest.to_git_ref(), "release:latest");
+        assert_eq!(
+            ReleaseSelector::PreviousLatest.to_git_ref(),
+            "release:previous-latest"
+        );
+    }
+
+    #[test]
+    fn release_selector_display() {
+        assert_eq!(
+            ReleaseSelector::Tag("5.6.8").to_string(),
+            "release tag '5.6.8'"
+        );
+        assert_eq!(
+            ReleaseSelector::LatestStable.to_string(),
+            "latest stable release"
+        );
+        assert_eq!(
+            ReleaseSelector::PreviousStable.to_string(),
+            "previous stable release"
+        );
+        assert_eq!(ReleaseSelector::Latest.to_string(), "latest release");
+        assert_eq!(
+            ReleaseSelector::PreviousLatest.to_string(),
+            "previous latest release"
+        );
+    }
+
+    #[test]
+    fn release_selector_equality() {
+        assert_eq!(ReleaseSelector::LatestStable, ReleaseSelector::LatestStable);
+        assert_ne!(ReleaseSelector::LatestStable, ReleaseSelector::Latest);
+        assert_eq!(ReleaseSelector::Tag("v1.0"), ReleaseSelector::Tag("v1.0"));
+        assert_ne!(ReleaseSelector::Tag("v1.0"), ReleaseSelector::Tag("v2.0"));
+    }
+
+    #[test]
+    fn release_selector_is_copy() {
+        let selector = ReleaseSelector::LatestStable;
+        let copied = selector; // Copy
+        assert_eq!(selector, copied); // Both still usable
     }
 }

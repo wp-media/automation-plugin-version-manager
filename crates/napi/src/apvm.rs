@@ -25,7 +25,7 @@ use napi_derive::napi;
 use crate::config::ApvmConfig;
 use crate::error::core_error_to_napi;
 use crate::progress::JsProgressReporter;
-use crate::types::{BuildOptions, JsBuildEvent, JsBuildOutput};
+use crate::types::{BuildOptions, JsBuildEvent, JsBuildOutput, JsReleaseSelector};
 
 /// Main APVM instance for building WordPress plugins.
 ///
@@ -509,6 +509,141 @@ impl Apvm {
                 project,
                 git_ref: format!("commit:{commit}"),
                 version,
+                variants,
+                output_dir,
+            },
+            on_progress,
+        )
+        .await
+    }
+
+    /// Download pre-built assets from a specific GitHub Release.
+    ///
+    /// This bypasses the clone → build pipeline entirely — release assets
+    /// are downloaded directly from GitHub. The version is derived from
+    /// the release tag automatically.
+    ///
+    /// # Arguments
+    ///
+    /// * `project` - Project name (`"backwpup"` or `"wp-rocket"`)
+    /// * `tag` - Release tag (e.g., `"5.6.8"`, `"v5.6.8"`)
+    /// * `output_dir` - Directory for downloaded assets
+    /// * `variants` - Optional variant filter
+    /// * `on_progress` - Optional progress callback
+    ///
+    /// # Throws
+    ///
+    /// - `InvalidArg` if the project is not found
+    /// - `InvalidArg` if a private repo has no token
+    /// - `GenericFailure` if the release or assets are not found
+    ///
+    /// # TypeScript
+    ///
+    /// ```typescript
+    /// const output = await apvm.downloadRelease(
+    ///   'backwpup', '5.6.8', '/tmp/output',
+    /// );
+    ///
+    /// // With variants and progress
+    /// const output = await apvm.downloadRelease(
+    ///   'backwpup', '5.6.8', '/tmp/output',
+    ///   ['free', 'pro-en'],
+    ///   (err, event) => {
+    ///     if (err || !event) return;
+    ///     console.log(event.type, event.message);
+    ///   },
+    /// );
+    /// ```
+    #[napi(
+        ts_args_type = "project: string, tag: string, outputDir: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+    )]
+    pub async fn download_release(
+        &self,
+        project: String,
+        tag: String,
+        output_dir: String,
+        variants: Option<Vec<String>>,
+        on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
+    ) -> napi::Result<JsBuildOutput> {
+        self.build(
+            BuildOptions {
+                project,
+                git_ref: format!("release:{tag}"),
+                version: None,
+                variants,
+                output_dir,
+            },
+            on_progress,
+        )
+        .await
+    }
+
+    /// Download pre-built assets using a release selector keyword.
+    ///
+    /// Instead of specifying an exact tag, use a [`JsReleaseSelector`] to
+    /// dynamically resolve the latest or previous release from the GitHub
+    /// Releases API. Drafts are always excluded.
+    ///
+    /// # Arguments
+    ///
+    /// * `project` - Project name (`"backwpup"` or `"wp-rocket"`)
+    /// * `selector` - Which release to download (see [`JsReleaseSelector`])
+    /// * `output_dir` - Directory for downloaded assets
+    /// * `variants` - Optional variant filter
+    /// * `on_progress` - Optional progress callback
+    ///
+    /// # Throws
+    ///
+    /// - `InvalidArg` if the project is not found
+    /// - `InvalidArg` if a private repo has no token
+    /// - `GenericFailure` if no matching release is found
+    ///
+    /// # TypeScript
+    ///
+    /// ```typescript
+    /// import { JsReleaseSelector } from 'apvm-napi';
+    ///
+    /// // Download the latest stable release
+    /// const output = await apvm.downloadReleaseBySelector(
+    ///   'backwpup',
+    ///   JsReleaseSelector.LatestStable,
+    ///   '/tmp/output',
+    /// );
+    ///
+    /// // Download the very latest release (including prereleases)
+    /// const output = await apvm.downloadReleaseBySelector(
+    ///   'backwpup',
+    ///   JsReleaseSelector.Latest,
+    ///   '/tmp/output',
+    ///   undefined,
+    ///   (err, event) => {
+    ///     if (err || !event) return;
+    ///     console.log(event.type, event.message);
+    ///   },
+    /// );
+    /// ```
+    #[napi(
+        ts_args_type = "project: string, selector: JsReleaseSelector, outputDir: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+    )]
+    pub async fn download_release_by_selector(
+        &self,
+        project: String,
+        selector: JsReleaseSelector,
+        output_dir: String,
+        variants: Option<Vec<String>>,
+        on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
+    ) -> napi::Result<JsBuildOutput> {
+        let keyword = match selector {
+            JsReleaseSelector::LatestStable => "latest-stable",
+            JsReleaseSelector::PreviousStable => "previous-stable",
+            JsReleaseSelector::Latest => "latest",
+            JsReleaseSelector::PreviousLatest => "previous-latest",
+        };
+        self.build(
+            BuildOptions {
+                project,
+                git_ref: format!("release:{keyword}"),
+                version: None,
                 variants,
                 output_dir,
             },
