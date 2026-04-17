@@ -47,13 +47,28 @@ setup_colors() {
     # Only use colors if stdout is a terminal and TERM is set and not "dumb".
     # Reference: https://no-color.org/
     if [ -t 1 ] && [ "${TERM-}" != "dumb" ] && [ -z "${NO_COLOR-}" ]; then
-        RED='\033[0;31m'
-        GREEN='\033[0;32m'
-        YELLOW='\033[0;33m'
-        BLUE='\033[0;34m'
-        BOLD='\033[1m'
-        DIM='\033[2m'
-        RESET='\033[0m'
+        # Capture the actual ESC byte (0x1B) via printf subshell.
+        #
+        # Why not single-quoted '\033[1m' strings?
+        # POSIX printf only interprets \0ddd octal escapes in the FORMAT operand,
+        # not in %s argument operands. Variables like ${BOLD} are often embedded
+        # in strings passed as %s arguments (e.g. info "text ${BOLD}...${RESET}").
+        # Using the actual ESC byte makes the escape sequences work in both contexts.
+        #
+        # Source: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/printf.html
+        #   "In addition to the escape sequences shown in XBD File Format Notation
+        #    (\0ddd shall be written as a byte with the numeric value specified by
+        #    the octal number) — applies to the FORMAT operand only."
+        #   "%s: argument treated as a string — no backslash interpretation."
+        local ESC
+        ESC=$(printf '\033')
+        RED="${ESC}[0;31m"
+        GREEN="${ESC}[0;32m"
+        YELLOW="${ESC}[0;33m"
+        BLUE="${ESC}[0;34m"
+        BOLD="${ESC}[1m"
+        DIM="${ESC}[2m"
+        RESET="${ESC}[0m"
     else
         RED=''
         GREEN=''
