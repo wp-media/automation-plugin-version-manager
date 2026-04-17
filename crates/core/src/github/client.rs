@@ -82,29 +82,7 @@ impl GitHubClient {
             .await;
 
         match result {
-            Ok(release) => {
-                let assets = release
-                    .assets
-                    .iter()
-                    .map(|a| ReleaseAsset {
-                        id: a.id.into_inner(),
-                        name: a.name.clone(),
-                        size: a.size as u64,
-                        download_url: a.browser_download_url.to_string(),
-                        content_type: a.content_type.clone(),
-                    })
-                    .collect();
-
-                Ok(Some(Release {
-                    id: release.id.into_inner(),
-                    tag_name: release.tag_name.clone(),
-                    name: release.name.clone().unwrap_or_default(),
-                    prerelease: release.prerelease,
-                    draft: release.draft,
-                    assets,
-                    html_url: Some(release.html_url.to_string()),
-                }))
-            }
+            Ok(release) => Ok(Some(Self::convert_release(&release))),
             Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
                 Ok(None)
             }
@@ -112,7 +90,7 @@ impl GitHubClient {
         }
     }
 
-    /// Fetch the latest published release (non-draft, non-prerelease).
+    /// Fetch the latest **stable** release (non-draft, non-prerelease).
     ///
     /// Uses GitHub's "Get the latest release" API endpoint which returns the
     /// most recent release that is not a draft and not a prerelease.
@@ -123,37 +101,155 @@ impl GitHubClient {
     ///   <https://docs.github.com/en/rest/releases/releases#get-the-latest-release>
     /// - octocrab `get_latest()`:
     ///   <https://docs.rs/octocrab/0.49/octocrab/repos/struct.ReleasesHandler.html#method.get_latest>
-    pub async fn get_latest_release(&self, owner: &str, repo: &str) -> Result<Option<Release>> {
+    pub async fn get_latest_stable_release(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Option<Release>> {
         let result = self.inner.repos(owner, repo).releases().get_latest().await;
 
         match result {
-            Ok(release) => {
-                let assets = release
-                    .assets
-                    .iter()
-                    .map(|a| ReleaseAsset {
-                        id: a.id.into_inner(),
-                        name: a.name.clone(),
-                        size: a.size as u64,
-                        download_url: a.browser_download_url.to_string(),
-                        content_type: a.content_type.clone(),
-                    })
-                    .collect();
+            Ok(release) => Ok(Some(Self::convert_release(&release))),
+            Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 
-                Ok(Some(Release {
-                    id: release.id.into_inner(),
-                    tag_name: release.tag_name.clone(),
-                    name: release.name.clone().unwrap_or_default(),
-                    prerelease: release.prerelease,
-                    draft: release.draft,
-                    assets,
-                    html_url: Some(release.html_url.to_string()),
-                }))
+    /// Fetch the previous **stable** release (the second most recent
+    /// non-draft, non-prerelease release).
+    ///
+    /// Lists releases ordered by `created_at` descending (GitHub's default),
+    /// filters out drafts and prereleases, and returns the **second** match.
+    /// Returns `Ok(None)` if fewer than 2 stable releases exist.
+    ///
+    /// # Sources
+    ///
+    /// - GitHub REST API — List releases:
+    ///   <https://docs.github.com/en/rest/releases/releases#list-releases>
+    /// - octocrab `list().per_page().send()`:
+    ///   <https://docs.rs/octocrab/0.49/octocrab/repos/releases/struct.ReleasesHandler.html#method.list>
+    /// - octocrab `Page<T>` (field `items: Vec<T>`):
+    ///   <https://docs.rs/octocrab/0.49/octocrab/struct.Page.html>
+    pub async fn get_previous_stable_release(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Option<Release>> {
+        self.get_nth_release(owner, repo, 1, true).await
+    }
+
+    /// Fetch the latest release of **any** kind (including prereleases,
+    /// but never drafts).
+    ///
+    /// Lists releases ordered by `created_at` descending, skips drafts, and
+    /// returns the first non-draft release (which may be a prerelease).
+    /// Returns `Ok(None)` if no non-draft releases exist.
+    ///
+    /// # Sources
+    ///
+    /// - GitHub REST API — List releases:
+    ///   <https://docs.github.com/en/rest/releases/releases#list-releases>
+    pub async fn get_latest_release_any(&self, owner: &str, repo: &str) -> Result<Option<Release>> {
+        self.get_nth_release(owner, repo, 0, false).await
+    }
+
+    /// Fetch the previous release of **any** kind (including prereleases,
+    /// but never drafts).
+    ///
+    /// Lists releases ordered by `created_at` descending, skips drafts, and
+    /// returns the **second** non-draft release.
+    /// Returns `Ok(None)` if fewer than 2 non-draft releases exist.
+    ///
+    /// # Sources
+    ///
+    /// - GitHub REST API — List releases:
+    ///   <https://docs.github.com/en/rest/releases/releases#list-releases>
+    pub async fn get_previous_release_any(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Option<Release>> {
+        self.get_nth_release(owner, repo, 1, false).await
+    }
+
+    /// Fetch the Nth non-draft release from the list, optionally filtering
+    /// to stable-only (non-prerelease).
+    ///
+    /// # Arguments
+    ///
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `index` - Zero-based index into the filtered list (0 = first, 1 = second)
+    /// * `stable_only` - If `true`, skip prereleases in addition to drafts
+    ///
+    /// # Sources
+    ///
+    /// - GitHub REST API — List releases (ordered by `created_at` desc):
+    ///   <https://docs.github.com/en/rest/releases/releases#list-releases>
+    async fn get_nth_release(
+        &self,
+        owner: &str,
+        repo: &str,
+        index: usize,
+        stable_only: bool,
+    ) -> Result<Option<Release>> {
+        let result = self
+            .inner
+            .repos(owner, repo)
+            .releases()
+            .list()
+            .per_page(30)
+            .send()
+            .await;
+
+        match result {
+            Ok(page) => {
+                let found = page
+                    .items
+                    .iter()
+                    .filter(|r| !r.draft)
+                    .filter(|r| !stable_only || !r.prerelease)
+                    .nth(index)
+                    .map(Self::convert_release);
+
+                Ok(found)
             }
             Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
                 Ok(None)
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Convert an octocrab `Release` model into our simplified `Release`.
+    ///
+    /// # Sources
+    ///
+    /// - octocrab `Release` model:
+    ///   <https://docs.rs/octocrab/0.49/octocrab/models/repos/struct.Release.html>
+    fn convert_release(release: &octocrab::models::repos::Release) -> Release {
+        let assets = release
+            .assets
+            .iter()
+            .map(|a| ReleaseAsset {
+                id: a.id.into_inner(),
+                name: a.name.clone(),
+                size: a.size as u64,
+                download_url: a.browser_download_url.to_string(),
+                content_type: a.content_type.clone(),
+            })
+            .collect();
+
+        Release {
+            id: release.id.into_inner(),
+            tag_name: release.tag_name.clone(),
+            name: release.name.clone().unwrap_or_default(),
+            prerelease: release.prerelease,
+            draft: release.draft,
+            assets,
+            html_url: Some(release.html_url.to_string()),
         }
     }
 

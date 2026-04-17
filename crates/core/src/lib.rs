@@ -223,9 +223,17 @@ impl Apvm {
     /// Explicit prefixes are also supported:
     /// - `pr:123` → Force PR interpretation
     /// - `tag:v1.0.0` → Force tag interpretation
+    /// - `tag:latest-stable` → Build from the latest stable tag (no alpha/beta/rc)
+    /// - `tag:previous-stable` → Build from the previous stable tag
+    /// - `tag:latest` → Build from the very latest tag (including prereleases)
+    /// - `tag:previous-latest` → Build from the tag before the very latest
     /// - `branch:main` → Force branch interpretation
     /// - `commit:a1b2c3d` → Force commit interpretation
     /// - `release:5.6.8` → Download pre-built assets from GitHub Release
+    /// - `release:latest-stable` → Download the latest stable release (non-prerelease, non-draft)
+    /// - `release:previous-stable` → Download the previous stable release
+    /// - `release:latest` → Download the very latest non-draft release (including prereleases)
+    /// - `release:previous-latest` → Download the previous non-draft release
     ///
     /// # Arguments
     ///

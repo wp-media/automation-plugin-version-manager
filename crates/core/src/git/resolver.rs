@@ -2,6 +2,12 @@
 //!
 //! Automatically detects the type of a git reference (PR, branch, tag, commit)
 //! from user input and resolves it to a concrete ref for checkout.
+//!
+//! Supports special keywords for tags and releases:
+//! - `tag:latest-stable` / `release:latest-stable` — latest non-prerelease
+//! - `tag:previous-stable` / `release:previous-stable` — previous non-prerelease
+//! - `tag:latest` / `release:latest` — very latest (including prereleases)
+//! - `tag:previous-latest` / `release:previous-latest` — previous to the very latest
 
 use std::path::Path;
 
@@ -182,6 +188,10 @@ impl From<&BuildSource> for RefSource {
 /// - `a1b2c3d4` → Commit SHA
 /// - `pr:123` → Force PR interpretation
 /// - `tag:v1.0.0` → Force tag interpretation
+/// - `tag:latest-stable` → Latest tag excluding prereleases (alpha/beta)
+/// - `tag:previous-stable` → Previous tag excluding prereleases
+/// - `tag:latest` → Very latest tag (including prereleases)
+/// - `tag:previous-latest` → Tag before the very latest
 /// - `branch:main` → Force branch interpretation
 /// - `commit:a1b2c3d` → Force commit interpretation
 pub struct RefResolver<'a> {
@@ -263,7 +273,12 @@ impl<'a> RefResolver<'a> {
                     .map_err(|_| Error::Git(format!("Invalid PR number: '{value}'")))?;
                 self.resolve_pr(input, pr_number).await.map(Some)
             }
-            "tag" => self.resolve_tag(input, value).await.map(Some),
+            "tag" => {
+                if let Some(resolved) = self.resolve_tag_keyword(input, value).await? {
+                    return Ok(Some(resolved));
+                }
+                self.resolve_tag(input, value).await.map(Some)
+            }
             "branch" => self.resolve_branch(input, value).await.map(Some),
             "commit" => self.resolve_commit(input, value).await.map(Some),
             "release" => self.resolve_release(input, value).map(Some),
@@ -278,7 +293,10 @@ impl<'a> RefResolver<'a> {
         if input.contains(':') {
             return Err(Error::Git(format!(
                 "Invalid reference '{input}'. Unknown prefix or ':' is not allowed in git refs. \
-                 Valid prefixes are: pr:, tag:, branch:, commit:, release:"
+                 Valid prefixes are: pr:, tag:, branch:, commit:, release:\n\
+                 Special keywords: tag:latest-stable, tag:previous-stable, tag:latest, \
+                 tag:previous-latest, release:latest-stable, release:previous-stable, \
+                 release:latest, release:previous-latest"
             )));
         }
 
@@ -333,7 +351,10 @@ impl<'a> RefResolver<'a> {
 
         Err(Error::Git(format!(
             "Could not resolve '{input}' as PR, release, tag, branch, or commit. \
-             Use explicit prefix (pr:, tag:, branch:, commit:, release:) to specify type."
+             Use explicit prefix (pr:, tag:, branch:, commit:, release:) to specify type. \
+             Special keywords: tag:latest-stable, tag:previous-stable, tag:latest, \
+             tag:previous-latest, release:latest-stable, release:previous-stable, \
+             release:latest, release:previous-latest."
         )))
     }
 
@@ -588,6 +609,129 @@ impl<'a> RefResolver<'a> {
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
+
+    /// Resolve a `tag:` keyword to a concrete tag, or return `None` if the
+    /// value is not a recognized keyword (i.e. it's a literal tag name).
+    ///
+    /// Recognized keywords:
+    /// - `latest-stable` — latest tag excluding prereleases (`-alpha`, `-beta`)
+    /// - `previous-stable` — previous tag excluding prereleases
+    /// - `latest` — very latest tag (any, including prereleases)
+    /// - `previous-latest` — the tag right before the very latest
+    ///
+    /// Tags are sorted by creation date (most recent first) via
+    /// `git tag --sort=-creatordate`.
+    async fn resolve_tag_keyword(&self, input: &str, keyword: &str) -> Result<Option<ResolvedRef>> {
+        let (stable_only, index) = match keyword.to_ascii_lowercase().as_str() {
+            "latest-stable" => (true, 0),
+            "previous-stable" => (true, 1),
+            "latest" => (false, 0),
+            "previous-latest" => (false, 1),
+            _ => return Ok(None),
+        };
+
+        let tags = self.get_tags_by_date().await?;
+
+        let filtered: Vec<&String> = if stable_only {
+            tags.iter().filter(|t| !is_prerelease_tag(t)).collect()
+        } else {
+            tags.iter().collect()
+        };
+
+        let label = keyword.to_ascii_lowercase();
+
+        if filtered.is_empty() {
+            return Err(Error::Git(format!(
+                "No {qualifier}tags found in repository",
+                qualifier = if stable_only { "stable " } else { "" }
+            )));
+        }
+
+        let tag = filtered.get(index).ok_or_else(|| {
+            Error::Git(format!(
+                "Not enough {qualifier}tags to determine '{label}' \
+                 (need at least {needed}, found {found})",
+                qualifier = if stable_only { "stable " } else { "" },
+                needed = index + 1,
+                found = filtered.len(),
+            ))
+        })?;
+
+        tracing::info!("Resolved 'tag:{label}' to tag '{tag}'");
+        self.resolve_tag(input, tag).await.map(Some)
+    }
+
+    /// List all tags in the local repository sorted by creation date
+    /// (most recent first).
+    ///
+    /// Uses `git tag --sort=-creatordate` which orders tags by the date
+    /// they were created (the `taggerdate` for annotated tags or
+    /// `committerdate` for lightweight tags). This avoids the pitfalls
+    /// of version-based sorting where e.g. `v28.19` would appear above
+    /// `v3.21.1` because 28 > 3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No local repository path is set
+    /// - The `git tag` command fails
+    ///
+    /// # Sources
+    ///
+    /// - `git tag --sort`: <https://git-scm.com/docs/git-tag#Documentation/git-tag.txt---sortltkeygt>
+    /// - `creatordate`: <https://git-scm.com/docs/git-for-each-ref#_field_names>
+    ///   "For commit and tag objects, `creatordate` corresponds to the appropriate
+    ///   date from the committer or tagger fields" (Git 2.12+).
+    async fn get_tags_by_date(&self) -> Result<Vec<String>> {
+        let repo_path = self.repo_path.ok_or_else(|| {
+            Error::Git("Local repository path required for tag lookup".to_string())
+        })?;
+
+        let output = Command::new("git")
+            .args(["tag", "--sort=-creatordate"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| Error::Git(format!("Failed to list tags: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Git(format!("Failed to list tags: {stderr}")));
+        }
+
+        let tags: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect();
+
+        Ok(tags)
+    }
+}
+
+/// Check whether a tag name looks like a prerelease.
+///
+/// Returns `true` if the tag contains `-alpha`, `-beta`, `-rc`, or
+/// their numbered variants (e.g., `-alpha2`, `-beta3`, `-rc1`),
+/// case-insensitively.
+///
+/// # Examples
+///
+/// ```
+/// use apvm_core::git::is_prerelease_tag;
+///
+/// assert!(is_prerelease_tag("v3.21.1-alpha"));
+/// assert!(is_prerelease_tag("v3.21.1-alpha2"));
+/// assert!(is_prerelease_tag("v3.21.1-beta"));
+/// assert!(is_prerelease_tag("v3.21.1-BETA3"));
+/// assert!(is_prerelease_tag("v5.0.0-rc1"));
+/// assert!(!is_prerelease_tag("v3.21.1"));
+/// assert!(!is_prerelease_tag("v3.21.0"));
+/// ```
+pub fn is_prerelease_tag(tag: &str) -> bool {
+    let lower = tag.to_ascii_lowercase();
+    // Match `-alpha`, `-beta`, `-rc` optionally followed by digits.
+    lower.contains("-alpha") || lower.contains("-beta") || lower.contains("-rc")
 }
 
 #[cfg(test)]
@@ -747,5 +891,36 @@ mod tests {
             commit_sha: Some("a1b2c3d4e5f6".to_string()),
         };
         assert_eq!(resolved.detailed_description(), "commit a1b2c3d");
+    }
+
+    #[test]
+    fn test_is_prerelease_tag_alpha() {
+        assert!(is_prerelease_tag("v3.21.1-alpha"));
+        assert!(is_prerelease_tag("v3.21.1-alpha2"));
+        assert!(is_prerelease_tag("v3.21.1-ALPHA"));
+        assert!(is_prerelease_tag("v3.21.1-Alpha3"));
+    }
+
+    #[test]
+    fn test_is_prerelease_tag_beta() {
+        assert!(is_prerelease_tag("v3.21.1-beta"));
+        assert!(is_prerelease_tag("v3.21.1-beta1"));
+        assert!(is_prerelease_tag("v3.21.1-BETA"));
+        assert!(is_prerelease_tag("v3.21.1-Beta2"));
+    }
+
+    #[test]
+    fn test_is_prerelease_tag_rc() {
+        assert!(is_prerelease_tag("v5.0.0-rc1"));
+        assert!(is_prerelease_tag("v5.0.0-RC2"));
+        assert!(is_prerelease_tag("v5.0.0-rc"));
+    }
+
+    #[test]
+    fn test_is_prerelease_tag_stable() {
+        assert!(!is_prerelease_tag("v3.21.1"));
+        assert!(!is_prerelease_tag("v3.21.0"));
+        assert!(!is_prerelease_tag("3.21.1"));
+        assert!(!is_prerelease_tag("release-1.0"));
     }
 }

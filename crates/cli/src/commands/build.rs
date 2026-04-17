@@ -16,18 +16,70 @@ use apvm_core::{Apvm, Result};
 
 /// Arguments for the build command.
 #[derive(Args, Debug)]
+#[command(after_long_help = "\
+\x1b[1;4mGit Reference Formats:\x1b[0m
+
+  The <GIT_REF> argument accepts many formats. APVM auto-detects the type,
+  or you can use an explicit prefix for disambiguation.
+
+  \x1b[1mAutomatic detection (no prefix):\x1b[0m
+    123               PR #123 (or branch if PR doesn't exist)
+    develop           Branch name
+    v1.0.0            Tag (if exists) or branch
+    abc1234           Commit SHA (7-40 hex chars)
+    5.6.8             Version → tries GitHub Release first, then tag/branch
+
+  \x1b[1mExplicit prefixes:\x1b[0m
+    pr:123            Force PR interpretation
+    branch:main       Force branch interpretation
+    tag:v1.0.0        Force tag interpretation
+    commit:abc1234    Force commit interpretation
+    release:v5.6.8    Download pre-built assets from a specific GitHub Release
+
+\x1b[1;4mSpecial Keywords (tags):\x1b[0m
+
+  Tags are sorted by creation date (most recent first).
+
+  \x1b[1mStable (excludes -alpha, -beta, -rc tags):\x1b[0m
+    tag:latest-stable       Latest stable tag
+    tag:previous-stable     Previous stable tag
+
+  \x1b[1mAny (includes prereleases):\x1b[0m
+    tag:latest              Very latest tag (any kind)
+    tag:previous-latest     Tag right before the latest
+
+\x1b[1;4mSpecial Keywords (releases):\x1b[0m
+
+  Releases are fetched from the GitHub Releases API.
+  Drafts are always excluded.
+
+  \x1b[1mStable (excludes prereleases):\x1b[0m
+    release:latest-stable   Latest stable release (non-prerelease, non-draft)
+    release:previous-stable Previous stable release
+
+  \x1b[1mAny (includes prereleases):\x1b[0m
+    release:latest          Very latest non-draft release
+    release:previous-latest Previous non-draft release
+")]
 pub struct BuildArgs {
     /// Plugin name (e.g., "backwpup")
     pub plugin: String,
 
-    /// Git reference: PR number (#123 or 123), branch, tag, commit, or release
-    ///
-    /// Examples:
-    ///   #123, 123       → Build from PR #123
-    ///   develop         → Build from branch
-    ///   tag:v5.0.0      → Build from tag
-    ///   abc1234         → Build from commit
-    ///   release:5.6.8   → Download pre-built assets from GitHub Release
+    /// Git reference: PR number, branch, tag, commit, or release
+    #[arg(long_help = "Git reference to build from.\n\n\
+            Supports automatic detection or explicit prefixes:\n\
+            \x20 123, #123             → Build from PR #123\n\
+            \x20 develop               → Build from branch\n\
+            \x20 tag:v5.0.0            → Build from specific tag\n\
+            \x20 tag:latest-stable     → Latest stable tag (no alpha/beta/rc)\n\
+            \x20 tag:previous-stable   → Previous stable tag\n\
+            \x20 tag:latest            → Very latest tag (including prereleases)\n\
+            \x20 tag:previous-latest   → Tag before the very latest\n\
+            \x20 abc1234               → Build from commit SHA\n\
+            \x20 release:5.6.8         → Download pre-built GitHub Release\n\
+            \x20 release:latest-stable → Latest stable release\n\
+            \x20 release:latest        → Very latest non-draft release\n\n\
+            Run 'apvm build --help' for the full reference guide.")]
     pub git_ref: String,
 
     /// Package version (default: plugin-specific, e.g., 9.99.99 for BackWPup)

@@ -313,6 +313,23 @@ fn looks_like_version_tag(input: &str) -> bool {
     version_part.split('.').all(|s| !s.is_empty()) && version_part.split('.').count() >= 2
 }
 
+/// Check whether a `release:` value is a recognized keyword rather than
+/// a literal tag name.
+///
+/// The four recognized keywords are:
+/// - `latest-stable` — latest non-prerelease, non-draft release
+/// - `previous-stable` — second non-prerelease, non-draft release
+/// - `latest` — very latest non-draft release (including prereleases)
+/// - `previous-latest` — second non-draft release (including prereleases)
+///
+/// Comparison is case-insensitive.
+fn is_release_keyword(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "latest-stable" | "previous-stable" | "latest" | "previous-latest"
+    )
+}
+
 /// Command to build a project from any git reference.
 ///
 /// Supports automatic detection of reference types:
@@ -324,9 +341,17 @@ fn looks_like_version_tag(input: &str) -> bool {
 /// Explicit prefixes are also supported:
 /// - `pr:123` → Force PR interpretation
 /// - `tag:v1.0.0` → Force tag interpretation
+/// - `tag:latest-stable` → Build from the latest stable tag (no alpha/beta/rc)
+/// - `tag:previous-stable` → Build from the previous stable tag
+/// - `tag:latest` → Build from the very latest tag (including prereleases)
+/// - `tag:previous-latest` → Build from the tag before the very latest
 /// - `branch:main` → Force branch interpretation
 /// - `commit:a1b2c3d` → Force commit interpretation
 /// - `release:5.6.8` → Download pre-built assets from GitHub Release
+/// - `release:latest-stable` → Download the latest stable release (non-prerelease, non-draft)
+/// - `release:previous-stable` → Download the previous stable release
+/// - `release:latest` → Download the very latest non-draft release (including prereleases)
+/// - `release:previous-latest` → Download the previous non-draft release
 ///
 /// Version-like bare inputs (e.g., `5.6.8`, `v3.21.1`) are automatically
 /// checked against the GitHub Release API before cloning, if the project
@@ -573,9 +598,14 @@ impl<'a> BuildCommand<'a> {
     /// | `pr:123`       | Yes          | Return error immediately          |
     /// | `123` (bare)   | Yes          | Return `Ok(None)` (fallback)      |
     /// | `release:TAG`  | Yes          | Immediate `ResolvedRef`           |
+    /// | `release:latest-stable` | Yes | Resolve via GitHub API            |
+    /// | `release:previous-stable` | Yes | Resolve via GitHub API          |
+    /// | `release:latest` | Yes        | Resolve via GitHub API            |
+    /// | `release:previous-latest` | Yes | Resolve via GitHub API          |
     /// | `5.6.8` / `v5.6.8` (version-like, `has_releases=true`) | Yes | Return `Ok(None)` (fallback to clone) |
     /// | `branch:main`  | No           | N/A (needs local repo)            |
     /// | `tag:v1.0.0`   | No           | N/A (needs local repo)            |
+    /// | `tag:latest-stable` | No      | N/A (needs local repo)            |
     /// | `develop`      | No           | N/A (needs local repo)            |
     ///
     /// # Arguments
@@ -614,8 +644,16 @@ impl<'a> BuildCommand<'a> {
                         (num, true)
                     }
                     "release" => {
-                        // Release references are resolved immediately — return as ResolvedRef
-                        // for the caller to handle via download_release().
+                        // Special keywords: resolve the concrete release tag
+                        // via the GitHub API, then return as a normal Release ref.
+                        if is_release_keyword(value) {
+                            return self
+                                .resolve_release_keyword(trimmed, value, owner, repo, reporter)
+                                .await;
+                        }
+
+                        // Regular release:TAG — return immediately for the
+                        // caller to handle via download_release().
                         return Ok(Some(ResolvedRef {
                             input: trimmed.to_string(),
                             source: RefSource::Release(value.to_string()),
@@ -792,6 +830,74 @@ impl<'a> BuildCommand<'a> {
                 Ok(None)
             }
         }
+    }
+
+    /// Resolve a `release:` keyword to a concrete release tag via the GitHub API.
+    ///
+    /// Recognized keywords:
+    /// - `latest-stable` — latest non-prerelease, non-draft release (via
+    ///   GitHub's "Get the latest release" endpoint).
+    /// - `previous-stable` — the second non-prerelease, non-draft release.
+    /// - `latest` — very latest non-draft release (may be a prerelease).
+    /// - `previous-latest` — the second non-draft release.
+    ///
+    /// # Sources
+    ///
+    /// - GitHub "Get the latest release" (non-prerelease, non-draft):
+    ///   <https://docs.github.com/en/rest/releases/releases#get-the-latest-release>
+    /// - GitHub "List releases" (ordered by `created_at` desc):
+    ///   <https://docs.github.com/en/rest/releases/releases#list-releases>
+    async fn resolve_release_keyword(
+        &self,
+        user_input: &str,
+        keyword: &str,
+        owner: &str,
+        repo: &str,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<Option<ResolvedRef>> {
+        let label = keyword.to_ascii_lowercase();
+
+        reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Preflight,
+            message: format!("Resolving release:{label} from {owner}/{repo}"),
+        });
+
+        let release_opt = match label.as_str() {
+            "latest-stable" => self.github.get_latest_stable_release(owner, repo).await?,
+            "previous-stable" => self.github.get_previous_stable_release(owner, repo).await?,
+            "latest" => self.github.get_latest_release_any(owner, repo).await?,
+            "previous-latest" => self.github.get_previous_release_any(owner, repo).await?,
+            _ => {
+                reporter.report(&BuildEvent::PhaseCompleted {
+                    phase: BuildPhase::Preflight,
+                });
+                return Err(Error::Git(format!(
+                    "Unknown release keyword '{keyword}'. \
+                     Valid keywords: latest-stable, previous-stable, latest, previous-latest"
+                )));
+            }
+        };
+
+        reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::Preflight,
+        });
+
+        let release = release_opt.ok_or_else(|| Error::ReleaseNotFound {
+            tag: keyword.to_string(),
+            repo: format!("{owner}/{repo}"),
+        })?;
+
+        tracing::info!(
+            "Resolved 'release:{keyword}' to release tag '{}'",
+            release.tag_name
+        );
+
+        Ok(Some(ResolvedRef {
+            input: user_input.to_string(),
+            source: RefSource::Release(release.tag_name.clone()),
+            git_ref: release.tag_name,
+            commit_sha: None,
+        }))
     }
 
     /// Download pre-built assets from a GitHub Release.
@@ -1485,6 +1591,37 @@ mod tests {
         // Single segment is not a version
         assert!(!looks_like_version_tag("v1"));
         assert!(!looks_like_version_tag("123"));
+    }
+
+    // =========================================================================
+    // is_release_keyword tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_release_keyword_recognized() {
+        assert!(is_release_keyword("latest-stable"));
+        assert!(is_release_keyword("previous-stable"));
+        assert!(is_release_keyword("latest"));
+        assert!(is_release_keyword("previous-latest"));
+    }
+
+    #[test]
+    fn test_is_release_keyword_case_insensitive() {
+        assert!(is_release_keyword("Latest-Stable"));
+        assert!(is_release_keyword("LATEST"));
+        assert!(is_release_keyword("Previous-Latest"));
+        assert!(is_release_keyword("PREVIOUS-STABLE"));
+    }
+
+    #[test]
+    fn test_is_release_keyword_rejects_non_keywords() {
+        assert!(!is_release_keyword("v5.6.8"));
+        assert!(!is_release_keyword("5.6.8"));
+        assert!(!is_release_keyword("stable"));
+        assert!(!is_release_keyword("previous"));
+        assert!(!is_release_keyword(""));
+        assert!(!is_release_keyword("latest-"));
+        assert!(!is_release_keyword("some-tag"));
     }
 
     // =========================================================================

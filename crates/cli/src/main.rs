@@ -51,7 +51,7 @@ struct Cli {
 /// Available commands
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Build a plugin from a git reference (PR, branch, tag, commit)
+    /// Build a plugin from a git reference (PR, branch, tag, commit, release)
     Build(BuildArgs),
     /// List all available plugins
     List,

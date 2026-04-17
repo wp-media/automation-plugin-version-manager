@@ -246,7 +246,7 @@ pub async fn execute() -> Result<()> {
     // ── 1. Fetch latest release ──────────────────────────────────────────
     let github = make_github_client().await?;
     let release = github
-        .get_latest_release(REPO_OWNER, REPO_NAME)
+        .get_latest_stable_release(REPO_OWNER, REPO_NAME)
         .await?
         .ok_or_else(|| {
             Error::Update(format!(
