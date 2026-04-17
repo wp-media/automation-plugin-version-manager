@@ -168,6 +168,21 @@ export declare class Apvm {
    * that supports automatic detection of the reference type, or explicit
    * prefixes for disambiguation.
    *
+   * Supported prefixes:
+   * - `pr:123` — Build from Pull Request
+   * - `tag:v1.0.0` — Build from tag
+   * - `tag:latest-stable` — Build from the latest stable tag (no alpha/beta/rc)
+   * - `tag:previous-stable` — Build from the previous stable tag
+   * - `tag:latest` — Build from the very latest tag (including prereleases)
+   * - `tag:previous-latest` — Build from the tag before the very latest
+   * - `branch:develop` — Build from branch
+   * - `commit:a1b2c3d` — Build from commit
+   * - `release:5.6.8` — Download pre-built GitHub Release assets
+   * - `release:latest-stable` — Download the latest stable release (non-prerelease, non-draft)
+   * - `release:previous-stable` — Download the previous stable release
+   * - `release:latest` — Download the very latest non-draft release (including prereleases)
+   * - `release:previous-latest` — Download the previous non-draft release
+   *
    * The build runs asynchronously on the tokio runtime and returns a
    * Promise that resolves with the complete build output.
    *
@@ -406,8 +421,16 @@ export interface BuildOptions {
    * - `"pr:123"` → Force PR interpretation
    * - `"branch:develop"` → Force branch interpretation
    * - `"tag:v1.0.0"` → Force tag interpretation
+   * - `"tag:latest-stable"` → Build from the latest stable tag (no alpha/beta/rc)
+   * - `"tag:previous-stable"` → Build from the previous stable tag
+   * - `"tag:latest"` → Build from the very latest tag (including prereleases)
+   * - `"tag:previous-latest"` → Build from the tag before the very latest
    * - `"commit:a1b2c3d"` → Force commit interpretation
    * - `"release:5.6.8"` → Download from GitHub Release
+   * - `"release:latest-stable"` → Download the latest stable release (non-prerelease, non-draft)
+   * - `"release:previous-stable"` → Download the previous stable release
+   * - `"release:latest"` → Download the very latest non-draft release (including prereleases)
+   * - `"release:previous-latest"` → Download the previous non-draft release
    * - `"develop"` → Branch name
    * - `"v1.0.0"` → Tag (if exists) or branch
    * - `"5.6.8"` → GitHub Release (if project has releases), else tag/branch
