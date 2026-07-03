@@ -54,6 +54,11 @@ sha2 = "0.11"
 walkdir = "2"
 glob = "0.3"
 
+# Windows NTFS junction creation via the Win32 API (no admin privileges,
+# no cmd.exe subprocess). Used by apvm-storage on Windows only.
+# https://docs.rs/junction/1 — SemVer stable since 1.0
+junction = "1"
+
 # ZIP archive creation
 # https://docs.rs/zip/8 — SemVer stable since 2.0, latest 8.x
 # default-features = false: only include deflate (no aes, bzip2, lzma, xz, zstd, time)

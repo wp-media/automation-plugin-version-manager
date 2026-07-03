@@ -99,7 +99,11 @@ impl RefSource {
             Self::PullRequest(num) => format!("PR #{num}"),
             Self::Tag(tag) => format!("tag '{tag}'"),
             Self::Branch(branch) => format!("branch '{branch}'"),
-            Self::Commit(sha) => format!("commit {}", &sha[..7.min(sha.len())]),
+            // chars() (not byte slicing) so a non-hex value containing
+            // multibyte characters can never panic on a char boundary.
+            Self::Commit(sha) => {
+                format!("commit {}", sha.chars().take(7).collect::<String>())
+            }
             Self::Release(tag) => format!("release '{tag}'"),
         }
     }

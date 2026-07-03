@@ -23,8 +23,11 @@ thiserror = { workspace = true }
 # Logging and diagnostics
 tracing = { workspace = true }
 
-# File system utilities
-walkdir = { workspace = true }
-
-[dev-dependencies]
+# Atomic file writes via temp file + persist (crash-safe manifest/artifact
+# writes) and temp directories in tests.
 tempfile = { workspace = true }
+
+# NTFS junctions without admin privileges (replaces shelling out to
+# `cmd /C mklink`, which is fragile and quoting-unsafe).
+[target.'cfg(windows)'.dependencies]
+junction = { workspace = true }
