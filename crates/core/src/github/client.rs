@@ -65,6 +65,45 @@ impl GitHubClient {
         })
     }
 
+    /// Resolve a commit reference (full or abbreviated SHA) to its full SHA.
+    ///
+    /// Used by pre-clone ref resolution: `git ls-remote` can list branches
+    /// and tags but cannot confirm an arbitrary commit exists, so commits
+    /// are validated (and short SHAs expanded) through the GitHub commits
+    /// API instead.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(full_sha))` — the commit exists
+    /// - `Ok(None)` — no such commit (404) or unresolvable/ambiguous
+    ///   reference (422)
+    /// - `Err(_)` — transport/auth/rate-limit failure (existence unknown)
+    ///
+    /// # Sources
+    ///
+    /// - GitHub REST API — Get a commit:
+    ///   <https://docs.github.com/en/rest/commits/commits#get-a-commit>
+    /// - octocrab `commits().get()`:
+    ///   <https://docs.rs/octocrab/0.49/octocrab/commits/struct.CommitHandler.html#method.get>
+    pub async fn get_commit_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Option<String>> {
+        let result = self.inner.commits(owner, repo).get(reference).await;
+
+        match result {
+            Ok(commit) => Ok(Some(commit.sha)),
+            Err(octocrab::Error::GitHub { source, .. })
+                if matches!(source.status_code.as_u16(), 404 | 422) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Fetch a release by tag name.
     ///
     /// Returns `None` if no release exists for the given tag.

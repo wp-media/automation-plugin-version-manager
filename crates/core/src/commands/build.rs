@@ -7,7 +7,7 @@ use crate::build::plugins::VersionRequirement;
 use crate::build::progress::{BuildEvent, BuildPhase, BuildStep, ProgressReporter};
 use crate::build::{BuildResult, BuildRunner, ProducedArtifact};
 use crate::error::{Error, Result};
-use crate::git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
+use crate::git::{BuildWorkspace, RefResolver, RefSource, RemoteGit, ResolvedRef};
 use crate::github::GitHubClient;
 use crate::github::client::download_asset_owned;
 use crate::projects::ProjectRegistry;
@@ -460,7 +460,53 @@ impl<'a> BuildCommand<'a> {
                 .await;
         }
 
-        // 4. Create isolated build workspace (auto-cleaned on drop)
+        // 4. Resolve the git reference BEFORE cloning (fail-fast phase).
+        //
+        // Tags and branches are checked against the remote with a single
+        // `git ls-remote` round-trip, commits are validated via the GitHub
+        // commits API, and `tag:` keywords use a minimal clone-free tags
+        // probe. An unresolvable reference therefore fails here — before
+        // any repository has been cloned — and a resolvable one carries its
+        // commit SHA, ready for future cache lookups.
+        let resolved = match early_resolved {
+            Some(r) => {
+                tracing::debug!(
+                    "Using early-resolved ref: {} → {}",
+                    r.source.description(),
+                    r.git_ref
+                );
+                r
+            }
+            None => {
+                reporter.report(&BuildEvent::PhaseStarted {
+                    phase: BuildPhase::Preflight,
+                    message: format!("Resolving '{git_ref}' against remote"),
+                });
+                let remote =
+                    RemoteGit::new(&project_info.repo_url, self.config.github_token.as_deref());
+                let resolver =
+                    RefResolver::new(self.github, &project_info.owner, &project_info.repo)
+                        .with_remote(remote);
+                let result = resolver.resolve(git_ref).await;
+                reporter.report(&BuildEvent::PhaseCompleted {
+                    phase: BuildPhase::Preflight,
+                });
+                let resolved = result?;
+                tracing::info!(
+                    "Resolved '{git_ref}' to {} without cloning{}",
+                    resolved.detailed_description(),
+                    resolved
+                        .commit_sha
+                        .as_deref()
+                        .map(|sha| format!(" (commit {})", sha.chars().take(7).collect::<String>()))
+                        .unwrap_or_default()
+                );
+                resolved
+            }
+        };
+
+        // 5. Create isolated build workspace (auto-cleaned on drop) and
+        // clone — only reached with a successfully resolved reference.
         let workspace = BuildWorkspace::new(
             &project_info.name,
             &project_info.repo_url,
@@ -482,24 +528,6 @@ impl<'a> BuildCommand<'a> {
 
         // Get repository handle for local operations
         let repo = workspace.repository();
-
-        // 5. Resolve the git reference — skip if already resolved early.
-        let resolved = match early_resolved {
-            Some(r) => {
-                tracing::debug!(
-                    "Using early-resolved ref: {} → {}",
-                    r.source.description(),
-                    r.git_ref
-                );
-                r
-            }
-            None => {
-                let resolver =
-                    RefResolver::new(self.github, &project_info.owner, &project_info.repo)
-                        .with_repo_path(repo.path());
-                resolver.resolve(git_ref).await?
-            }
-        };
 
         // 6. Prepare repository for checkout (clean state)
         // Reset FIRST to avoid checkout failures due to uncommitted changes.
@@ -602,11 +630,13 @@ impl<'a> BuildCommand<'a> {
     /// | `release:previous-stable` | Yes | Resolve via GitHub API          |
     /// | `release:latest` | Yes        | Resolve via GitHub API            |
     /// | `release:previous-latest` | Yes | Resolve via GitHub API          |
-    /// | `5.6.8` / `v5.6.8` (version-like, `has_releases=true`) | Yes | Return `Ok(None)` (fallback to clone) |
-    /// | `branch:main`  | No           | N/A (needs local repo)            |
-    /// | `tag:v1.0.0`   | No           | N/A (needs local repo)            |
-    /// | `tag:latest-stable` | No      | N/A (needs local repo)            |
-    /// | `develop`      | No           | N/A (needs local repo)            |
+    /// | `5.6.8` / `v5.6.8` (version-like, `has_releases=true`) | Yes | Return `Ok(None)` (fallback) |
+    /// | `branch:main`, `tag:v1.0.0`, `tag:latest-stable`, `commit:SHA`, bare names | Not here | Resolved clone-free by the remote-enabled [`RefResolver`] in [`Self::execute`] step 4 |
+    ///
+    /// Inputs this method returns `Ok(None)` for are still resolved
+    /// **before any clone**: the caller runs them through a
+    /// [`RefResolver`] configured with a [`RemoteGit`] (`git ls-remote` +
+    /// GitHub commits API), so an unresolvable reference fails early.
     ///
     /// # Arguments
     ///

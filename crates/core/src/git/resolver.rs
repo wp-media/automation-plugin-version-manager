@@ -3,6 +3,21 @@
 //! Automatically detects the type of a git reference (PR, branch, tag, commit)
 //! from user input and resolves it to a concrete ref for checkout.
 //!
+//! # Resolution backends
+//!
+//! - **Local** ([`RefResolver::with_repo_path`]): validates refs against an
+//!   existing clone (`git show-ref` / `rev-parse`).
+//! - **Remote** ([`RefResolver::with_remote`]): validates refs **without any
+//!   clone** — tags/branches via one cached `git ls-remote` round-trip,
+//!   commits via the GitHub commits API, `tag:` keywords via a minimal
+//!   tags-only fetch. This is what lets a build pipeline reject a bad ref
+//!   (and learn the commit SHA of a good one) before paying for a clone.
+//! - **Neither**: last-resort trust-the-user mode (bare names are assumed
+//!   to be branches, with a warning).
+//!
+//! Local wins when both are configured; the ordering of automatic detection
+//! (PR → commit → tag → branch) is identical across backends.
+//!
 //! Supports special keywords for tags and releases:
 //! - `tag:latest-stable` / `release:latest-stable` — latest non-prerelease
 //! - `tag:previous-stable` / `release:previous-stable` — previous non-prerelease
@@ -13,8 +28,10 @@ use std::path::Path;
 
 use apvm_storage::path::BuildSource;
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 
 use crate::error::{Error, Result};
+use crate::git::remote::{RemoteGit, RemoteRefs};
 use crate::github::GitHubClient;
 
 /// Resolved git reference with metadata.
@@ -199,7 +216,7 @@ impl From<&BuildSource> for RefSource {
 /// - `branch:main` → Force branch interpretation
 /// - `commit:a1b2c3d` → Force commit interpretation
 pub struct RefResolver<'a> {
-    /// GitHub client for PR lookups.
+    /// GitHub client for PR lookups (and commit validation in remote mode).
     github: &'a GitHubClient,
     /// Repository owner.
     owner: &'a str,
@@ -207,6 +224,11 @@ pub struct RefResolver<'a> {
     repo: &'a str,
     /// Local repository path (for git commands).
     repo_path: Option<&'a Path>,
+    /// Remote client for clone-free resolution (`git ls-remote` + tags probe).
+    remote: Option<RemoteGit>,
+    /// Cached `ls-remote` snapshot: one network round-trip serves every
+    /// tag/branch check within a single resolution session.
+    remote_refs: OnceCell<RemoteRefs>,
 }
 
 impl<'a> RefResolver<'a> {
@@ -223,15 +245,42 @@ impl<'a> RefResolver<'a> {
             owner,
             repo,
             repo_path: None,
+            remote: None,
+            remote_refs: OnceCell::new(),
         }
     }
 
     /// Set the local repository path for git-based resolution.
     ///
-    /// Required for resolving tags, branches, and commits locally.
+    /// Takes priority over remote resolution when both are configured
+    /// (local lookups are free once a clone exists).
     pub fn with_repo_path(mut self, path: &'a Path) -> Self {
         self.repo_path = Some(path);
         self
+    }
+
+    /// Enable clone-free resolution against the remote repository.
+    ///
+    /// Tags and branches are checked with a single `git ls-remote` call,
+    /// commits are validated through the GitHub commits API, and `tag:`
+    /// keywords use a minimal tags-only fetch — so a build pipeline can
+    /// resolve (or reject) any reference **before** paying for a clone.
+    pub fn with_remote(mut self, remote: RemoteGit) -> Self {
+        self.remote = Some(remote);
+        self
+    }
+
+    /// Fetch (once) and cache the remote's advertised refs.
+    ///
+    /// Only callable when a remote is configured.
+    async fn remote_refs(&self) -> Result<&RemoteRefs> {
+        let remote = self
+            .remote
+            .as_ref()
+            .ok_or_else(|| Error::Git("No remote configured for ref resolution".to_string()))?;
+        self.remote_refs
+            .get_or_try_init(|| remote.ls_remote())
+            .await
     }
 
     /// Resolve a reference string to a concrete ref.
@@ -319,10 +368,38 @@ impl<'a> RefResolver<'a> {
 
         // 2. Looks like a commit SHA (hex, 7-40 chars)
         if Self::looks_like_commit_sha(input) {
-            match self.resolve_commit(input, input).await {
-                Ok(resolved) => return Ok(resolved),
-                Err(_) => {
-                    tracing::debug!("'{input}' is not a valid commit, trying other types");
+            if self.repo_path.is_some() {
+                match self.resolve_commit(input, input).await {
+                    Ok(resolved) => return Ok(resolved),
+                    Err(_) => {
+                        tracing::debug!("'{input}' is not a valid commit, trying other types");
+                    }
+                }
+            } else if self.remote.is_some() {
+                // Auto-detection must only accept a CONFIRMED commit — on a
+                // 404 or an API outage alike, fall through to tag/branch
+                // checks (a hex-looking name may well be a branch).
+                match self
+                    .github
+                    .get_commit_sha(self.owner, self.repo, input)
+                    .await
+                {
+                    Ok(Some(full_sha)) => {
+                        return Ok(ResolvedRef {
+                            input: input.to_string(),
+                            source: RefSource::Commit(full_sha.clone()),
+                            git_ref: full_sha.clone(),
+                            commit_sha: Some(full_sha),
+                        });
+                    }
+                    Ok(None) => {
+                        tracing::debug!("'{input}' is not a commit on remote, trying other types");
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Commit check for '{input}' failed ({e}), trying other types"
+                        );
+                    }
                 }
             }
         }
@@ -337,12 +414,22 @@ impl<'a> RefResolver<'a> {
             if self.ref_exists_as_branch(input).await? {
                 return self.resolve_branch(input, input).await;
             }
+        } else if self.remote.is_some() {
+            // Clone-free: one ls-remote snapshot answers both checks.
+            let refs = self.remote_refs().await?;
+            if refs.tag_sha(input).is_some() {
+                return self.resolve_tag(input, input).await;
+            }
+            if refs.branch_sha(input).is_some() {
+                return self.resolve_branch(input, input).await;
+            }
         }
 
-        // 5. No local repo - try as branch by default
-        if self.repo_path.is_none() {
+        // 5. No local repo AND no remote — cannot verify anything, assume
+        // branch (last-resort behavior for standalone resolver use).
+        if self.repo_path.is_none() && self.remote.is_none() {
             tracing::warn!(
-                "No local repo available, assuming '{input}' is a branch. \
+                "No local repo or remote available, assuming '{input}' is a branch. \
                  Use explicit prefix (tag:, commit:) if needed."
             );
             return Ok(ResolvedRef {
@@ -387,10 +474,13 @@ impl<'a> RefResolver<'a> {
     }
 
     /// Resolve a tag name.
+    ///
+    /// Validation order: local repository (free once cloned), then remote
+    /// (`ls-remote`, no clone needed), then trust-the-user as a last resort
+    /// when neither is available.
     async fn resolve_tag(&self, input: &str, tag: &str) -> Result<ResolvedRef> {
         tracing::debug!("Resolving tag '{tag}'");
 
-        // Validate tag exists if we have a local repo
         if let Some(repo_path) = self.repo_path {
             let exists = self.ref_exists_as_tag(tag).await?;
             if !exists {
@@ -406,8 +496,24 @@ impl<'a> RefResolver<'a> {
                 git_ref: tag.to_string(),
                 commit_sha,
             })
+        } else if self.remote.is_some() {
+            // Clone-free: check the remote's advertised refs. The SHA from
+            // ls-remote is the peeled commit, exactly what checkout lands on.
+            let refs = self.remote_refs().await?;
+            match refs.tag_sha(tag) {
+                Some(sha) => Ok(ResolvedRef {
+                    input: input.to_string(),
+                    source: RefSource::Tag(tag.to_string()),
+                    git_ref: tag.to_string(),
+                    commit_sha: Some(sha.to_string()),
+                }),
+                None => Err(Error::Git(format!(
+                    "Tag '{tag}' not found on remote {}/{}",
+                    self.owner, self.repo
+                ))),
+            }
         } else {
-            // No local repo, trust the user
+            // No local repo and no remote configured: trust the user.
             Ok(ResolvedRef {
                 input: input.to_string(),
                 source: RefSource::Tag(tag.to_string()),
@@ -418,10 +524,11 @@ impl<'a> RefResolver<'a> {
     }
 
     /// Resolve a branch name.
+    ///
+    /// Same validation order as [`Self::resolve_tag`].
     async fn resolve_branch(&self, input: &str, branch: &str) -> Result<ResolvedRef> {
         tracing::debug!("Resolving branch '{branch}'");
 
-        // Validate branch exists if we have a local repo
         if let Some(repo_path) = self.repo_path {
             let exists = self.ref_exists_as_branch(branch).await?;
             if !exists {
@@ -437,8 +544,22 @@ impl<'a> RefResolver<'a> {
                 git_ref: branch.to_string(),
                 commit_sha,
             })
+        } else if self.remote.is_some() {
+            let refs = self.remote_refs().await?;
+            match refs.branch_sha(branch) {
+                Some(sha) => Ok(ResolvedRef {
+                    input: input.to_string(),
+                    source: RefSource::Branch(branch.to_string()),
+                    git_ref: branch.to_string(),
+                    commit_sha: Some(sha.to_string()),
+                }),
+                None => Err(Error::Git(format!(
+                    "Branch '{branch}' not found on remote {}/{}",
+                    self.owner, self.repo
+                ))),
+            }
         } else {
-            // No local repo, trust the user
+            // No local repo and no remote configured: trust the user.
             Ok(ResolvedRef {
                 input: input.to_string(),
                 source: RefSource::Branch(branch.to_string()),
@@ -449,6 +570,12 @@ impl<'a> RefResolver<'a> {
     }
 
     /// Resolve a commit SHA.
+    ///
+    /// In remote mode the commit is validated (and a short SHA expanded)
+    /// through the GitHub commits API — `ls-remote` only lists refs and
+    /// cannot confirm arbitrary commits. If the API is unreachable (rate
+    /// limit, outage), resolution degrades to trusting the input with a
+    /// warning: the post-clone checkout still validates it definitively.
     async fn resolve_commit(&self, input: &str, sha: &str) -> Result<ResolvedRef> {
         tracing::debug!("Resolving commit '{sha}'");
 
@@ -473,8 +600,35 @@ impl<'a> RefResolver<'a> {
                 git_ref: full_sha.clone(),
                 commit_sha: Some(full_sha),
             })
+        } else if self.remote.is_some() {
+            match self.github.get_commit_sha(self.owner, self.repo, sha).await {
+                Ok(Some(full_sha)) => Ok(ResolvedRef {
+                    input: input.to_string(),
+                    source: RefSource::Commit(full_sha.clone()),
+                    git_ref: full_sha.clone(),
+                    commit_sha: Some(full_sha),
+                }),
+                Ok(None) => Err(Error::Git(format!(
+                    "Commit '{sha}' not found in {}/{}",
+                    self.owner, self.repo
+                ))),
+                Err(e) => {
+                    // API unavailable ≠ commit missing. Availability wins:
+                    // proceed unvalidated, checkout will be the final judge.
+                    tracing::warn!(
+                        "Could not verify commit '{sha}' via GitHub API ({e}); \
+                         proceeding — checkout will validate it"
+                    );
+                    Ok(ResolvedRef {
+                        input: input.to_string(),
+                        source: RefSource::Commit(sha.to_string()),
+                        git_ref: sha.to_string(),
+                        commit_sha: Some(sha.to_string()),
+                    })
+                }
+            }
         } else {
-            // No local repo, trust the user
+            // No local repo and no remote configured: trust the user.
             Ok(ResolvedRef {
                 input: input.to_string(),
                 source: RefSource::Commit(sha.to_string()),
@@ -623,8 +777,10 @@ impl<'a> RefResolver<'a> {
     /// - `latest` — very latest tag (any, including prereleases)
     /// - `previous-latest` — the tag right before the very latest
     ///
-    /// Tags are sorted by creation date (most recent first) via
-    /// `git tag --sort=-creatordate`.
+    /// Tags are sorted by creation date (most recent first): via local
+    /// `git tag --sort=-creatordate` when a repository is available, or via
+    /// a minimal clone-free tags probe ([`RemoteGit::tags_by_creatordate`])
+    /// in remote mode — both produce identical ordering.
     async fn resolve_tag_keyword(&self, input: &str, keyword: &str) -> Result<Option<ResolvedRef>> {
         let (stable_only, index) = match keyword.to_ascii_lowercase().as_str() {
             "latest-stable" => (true, 0),
@@ -634,7 +790,16 @@ impl<'a> RefResolver<'a> {
             _ => return Ok(None),
         };
 
-        let tags = self.get_tags_by_date().await?;
+        let tags = if self.repo_path.is_some() {
+            self.get_tags_by_date().await?
+        } else if let Some(remote) = &self.remote {
+            remote.tags_by_creatordate().await?
+        } else {
+            return Err(Error::Git(
+                "Resolving tag keywords requires a local repository or a configured remote"
+                    .to_string(),
+            ));
+        };
 
         let filtered: Vec<&String> = if stable_only {
             tags.iter().filter(|t| !is_prerelease_tag(t)).collect()
@@ -895,6 +1060,146 @@ mod tests {
             commit_sha: Some("a1b2c3d4e5f6".to_string()),
         };
         assert_eq!(resolved.detailed_description(), "commit a1b2c3d");
+    }
+
+    // =========================================================================
+    // Remote-mode resolution (clone-free, against local file:// repos)
+    // =========================================================================
+
+    use crate::git::testutil::{file_url, make_remote_repo};
+
+    /// Resolver in remote mode against a local test repo. The GitHub client
+    /// is anonymous and unused by these paths (tags/branches/keywords go
+    /// through git, not the API).
+    fn remote_resolver(url: &str) -> RefResolver<'_> {
+        // Leak the client: tests only — keeps the borrow-based API simple.
+        let github: &'static GitHubClient = Box::leak(Box::new(GitHubClient::anonymous().unwrap()));
+        RefResolver::new(github, "owner", "repo").with_remote(RemoteGit::new(url, None))
+    }
+
+    #[tokio::test]
+    async fn remote_resolves_explicit_branch_with_sha() {
+        let repo = make_remote_repo();
+        let url = file_url(&repo);
+        let resolver = remote_resolver(&url);
+
+        let resolved = resolver.resolve("branch:feature/x").await.unwrap();
+        assert_eq!(resolved.source, RefSource::Branch("feature/x".into()));
+        assert_eq!(resolved.git_ref, "feature/x");
+        let sha = resolved
+            .commit_sha
+            .expect("remote resolution must yield SHA");
+        assert_eq!(sha.len(), 40);
+    }
+
+    #[tokio::test]
+    async fn remote_resolves_explicit_tag_to_peeled_commit() {
+        let repo = make_remote_repo();
+        let url = file_url(&repo);
+        let resolver = remote_resolver(&url);
+
+        // v2.0.0 is annotated: the resolved SHA must be the tagged COMMIT
+        // (peeled), which equals main's tip.
+        let tag = resolver.resolve("tag:v2.0.0").await.unwrap();
+        let main = remote_resolver(&url).resolve("branch:main").await.unwrap();
+        assert_eq!(tag.source, RefSource::Tag("v2.0.0".into()));
+        assert_eq!(tag.commit_sha, main.commit_sha);
+    }
+
+    #[tokio::test]
+    async fn remote_missing_refs_fail_before_any_clone() {
+        let repo = make_remote_repo();
+        let url = file_url(&repo);
+
+        let err = remote_resolver(&url)
+            .resolve("tag:v9.9.9")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found on remote"));
+
+        let err = remote_resolver(&url)
+            .resolve("branch:does-not-exist")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found on remote"));
+    }
+
+    #[tokio::test]
+    async fn remote_resolves_tag_keywords_by_creation_date() {
+        let repo = make_remote_repo();
+        let url = file_url(&repo);
+
+        // latest / latest-stable → v2.0.0 (2025-01, stable).
+        for input in ["tag:latest", "tag:latest-stable"] {
+            let resolved = remote_resolver(&url).resolve(input).await.unwrap();
+            assert_eq!(
+                resolved.source,
+                RefSource::Tag("v2.0.0".into()),
+                "input {input}"
+            );
+        }
+
+        // previous-latest → v2.0.0-beta1 (2024-06, prerelease included).
+        let resolved = remote_resolver(&url)
+            .resolve("tag:previous-latest")
+            .await
+            .unwrap();
+        assert_eq!(resolved.source, RefSource::Tag("v2.0.0-beta1".into()));
+
+        // previous-stable → v1.0.0 (beta filtered out).
+        let resolved = remote_resolver(&url)
+            .resolve("tag:previous-stable")
+            .await
+            .unwrap();
+        assert_eq!(resolved.source, RefSource::Tag("v1.0.0".into()));
+    }
+
+    #[tokio::test]
+    async fn remote_auto_detects_tag_then_branch() {
+        let repo = make_remote_repo();
+        let url = file_url(&repo);
+
+        // Bare tag name → tag (tags have priority over branches).
+        let resolved = remote_resolver(&url).resolve("v1.0.0").await.unwrap();
+        assert_eq!(resolved.source, RefSource::Tag("v1.0.0".into()));
+
+        // Bare branch names → branch, with SHA.
+        for input in ["main", "feature/x"] {
+            let resolved = remote_resolver(&url).resolve(input).await.unwrap();
+            assert_eq!(
+                resolved.source,
+                RefSource::Branch(input.into()),
+                "input {input}"
+            );
+            assert!(resolved.commit_sha.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_auto_detect_unknown_ref_fails_early() {
+        let repo = make_remote_repo();
+        let url = file_url(&repo);
+
+        // With a remote configured, an unknown bare name must ERROR (the
+        // old assume-it's-a-branch guess is reserved for the no-repo,
+        // no-remote standalone case).
+        let err = remote_resolver(&url)
+            .resolve("totally-unknown-thing")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Could not resolve"));
+    }
+
+    #[tokio::test]
+    async fn remote_unreachable_fails_early_with_clear_error() {
+        let missing = tempfile::TempDir::new().unwrap();
+        let url = format!("file://{}/nope", missing.path().display());
+
+        let err = remote_resolver(&url)
+            .resolve("branch:main")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ls-remote failed"));
     }
 
     #[test]
