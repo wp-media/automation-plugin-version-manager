@@ -1,6 +1,6 @@
 {
   "name": "apvm-napi",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "Node.js bindings for APVM (Automation Plugin Version Manager) — build WordPress plugins from PRs, branches, tags, and commits. And download from releases.",
   "main": "index.js",
   "types": "index.d.ts",

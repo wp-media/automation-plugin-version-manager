@@ -1,104 +1,99 @@
 //! High-level cache lookup with version-match semantics.
 //!
-//! This is the API a build pipeline calls *before* building: "is this
-//! commit already cached, and does the cached copy satisfy my version and
-//! variant requirements?"
+//! Some plugins are version-aware: the requested version string is baked
+//! into the built artifact (BackWPup stamps it into the zip and the plugin
+//! headers), so a build of the *right commit* at the *wrong version* may or
+//! may not be an acceptable cache hit:
 //!
-//! # Version matching
+//! - [`VersionMatch::Strict`] — only a build of the exact requested version
+//!   counts. Use for version-stamping plugins when the version matters
+//!   (e.g. testing data migrations).
+//! - [`VersionMatch::Lenient`] — any healthy build of the commit counts;
+//!   an exact-version build is preferred and [`LookupHit::version_matched`]
+//!   reports which case occurred.
 //!
-//! Some plugins are *version-aware*: the version string is baked into the
-//! built artifact (e.g. BackWPup, where it is mostly cosmetic — what
-//! WordPress displays — except for special cases like data migrations).
-//! For those, an artifact built from the same commit under a different
-//! requested version may or may not be acceptable:
-//!
-//! - [`VersionMatch::Strict`]: only a build stored under the exact requested
-//!   version is a hit. A same-commit build under another version is reported
-//!   as [`MissReason::VersionMismatch`] (with the available versions), so the
-//!   caller knows a rebuild is needed *only* because of the version stamp.
-//! - [`VersionMatch::Lenient`]: any healthy build of the commit is a hit;
-//!   [`LookupHit::version_matched`] tells the caller whether the version
-//!   also matched, so it can inform the user.
-//!
-//! Plugins that are not version-aware should simply use `Lenient`.
-//!
-//! # Integrity
-//!
-//! Only healthy builds (manifest-recorded file sizes verified) count as
-//! hits. A cached-but-damaged build surfaces as [`MissReason::Incomplete`];
-//! re-storing after rebuild self-heals it.
+//! On a miss, [`MissReason`] says *why* — not cached at all, only other
+//! versions cached, required variants missing, or files damaged — so a
+//! caller can print an actionable message or decide to rebuild only what is
+//! missing.
 
+use chrono::Utc;
+
+use crate::db;
 use crate::error::Result;
-use crate::store::{ArtifactStore, StoredBuild};
-use crate::validate;
-use crate::verify::VerifyMode;
+use crate::paths;
+use crate::store::{ArtifactStore, artifacts_healthy, touch_build_quiet};
+use crate::types::{BuildSource, StoredBuild};
 
-/// How strictly the requested version must match a cached build.
+/// How strictly the requested version must match the cached build's version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VersionMatch {
-    /// Only builds stored under the exact requested version are hits.
-    #[default]
+    /// Only exact-version builds are hits; other versions of the same
+    /// commit produce [`MissReason::VersionMismatch`].
     Strict,
-    /// Any healthy build of the commit is a hit, regardless of version.
+    /// Any healthy build of the key is a hit; exact-version builds are
+    /// preferred when available.
+    #[default]
     Lenient,
 }
 
-/// A cache lookup request.
-///
-/// Build with [`LookupRequest::new`] and refine with the builder methods:
-///
-/// ```ignore
-/// let request = LookupRequest::new("backwpup", &commit_sha)
-///     .version("5.6.0")
-///     .version_match(VersionMatch::Lenient)
-///     .require_variants(&[Some("free".into()), Some("pro".into())]);
-///
-/// match store.lookup_build(&request)? {
-///     LookupResult::Hit(hit) => use_cached(hit.build),
-///     LookupResult::Miss(reason) => build_fresh(reason),
-/// }
-/// ```
+/// What to look up: a commit or a source reference.
+#[derive(Debug, Clone, Copy)]
+pub enum LookupKey<'a> {
+    /// A commit SHA, short (≥ 7 hex chars) or full.
+    Commit(&'a str),
+    /// A build source (PR, branch, tag, ...); candidates are the builds the
+    /// source has been linked to, most recently linked first.
+    Source(&'a BuildSource),
+}
+
+/// A cache lookup request. Construct with [`LookupRequest::new`] and refine
+/// with the builder methods; the struct is `#[non_exhaustive]` so new knobs
+/// can be added without breaking callers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LookupRequest<'a> {
-    /// Project name.
+    /// Project to search in.
     pub project: &'a str,
-    /// Commit hash (short or full, any case).
-    pub commit: &'a str,
-    /// Requested version, when known. `None` means "any version".
+    /// What to search by.
+    pub key: LookupKey<'a>,
+    /// Requested version, if the caller has one.
     pub version: Option<&'a str>,
-    /// How strictly `version` must match (ignored when `version` is `None`).
+    /// How strictly `version` must match. Defaults to [`VersionMatch::Lenient`].
     pub version_match: VersionMatch,
-    /// Variants that must all be present (and healthy) for a hit.
-    /// Empty means any cached artifact set is acceptable.
+    /// Variants that must be present and healthy for a hit (`None` entries
+    /// mean the variant-less artifact). Empty = any healthy artifact set.
     pub required_variants: &'a [Option<String>],
 }
 
 impl<'a> LookupRequest<'a> {
-    /// Create a request for a project + commit with default semantics
-    /// (any version, no required variants).
-    pub fn new(project: &'a str, commit: &'a str) -> Self {
+    /// A lenient request with no version pin and no variant requirements.
+    pub fn new(project: &'a str, key: LookupKey<'a>) -> Self {
         Self {
             project,
-            commit,
+            key,
             version: None,
-            version_match: VersionMatch::default(),
+            version_match: VersionMatch::Lenient,
             required_variants: &[],
         }
     }
 
-    /// Require (or prefer, depending on [`VersionMatch`]) a specific version.
+    /// Pin the requested version.
+    #[must_use]
     pub fn version(mut self, version: &'a str) -> Self {
         self.version = Some(version);
         self
     }
 
-    /// Set the version-match strictness.
-    pub fn version_match(mut self, mode: VersionMatch) -> Self {
-        self.version_match = mode;
+    /// Set the version-match policy.
+    #[must_use]
+    pub fn version_match(mut self, version_match: VersionMatch) -> Self {
+        self.version_match = version_match;
         self
     }
 
-    /// Require these variants to be present for a hit.
+    /// Require these variants to be present and healthy.
+    #[must_use]
     pub fn require_variants(mut self, variants: &'a [Option<String>]) -> Self {
         self.required_variants = variants;
         self
@@ -106,446 +101,195 @@ impl<'a> LookupRequest<'a> {
 }
 
 /// A successful lookup.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LookupHit {
-    /// The cached build satisfying the request.
+    /// The healthy cached build.
     pub build: StoredBuild,
-    /// Whether the build's version equals the requested version
-    /// (always `true` when no version was requested).
+    /// `true` when the build's version equals the requested version (always
+    /// `true` when no version was requested). `false` only happens under
+    /// [`VersionMatch::Lenient`].
     pub version_matched: bool,
 }
 
 /// Why a lookup missed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissReason {
-    /// Nothing cached for this commit at all.
+    /// Nothing is cached for the key.
     NotCached,
-    /// Strict version matching: the commit is cached, but only under other
-    /// versions. Contains the versions it *is* cached under.
+    /// Builds of the key exist, but none at the requested version
+    /// (strict mode). `available` lists the cached versions, newest first.
     VersionMismatch {
-        /// Versions under which this commit is cached.
+        /// Versions of the key that *are* cached.
         available: Vec<String>,
     },
-    /// A build exists but lacks some required variants.
+    /// A build exists with healthy files, but not all required variants are
+    /// stored. `missing` is what would have to be built.
     MissingVariants {
         /// The required variants that are absent or unhealthy.
         missing: Vec<Option<String>>,
     },
-    /// A build exists but its files are missing/damaged; rebuilding and
-    /// re-storing will self-heal it.
+    /// Cached entries exist but their files are missing or damaged on disk;
+    /// rebuilding (and re-storing) heals them.
     Incomplete,
 }
 
-impl std::fmt::Display for MissReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotCached => write!(f, "commit not cached"),
-            Self::VersionMismatch { available } => write!(
-                f,
-                "commit cached under other version(s): {}",
-                available.join(", ")
-            ),
-            Self::MissingVariants { missing } => {
-                let names: Vec<String> = missing
-                    .iter()
-                    .map(|v| v.clone().unwrap_or_else(|| "<default>".to_string()))
-                    .collect();
-                write!(f, "cached build lacks variant(s): {}", names.join(", "))
-            }
-            Self::Incomplete => write!(f, "cached build is damaged or incomplete"),
-        }
-    }
-}
-
-/// Result of a cache lookup.
-#[derive(Debug)]
+/// Result of [`ArtifactStore::lookup_build`].
+#[derive(Debug, Clone)]
 pub enum LookupResult {
-    /// A cached build satisfies the request.
+    /// A healthy build satisfying the request.
     Hit(LookupHit),
-    /// No cached build satisfies the request; the reason says why.
+    /// No satisfying build; the reason says why.
     Miss(MissReason),
 }
 
 impl LookupResult {
-    /// Convenience: the hit, if any.
+    /// `true` for [`LookupResult::Hit`].
+    pub fn is_hit(&self) -> bool {
+        matches!(self, Self::Hit(_))
+    }
+
+    /// Unwrap into the hit, if any.
     pub fn hit(self) -> Option<LookupHit> {
         match self {
             Self::Hit(hit) => Some(hit),
             Self::Miss(_) => None,
         }
     }
-
-    /// Convenience: whether this is a hit.
-    pub fn is_hit(&self) -> bool {
-        matches!(self, Self::Hit(_))
-    }
 }
 
-/// Outcome of evaluating one candidate build against a request.
-enum CandidateOutcome {
-    /// Candidate satisfies the request.
-    Usable,
-    /// Files missing or damaged.
-    Incomplete,
-    /// Required variants absent/unhealthy.
-    MissingVariants(Vec<Option<String>>),
+/// A candidate build with its evaluation against the request.
+struct Candidate {
+    build: StoredBuild,
+    files_ok: bool,
+    missing_variants: Vec<Option<String>>,
 }
 
 impl ArtifactStore {
-    /// Look up a cached build for a commit with version/variant semantics.
+    /// Decide whether a cached build satisfies `request`, and if not, why.
     ///
-    /// See the [module docs](crate::lookup) for the decision model. In
-    /// short: the exact requested version is preferred; other versions of
-    /// the same commit are hits only under [`VersionMatch::Lenient`]
-    /// (newest first), and otherwise explain the miss via
-    /// [`MissReason::VersionMismatch`].
+    /// Hits update the build's last-used timestamp (feeding age-based
+    /// [`clean`](ArtifactStore::clean)); candidates whose files are damaged
+    /// are never returned.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidInput`] for malformed project/version/commit
+    /// inputs, [`crate::Error::Database`] for SQLite failures. An empty or
+    /// damaged cache is a [`LookupResult::Miss`], not an error.
     pub fn lookup_build(&self, request: &LookupRequest<'_>) -> Result<LookupResult> {
-        validate::validate_project(request.project)?;
-        validate::validate_commit(request.commit)?;
+        paths::validate_project(request.project)?;
         if let Some(version) = request.version {
-            validate::validate_version(version)?;
+            paths::validate_version(version)?;
         }
 
-        // Candidate builds paired with whether they match the requested
-        // version, ordered by preference: exact version first, then other
-        // versions newest-first. Candidates are loaded *raw* (no integrity
-        // filter) so a damaged cached build is classified as `Incomplete`
-        // rather than misreported as `NotCached`.
-        let mut candidates: Vec<(StoredBuild, bool)> = Vec::new();
-
-        if let Some(version) = request.version {
-            if let Some(build) =
-                self.find_by_commit_raw(request.project, version, request.commit)?
-            {
-                candidates.push((build, true));
+        let conn = self.conn();
+        let rows = match request.key {
+            LookupKey::Commit(commit) => {
+                let commit = paths::validate_commit(commit)?;
+                db::builds::by_commit(&conn, request.project, &commit, None)?
             }
-            for build in self.find_commit_in_versions_raw(request.project, request.commit)? {
-                if build.manifest.version != version {
-                    candidates.push((build, false));
-                }
+            LookupKey::Source(source) => {
+                db::builds::by_source(&conn, request.project, source.kind(), &source.reference())?
             }
-        } else {
-            for build in self.find_commit_in_versions_raw(request.project, request.commit)? {
-                candidates.push((build, true));
-            }
-        }
-
-        if candidates.is_empty() {
+        };
+        if rows.is_empty() {
             return Ok(LookupResult::Miss(MissReason::NotCached));
         }
 
-        // Versions the commit is cached under (for VersionMismatch reporting).
-        let available: Vec<String> = candidates
-            .iter()
-            .filter(|(_, matched)| !matched)
-            .map(|(b, _)| b.manifest.version.clone())
-            .collect();
-
-        // Whether a non-matching version may satisfy the request at all.
-        let cross_version_ok =
-            request.version.is_none() || request.version_match == VersionMatch::Lenient;
-
-        // Track the most meaningful miss reason while scanning candidates:
-        // an exact-version candidate's failure beats a generic NotCached.
-        let mut miss_reason: Option<MissReason> = None;
-
-        for (build, version_matched) in candidates {
-            if !version_matched && !cross_version_ok {
-                continue;
-            }
-
-            match self.evaluate_candidate(&build, request)? {
-                CandidateOutcome::Usable => {
-                    return Ok(LookupResult::Hit(LookupHit {
-                        build,
-                        version_matched,
-                    }));
-                }
-                CandidateOutcome::Incomplete => {
-                    miss_reason.get_or_insert(MissReason::Incomplete);
-                }
-                CandidateOutcome::MissingVariants(missing) => {
-                    miss_reason.get_or_insert(MissReason::MissingVariants { missing });
-                }
+        // Evaluate every candidate; unreadable rows degrade to a miss, not
+        // an error.
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            match self.build_from_row(&conn, row) {
+                Ok(build) => candidates.push(evaluate(build, request.required_variants)),
+                Err(err) => tracing::warn!(error = %err, "skipping unreadable build row"),
             }
         }
-
-        // No usable candidate. Prefer the concrete failure of an evaluated
-        // candidate; otherwise the only candidates were excluded by strict
-        // version matching.
-        let reason = match miss_reason {
-            Some(reason) => reason,
-            None if available.is_empty() => MissReason::NotCached,
-            None => MissReason::VersionMismatch { available },
-        };
-
-        Ok(LookupResult::Miss(reason))
-    }
-
-    /// Evaluate whether one candidate build satisfies a request.
-    fn evaluate_candidate(
-        &self,
-        build: &StoredBuild,
-        request: &LookupRequest<'_>,
-    ) -> Result<CandidateOutcome> {
-        // Integrity first: a damaged build satisfies nothing.
-        if !build.verify(VerifyMode::Size)?.is_empty() {
-            return Ok(CandidateOutcome::Incomplete);
+        if candidates.is_empty() {
+            return Ok(LookupResult::Miss(MissReason::Incomplete));
         }
 
-        // Variant coverage (files already verified above, so manifest
-        // presence is sufficient here).
-        let missing: Vec<Option<String>> = request
-            .required_variants
-            .iter()
-            .filter(|v| !build.manifest.has_variant(v.as_deref()))
-            .cloned()
+        let matches_version =
+            |candidate: &Candidate| request.version.is_none_or(|v| candidate.build.version == v);
+
+        // Preference order over candidate indices (already newest-first):
+        // strict considers only exact-version candidates; lenient prefers
+        // them but falls back to the rest.
+        let mut order: Vec<usize> = (0..candidates.len())
+            .filter(|&i| matches_version(&candidates[i]))
             .collect();
-        if !missing.is_empty() {
-            return Ok(CandidateOutcome::MissingVariants(missing));
+        if request.version_match == VersionMatch::Lenient {
+            order.extend((0..candidates.len()).filter(|&i| !matches_version(&candidates[i])));
         }
 
-        Ok(CandidateOutcome::Usable)
+        if let Some(&picked) = order
+            .iter()
+            .find(|&&i| candidates[i].files_ok && candidates[i].missing_variants.is_empty())
+        {
+            let candidate = candidates.swap_remove(picked);
+            touch_build_quiet(&conn, candidate.build.id, db::to_ms(Utc::now()));
+            let version_matched = request.version.is_none_or(|v| candidate.build.version == v);
+            return Ok(LookupResult::Hit(LookupHit {
+                build: candidate.build,
+                version_matched,
+            }));
+        }
+
+        Ok(LookupResult::Miss(miss_reason(&candidates, &order)))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::path::BuildSource;
-    use crate::store::{BuildMetadata, SourceArtifact};
-    use tempfile::TempDir;
-
-    const COMMIT: &str = "abc1234567890abcdef1234567890abcdef12345";
-
-    fn temp_store() -> (TempDir, ArtifactStore) {
-        let dir = TempDir::new().unwrap();
-        let store = ArtifactStore::new(dir.path().join("store"));
-        (dir, store)
+/// Health-check a build against the required variants.
+fn evaluate(build: StoredBuild, required_variants: &[Option<String>]) -> Candidate {
+    let files_ok = artifacts_healthy(&build);
+    let healthy_variants: Vec<&Option<String>> = build
+        .artifacts
+        .iter()
+        .filter(|artifact| crate::fsx::file_size(&artifact.path) == Some(artifact.size_bytes))
+        .map(|artifact| &artifact.variant_id)
+        .collect();
+    let missing_variants = required_variants
+        .iter()
+        .filter(|required| !healthy_variants.contains(required))
+        .cloned()
+        .collect();
+    Candidate {
+        build,
+        files_ok,
+        missing_variants,
     }
+}
 
-    /// Store a build for `COMMIT` under the given version with the given
-    /// variants (one file per variant).
-    fn store_variants(
-        dir: &std::path::Path,
-        store: &ArtifactStore,
-        version: &str,
-        variants: &[Option<&str>],
-    ) {
-        let artifacts: Vec<SourceArtifact> = variants
-            .iter()
-            .map(|v| {
-                let name = format!("backwpup-{version}-{}.zip", v.unwrap_or("default"));
-                let path = dir.join(&name);
-                std::fs::write(&path, format!("content {name}")).unwrap();
-                SourceArtifact {
-                    variant_id: v.map(|s| s.to_string()),
-                    path,
-                    target_name: name,
-                }
-            })
-            .collect();
-        let meta = BuildMetadata::new(
-            "backwpup".to_string(),
-            version.to_string(),
-            BuildSource::Branch("develop".into()),
-            COMMIT.to_string(),
-            "develop".to_string(),
-        );
-        store.store(&artifacts, &meta).unwrap();
+/// Explain the best-available candidate's shortfall, most actionable first.
+fn miss_reason(candidates: &[Candidate], order: &[usize]) -> MissReason {
+    if order.is_empty() {
+        // Strict mode and no candidate at the requested version.
+        return MissReason::VersionMismatch {
+            available: available_versions(candidates),
+        };
     }
-
-    #[test]
-    fn test_lookup_not_cached() {
-        let (_dir, store) = temp_store();
-        let result = store
-            .lookup_build(&LookupRequest::new("backwpup", COMMIT))
-            .unwrap();
-        assert!(matches!(result, LookupResult::Miss(MissReason::NotCached)));
+    // Files intact but variants missing → tell the caller what to build.
+    let fewest_missing = order
+        .iter()
+        .map(|&i| &candidates[i])
+        .filter(|candidate| candidate.files_ok && !candidate.missing_variants.is_empty())
+        .min_by_key(|candidate| candidate.missing_variants.len());
+    match fewest_missing {
+        Some(candidate) => MissReason::MissingVariants {
+            missing: candidate.missing_variants.clone(),
+        },
+        None => MissReason::Incomplete,
     }
+}
 
-    #[test]
-    fn test_lookup_exact_version_hit() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-
-        let request = LookupRequest::new("backwpup", COMMIT).version("5.6.0");
-        let result = store.lookup_build(&request).unwrap();
-        let hit = result.hit().expect("expected hit");
-        assert!(hit.version_matched);
-        assert_eq!(hit.build.manifest.version, "5.6.0");
-    }
-
-    #[test]
-    fn test_lookup_short_commit_hits_full_stored() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-
-        // Lookup by 7-char short of the stored full hash.
-        let request = LookupRequest::new("backwpup", "abc1234").version("5.6.0");
-        assert!(store.lookup_build(&request).unwrap().is_hit());
-    }
-
-    #[test]
-    fn test_lookup_strict_version_mismatch() {
-        let (dir, store) = temp_store();
-        // Commit cached under 5.6.0, requested as 5.7.0 (version-aware
-        // plugin, strict): must miss and report where it IS cached.
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-
-        let request = LookupRequest::new("backwpup", COMMIT)
-            .version("5.7.0")
-            .version_match(VersionMatch::Strict);
-        let result = store.lookup_build(&request).unwrap();
-        match result {
-            LookupResult::Miss(MissReason::VersionMismatch { available }) => {
-                assert_eq!(available, vec!["5.6.0".to_string()]);
-            }
-            other => panic!("expected VersionMismatch, got {other:?}"),
+/// Distinct cached versions across the candidates, newest first.
+fn available_versions(candidates: &[Candidate]) -> Vec<String> {
+    let mut versions: Vec<String> = Vec::new();
+    for candidate in candidates {
+        if !versions.contains(&candidate.build.version) {
+            versions.push(candidate.build.version.clone());
         }
     }
-
-    #[test]
-    fn test_lookup_lenient_version_mismatch_hits() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-
-        // Lenient: the 5.6.0 build of the same commit is acceptable for a
-        // 5.7.0 request, flagged as version_matched = false.
-        let request = LookupRequest::new("backwpup", COMMIT)
-            .version("5.7.0")
-            .version_match(VersionMatch::Lenient);
-        let result = store.lookup_build(&request).unwrap();
-        let hit = result.hit().expect("expected lenient hit");
-        assert!(!hit.version_matched);
-        assert_eq!(hit.build.manifest.version, "5.6.0");
-    }
-
-    #[test]
-    fn test_lookup_no_version_requested() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-
-        let result = store
-            .lookup_build(&LookupRequest::new("backwpup", COMMIT))
-            .unwrap();
-        let hit = result.hit().expect("expected hit");
-        // No constraint given: reported as matched.
-        assert!(hit.version_matched);
-    }
-
-    #[test]
-    fn test_lookup_required_variants_hit_and_miss() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[Some("free"), Some("pro")]);
-
-        let both = [Some("free".to_string()), Some("pro".to_string())];
-        let request = LookupRequest::new("backwpup", COMMIT)
-            .version("5.6.0")
-            .require_variants(&both);
-        assert!(store.lookup_build(&request).unwrap().is_hit());
-
-        let with_extra = [Some("free".to_string()), Some("enterprise".to_string())];
-        let request = LookupRequest::new("backwpup", COMMIT)
-            .version("5.6.0")
-            .require_variants(&with_extra);
-        match store.lookup_build(&request).unwrap() {
-            LookupResult::Miss(MissReason::MissingVariants { missing }) => {
-                assert_eq!(missing, vec![Some("enterprise".to_string())]);
-            }
-            other => panic!("expected MissingVariants, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_lookup_incomplete_when_file_deleted() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-
-        // Damage the cache behind the manifest.
-        let commit_dir = store.paths().commit_dir("backwpup", "5.6.0", "abc1234");
-        std::fs::remove_file(commit_dir.join("backwpup-5.6.0-default.zip")).unwrap();
-
-        let request = LookupRequest::new("backwpup", COMMIT).version("5.6.0");
-        let result = store.lookup_build(&request).unwrap();
-        assert!(matches!(result, LookupResult::Miss(MissReason::Incomplete)));
-    }
-
-    #[test]
-    fn test_lookup_incomplete_without_version_constraint() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-
-        // Damage the only cached build.
-        let commit_dir = store.paths().commit_dir("backwpup", "5.6.0", "abc1234");
-        std::fs::remove_file(commit_dir.join("backwpup-5.6.0-default.zip")).unwrap();
-
-        // With no version constraint the damaged build must still be
-        // reported as Incomplete (rebuild + re-store heals), not NotCached.
-        let result = store
-            .lookup_build(&LookupRequest::new("backwpup", COMMIT))
-            .unwrap();
-        assert!(matches!(result, LookupResult::Miss(MissReason::Incomplete)));
-    }
-
-    #[test]
-    fn test_lookup_lenient_falls_back_when_exact_version_damaged() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-        store_variants(dir.path(), &store, "5.7.0", &[None]);
-
-        // Damage the exact-version build; the other version stays healthy.
-        let commit_dir = store.paths().commit_dir("backwpup", "5.6.0", "abc1234");
-        std::fs::remove_file(commit_dir.join("backwpup-5.6.0-default.zip")).unwrap();
-
-        let request = LookupRequest::new("backwpup", COMMIT)
-            .version("5.6.0")
-            .version_match(VersionMatch::Lenient);
-        let hit = store.lookup_build(&request).unwrap().hit().unwrap();
-        assert!(!hit.version_matched);
-        assert_eq!(hit.build.manifest.version, "5.7.0");
-    }
-
-    #[test]
-    fn test_lookup_prefers_exact_version_over_other_versions() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-        store_variants(dir.path(), &store, "5.7.0", &[None]);
-
-        let request = LookupRequest::new("backwpup", COMMIT)
-            .version("5.6.0")
-            .version_match(VersionMatch::Lenient);
-        let hit = store.lookup_build(&request).unwrap().hit().unwrap();
-        assert!(hit.version_matched);
-        assert_eq!(hit.build.manifest.version, "5.6.0");
-    }
-
-    #[test]
-    fn test_lookup_full_hash_prefix_mismatch_is_not_cached() {
-        let (dir, store) = temp_store();
-        store_variants(dir.path(), &store, "5.6.0", &[None]);
-
-        // Same 7-char short as the stored build, different full hash: the
-        // stored build is a different commit, so this must be NotCached —
-        // never a hit, never VersionMismatch.
-        let impostor = format!("{}{}", &COMMIT[..7], "0".repeat(33));
-        let request = LookupRequest::new("backwpup", &impostor).version("5.6.0");
-        let result = store.lookup_build(&request).unwrap();
-        assert!(matches!(result, LookupResult::Miss(MissReason::NotCached)));
-    }
-
-    #[test]
-    fn test_lookup_rejects_invalid_input() {
-        let (_dir, store) = temp_store();
-        assert!(
-            store
-                .lookup_build(&LookupRequest::new("../evil", COMMIT))
-                .is_err()
-        );
-        assert!(
-            store
-                .lookup_build(&LookupRequest::new("backwpup", "nothex!"))
-                .is_err()
-        );
-    }
+    versions.sort_by(|a, b| paths::cmp_versions(b, a));
+    versions
 }

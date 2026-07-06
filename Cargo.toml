@@ -56,10 +56,11 @@ sha2 = "0.11"
 walkdir = "2"
 glob = "0.3"
 
-# Windows NTFS junction creation via the Win32 API (no admin privileges,
-# no cmd.exe subprocess). Used by apvm-storage on Windows only.
-# https://docs.rs/junction/1 — SemVer stable since 1.0
-junction = "1"
+# Embedded SQLite with the C library compiled in (`bundled`) — no system
+# dependency, identical behavior on every platform. Used by apvm-storage as
+# the single metadata index for cached builds and release assets.
+# https://docs.rs/rusqlite/0.40 — pre-1.0, 0.40.x is compatible range
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # ZIP archive creation
 # https://docs.rs/zip/8 — SemVer stable since 2.0, latest 8.x

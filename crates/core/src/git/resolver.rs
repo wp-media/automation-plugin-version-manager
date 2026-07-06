@@ -26,7 +26,7 @@
 
 use std::path::Path;
 
-use apvm_storage::path::BuildSource;
+use apvm_storage::BuildSource;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 
@@ -79,13 +79,13 @@ impl ResolvedRef {
 
 /// Source type of a git reference.
 ///
-/// Convertible to/from [`apvm_storage::path::BuildSource`] for storage operations.
+/// Convertible to/from [`apvm_storage::BuildSource`] for storage operations.
 ///
 /// # Examples
 ///
 /// ```
 /// use apvm_core::git::RefSource;
-/// use apvm_storage::path::BuildSource;
+/// use apvm_storage::BuildSource;
 ///
 /// // RefSource → BuildSource
 /// let ref_source = RefSource::Branch("develop".to_string());

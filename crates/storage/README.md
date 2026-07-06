@@ -1,141 +1,134 @@
 # apvm-storage
 
-Production-grade, filesystem-backed cache for built plugin artifacts and
-downloaded GitHub Release assets. Point it at a builds cache directory and it
-deduplicates artifacts per commit, tracks every build in JSON manifests, and
-answers "is this already built?" before a pipeline spends minutes rebuilding.
+SQLite-backed cache for APVM build artifacts and GitHub Release assets.
 
-> **Naming note**: the crate is called *storage* rather than *cache* on
-> purpose — it holds the authoritative copy of built artifacts (a cache
-> implies the content is evictable and reproducible elsewhere at zero cost;
-> rebuilding is exactly the cost this crate exists to avoid). The directory
-> it manages is what the CLI/config layers expose as the *builds cache dir*.
-
-## Directory layout
+One embedded SQLite database (`apvm.db`, via `rusqlite` with the bundled C
+library — zero system dependencies) is the single source of truth for all
+metadata. Artifact **files** live in plain directories next to it. There are
+no manifests and no symlinks.
 
 ```text
-{base_dir}/
-├── .apvm-store.json                  # store marker + layout schema version
-├── .apvm-store.lock                  # cross-process mutation lock
-└── {project}/
-    ├── releases/                     # cached GitHub Release assets, keyed by tag
-    │   └── {tag}/
-    │       ├── release-manifest.json
-    │       └── *.zip
-    └── {major.minor}/
-        └── {version}/
-            ├── by-commit/
-            │   └── {commit_short}/   # the single physical copy per commit
-            │       ├── build-manifest.json
-            │       └── *.zip
-            └── by-source/            # navigation links, one dir per source
-                ├── pr-123/{commit}              → ../../by-commit/{commit}
-                └── branch-develop/{commit}      → ../../by-commit/{commit}
+{base_dir}/apvm.db                                  ← all metadata
+{base_dir}/{project}/commits/{version}/{commit}/    ← build artifact files
+{base_dir}/{project}/releases/{tag}/                ← release asset files
 ```
 
-- `releases/` can never collide with a `{major.minor}` directory: major.minor
-  names always contain a `.`, `releases` does not.
-- Source/tag names are sanitized for the filesystem; names that needed
-  sanitizing get a deterministic 8-hex-char suffix so distinct sources never
-  share a directory. The *exact* original source values are recorded in the
-  manifests.
-- Links are relative symlinks on Unix (the store is relocatable) and NTFS
-  junctions on Windows (created via the Win32 API, no admin rights needed).
+Directory paths are stored relative to `base_dir`, so the whole store can be
+moved and reopened.
+
+## Schema (v1, `PRAGMA user_version`)
+
+| Table             | Keyed by                            | Holds                                            |
+| ----------------- | ----------------------------------- | ------------------------------------------------ |
+| `builds`          | `(project, version, commit)` unique | directory, built-at, last-used timestamps        |
+| `build_artifacts` | `(build, filename)` unique          | variant, size, SHA-256                           |
+| `build_sources`   | `(build, kind, reference)` unique   | PR/branch/tag/commit links + branch + linked-at  |
+| `releases`        | `(project, tag)` unique             | GitHub flags, directory, cached-at, last-used    |
+| `release_assets`  | `(release, filename)` unique        | size, SHA-256                                    |
+
+All tables are `STRICT`; deletes cascade; timestamps are epoch milliseconds
+(exposed as `chrono::DateTime<Utc>`).
 
 ## Guarantees
 
-| Concern | Mechanism |
-|---|---|
-| Path safety | Every caller-provided value that becomes a path component is validated (`validate.rs`): no traversal, no separators, no Windows-reserved names, no shadowing of store metadata files. |
-| Crash consistency | Manifests and artifacts are written to temp files, fsynced, and atomically renamed (`fsx.rs`). Readers never see torn files; stale temps are swept on the next store. |
-| Concurrency | Mutations hold an exclusive cross-process lock (`File::lock`); reads are lock-free and stay consistent thanks to atomic renames. |
-| Integrity | Manifests record size + SHA-256 per file. Read paths verify sizes and treat damaged entries as cache misses; `VerifyMode::Checksum` is available for full audits. |
-| Self-healing | A damaged/incomplete entry reads as a miss; the next `store()` / `store_release()` of the same build re-copies only what is broken. |
-| Short-commit collisions | Commit dirs use 7-char shorts for readability, but the full hash in the manifest is always cross-checked. A genuine collision is a loud `Error::CommitCollision`, never silent dedup. |
-| Forward compatibility | Manifests and the store marker carry schema versions. Data written by a newer crate version is never overwritten (`Error::UnsupportedSchema`). |
+- **Row ⇒ files.** Stores copy files first (temp file + fsync + atomic
+  rename), commit metadata last; deletes remove metadata first, files last.
+  Crashes leave only invisible or orphan files — never a record pointing at
+  nothing. `gc()` reclaims orphans in both directions.
+- **Hits are verified.** Finds/lookups check presence + size before
+  reporting a hit; damaged entries degrade to a miss and re-storing heals
+  them. `verify(VerifyMode::Checksum)` re-hashes everything on demand.
+- **Corruption story.** WAL journal + integrity check on every open; a
+  damaged database fails with `Error::DatabaseCorrupted`, and
+  `ArtifactStore::repair()` quarantines it, rebuilds a fresh index, and
+  re-adopts artifact files found on disk (hashes recomputed).
+- **Concurrency.** `ArtifactStore` is `Send + Sync`. Cross-process:
+  SQLite/WAL guards the database; an advisory lock (`.apvm.lock`)
+  serializes mutating operations so a clean can't race a store. Keep the
+  store on a local disk (advisory locks over NFS/SMB are unreliable).
+- **Async.** Everything is intentionally blocking; call through
+  `tokio::task::spawn_blocking` from async code.
 
-## Cache flow
+## API tour
 
-```rust,ignore
-use apvm_storage::{ArtifactStore, LookupRequest, LookupResult, VersionMatch};
+```rust,no_run
+use apvm_storage::{
+    ArtifactStore, BuildMetadata, BuildSource, CleanOptions, CleanTarget, LookupKey,
+    LookupRequest, SourceArtifact, VerifyMode, VersionMatch,
+};
 
-let store = ArtifactStore::new(builds_cache_dir);
+fn main() -> apvm_storage::Result<()> {
+    let store = ArtifactStore::open("/var/lib/apvm/builds")?;
 
-// Releases resolve to a tag, not a commit — check the releases cache:
-if let Some(release) = store.find_release("backwpup", "v5.6.0")? {
-    return Ok(release.files); // verified cache hit, no download
-}
+    // Store a build (idempotent; re-stores reuse healthy files).
+    let metadata = BuildMetadata::new(
+        "backwpup", "5.6.0",
+        BuildSource::PullRequest(123),
+        "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+        "feature/faster-backups".to_string(),
+    );
+    let artifacts = vec![SourceArtifact {
+        variant_id: Some("pro-en".into()),
+        path: "/tmp/build-output/backwpup-pro-en-5.6.0.zip".into(),
+        target_name: "backwpup-pro-en-5.6.0.zip".into(),
+    }];
+    store.store(&metadata, &artifacts)?;
 
-// Everything else resolves to a commit — check the build cache:
-let request = LookupRequest::new("backwpup", &commit_sha)
-    .version("5.6.0")
-    .version_match(VersionMatch::Lenient) // or Strict, see below
-    .require_variants(&requested_variants);
-
-match store.lookup_build(&request)? {
-    LookupResult::Hit(hit) => {
-        if !hit.version_matched {
-            // Lenient match: same commit, different stamped version.
-        }
-        Ok(hit.build.files)
+    // Cache lookup with version semantics. BackWPup stamps the version into
+    // the artifact, so version-critical flows use Strict; others use the
+    // default Lenient and check `version_matched` on the hit.
+    let required = vec![Some("pro-en".to_string())];
+    let request = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"))
+        .version("5.6.0")
+        .version_match(VersionMatch::Strict)
+        .require_variants(&required);
+    if let Some(hit) = store.lookup_build(&request)?.hit() {
+        println!("cached at {}", hit.build.dir.display());
     }
-    LookupResult::Miss(reason) => {
-        // reason: NotCached | VersionMismatch { available } |
-        //         MissingVariants { missing } | Incomplete
-        let output = build_it()?;
-        store.store(&output.to_source_artifacts(), &output.to_build_metadata("backwpup"))?;
-        // ...
-    }
+
+    // Disk accounting and cleanup.
+    let usage = store.usage()?;
+    println!("cache holds {} bytes across {} builds", usage.total_bytes, usage.build_count);
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+    let preview = store.clean(&CleanOptions::default().older_than(cutoff).dry_run(true))?;
+    println!("cleaning would free {} bytes", preview.bytes_freed);
+    store.clear_older_than(cutoff)?;                       // by age (last-used)
+    store.clean(&CleanOptions::default()                   // scoped variants
+        .project("backwpup")
+        .target(CleanTarget::Releases))?;
+    store.clear_all()?;                                    // everything
+
+    // Maintenance.
+    store.gc()?;                            // reconcile db ↔ disk, sweep temp files
+    store.verify(VerifyMode::Checksum)?;    // deep integrity audit
+    store.integrity_check()?;               // SQLite-level check
+    Ok(())
 }
 ```
 
-### Strict vs lenient version matching
+Releases mirror the build API: `store_release` / `find_release` (exact-tag,
+health-checked) / `has_release` / `list_releases` / `delete_release`.
+Release tags are stored verbatim; on-disk directory names are sanitized
+derivations, so tags like `release/5.3` are safe everywhere. Keyword tags
+(`latest-stable`, ...) must be resolved against the GitHub API *before*
+consulting the cache — they are moving targets and are never cached.
 
-Version-aware plugins (e.g. BackWPup) bake the requested version string into
-the artifact. The same commit built as `5.6.0` and as `5.7.0` differs only by
-that stamp — usually cosmetic, occasionally load-bearing (upgrade notices,
-data migrations). `VersionMatch` lets the caller decide per request:
+## Design notes
 
-- **`Strict`** — only an exact-version build is a hit. A same-commit build
-  under another version misses with `VersionMismatch { available }`, telling
-  the caller precisely why a rebuild is happening.
-- **`Lenient`** — any healthy build of the commit is a hit;
-  `LookupHit::version_matched` reports whether the version also matched.
-
-Plugins that are not version-aware should use `Lenient`.
-
-### Releases cache
-
-GitHub Releases don't reliably expose their underlying commit, so cached
-releases are keyed by tag in a separate `releases/` subtree, with the same
-guarantees (`store_release`, `find_release`, `list_releases`,
-`delete_release`). Moving-target keywords (`latest-stable`, …) must be
-resolved to a concrete tag against the GitHub API *before* consulting the
-cache — they are deliberately never cached.
-
-## Module map
-
-| Module | Responsibility |
-|---|---|
-| `store` | `ArtifactStore`: store/find/list/delete builds, locking, store marker |
-| `release` | Releases cache: manifests + store/find/list/delete by tag |
-| `lookup` | Version-aware cache lookup (`Strict`/`Lenient`, required variants, miss reasons) |
-| `query` | Fluent inventory queries (project/version/source/commit filters) |
-| `manifest` | Schema-versioned JSON manifests, atomic save, invariant checks |
-| `verify` | Integrity checks (presence / size / checksum) |
-| `path` | Single source of truth for the on-disk layout + name sanitization |
-| `validate` | Input validation for everything that becomes a path component |
-| `link` | Cross-platform directory links (symlink / junction) |
-| `fsx` | Atomic writes, streamed hashing copies, temp management, store lock |
-| `error` | Contextual, `#[non_exhaustive]` error type |
-
-## Testing
-
-```bash
-cargo test -p apvm-storage
-```
-
-The suite covers crash-consistency behaviors (no temp leftovers, corrupted
-manifest recovery), concurrency (parallel stores to one commit), collision
-detection, sanitization round-trips, integrity misses, and the full
-strict/lenient lookup matrix.
+- **Why SQLite/rusqlite?** A local artifact cache needs an index that
+  supports aggregation (usage by project), range deletes (clean by age) and
+  prefix search (short commits) — with real crash-safety. That is exactly
+  SQLite's home turf, and `rusqlite` + bundled SQLite is the boring, proven
+  way to embed it (cargo itself tracks its global cache the same way).
+  Turso was evaluated and is still in beta by its own documentation; a full
+  ORM adds machinery without removing risk at this scale. All SQL lives in
+  the private `db/` module behind typed functions — nothing else in the
+  crate sees a query string.
+- **`last_used_at`** is bumped on every hit, so `clean(older_than: …)`
+  implements LRU-style aging: entries you keep using never age out, and
+  never-used entries age from their build/cache time.
+- **Short-commit collisions**: directories are named by the 7-char short
+  hash, lengthened automatically (12, then full) if another commit already
+  owns that prefix within the same project + version. The database always
+  records the full hash it was given.

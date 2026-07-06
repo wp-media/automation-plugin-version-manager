@@ -1,95 +1,110 @@
-//! APVM Storage Library
+//! # apvm-storage
 //!
-//! A production-grade, filesystem-backed cache for built plugin artifacts
-//! and downloaded release assets. Point it at a builds cache directory and
-//! it deduplicates per commit, tracks every build in JSON manifests, and
-//! answers "is this already built?" before a pipeline spends minutes
-//! rebuilding.
+//! SQLite-backed cache for APVM build artifacts and GitHub Release assets.
 //!
-//! # Directory Structure
+//! All metadata — builds, artifacts (with sizes and SHA-256 hashes), source
+//! links, cached releases — lives in a single embedded SQLite database.
+//! Artifact **files** live in plain directories next to it; the database is
+//! the only index (no manifests, no symlinks):
 //!
 //! ```text
-//! {base_dir}/
-//! ├── .apvm-store.json                  - store marker + layout schema version
-//! └── {project}/
-//!     ├── releases/                     - cached GitHub Release assets (keyed by tag)
-//!     │   └── {tag}/
-//!     │       ├── release-manifest.json
-//!     │       └── *.zip
-//!     └── {major.minor}/
-//!         └── {version}/
-//!             ├── by-commit/
-//!             │   └── {commit_short}/   - the single physical copy per commit
-//!             │       ├── build-manifest.json
-//!             │       └── *.zip
-//!             └── by-source/            - navigation links, one dir per source
-//!                 ├── pr-123/{commit}      → ../../by-commit/{commit}
-//!                 └── branch-develop/{commit} → ../../by-commit/{commit}
+//! {base_dir}/apvm.db                                  ← all metadata
+//! {base_dir}/{project}/commits/{version}/{commit}/    ← build artifact files
+//! {base_dir}/{project}/releases/{tag}/                ← release asset files
 //! ```
+//!
+//! Directory paths are recorded relative to `base_dir`, so the store can be
+//! moved wholesale and reopened.
 //!
 //! # Guarantees
 //!
-//! - **Validated inputs**: every caller-provided value that becomes a path
-//!   component is validated (`validate.rs`); nothing can escape the
-//!   base directory or shadow store metadata.
-//! - **Crash consistency**: manifests and artifacts are written to temp
-//!   files, fsynced, and atomically renamed — readers never see torn files
-//!   (`fsx.rs`).
-//! - **Concurrency**: mutations hold an exclusive cross-process lock; reads
-//!   are lock-free and integrity-checked.
-//! - **Self-healing**: damaged entries read as cache misses and are
-//!   repaired by the next store of the same build.
-//! - **Collision safety**: short-commit directories are cross-checked
-//!   against the full hash in the manifest; a real 7-hex-char collision is
-//!   a loud [`Error::CommitCollision`], never silent deduplication.
+//! - **Row ⇒ files.** Files are copied (atomically: temp file + fsync +
+//!   rename) *before* metadata commits; deletes remove metadata *before*
+//!   files. A crash therefore leaves either invisible files or orphan files
+//!   — never a record pointing at nothing. [`ArtifactStore::gc`] reclaims
+//!   orphans from both directions.
+//! - **Hits are verified.** Every find/lookup checks presence + size of the
+//!   files before reporting a hit; damaged entries degrade to a miss and
+//!   are healed by the next store. [`ArtifactStore::verify`] goes deeper on
+//!   demand (up to full SHA-256 re-hashing).
+//! - **Corruption is detected and recoverable.** The database runs in WAL
+//!   mode (crash-safe by design) and is integrity-checked on every open; a
+//!   damaged database fails with [`Error::DatabaseCorrupted`] and
+//!   [`ArtifactStore::repair`] quarantines it, rebuilds a fresh index, and
+//!   re-adopts the artifact files found on disk.
+//! - **Concurrency.** The store is `Send + Sync`; in-process access is
+//!   serialized internally. Across processes, SQLite's WAL handles the
+//!   database and an advisory file lock serializes mutations so a clean
+//!   cannot race a store. (Keep the store on a local disk — advisory locks
+//!   on network filesystems are unreliable.)
 //!
-//! # Typical cache flow
+//! # Async usage
 //!
-//! ```ignore
-//! use apvm_storage::{ArtifactStore, LookupRequest, LookupResult, VersionMatch};
+//! All I/O is intentionally blocking (SQLite is a blocking library). From
+//! async code, wrap calls in `tokio::task::spawn_blocking`.
 //!
-//! let store = ArtifactStore::new(config.builds_dir);
+//! # Example
 //!
-//! // Releases (no commit available — keyed by tag):
-//! if let Some(release) = store.find_release("backwpup", "v5.6.0")? {
-//!     return Ok(release.files);
-//! }
+//! ```
+//! use apvm_storage::{
+//!     ArtifactStore, BuildMetadata, BuildSource, LookupKey, LookupRequest, SourceArtifact,
+//!     VersionMatch,
+//! };
 //!
-//! // Builds (keyed by resolved commit):
-//! let request = LookupRequest::new("backwpup", &commit_sha)
+//! # fn main() -> apvm_storage::Result<()> {
+//! let base = tempfile::tempdir().expect("tempdir");
+//! let store = ArtifactStore::open(base.path())?;
+//!
+//! // A build produced two variant artifacts; put them in the cache.
+//! let zip = base.path().join("backwpup-5.6.0.zip");
+//! std::fs::write(&zip, b"zip-bytes").expect("write");
+//! let metadata = BuildMetadata::new(
+//!     "backwpup",
+//!     "5.6.0",
+//!     BuildSource::PullRequest(123),
+//!     "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+//!     "feature/faster-backups".to_string(),
+//! );
+//! let artifacts = vec![SourceArtifact {
+//!     variant_id: Some("free".to_string()),
+//!     path: zip.clone(),
+//!     target_name: "backwpup-5.6.0.zip".to_string(),
+//! }];
+//! store.store(&metadata, &artifacts)?;
+//!
+//! // Cache hit by short commit — strict version matching (the BackWPup case).
+//! let request = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"))
 //!     .version("5.6.0")
-//!     // Version-aware plugin + strict flag off → accept any version:
-//!     .version_match(VersionMatch::Lenient);
-//! match store.lookup_build(&request)? {
-//!     LookupResult::Hit(hit) => Ok(hit.build.files),
-//!     LookupResult::Miss(reason) => {
-//!         tracing::info!("cache miss: {reason}");
-//!         let output = build_it()?;
-//!         store.store(&output.artifacts, &output.metadata)?;
-//!         // ...
-//!     }
-//! }
+//!     .version_match(VersionMatch::Strict);
+//! assert!(store.lookup_build(&request)?.is_hit());
+//!
+//! // Disk accounting and cleanup are first-class.
+//! let usage = store.usage()?;
+//! assert_eq!(usage.build_count, 1);
+//! store.clear_all()?;
+//! # Ok(())
+//! # }
 //! ```
 
-pub mod error;
+mod db;
+mod error;
 mod fsx;
-pub mod link;
-pub mod lookup;
-pub mod manifest;
-pub mod path;
-pub mod query;
-pub mod release;
-pub mod store;
-mod validate;
-pub mod verify;
+mod lock;
+mod lookup;
+mod maintenance;
+mod paths;
+mod release;
+mod store;
+mod types;
 
 pub use error::{Error, Result};
-pub use lookup::{LookupHit, LookupRequest, LookupResult, MissReason, VersionMatch};
-pub use manifest::{ArtifactEntry, BuildManifest, SourceEntry};
-pub use path::{BuildSource, PathBuilder, compare_versions, major_minor};
-pub use query::BuildQuery;
-pub use release::{ReleaseManifest, ReleaseMetadata, StoreReleaseResult, StoredRelease};
-pub use store::{
-    ArtifactStore, BuildMetadata, DeleteSourceResult, SourceArtifact, StoreResult, StoredBuild,
+pub use lookup::{LookupHit, LookupKey, LookupRequest, LookupResult, MissReason, VersionMatch};
+pub use maintenance::{
+    CleanOptions, CleanReport, CleanTarget, GcReport, IssueContext, ProjectUsage, RepairReport,
+    UsageReport, VerifyIssue, VerifyMode, VerifyProblem,
 };
-pub use verify::{VerifyIssue, VerifyMode};
+pub use store::{ArtifactStore, StoreOptions};
+pub use types::{
+    BuildMetadata, BuildSource, ReleaseMetadata, SourceArtifact, SourceLink, StoreReleaseResult,
+    StoreResult, StoredArtifact, StoredBuild, StoredRelease,
+};

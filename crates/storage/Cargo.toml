@@ -3,18 +3,17 @@ name = "apvm-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Artifact storage management for APVM"
+description = "SQLite-backed artifact cache for APVM builds and release assets"
 license = "MIT"
 
 [dependencies]
-# Date/time
+# Date/time (timestamps are stored as epoch milliseconds, exposed as DateTime<Utc>)
 chrono = { workspace = true }
 
-# Serialization
-serde = { workspace = true }
-serde_json = { workspace = true }
+# Embedded SQLite — the single source of truth for all cache metadata.
+rusqlite = { workspace = true }
 
-# Hashing
+# SHA-256 hashing of artifacts while they are copied into the store.
 sha2 = { workspace = true }
 
 # Error handling
@@ -23,11 +22,14 @@ thiserror = { workspace = true }
 # Logging and diagnostics
 tracing = { workspace = true }
 
-# Atomic file writes via temp file + persist (crash-safe manifest/artifact
-# writes) and temp directories in tests.
+# Atomic file writes: artifacts are streamed to a temp file in the destination
+# directory and renamed into place, so a crash never leaves a half-written
+# artifact under its final name.
 tempfile = { workspace = true }
 
-# NTFS junctions without admin privileges (replaces shelling out to
-# `cmd /C mklink`, which is fragile and quoting-unsafe).
-[target.'cfg(windows)'.dependencies]
-junction = { workspace = true }
+[dev-dependencies]
+# Integration tests exercise the store through real temp directories and
+# poke the raw database to simulate corruption / future schemas.
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }

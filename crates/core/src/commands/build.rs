@@ -33,10 +33,10 @@ pub use apvm_storage::{BuildMetadata, SourceArtifact};
 /// let output = apvm.build("backwpup", "5.6.0", "pr:123", None).await?;
 ///
 /// // Convert for storage (if consumer wants to store)
-/// let store = ArtifactStore::new(config.builds_dir);
+/// let store = ArtifactStore::open(config.builds_dir)?;
 /// store.store(
-///     &output.to_source_artifacts(),
 ///     &output.to_build_metadata("backwpup"),
+///     &output.to_source_artifacts(),
 /// )?;
 /// ```
 #[derive(Debug)]
@@ -150,7 +150,7 @@ impl BuildOutput {
     /// # Example
     ///
     /// ```ignore
-    /// let store = ArtifactStore::new(config.builds_dir);
+    /// let store = ArtifactStore::open(config.builds_dir)?;
     ///
     /// // Check before building (dry-run or skip logic)
     /// let exists = output.exists_in_store(&store, "backwpup")?;
@@ -228,7 +228,7 @@ impl BuildOutput {
     /// // Only store what's new (deduplication)
     /// let new_artifacts = output.to_source_artifacts_filtered(&store, "backwpup")?;
     /// if !new_artifacts.is_empty() {
-    ///     store.store(&new_artifacts, &output.to_build_metadata("backwpup"))?;
+    ///     store.store(&output.to_build_metadata("backwpup"), &new_artifacts)?;
     /// }
     /// ```
     pub fn to_source_artifacts_filtered(
@@ -1701,7 +1701,7 @@ mod tests {
         assert_eq!(meta.project, "wp-rocket");
         assert_eq!(meta.version, "3.17.4");
         assert_eq!(meta.commit, "abc1234567890");
-        assert_eq!(meta.branch, "develop");
+        assert_eq!(meta.branch.as_deref(), Some("develop"));
     }
 
     #[test]
@@ -1777,7 +1777,7 @@ mod tests {
     #[test]
     fn test_build_output_exists_in_store() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = apvm_storage::ArtifactStore::new(dir.path().to_path_buf());
+        let store = apvm_storage::ArtifactStore::open(dir.path()).unwrap();
 
         let output = make_build_output(
             vec![],
@@ -1794,7 +1794,7 @@ mod tests {
     #[test]
     fn test_build_output_missing_variants_empty_store() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = apvm_storage::ArtifactStore::new(dir.path().to_path_buf());
+        let store = apvm_storage::ArtifactStore::open(dir.path()).unwrap();
 
         let output = make_build_output(
             vec![ProducedArtifact::new(

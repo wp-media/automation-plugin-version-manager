@@ -46,10 +46,16 @@ pub fn core_error_to_napi(err: apvm_core::Error) -> napi::Error {
 
 /// Convert an [`apvm_storage::Error`] into a [`napi::Error`].
 ///
-/// Storage errors are always mapped to `GenericFailure` since they
-/// represent I/O or data integrity issues that the consumer cannot
-/// fix by changing arguments.
+/// Validation failures (`InvalidInput`, `SourceFileMissing`) map to
+/// `InvalidArg` — the caller can fix them by changing arguments. Everything
+/// else (I/O, database, corruption) is a `GenericFailure` the caller can
+/// only report or retry.
 #[allow(dead_code)]
 pub fn storage_error_to_napi(err: apvm_storage::Error) -> napi::Error {
-    napi::Error::new(Status::GenericFailure, err.to_string())
+    let status = match &err {
+        apvm_storage::Error::InvalidInput { .. }
+        | apvm_storage::Error::SourceFileMissing { .. } => Status::InvalidArg,
+        _ => Status::GenericFailure,
+    };
+    napi::Error::new(status, err.to_string())
 }

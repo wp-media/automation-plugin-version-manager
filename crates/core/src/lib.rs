@@ -32,9 +32,10 @@
 //! let output = apvm.build("wp-rocket", None, "pr:456", None, "/output").await?;
 //!
 //! // Store artifacts (optional - you choose!)
-//! let store = ArtifactStore::new(PathBuf::from("/var/lib/myapp/builds"));
-//! for artifact in output.to_source_artifacts_filtered(&store, "wp-rocket")? {
-//!     store.store(&artifact)?;
+//! let store = ArtifactStore::open(PathBuf::from("/var/lib/myapp/builds"))?;
+//! let new_artifacts = output.to_source_artifacts_filtered(&store, "wp-rocket")?;
+//! if !new_artifacts.is_empty() {
+//!     store.store(&output.to_build_metadata("wp-rocket"), &new_artifacts)?;
 //! }
 //! ```
 
