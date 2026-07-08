@@ -123,7 +123,7 @@ detect_platform() {
             error ""
             error "  irm https://raw.githubusercontent.com/${REPO}/develop/install.ps1 | iex"
             error ""
-            error "Alternatively, if you have the Rust toolchain installed (>= 1.94.1):"
+            error "Alternatively, if you have the Rust toolchain installed (>= 1.96.1):"
             error "  cargo install --path crates/cli"
             error "  https://github.com/${REPO}#install-from-source"
             exit 1
@@ -132,7 +132,7 @@ detect_platform() {
             error "No pre-built binary available for operating system: ${os}"
             error "APVM provides pre-built binaries for macOS, Linux and Windows."
             error ""
-            error "If you have the Rust toolchain installed (>= 1.94.1), build from source:"
+            error "If you have the Rust toolchain installed (>= 1.96.1), build from source:"
             error "  cargo install --path crates/cli"
             error "  https://github.com/${REPO}#install-from-source"
             exit 1
@@ -149,7 +149,7 @@ detect_platform() {
             error "No pre-built binary available for architecture: ${arch}"
             error "APVM provides pre-built binaries for x86_64 (x64) and aarch64 (arm64)."
             error ""
-            error "If you have the Rust toolchain installed (>= 1.94.1), build from source:"
+            error "If you have the Rust toolchain installed (>= 1.96.1), build from source:"
             error "  cargo install --path crates/cli"
             error "  https://github.com/${REPO}#install-from-source"
             exit 1
@@ -165,7 +165,7 @@ detect_platform() {
         *)
             error "No pre-built binary available for ${os}-${arch}."
             error ""
-            error "If you have the Rust toolchain installed (>= 1.94.1), build from source:"
+            error "If you have the Rust toolchain installed (>= 1.96.1), build from source:"
             error "  cargo install --path crates/cli"
             error "  https://github.com/${REPO}#install-from-source"
             exit 1
@@ -430,9 +430,11 @@ main() {
 
     printf "\n"
 
-    # Try to get the installed version
+    # Try to get the installed version.
+    # `apvm --version` prints the version on the first line followed by author
+    # metadata on subsequent lines; keep only the first line for the summary.
     local version_output
-    version_output=$("${BIN_DIR}/${BINARY_NAME}" --version 2>/dev/null || true)
+    version_output=$("${BIN_DIR}/${BINARY_NAME}" --version 2>/dev/null | head -n 1 || true)
 
     if [ -z "$version_output" ]; then
         error "Installation completed but the binary could not be executed."

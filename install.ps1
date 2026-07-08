@@ -167,7 +167,7 @@ function Install-Apvm {
             Write-Err "ARM64 Windows support may be added in a future release."
         }
         Write-Err ""
-        Write-Err "If you have the Rust toolchain installed (>= 1.94.1), build from source:"
+        Write-Err "If you have the Rust toolchain installed (>= 1.96.1), build from source:"
         Write-Err "  cargo install --path crates/cli"
         Write-Err "  https://github.com/$Repo#install-from-source"
         exit 1

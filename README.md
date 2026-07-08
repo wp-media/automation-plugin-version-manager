@@ -43,7 +43,7 @@ For extended CLI documentation, see the [CLI crate README](crates/cli/README.md)
 
 ## Requirements
 
-- [**Rust**](https://www.rust-lang.org/tools/install) ≥ 1.94.1 (2024 edition)
+- [**Rust**](https://www.rust-lang.org/tools/install) ≥ 1.96.1 (2024 edition)
 - **Git** installed and in `PATH`
 - **GitHub authentication** for private repositories (optional for public). The tool auto-detects tokens from multiple sources (config file, environment variables, `gh` CLI)
 - Plugin-specific build tools (npm, composer, gulp, rsync, zip, etc.) as needed (try `apvm info [plugin-name]` to learn more about a specific plugin)
