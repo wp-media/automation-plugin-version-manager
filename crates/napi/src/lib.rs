@@ -17,6 +17,7 @@
 //!
 //! - **BackWPup** (`backwpup`) — Private repository, version required
 //! - **WP Rocket** (`wp-rocket`) — Public repository, version auto-detected
+//! - **Imagify** (`imagify`) — Public repository, version auto-detected
 //!
 //! # Quick Start (JavaScript/TypeScript)
 //!

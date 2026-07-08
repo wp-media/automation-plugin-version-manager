@@ -111,6 +111,7 @@ describe('listProjects()', () => {
     const projects = apvm.listProjects();
     expect(projects).toContain('wp-rocket');
     expect(projects).toContain('backwpup');
+    expect(projects).toContain('imagify');
   });
 
   it('returns strings for all entries', async () => {
@@ -165,6 +166,56 @@ describe('build() basic functionality', () => {
         expect(fileStat.isFile()).toBe(true);
         expect(fileStat.size).toBeGreaterThan(0);
       }
+    } finally {
+      if (tempRoot) {
+        await rm(tempRoot, { recursive: true, force: true });
+      }
+    }
+  }, 10 * 60_000);
+
+  it('builds imagify from develop and writes a versioned imagify-<version>.zip artifact', async () => {
+    let tempRoot = '';
+
+    try {
+      tempRoot = await mkdtemp(join(tmpdir(), 'apvm-build-imagify-'));
+      const outputDir = join(tempRoot, 'output');
+      const apvm = await Apvm.create({});
+
+      const output = await apvm.buildFromBranch('imagify', 'develop', outputDir);
+
+      expect(output).toBeTruthy();
+      expect(output.result).toBeTruthy();
+      // Imagify is single-variant: exactly one artifact.
+      expect(output.result.artifacts.length).toBe(1);
+      expect(output.description.length).toBeGreaterThan(0);
+      expect(output.commit.length).toBeGreaterThan(0);
+      expect(output.commitShort.length).toBeGreaterThan(0);
+
+      // Version is embedded (auto-detected from imagify.php), so no pin and no
+      // possibility of a version mismatch.
+      expect(typeof output.fromCache).toBe('boolean');
+      expect(output.cacheVersionMismatch).toBe(false);
+
+      const outputDirResolved = resolve(outputDir);
+      const artifactsInOutput = await readdir(outputDir);
+      expect(artifactsInOutput.length).toBe(1);
+
+      const artifact = output.result.artifacts[0];
+      expect(['built', 'cache', 'downloaded']).toContain(artifact.origin);
+
+      // The delivered file must be named imagify-<version>.zip (versioned,
+      // matching the WP Rocket convention) — never the script's default
+      // imagify.zip.
+      expect(artifact.filename).toMatch(/^imagify-.+\.zip$/);
+      expect(artifact.filename).toBe(`imagify-${output.result.version}.zip`);
+
+      const expectedOutputPath = join(outputDir, artifact.filename);
+      const expectedOutputPathResolved = resolve(expectedOutputPath);
+      expect(expectedOutputPathResolved.startsWith(outputDirResolved)).toBe(true);
+
+      const fileStat = await stat(expectedOutputPath);
+      expect(fileStat.isFile()).toBe(true);
+      expect(fileStat.size).toBeGreaterThan(0);
     } finally {
       if (tempRoot) {
         await rm(tempRoot, { recursive: true, force: true });

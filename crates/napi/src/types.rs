@@ -654,7 +654,8 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
 pub struct BuildOptions {
     /// The project to build.
     ///
-    /// Must be a registered project name: `"backwpup"` or `"wp-rocket"`.
+    /// Must be a registered project name: `"backwpup"`, `"wp-rocket"`, or
+    /// `"imagify"`. Call `listProjects()` for the authoritative list.
     pub project: String,
 
     /// Git reference to build from.

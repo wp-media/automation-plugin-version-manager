@@ -253,10 +253,10 @@ interface ApvmConfig {
 
 ```ts
 interface BuildOptions {
-  project: string;        // "backwpup" or "wp-rocket" currently
+  project: string;        // "backwpup", "wp-rocket", or "imagify" currently
   gitRef: string;         // Any git ref (see above)
-  version?: string;       // Required for BackWPup, optional and No-Op for WP Rocket (Embedded version)
-  variants?: string[];    // e.g., ["free", "pro-en"]. No-Op for WP Rocket (No variants)
+  version?: string;       // Required for BackWPup, optional and No-Op for WP Rocket / Imagify (Embedded version)
+  variants?: string[];    // e.g., ["free", "pro-en"]. No-Op for WP Rocket / Imagify (No variants)
   outputDir: string;      // Absolute path for artifacts to be stored after build
   noCache?: boolean;      // Bypass the artifact cache for this build (default false)
   strictVersion?: boolean;// Require a cache hit to match `version` exactly (default false)
@@ -393,6 +393,7 @@ try {
 |-------------|----------------------|------------|----------|
 | `backwpup`  | free, pro-de, pro-en | Required   | Yes      |
 | `wp-rocket` | (single)             | Embedded   | No       |
+| `imagify`   | (single)             | Embedded   | No       |
 
 ## Full Example
 

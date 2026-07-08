@@ -123,6 +123,11 @@ apvm build backwpup 123 -v 5.1.0 ./dist
 
 # Verbose output
 apvm --verbose build backwpup 123 -v 5.1.0
+
+# Embedded-version plugins (WP Rocket, Imagify): no -v needed, version is
+# auto-detected from source and the artifact is named imagify-<version>.zip
+apvm build imagify develop
+apvm build imagify tag:v2.3.0
 ```
 
 ## List Command
@@ -154,6 +159,7 @@ Example:
 ```sh
 apvm info backwpup
 apvm info wp-rocket
+apvm info imagify
 ```
 
 ## Cache Command

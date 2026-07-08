@@ -2,7 +2,7 @@
 //!
 //! This module provides the build infrastructure for APVM:
 //!
-//! - [`plugins`] - Project-specific builders (BackWPup, WP Rocket, etc.)
+//! - [`plugins`] - Project-specific builders (BackWPup, WP Rocket, Imagify, etc.)
 //! - [`BuildRunner`] - Executes build commands and collects artifacts
 //! - [`BuildResult`] - Output from a build operation
 //!

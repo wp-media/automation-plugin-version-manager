@@ -40,6 +40,11 @@ For extended CLI documentation, see the [CLI crate README](crates/cli/README.md)
 |-----------|----------------------|----------|----------|------------|
 | BackWPup  | free, pro-de, pro-en | Required | Yes      | Private    |
 | WP Rocket | (single)             | Embedded | No       | Public     |
+| Imagify   | (single)             | Embedded | No¹      | Public     |
+
+¹ Imagify publishes GitHub Releases (git tags), but they carry no downloadable
+build assets — distribution goes to WordPress.org. Build a specific released
+version from its tag instead, e.g. `apvm build imagify tag:v2.3.0`.
 
 ## Requirements
 
@@ -168,6 +173,18 @@ apvm build backwpup 123 -v 5.1.0 ./dist
 
 # Verbose output (shows commands and full output)
 apvm --verbose build backwpup 123 -v 5.1.0
+```
+
+For embedded-version plugins (WP Rocket, Imagify) the version is auto-detected
+from source, so `-v` is unnecessary (any value passed is ignored) and the
+artifact is named automatically (e.g. `imagify-<version>.zip`):
+
+```sh
+# Imagify — public repo, embedded version, single artifact
+apvm build imagify develop            # build from the develop branch
+apvm build imagify tag:v2.3.0         # build a specific released version from its tag
+apvm build imagify pr:123             # build from a pull request
+apvm build imagify develop ./dist     # choose an output directory
 ```
 
 **Ref auto-detection rules:**

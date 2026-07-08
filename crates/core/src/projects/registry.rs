@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::build::plugins::{BackWPupBuilder, Builder, WpRocketBuilder};
+use crate::build::plugins::{BackWPupBuilder, Builder, ImagifyBuilder, WpRocketBuilder};
 use crate::error::{Error, Result};
 
 pub const DEFAULT_BRANCH_NAME: &str = "develop";
@@ -73,6 +73,22 @@ impl ProjectRegistry {
             is_private: false,
             has_releases: false,
             builder: Box::new(WpRocketBuilder),
+        });
+
+        // Imagify is a public repository whose version is embedded in the
+        // `imagify.php` plugin header. Its GitHub Releases carry no downloadable
+        // assets (distribution goes to WordPress.org SVN), so `has_releases` is
+        // false: a specific released version is built from its tag
+        // (e.g. `tag:v2.3.0`) rather than downloaded.
+        registry.register(Project {
+            name: "imagify".to_string(),
+            repo_url: "https://github.com/wp-media/imagify-plugin.git".to_string(),
+            owner: "wp-media".to_string(),
+            repo: "imagify-plugin".to_string(),
+            default_branch: DEFAULT_BRANCH_NAME.to_string(),
+            is_private: false,
+            has_releases: false,
+            builder: Box::new(ImagifyBuilder),
         });
 
         registry
@@ -158,6 +174,23 @@ mod tests {
         let project = registry.get("backwpup");
         assert!(project.is_ok());
         assert_eq!(project.unwrap().name, "backwpup");
+    }
+
+    #[test]
+    fn test_registry_with_known_projects_has_imagify() {
+        let registry = ProjectRegistry::with_known_projects();
+        let project = registry.get("imagify").expect("imagify must be registered");
+        assert_eq!(project.name, "imagify");
+        assert_eq!(project.repo, "imagify-plugin");
+        assert_eq!(project.owner, "wp-media");
+        assert_eq!(project.default_branch, DEFAULT_BRANCH_NAME);
+        // Public repo with an embedded version and no downloadable release assets.
+        assert!(!project.is_private);
+        assert!(!project.has_releases);
+        assert!(
+            project.builder.version_requirement().is_embedded(),
+            "imagify version is embedded in imagify.php"
+        );
     }
 
     #[test]

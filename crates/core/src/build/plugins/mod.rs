@@ -4,11 +4,13 @@
 //! See [`VersionRequirement`] for how different projects handle versions.
 
 mod bwu;
+mod imagify;
 mod wpr;
 
 use std::path::Path;
 
 pub use bwu::BackWPupBuilder;
+pub use imagify::ImagifyBuilder;
 pub use wpr::WpRocketBuilder;
 
 use crate::Result;
