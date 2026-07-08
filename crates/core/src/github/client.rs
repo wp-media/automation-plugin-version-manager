@@ -53,12 +53,17 @@ impl GitHubClient {
         let base_branch = pr.base.ref_field.clone();
 
         let head_branch = pr.head.ref_field.clone();
+        // `head.sha` is a required field on GitHub's PR payload (octocrab types
+        // it as a non-optional String); wrapped in `Some` to keep the model
+        // tolerant of a future absent value.
+        let head_sha = Some(pr.head.sha.clone());
         let html_url = pr.html_url.map(|url| url.to_string());
         Ok(PullRequest {
             number: pr_number,
             title,
             base_branch,
             head_branch,
+            head_sha,
             owner: owner.to_string(),
             repo: repo.to_string(),
             html_url,

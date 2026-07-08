@@ -22,11 +22,33 @@ pub enum SanitizeResult {
 ///
 /// Dispatches to key-specific sanitization logic:
 /// - [`ConfigKey::Token`] → [`sanitize_token`]
-/// - [`ConfigKey::BuildsDir`] → [`sanitize_path`]
+/// - [`ConfigKey::CacheDir`] → [`sanitize_path`]
+/// - [`ConfigKey::Cache`] → [`sanitize_bool`]
 pub fn sanitize_value(key: ConfigKey, value: &str) -> SanitizeResult {
     match key {
         ConfigKey::Token => sanitize_token(value),
-        ConfigKey::BuildsDir => sanitize_path(value),
+        ConfigKey::CacheDir => sanitize_path(value),
+        ConfigKey::Cache => sanitize_bool(value),
+    }
+}
+
+/// Sanitize a boolean config value.
+///
+/// Accepts common truthy/falsy spellings (case-insensitive) and normalizes
+/// them to the canonical `"true"` / `"false"` the config store expects:
+/// - true:  `true`, `1`, `yes`, `on`
+/// - false: `false`, `0`, `no`, `off`
+///
+/// Anything else (including an empty string) is rejected so a typo never
+/// silently disables or enables the cache.
+fn sanitize_bool(value: &str) -> SanitizeResult {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => SanitizeResult::Ok("true".to_string()),
+        "false" | "0" | "no" | "off" => SanitizeResult::Ok("false".to_string()),
+        "" => SanitizeResult::Error("Value cannot be empty. Use 'true' or 'false'.".to_string()),
+        other => {
+            SanitizeResult::Error(format!("Invalid boolean '{other}'. Use 'true' or 'false'."))
+        }
     }
 }
 
@@ -86,7 +108,7 @@ fn sanitize_path(value: &str) -> SanitizeResult {
 
     if trimmed.is_empty() {
         return SanitizeResult::Error(
-            "Path cannot be empty. Use 'apvm config unset builds-dir' to reset to default."
+            "Path cannot be empty. Use 'apvm config unset cache-dir' to reset to default."
                 .to_string(),
         );
     }
@@ -373,7 +395,49 @@ mod tests {
 
     #[test]
     fn sanitize_value_dispatches_path() {
-        let result = sanitize_value(ConfigKey::BuildsDir, "/my/builds");
+        let result = sanitize_value(ConfigKey::CacheDir, "/my/cache");
         assert!(matches!(result, SanitizeResult::Ok(_)));
+    }
+
+    #[test]
+    fn sanitize_value_dispatches_bool() {
+        let result = sanitize_value(ConfigKey::Cache, "true");
+        assert!(matches!(result, SanitizeResult::Ok(v) if v == "true"));
+    }
+
+    // =========================================================================
+    // Bool sanitization
+    // =========================================================================
+
+    #[test]
+    fn bool_true_aliases_normalize_to_true() {
+        for input in ["true", "TRUE", "  True  ", "1", "yes", "on", "ON"] {
+            assert!(
+                matches!(sanitize_bool(input), SanitizeResult::Ok(v) if v == "true"),
+                "expected '{input}' -> true"
+            );
+        }
+    }
+
+    #[test]
+    fn bool_false_aliases_normalize_to_false() {
+        for input in ["false", "FALSE", "  False ", "0", "no", "off", "OFF"] {
+            assert!(
+                matches!(sanitize_bool(input), SanitizeResult::Ok(v) if v == "false"),
+                "expected '{input}' -> false"
+            );
+        }
+    }
+
+    #[test]
+    fn bool_empty_is_error() {
+        assert!(matches!(sanitize_bool(""), SanitizeResult::Error(_)));
+        assert!(matches!(sanitize_bool("   "), SanitizeResult::Error(_)));
+    }
+
+    #[test]
+    fn bool_invalid_is_error() {
+        assert!(matches!(sanitize_bool("maybe"), SanitizeResult::Error(_)));
+        assert!(matches!(sanitize_bool("2"), SanitizeResult::Error(_)));
     }
 }

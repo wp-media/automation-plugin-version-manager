@@ -12,7 +12,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use apvm_core::build::plugins::VersionRequirement;
 use apvm_core::build::progress::{BuildEvent, ClosureReporter};
-use apvm_core::{Apvm, Result};
+use apvm_core::{Apvm, ArtifactOrigin, ProducedArtifact, Result};
+
+use crate::color::{self, Color};
 
 /// Arguments for the build command.
 #[derive(Args, Debug)]
@@ -95,6 +97,19 @@ pub struct BuildArgs {
     /// Output directory for build artifacts
     #[arg(default_value = ".")]
     pub output: PathBuf,
+
+    /// Bypass the artifact cache for this build (still builds and warms the
+    /// cache unless caching is disabled in config)
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Require a cache hit to match the requested version (`--ver`) exactly,
+    /// rebuilding instead of serving a different cached version
+    ///
+    /// Modifies how the cache is read, so it cannot be combined with
+    /// `--no-cache` (which skips cache reads entirely).
+    #[arg(long, conflicts_with = "no_cache")]
+    pub strict_version: bool,
 }
 
 impl BuildArgs {
@@ -173,8 +188,14 @@ impl BuildArgs {
         println!("  Output: {}", output_dir.display());
         println!();
 
-        // 9. Execute the build with appropriate reporter
-        let variants_refs: Vec<&str> = variants.iter().map(|s| s.as_str()).collect();
+        // 9. Assemble the build request, including per-invocation cache
+        //    overrides.
+        let request =
+            apvm_core::BuildRequest::new(self.plugin.clone(), git_ref, output_dir.clone())
+                .version(version.clone())
+                .variants(variants.clone())
+                .no_cache(self.no_cache)
+                .strict_version(self.strict_version);
 
         let result = if verbose {
             // Verbose mode: print everything, no spinner
@@ -203,19 +224,7 @@ impl BuildArgs {
                 _ => {}
             });
 
-            apvm.build(
-                &self.plugin,
-                version.as_deref(),
-                &git_ref,
-                if variants_refs.is_empty() {
-                    None
-                } else {
-                    Some(&variants_refs)
-                },
-                &output_dir,
-                &reporter,
-            )
-            .await?
+            apvm.build(request, &reporter).await?
         } else {
             // Normal mode: spinner with step descriptions
             let spinner = ProgressBar::new_spinner();
@@ -249,33 +258,41 @@ impl BuildArgs {
                 }
             });
 
-            let result = apvm
-                .build(
-                    &self.plugin,
-                    version.as_deref(),
-                    &git_ref,
-                    if variants_refs.is_empty() {
-                        None
-                    } else {
-                        Some(&variants_refs)
-                    },
-                    &output_dir,
-                    &reporter,
-                )
-                .await;
+            let result = apvm.build(request, &reporter).await;
 
             spinner.finish_and_clear();
             result?
         };
 
-        // 10. Show results
+        // 10. Show results, including where each artifact came from.
         println!("Build complete: {}", result.description());
-        println!("  Commit: {}", result.commit_short);
+        println!("  Commit:  {}", result.commit_short);
         println!("  Version: {}", result.result.version);
         println!("  Artifacts:");
         for artifact in &result.result.artifacts {
-            println!("    - {}", artifact.path.display());
+            // Pad the plain label first so ANSI codes never affect alignment.
+            let label = format!("{:<10}", artifact.origin.to_string());
+            println!(
+                "    {} {}",
+                color::paint(&label, origin_color(artifact.origin)),
+                artifact.filename
+            );
         }
+
+        // A cache hit that returned a different version than the user pinned
+        // is the one genuinely surprising case — draw attention to it (yellow)
+        // and offer the remedy, above the neutral provenance summary.
+        if result.cache_version_mismatch {
+            let requested = result.requested_version.as_deref().unwrap_or("(requested)");
+            let got = &result.result.version;
+            let msg = format!(
+                "⚠ Requested version {requested} but the cache holds this commit as {got}.\n  \
+                 Returning the cached {got} artifacts. Pass --strict-version to rebuild at {requested}, if specific version is required.",
+            );
+            println!("{}", color::paint(&msg, Color::Yellow));
+        }
+
+        println!("  Source: {}", source_summary(&result.result.artifacts));
 
         Ok(())
     }
@@ -294,6 +311,53 @@ impl BuildArgs {
     }
 }
 
+/// The informational color for an artifact's provenance. Cache reuse is
+/// expected/good news, so it is a neutral accent — not a warning color.
+fn origin_color(origin: ArtifactOrigin) -> Color {
+    match origin {
+        ArtifactOrigin::Built => Color::Green,
+        ArtifactOrigin::Cache => Color::Cyan,
+        ArtifactOrigin::Downloaded => Color::Blue,
+    }
+}
+
+/// One-line provenance summary for the delivered artifacts, e.g.
+/// `all from cache`, `all built`, or `1 built, 2 from cache`.
+fn source_summary(artifacts: &[ProducedArtifact]) -> String {
+    let (mut built, mut cached, mut downloaded) = (0usize, 0usize, 0usize);
+    for artifact in artifacts {
+        match artifact.origin {
+            ArtifactOrigin::Built => built += 1,
+            ArtifactOrigin::Cache => cached += 1,
+            ArtifactOrigin::Downloaded => downloaded += 1,
+        }
+    }
+    let total = artifacts.len();
+    if total == 0 {
+        return "no artifacts".to_string();
+    }
+    if built == total {
+        return "all built".to_string();
+    }
+    if cached == total {
+        return "all from cache".to_string();
+    }
+    if downloaded == total {
+        return "all downloaded".to_string();
+    }
+    let mut parts = Vec::new();
+    if built > 0 {
+        parts.push(format!("{built} built"));
+    }
+    if cached > 0 {
+        parts.push(format!("{cached} from cache"));
+    }
+    if downloaded > 0 {
+        parts.push(format!("{downloaded} downloaded"));
+    }
+    parts.join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,7 +369,45 @@ mod tests {
             version: None,
             variants: None,
             output: PathBuf::from("."),
+            no_cache: false,
+            strict_version: false,
         }
+    }
+
+    fn artifact(origin: ArtifactOrigin) -> ProducedArtifact {
+        ProducedArtifact::new(None, PathBuf::from("/x.zip"), "x.zip".to_string(), 1)
+            .with_origin(origin)
+    }
+
+    #[test]
+    fn source_summary_all_one_kind() {
+        assert_eq!(
+            source_summary(&[artifact(ArtifactOrigin::Built)]),
+            "all built"
+        );
+        assert_eq!(
+            source_summary(&[artifact(ArtifactOrigin::Cache)]),
+            "all from cache"
+        );
+        assert_eq!(
+            source_summary(&[artifact(ArtifactOrigin::Downloaded)]),
+            "all downloaded"
+        );
+    }
+
+    #[test]
+    fn source_summary_mixed_partial() {
+        let mixed = [
+            artifact(ArtifactOrigin::Built),
+            artifact(ArtifactOrigin::Cache),
+            artifact(ArtifactOrigin::Cache),
+        ];
+        assert_eq!(source_summary(&mixed), "1 built, 2 from cache");
+    }
+
+    #[test]
+    fn source_summary_empty() {
+        assert_eq!(source_summary(&[]), "no artifacts");
     }
 
     #[test]

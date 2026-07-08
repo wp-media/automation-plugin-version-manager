@@ -28,6 +28,7 @@ For extended CLI documentation, see the [CLI crate README](crates/cli/README.md)
 - **Special keyword refs** — use `tag:latest-stable`, `tag:latest`, `release:latest-stable`, `release:latest` (and their `previous-*` variants) to dynamically resolve the most recent tags or releases without knowing the exact version
 - **Automatic ref detection** — `v1.0.0` resolves to a tag, `develop` to a branch, `123` to PR #123, and version-like inputs (e.g., `5.6.8`) are checked against GitHub Releases first (when the plugin supports releases)
 - **Multi-variant builds** — e.g., BackWPup produces `free`, `pro-de`, and `pro-en` variants. You can choose which ones to build (`free` and `pro-en` are the defaults for BackWPup)
+- **Persistent artifact cache** — builds and release downloads are cached (SQLite-indexed, on by default): rebuilding the same commit is served from the cache, and a partial request reuses cached variants and builds only the rest. Per-artifact provenance (`built`/`cache`/`downloaded`), `--no-cache` / `--strict-version` overrides, and an `apvm cache` maintenance command
 - **Version handling** — required, embedded (auto-detected), or optional per plugin (BackWPup requires a version at build time; WP Rocket auto-detects it from source)
 - **Self-update** — `apvm update` downloads and replaces the binary with the latest release, verifying SHA-256 checksums
 - **Self-uninstall** — `apvm uninstall` cleanly removes the binary and its directory (with `-y`/`--yes` to skip confirmation)
@@ -223,8 +224,11 @@ apvm config get token
 # Set GitHub token (required for private repos and PR builds)
 apvm config set token ghp_xxxxxxxxxxxx
 
-# Set custom builds directory
-apvm config set builds-dir /path/to/builds
+# Set custom cache directory
+apvm config set cache-dir /path/to/cache
+
+# Toggle the artifact cache (default: true)
+apvm config set cache false
 
 # Remove a value (revert to default)
 apvm config unset token
@@ -232,6 +236,28 @@ apvm config unset token
 # Show config file path
 apvm config path
 ```
+
+### Cache Maintenance
+
+```sh
+# Usage totals and per-project breakdown
+apvm cache info
+
+# Remove cached entries (preview with --dry-run; scope by kind/project/age)
+apvm cache clean --dry-run
+apvm cache clean --older-than 30d --project backwpup
+
+# Reconcile with disk, verify integrity, or recover a corrupt database
+apvm cache gc
+apvm cache verify --checksum
+apvm cache repair
+
+# Remove everything
+apvm cache clear -y
+```
+
+See the [CLI crate README](crates/cli/README.md#cache-command) for the full
+cache command reference.
 
 ### Update
 
@@ -282,16 +308,16 @@ crates/
 ├── config/     Pure configuration types (no I/O, no defaults)
 ├── core/       Core library: building, git, GitHub API, version detection
 ├── napi/       Node.js N-API bindings (napi-rs cdylib)
-└── storage/    Artifact storage, deduplication, manifests, queries
+└── storage/    SQLite-backed artifact cache (builds + release assets)
 ```
 
 ### Architecture
 
 - **Config** — pure `serde` types for configuration. No file I/O, no hardcoded paths.
-- **Core** — orchestrates builds (clone → fetch → resolve ref → checkout → detect version → build → collect artifacts), downloads from GitHub Releases, git operations, and GitHub API via [octocrab](https://docs.rs/octocrab/0.49). For extended documentation, see the [Core crate README](crates/core/README.md).
-- **Storage** — manages artifacts with commit-based deduplication, cross-platform links (symlinks on Unix, junctions on Windows), and a fluent query API.
+- **Core** — orchestrates builds (resolve ref → cache fast path → clone → checkout → detect version → build → collect artifacts), downloads from GitHub Releases, integrates the artifact cache (serve on hit, reuse partial variants, warm after builds), git operations, and GitHub API via [octocrab](https://docs.rs/octocrab/0.49). For extended documentation, see the [Core crate README](crates/core/README.md).
+- **Storage** — the SQLite-backed artifact cache: one embedded database indexes builds (keyed by project/version/commit, per-variant artifacts) and release assets (keyed by tag/filename), with health-checked lookups, LRU-style aging, and maintenance operations (clean, gc, verify, repair). For extended documentation, see the [Storage crate README](crates/storage/README.md).
 - **NAPI** — Node.js bindings via [napi-rs](https://napi.rs/). Exposes the core library as a native addon with async support on the tokio runtime. For extended documentation, see the [NAPI crate README](crates/napi/README.md).
-- **CLI** — owns default paths (`~/.apvm`, `~/apvm-builds`), provides progress display via [indicatif](https://docs.rs/indicatif/0.18), and delegates all logic to core. For extended documentation, see the [CLI crate README](crates/cli/README.md).
+- **CLI** — owns default paths (`~/.apvm`, `~/.apvm/cache`), provides progress display via [indicatif](https://docs.rs/indicatif/0.18), and delegates all logic to core. For extended documentation, see the [CLI crate README](crates/cli/README.md).
 
 ## Running Tests
 

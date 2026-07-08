@@ -42,12 +42,12 @@ use crate::types::{BuildOptions, JsBuildEvent, JsBuildOutput, JsReleaseSelector}
 /// ```typescript
 /// import { Apvm } from 'apvm-napi';
 ///
-/// // Minimal — no config needed, uses temp dir for builds
+/// // Minimal — no config needed, cache defaults to ~/.apvm/cache
 /// const apvm = await Apvm.create({});
 ///
-/// // Create with explicit builds dir and token
+/// // Create with explicit cache dir and token
 /// const apvm = await Apvm.create({
-///   buildsDir: '/var/lib/apvm/builds',
+///   cacheDir: '/var/lib/apvm/cache',
 ///   githubToken: 'ghp_xxxxxxxxxxxx',
 /// });
 ///
@@ -85,7 +85,8 @@ impl Apvm {
     /// # Arguments
     ///
     /// * `config` - Configuration options. All fields are optional:
-    ///   - `buildsDir` — where artifacts are stored (uses temp dir if omitted)
+    ///   - `cacheDir` — artifact cache base (defaults to `~/.apvm/cache`)
+    ///   - `cacheEnabled` — whether the cache is active (defaults to `true`)
     ///   - `githubToken` — GitHub PAT for private repos
     ///
     /// # Throws
@@ -95,12 +96,12 @@ impl Apvm {
     /// # TypeScript
     ///
     /// ```typescript
-    /// // Minimal — uses a temp directory for builds
+    /// // Minimal — cache defaults to ~/.apvm/cache
     /// const apvm = await Apvm.create({});
     ///
     /// // With explicit config
     /// const apvm = await Apvm.create({
-    ///   buildsDir: '/var/lib/apvm/builds',
+    ///   cacheDir: '/var/lib/apvm/cache',
     ///   githubToken: 'ghp_xxxxxxxxxxxx',
     /// });
     /// ```
@@ -132,7 +133,8 @@ impl Apvm {
     /// # Arguments
     ///
     /// * `config` - Configuration options. All fields are optional:
-    ///   - `buildsDir` — where artifacts are stored (uses temp dir if omitted)
+    ///   - `cacheDir` — artifact cache base (defaults to `~/.apvm/cache`)
+    ///   - `cacheEnabled` — whether the cache is active (defaults to `true`)
     ///   - `githubToken` — if set, skips resolution and uses this token
     ///
     /// # Throws
@@ -142,12 +144,12 @@ impl Apvm {
     /// # TypeScript
     ///
     /// ```typescript
-    /// // Minimal — resolves token automatically, uses temp builds dir
+    /// // Minimal — resolves token automatically, cache defaults to ~/.apvm/cache
     /// const apvm = await Apvm.createWithTokenResolution({});
     ///
-    /// // With explicit builds dir
+    /// // With explicit cache dir
     /// const apvm = await Apvm.createWithTokenResolution({
-    ///   buildsDir: '/var/lib/apvm/builds',
+    ///   cacheDir: '/var/lib/apvm/cache',
     /// });
     ///
     /// console.log('Has token:', apvm.hasToken());
@@ -291,41 +293,26 @@ impl Apvm {
     ) -> napi::Result<JsBuildOutput> {
         let apvm = Arc::clone(&self.inner);
 
-        let version_ref = options.version.as_deref().map(String::from);
-        let variants_owned: Option<Vec<String>> = options.variants;
+        // Assemble the core build request, including per-call cache overrides.
+        let request =
+            apvm_core::BuildRequest::new(options.project, options.git_ref, options.output_dir)
+                .version(options.version)
+                .variants(options.variants.unwrap_or_default())
+                .no_cache(options.no_cache.unwrap_or(false))
+                .strict_version(options.strict_version.unwrap_or(false));
 
         let output = match on_progress {
             Some(callback) => {
                 let reporter = JsProgressReporter::new(callback);
-                apvm.build(
-                    &options.project,
-                    version_ref.as_deref(),
-                    &options.git_ref,
-                    variants_owned
-                        .as_ref()
-                        .map(|v| v.iter().map(String::as_str).collect::<Vec<&str>>())
-                        .as_deref(),
-                    &options.output_dir,
-                    &reporter,
-                )
-                .await
-                .map_err(core_error_to_napi)?
+                apvm.build(request, &reporter)
+                    .await
+                    .map_err(core_error_to_napi)?
             }
             None => {
                 let reporter = apvm_core::NullReporter;
-                apvm.build(
-                    &options.project,
-                    version_ref.as_deref(),
-                    &options.git_ref,
-                    variants_owned
-                        .as_ref()
-                        .map(|v| v.iter().map(String::as_str).collect::<Vec<&str>>())
-                        .as_deref(),
-                    &options.output_dir,
-                    &reporter,
-                )
-                .await
-                .map_err(core_error_to_napi)?
+                apvm.build(request, &reporter)
+                    .await
+                    .map_err(core_error_to_napi)?
             }
         };
 
@@ -376,6 +363,8 @@ impl Apvm {
                 version,
                 variants,
                 output_dir,
+                no_cache: None,
+                strict_version: None,
             },
             on_progress,
         )
@@ -421,6 +410,8 @@ impl Apvm {
                 version,
                 variants,
                 output_dir,
+                no_cache: None,
+                strict_version: None,
             },
             on_progress,
         )
@@ -466,6 +457,8 @@ impl Apvm {
                 version,
                 variants,
                 output_dir,
+                no_cache: None,
+                strict_version: None,
             },
             on_progress,
         )
@@ -511,6 +504,8 @@ impl Apvm {
                 version,
                 variants,
                 output_dir,
+                no_cache: None,
+                strict_version: None,
             },
             on_progress,
         )
@@ -572,6 +567,8 @@ impl Apvm {
                 version: None,
                 variants,
                 output_dir,
+                no_cache: None,
+                strict_version: None,
             },
             on_progress,
         )
@@ -646,6 +643,8 @@ impl Apvm {
                 version: None,
                 variants,
                 output_dir,
+                no_cache: None,
+                strict_version: None,
             },
             on_progress,
         )

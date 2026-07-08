@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path';
 // =============================================================================
 
 describe('Apvm.create()', () => {
-  it('creates an instance with empty config (temp builds dir)', async () => {
+  it('creates an instance with empty config (default cache dir)', async () => {
     const apvm = await Apvm.create({});
     expect(apvm).toBeInstanceOf(Apvm);
   });
@@ -17,20 +17,25 @@ describe('Apvm.create()', () => {
     const apvm = await Apvm.create();
     expect(apvm).toBeInstanceOf(Apvm);
   });
-  it('creates an instance with explicit buildsDir', async () => {
-    const apvm = await Apvm.create({ buildsDir: '/tmp/apvm-test-builds' });
+  it('creates an instance with explicit cacheDir', async () => {
+    const apvm = await Apvm.create({ cacheDir: '/tmp/apvm-test-cache' });
     expect(apvm).toBeInstanceOf(Apvm);
   });
 
-  it('creates an instance with buildsDir and githubToken', async () => {
+  it('creates an instance with caching disabled', async () => {
+    const apvm = await Apvm.create({ cacheEnabled: false });
+    expect(apvm).toBeInstanceOf(Apvm);
+  });
+
+  it('creates an instance with cacheDir and githubToken', async () => {
     const apvm = await Apvm.create({
-      buildsDir: '/tmp/apvm-test-builds',
+      cacheDir: '/tmp/apvm-test-cache',
       githubToken: 'ghp_test_fake_token_value',
     });
     expect(apvm).toBeInstanceOf(Apvm);
   });
 
-  it('creates an instance with only githubToken (temp builds dir)', async () => {
+  it('creates an instance with only githubToken (default cache dir)', async () => {
     const apvm = await Apvm.create({ githubToken: 'ghp_test_fake_token_value' });
     expect(apvm).toBeInstanceOf(Apvm);
   });
@@ -46,9 +51,9 @@ describe('Apvm.createWithTokenResolution()', () => {
     expect(apvm).toBeInstanceOf(Apvm);
   });
 
-  it('creates an instance with explicit buildsDir', async () => {
+  it('creates an instance with explicit cacheDir', async () => {
     const apvm = await Apvm.createWithTokenResolution({
-      buildsDir: '/tmp/apvm-test-builds',
+      cacheDir: '/tmp/apvm-test-cache',
     });
     expect(apvm).toBeInstanceOf(Apvm);
   });
@@ -137,6 +142,14 @@ describe('build() basic functionality', () => {
       expect(output.description.length).toBeGreaterThan(0);
       expect(output.commit.length).toBeGreaterThan(0);
       expect(output.commitShort.length).toBeGreaterThan(0);
+
+      // Cache metadata: no version was pinned, so a mismatch is impossible;
+      // fromCache depends on the machine's cache state, but must be a boolean.
+      expect(typeof output.fromCache).toBe('boolean');
+      expect(output.cacheVersionMismatch).toBe(false);
+      for (const artifact of output.result.artifacts) {
+        expect(['built', 'cache', 'downloaded']).toContain(artifact.origin);
+      }
 
       const outputDirResolved = resolve(outputDir);
       const artifactsInOutput = await readdir(outputDir);

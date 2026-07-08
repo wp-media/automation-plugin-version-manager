@@ -5,8 +5,8 @@
 //!
 //! # Default Locations
 //!
-//! - **APVM directory**: `~/.apvm` (stores config and cache)
-//! - **Builds directory**: `~/apvm-builds` (stores built artifacts)
+//! - **APVM directory**: `~/.apvm` (stores config and the artifact cache)
+//! - **Cache directory**: `~/.apvm/cache` (the artifact cache store)
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -26,23 +26,23 @@ static HOME_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
 
 /// Default APVM directory: `~/.apvm`
 ///
-/// Contains configuration file and repository cache.
+/// Contains the configuration file and the artifact cache.
 static DEFAULT_APVM_DIR: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".apvm"));
 
-/// Default builds directory: `~/apvm-builds`
+/// Default cache directory: `~/.apvm/cache`
 ///
-/// Contains built plugin artifacts, separate from APVM internals
-/// for easier access and management.
-static DEFAULT_BUILDS_DIR: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join("apvm-builds"));
+/// Base directory of the artifact cache (the `apvm-storage` store), kept
+/// inside the APVM directory alongside the config file.
+static DEFAULT_CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| DEFAULT_APVM_DIR.join("cache"));
 
 /// Get the default APVM directory (`~/.apvm`).
 pub fn default_apvm_dir() -> &'static PathBuf {
     &DEFAULT_APVM_DIR
 }
 
-/// Get the default builds directory (`~/apvm-builds`).
-pub fn default_builds_dir() -> &'static PathBuf {
-    &DEFAULT_BUILDS_DIR
+/// Get the default cache directory (`~/.apvm/cache`).
+pub fn default_cache_dir() -> &'static PathBuf {
+    &DEFAULT_CACHE_DIR
 }
 
 #[cfg(test)]
@@ -57,19 +57,17 @@ mod tests {
     }
 
     #[test]
-    fn builds_dir_is_absolute() {
-        let builds = default_builds_dir();
-        assert!(builds.is_absolute());
-        assert!(builds.ends_with("apvm-builds"));
+    fn cache_dir_is_absolute() {
+        let cache = default_cache_dir();
+        assert!(cache.is_absolute());
+        assert!(cache.ends_with("cache"));
     }
 
     #[test]
-    fn apvm_dir_and_builds_dir_share_parent() {
+    fn cache_dir_lives_inside_apvm_dir() {
         let apvm = default_apvm_dir();
-        let builds = default_builds_dir();
-        // Both should be under home directory
-        let apvm_parent = apvm.parent().expect("apvm should have parent");
-        let builds_parent = builds.parent().expect("builds should have parent");
-        assert_eq!(apvm_parent, builds_parent);
+        let cache = default_cache_dir();
+        // The cache directory is nested directly under the APVM directory.
+        assert_eq!(cache.parent(), Some(apvm.as_path()));
     }
 }

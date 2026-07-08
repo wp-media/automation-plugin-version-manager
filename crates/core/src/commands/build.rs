@@ -5,18 +5,109 @@
 
 use crate::build::plugins::VersionRequirement;
 use crate::build::progress::{BuildEvent, BuildPhase, BuildStep, ProgressReporter};
-use crate::build::{BuildResult, BuildRunner, ProducedArtifact};
+use crate::build::{ArtifactOrigin, BuildResult, BuildRunner, ProducedArtifact};
+use crate::commands::cache;
 use crate::error::{Error, Result};
 use crate::git::{BuildWorkspace, RefResolver, RefSource, RemoteGit, ResolvedRef};
-use crate::github::GitHubClient;
 use crate::github::client::download_asset_owned;
-use crate::projects::ProjectRegistry;
+use crate::github::{GitHubClient, ReleaseAsset};
+use crate::projects::{Project, ProjectRegistry};
 use apvm_config::Config;
-use std::path::Path;
+use apvm_storage::{ArtifactStore, ReleaseMetadata};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::task::JoinSet;
 
 // Re-export storage types for convenience (consumers don't need to add apvm-storage)
 pub use apvm_storage::{BuildMetadata, SourceArtifact};
+
+/// A request to build a project.
+///
+/// Bundles everything a build needs so per-invocation options (cache control,
+/// version strictness) don't sprawl across positional arguments. Construct
+/// with [`BuildRequest::new`] and refine with the chainable setters.
+///
+/// ```ignore
+/// let request = BuildRequest::new("wp-rocket", "pr:456", "/output")
+///     .version(Some("3.17.4".to_string()))
+///     .no_cache(true);
+/// ```
+#[derive(Debug, Clone)]
+pub struct BuildRequest {
+    /// Project name from the registry.
+    pub project: String,
+    /// Version to build, or `None` to auto-detect / use the builder default.
+    pub version: Option<String>,
+    /// Git reference: PR number, branch, tag, commit, or release.
+    pub git_ref: String,
+    /// Variants to build; empty means the builder's default set (all).
+    pub variants: Vec<String>,
+    /// Directory the produced artifacts are delivered to.
+    pub output_dir: PathBuf,
+    /// Skip the artifact cache for this build. The build still runs and (unless
+    /// caching is globally disabled) still warms the cache. Default `false`.
+    pub no_cache: bool,
+    /// Require a cache hit to match the requested version exactly; otherwise a
+    /// different cached version may be served (with a warning). Default `false`.
+    ///
+    /// Only affects cache *reads*: it has no effect for embedded-version
+    /// builders (reported as ignored) and is inert when combined with
+    /// [`no_cache`](Self::no_cache), since no cache read happens then.
+    pub strict_version: bool,
+}
+
+impl BuildRequest {
+    /// Create a request with the required fields; all options default off,
+    /// no version pin, and the builder's default variant set.
+    pub fn new(
+        project: impl Into<String>,
+        git_ref: impl Into<String>,
+        output_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            version: None,
+            git_ref: git_ref.into(),
+            variants: Vec::new(),
+            output_dir: output_dir.into(),
+            no_cache: false,
+            strict_version: false,
+        }
+    }
+
+    /// Pin the version to build (`None` clears any pin).
+    #[must_use]
+    pub fn version(mut self, version: Option<String>) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Set the variants to build (empty = builder defaults).
+    #[must_use]
+    pub fn variants(mut self, variants: Vec<String>) -> Self {
+        self.variants = variants;
+        self
+    }
+
+    /// Skip the artifact cache for this build.
+    #[must_use]
+    pub fn no_cache(mut self, no_cache: bool) -> Self {
+        self.no_cache = no_cache;
+        self
+    }
+
+    /// Require an exact-version cache hit.
+    #[must_use]
+    pub fn strict_version(mut self, strict_version: bool) -> Self {
+        self.strict_version = strict_version;
+        self
+    }
+
+    /// Borrow the variants as `&str` slices for the builder API.
+    fn variant_refs(&self) -> Vec<&str> {
+        self.variants.iter().map(String::as_str).collect()
+    }
+}
 
 /// Extended build result with git metadata.
 ///
@@ -26,14 +117,17 @@ pub use apvm_storage::{BuildMetadata, SourceArtifact};
 /// # Storage Integration
 ///
 /// This type provides conversion methods to transform build output into
-/// storage-compatible formats. The design follows composition over integration:
-/// core builds, consumer decides whether/how to store.
+/// storage-compatible formats. The build pipeline uses them itself to warm
+/// the artifact cache after a build; they remain public for consumers that
+/// maintain their own [`apvm_storage::ArtifactStore`]:
 ///
 /// ```ignore
-/// let output = apvm.build("backwpup", "5.6.0", "pr:123", None).await?;
+/// let output = apvm
+///     .build(BuildRequest::new("backwpup", "pr:123", "/output"), &NullReporter)
+///     .await?;
 ///
-/// // Convert for storage (if consumer wants to store)
-/// let store = ArtifactStore::open(config.builds_dir)?;
+/// // Convert for a consumer-owned store (the built-in cache already did this)
+/// let store = ArtifactStore::open("/my/own/store")?;
 /// store.store(
 ///     &output.to_build_metadata("backwpup"),
 ///     &output.to_source_artifacts(),
@@ -51,9 +145,30 @@ pub struct BuildOutput {
     pub commit_short: String,
     /// Branch name that was checked out.
     pub branch: String,
+    /// `true` when a lenient cache hit returned a version different from the
+    /// one the caller requested. Always `false` unless served from the cache.
+    pub cache_version_mismatch: bool,
+    /// The version the caller requested (`--ver`), if any. Retained so a
+    /// version mismatch can be reported against what was actually delivered
+    /// (`result.version`).
+    pub requested_version: Option<String>,
 }
 
 impl BuildOutput {
+    /// Whether every delivered artifact came from the cache (no build ran).
+    ///
+    /// Derived from artifact provenance: `true` only when there is at least
+    /// one artifact and all of them have [`ArtifactOrigin::Cache`]. A partial
+    /// build (some reused, some freshly built) is therefore `false`.
+    pub fn from_cache(&self) -> bool {
+        !self.result.artifacts.is_empty()
+            && self
+                .result
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.origin == ArtifactOrigin::Cache)
+    }
+
     /// Get the source type for storage.
     pub fn source(&self) -> &RefSource {
         &self.resolved_ref.source
@@ -150,7 +265,7 @@ impl BuildOutput {
     /// # Example
     ///
     /// ```ignore
-    /// let store = ArtifactStore::open(config.builds_dir)?;
+    /// let store = ArtifactStore::open(config.cache_dir)?;
     ///
     /// // Check before building (dry-run or skip logic)
     /// let exists = output.exists_in_store(&store, "backwpup")?;
@@ -330,6 +445,56 @@ fn is_release_keyword(value: &str) -> bool {
     )
 }
 
+/// Return `version` only if the artifact store would accept it as a version
+/// string (non-empty, ≤ 64 chars, `[A-Za-z0-9._+-]`).
+///
+/// Release rows carry the version as optional metadata; a version derived
+/// from an exotic tag (spaces, unicode, …) is dropped rather than allowed to
+/// fail the whole cache-warm for the release's assets.
+fn storable_version(version: &str) -> Option<String> {
+    let valid = !version.is_empty()
+        && version.len() <= 64
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
+    valid.then(|| version.to_string())
+}
+
+/// Human-readable branch label derived from the resolved source, used for
+/// storage metadata and display. Mirrors the `RefSource` → branch mapping so
+/// the fast-path (cache) and full-build paths agree.
+fn branch_label(resolved: &ResolvedRef) -> String {
+    match &resolved.source {
+        RefSource::PullRequest(_) | RefSource::Branch(_) => resolved.git_ref.clone(),
+        RefSource::Tag(tag) => format!("tag/{tag}"),
+        RefSource::Commit(sha) => format!("commit/{}", &sha[..7.min(sha.len())]),
+        RefSource::Release(tag) => format!("release/{tag}"),
+    }
+}
+
+/// Distinct variant ids present among `artifacts`, in first-seen order.
+/// Variant-less (single-output) artifacts contribute nothing.
+fn variants_built(artifacts: &[ProducedArtifact]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for artifact in artifacts {
+        if let Some(variant) = &artifact.variant_id
+            && !seen.contains(variant)
+        {
+            seen.push(variant.clone());
+        }
+    }
+    seen
+}
+
+/// Emit the case-C version-mismatch warning: the caller pinned `requested`
+/// but the cache served `got`. Points at `--strict-version` as the remedy.
+fn warn_version_mismatch(reporter: &dyn ProgressReporter, requested: &str, got: &str) {
+    reporter.report(&BuildEvent::Warning(format!(
+        "Requested version {requested} but the cache holds this commit as {got}. \
+         Returning the cached {got} artifacts. Pass --strict-version to rebuild at {requested}."
+    )));
+}
+
 /// Command to build a project from any git reference.
 ///
 /// Supports automatic detection of reference types:
@@ -360,82 +525,86 @@ pub struct BuildCommand<'a> {
     github: &'a GitHubClient,
     registry: &'a ProjectRegistry,
     config: &'a Config,
+    /// Shared artifact cache. `None` disables caching for this command
+    /// (store unavailable or caching disabled by config). Held as an `Arc`
+    /// so it can be cloned into `spawn_blocking` closures for cache I/O.
+    store: Option<Arc<ArtifactStore>>,
 }
 
 impl<'a> BuildCommand<'a> {
     /// Create a new build command.
+    ///
+    /// `store` is the shared artifact cache (`None` to disable caching). The
+    /// per-invocation `--no-cache` override lives on the [`BuildRequest`].
     pub fn new(
         github: &'a GitHubClient,
         registry: &'a ProjectRegistry,
         config: &'a Config,
+        store: Option<Arc<ArtifactStore>>,
     ) -> Self {
         Self {
             github,
             registry,
             config,
+            store,
         }
     }
 
-    /// Execute the build command with automatic ref detection.
+    /// Whether the cache should be consulted for this request: a store is
+    /// available and the caller did not pass `--no-cache`.
+    fn caching_enabled(&self, request: &BuildRequest) -> bool {
+        self.store.is_some() && !request.no_cache
+    }
+
+    /// Execute the build described by `request`, with automatic ref detection.
     ///
-    /// # Arguments
-    ///
-    /// * `project` - Project name from registry
-    /// * `version` - Version to build, or `None` for auto-detection if builder have it implemented
-    /// * `git_ref` - Git reference (PR number, branch, tag, or commit)
-    /// * `variants` - Specific variants to build (empty = all)
-    /// * `output_dir` - Directory where build artifacts will be placed
-    /// * `reporter` - Progress reporter for receiving build events
+    /// Orchestrates the phases and delegates the work (all private helpers):
+    /// 1. Registry lookup + private-repo auth check (fail-fast).
+    /// 2. Early GitHub resolution (`try_early_resolve_github_ref`).
+    /// 3. Release refs short-circuit to `download_release`.
+    /// 4. Reference resolution (`resolve_reference`).
+    /// 5. Pre-clone cache fast path (`try_cache_fast_path`) — a full hit
+    ///    returns here without cloning.
+    /// 6. Clone → checkout → build → collect (`run_clone_build`), which also
+    ///    does post-checkout partial reuse and best-effort cache warming.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PrivateRepoNoToken`] if the project's repository is private
-    /// and no GitHub token is configured. This check happens early to provide a
-    /// clear error message before any git operations are attempted.
+    /// Returns [`Error::PrivateRepoNoToken`] if the project's repository is
+    /// private and no GitHub token is configured. This check happens early to
+    /// provide a clear error message before any git operations are attempted.
     pub async fn execute(
         &self,
-        project: &str,
-        version: Option<&str>,
-        git_ref: &str,
-        variants: &[&str],
-        output_dir: impl AsRef<Path>,
+        request: BuildRequest,
         reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
-        let output_dir = output_dir.as_ref();
+        // 1. Look up project in registry.
+        let project_info = self.registry.get(&request.project)?;
 
-        // 1. Look up project in registry
-        let project_info = self.registry.get(project)?;
-
-        // 2. Validate authentication for private repositories (fail-fast)
-        //
-        // This check happens BEFORE any git operations to provide a clear,
-        // actionable error message. Without this, users would see cryptic
-        // git errors like "Authentication failed" or "Repository not found".
+        // 2. Validate authentication for private repositories (fail-fast),
+        // BEFORE any git operation, so users get a clear, actionable error
+        // instead of a cryptic "Authentication failed" from git.
         if project_info.is_private && self.config.github_token.is_none() {
             return Err(Error::PrivateRepoNoToken {
                 repo: format!("{}/{}", project_info.owner, project_info.repo),
             });
         }
 
-        let builder = project_info.builder.as_ref();
+        // `--strict-version` has no meaning for embedded-version builders (the
+        // version comes from source and is deterministic per commit), so report
+        // it as ignored rather than silently doing nothing.
+        if request.strict_version && project_info.builder.version_requirement().is_embedded() {
+            reporter.report(&BuildEvent::Warning(format!(
+                "--strict-version ignored: '{}' derives its version from source",
+                project_info.name
+            )));
+        }
 
-        // 3. Early-resolve GitHub refs that don't need a local repo.
-        //
-        // For PR references (either explicit `pr:123` or bare digits `123`),
-        // we verify the PR exists via the GitHub API BEFORE cloning. This
-        // avoids wasting time on a full clone when the PR doesn't exist.
-        //
-        // For release references (`release:TAG`), we fetch the release from
-        // the GitHub API and download pre-built assets directly, bypassing
-        // the clone → build pipeline entirely.
-        //
-        // - Explicit `pr:123`: fails immediately if PR is not found.
-        // - Bare digits `123` (auto-detect): on failure, continues to clone
-        //   and falls back to branch/tag/commit resolution.
-        // - Explicit `release:TAG`: fetches release, downloads assets, returns early.
+        // 3. Early-resolve GitHub refs that don't need a local repo (PRs,
+        // releases, version-as-release). See `try_early_resolve_github_ref`.
         let early_resolved = self
             .try_early_resolve_github_ref(
-                git_ref,
+                &request.git_ref,
                 &project_info.owner,
                 &project_info.repo,
                 project_info.has_releases,
@@ -443,39 +612,151 @@ impl<'a> BuildCommand<'a> {
             )
             .await?;
 
-        // 3b. Handle release refs — download pre-built assets, skip clone/build entirely.
-        if let Some(ref resolved) = early_resolved
-            && let RefSource::Release(ref tag) = resolved.source
+        // 3b. Release refs download pre-built assets, skipping clone/build.
+        if let Some(resolved) = &early_resolved
+            && let RefSource::Release(tag) = &resolved.source
         {
+            let variants = request.variant_refs();
             return self
                 .download_release(
                     project_info,
                     tag,
-                    git_ref,
-                    version,
-                    variants,
-                    output_dir,
+                    &request.git_ref,
+                    request.version.as_deref(),
+                    &variants,
+                    request.output_dir.as_path(),
+                    request.no_cache,
                     reporter,
                 )
                 .await;
         }
 
-        // 4. Resolve the git reference BEFORE cloning (fail-fast phase).
-        //
-        // Tags and branches are checked against the remote with a single
-        // `git ls-remote` round-trip, commits are validated via the GitHub
-        // commits API, and `tag:` keywords use a minimal clone-free tags
-        // probe. An unresolvable reference therefore fails here — before
-        // any repository has been cloned — and a resolvable one carries its
-        // commit SHA, ready for future cache lookups.
-        let resolved = match early_resolved {
-            Some(r) => {
+        // 4. Resolve the reference to a concrete commit before cloning.
+        let resolved = self
+            .resolve_reference(early_resolved, project_info, &request.git_ref, reporter)
+            .await?;
+
+        // 5. Pre-clone cache fast path (cases A/B/C). On a full hit the
+        // artifacts are already delivered — no clone, no build.
+        if let Some(output) = self
+            .try_cache_fast_path(&request, project_info, &resolved, reporter)
+            .await
+        {
+            return Ok(output);
+        }
+
+        // 6. Clone → checkout → build → collect (with post-checkout partial
+        // reuse and best-effort cache warming inside).
+        self.run_clone_build(&request, project_info, resolved, reporter)
+            .await
+    }
+
+    /// Pre-clone cache fast path (behavior-matrix cases A/B/C).
+    ///
+    /// Returns `Some(output)` only on a **full** hit — every requested variant
+    /// present for the resolved commit — with the artifacts already copied into
+    /// the output directory. Returns `None` (build normally) when caching is
+    /// off/`--no-cache`, the commit SHA isn't known pre-clone, or the lookup
+    /// misses / errors. A lenient hit at a different version than requested is
+    /// still a hit, but flags [`BuildOutput::cache_version_mismatch`] and warns.
+    async fn try_cache_fast_path(
+        &self,
+        request: &BuildRequest,
+        project_info: &Project,
+        resolved: &ResolvedRef,
+        reporter: &dyn ProgressReporter,
+    ) -> Option<BuildOutput> {
+        let store = match &self.store {
+            Some(store) if !request.no_cache => Arc::clone(store),
+            _ => return None,
+        };
+        // The cache key needs the commit before cloning; without it the
+        // post-checkout reuse path still applies once HEAD is known.
+        let commit = resolved.commit_sha.clone()?;
+        let builder = project_info.builder.as_ref();
+        let keys = cache::variant_keys(builder, &request.variant_refs());
+        let predicted = cache::predicted_version(builder, request.version.as_deref());
+
+        reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Cache,
+            message: format!(
+                "Checking cache for commit {}",
+                commit.chars().take(7).collect::<String>()
+            ),
+        });
+        let hit = cache::fast_path_lookup_and_copy(
+            store,
+            request.project.clone(),
+            commit,
+            predicted.clone(),
+            request.strict_version,
+            keys,
+            request.output_dir.clone(),
+        )
+        .await;
+        reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::Cache,
+        });
+
+        let hit = hit?;
+
+        // Case C: a lenient hit returned a version other than the one the user
+        // pinned. Gate on the *user's* `--ver` (`request.version`) — not on
+        // `predicted`, which can hold a builder default the user never asked
+        // for (case B: no pin ⇒ no warning, whatever version the cache holds).
+        let cache_version_mismatch = request.version.is_some() && !hit.version_matched;
+        if cache_version_mismatch {
+            warn_version_mismatch(
+                reporter,
+                request.version.as_deref().unwrap_or_default(),
+                &hit.version,
+            );
+        }
+
+        let artifact_paths = hit.artifacts.iter().map(|a| a.path.clone()).collect();
+        reporter.report(&BuildEvent::BuildSucceeded {
+            artifacts: artifact_paths,
+        });
+
+        let variants_built = variants_built(&hit.artifacts);
+        let result = BuildResult::new(
+            hit.artifacts,
+            request.output_dir.clone(),
+            hit.version,
+            variants_built,
+        );
+        Some(BuildOutput {
+            result,
+            resolved_ref: resolved.clone(),
+            commit_short: hit.commit.chars().take(7).collect(),
+            commit: hit.commit,
+            branch: branch_label(resolved),
+            cache_version_mismatch,
+            requested_version: request.version.clone(),
+        })
+    }
+
+    /// Resolve a git reference to a concrete commit **before** cloning.
+    ///
+    /// Reuses the early GitHub resolution when present; otherwise runs the
+    /// remote-enabled [`RefResolver`] (`git ls-remote` + commits API) so an
+    /// unresolvable reference fails here — before any repository is cloned —
+    /// and a resolvable one carries its commit SHA, ready for a cache lookup.
+    async fn resolve_reference(
+        &self,
+        early_resolved: Option<ResolvedRef>,
+        project_info: &Project,
+        git_ref: &str,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<ResolvedRef> {
+        match early_resolved {
+            Some(resolved) => {
                 tracing::debug!(
                     "Using early-resolved ref: {} → {}",
-                    r.source.description(),
-                    r.git_ref
+                    resolved.source.description(),
+                    resolved.git_ref
                 );
-                r
+                Ok(resolved)
             }
             None => {
                 reporter.report(&BuildEvent::PhaseStarted {
@@ -501,38 +782,55 @@ impl<'a> BuildCommand<'a> {
                         .map(|sha| format!(" (commit {})", sha.chars().take(7).collect::<String>()))
                         .unwrap_or_default()
                 );
-                resolved
+                Ok(resolved)
             }
-        };
+        }
+    }
 
-        // 5. Create isolated build workspace (auto-cleaned on drop) and
-        // clone — only reached with a successfully resolved reference.
+    /// Clone the repository, check out the resolved ref, build, and collect
+    /// artifacts into the request's output directory.
+    ///
+    /// Reached when the pre-clone fast path did not fully hit. Once the
+    /// authoritative version + commit are known (post-checkout), it performs
+    /// **partial reuse**: requested variants already cached are copied from the
+    /// store (origin [`ArtifactOrigin::Cache`]) and only the missing ones are
+    /// built (origin [`ArtifactOrigin::Built`]). The full delivered set is then
+    /// stored best-effort. The workspace is a temporary directory that is
+    /// auto-cleaned when it drops, so artifacts are collected to the output
+    /// directory before it goes out of scope.
+    async fn run_clone_build(
+        &self,
+        request: &BuildRequest,
+        project_info: &Project,
+        resolved: ResolvedRef,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<BuildOutput> {
+        let output_dir = request.output_dir.as_path();
+        let builder = project_info.builder.as_ref();
+        let variants = request.variant_refs();
+
+        // Create isolated build workspace (auto-cleaned on drop) and clone.
         let workspace = BuildWorkspace::new(
             &project_info.name,
             &project_info.repo_url,
             self.config.github_token.as_deref(),
         )?;
 
-        // Clone the repository into the temp workspace
         reporter.report(&BuildEvent::PhaseStarted {
             phase: BuildPhase::Clone,
             message: format!("Cloning {}", project_info.repo_url),
         });
         workspace.clone_repo().await?;
-
-        // Fetch latest refs (uses token if available)
         workspace.fetch().await?;
         reporter.report(&BuildEvent::PhaseCompleted {
             phase: BuildPhase::Clone,
         });
 
-        // Get repository handle for local operations
         let repo = workspace.repository();
 
-        // 6. Prepare repository for checkout (clean state)
-        // Reset FIRST to avoid checkout failures due to uncommitted changes.
-        // See: https://git-scm.com/docs/git-checkout#_description
-        // "git checkout refuses to switch branches if there are local modifications"
+        // Prepare repository for checkout (clean state). Reset FIRST to avoid
+        // checkout failures due to uncommitted changes.
+        // https://git-scm.com/docs/git-checkout#_description
         reporter.report(&BuildEvent::PhaseStarted {
             phase: BuildPhase::Checkout,
             message: format!("Checking out {}", resolved.detailed_description()),
@@ -546,72 +844,142 @@ impl<'a> BuildCommand<'a> {
         repo.reset_hard().await?;
         workspace.pull().await?;
 
-        // 7. Checkout the resolved ref
+        // Checkout the resolved ref.
         repo.checkout(&resolved.git_ref).await?;
 
-        // 8. Get the commit SHA after checkout
+        // Commit SHA after checkout — authoritative record of what was built.
         let (commit, commit_short) = repo.get_head_commit_pair().await?;
         reporter.report(&BuildEvent::PhaseCompleted {
             phase: BuildPhase::Checkout,
         });
 
-        // 9. Resolve version (AFTER checkout so detect_version sees correct files)
-        let resolved_version = self.resolve_version(project, version, builder, repo.path())?;
+        // Resolve version AFTER checkout so detect_version sees the right files.
+        let resolved_version = self.resolve_version(
+            &request.project,
+            request.version.as_deref(),
+            builder,
+            repo.path(),
+        )?;
 
         tracing::info!(
             "Building {} v{} from {}",
-            project,
+            request.project,
             resolved_version,
             resolved.detailed_description()
         );
-
         if variants.is_empty() {
             tracing::info!("Building all variants");
         } else {
             tracing::info!("Building variants: {}", variants.join(", "));
         }
 
-        // Determine branch name based on source type
-        let branch = match &resolved.source {
-            RefSource::PullRequest(_) | RefSource::Branch(_) => resolved.git_ref.clone(),
-            RefSource::Tag(tag) => format!("tag/{tag}"),
-            RefSource::Commit(sha) => format!("commit/{}", &sha[..7.min(sha.len())]),
-            RefSource::Release(tag) => format!("release/{tag}"),
-        };
-
+        let branch = branch_label(&resolved);
         tracing::debug!(
             "Checked out {} at commit {}",
             resolved.git_ref,
             commit_short
         );
 
-        // 10. Run the build using the project's builder
-        let build_context = workspace.to_build_context();
-        let mut runner = BuildRunner::with_reporter(build_context, reporter);
-        let result = runner
-            .execute_build(builder, &resolved_version, variants)
-            .await?;
+        // Post-checkout partial reuse (behavior-matrix cases D/E/F). Now that
+        // the authoritative version + commit are known, copy whichever
+        // requested variants are already cached and build only the rest.
+        let caching = self.caching_enabled(request);
+        let keys = cache::variant_keys(builder, &variants);
+        let (reused, to_build) = if let (true, Some(store)) = (caching, self.store.clone()) {
+            reporter.report(&BuildEvent::PhaseStarted {
+                phase: BuildPhase::Cache,
+                message: format!("Checking cache for v{resolved_version} @ {commit_short}"),
+            });
+            let outcome = cache::reuse_and_copy(
+                store,
+                request.project.clone(),
+                resolved_version.clone(),
+                commit.clone(),
+                keys.clone(),
+                output_dir.to_path_buf(),
+            )
+            .await;
+            reporter.report(&BuildEvent::PhaseCompleted {
+                phase: BuildPhase::Cache,
+            });
+            (outcome.reused, outcome.to_build)
+        } else {
+            (Vec::new(), keys)
+        };
 
-        // 11. Collect artifacts to output_dir BEFORE workspace cleanup
-        // The workspace will be automatically deleted when it goes out of scope,
-        // so we must move artifacts out first.
-        let artifact_paths: Vec<_> = result.artifacts.iter().map(|a| a.path.clone()).collect();
-        workspace.collect_artifacts(&artifact_paths, output_dir)?;
+        // Build only the variants not served from the cache (if any).
+        let mut artifacts = reused;
+        if to_build.is_empty() {
+            // Everything was reused — skip the builder entirely.
+            tracing::info!(
+                "All {} requested variant(s) reused from cache",
+                artifacts.len()
+            );
+            let paths = artifacts.iter().map(|a| a.path.clone()).collect();
+            reporter.report(&BuildEvent::BuildSucceeded { artifacts: paths });
+        } else {
+            if !artifacts.is_empty() {
+                tracing::info!(
+                    "Reusing {} cached variant(s); building {} more",
+                    artifacts.len(),
+                    to_build.len()
+                );
+            }
+            // For a single-output builder the lone key is `None`; passing an
+            // empty variant slice builds that one output. For a multi-variant
+            // builder these are the concrete variant ids still needed.
+            let build_variant_strs: Vec<&str> =
+                to_build.iter().filter_map(|k| k.as_deref()).collect();
 
-        // Update artifact paths to point to output_dir
-        let mut result = result;
-        for artifact in &mut result.artifacts {
-            artifact.path = output_dir.join(&artifact.filename);
+            let build_context = workspace.to_build_context();
+            let mut runner = BuildRunner::with_reporter(build_context, reporter);
+            let built = runner
+                .execute_build(builder, &resolved_version, &build_variant_strs)
+                .await?;
+
+            // Collect built artifacts to output_dir BEFORE workspace cleanup,
+            // then repoint their paths and merge (they keep origin `Built`).
+            let built_paths: Vec<_> = built.artifacts.iter().map(|a| a.path.clone()).collect();
+            workspace.collect_artifacts(&built_paths, output_dir)?;
+            for mut artifact in built.artifacts {
+                artifact.path = output_dir.join(&artifact.filename);
+                artifacts.push(artifact);
+            }
         }
 
-        // Workspace is automatically cleaned up here when it goes out of scope
-        Ok(BuildOutput {
-            result,
+        // Workspace is automatically cleaned up when it goes out of scope.
+        let variants_built = variants_built(&artifacts);
+        let output = BuildOutput {
+            result: BuildResult::new(
+                artifacts,
+                output_dir.to_path_buf(),
+                resolved_version,
+                variants_built,
+            ),
             resolved_ref: resolved,
             commit,
             commit_short,
             branch,
-        })
+            cache_version_mismatch: false,
+            requested_version: request.version.clone(),
+        };
+
+        // Best-effort warm: record the full delivered set under its
+        // authoritative (version, commit). Gated on store presence only — NOT
+        // on `caching` — so `--no-cache` (which skips *reading* the cache)
+        // still writes, keeping the cache fresh. Only a store that could not be
+        // opened / disabled config (`store == None`) skips warming. Idempotent:
+        // reused files are recognized, not recopied; never fails the build.
+        if let Some(store) = self.store.clone() {
+            cache::store_build(
+                store,
+                output.to_build_metadata(&request.project),
+                output.to_source_artifacts(),
+            )
+            .await;
+        }
+
+        Ok(output)
     }
 
     /// Attempt to resolve GitHub-hosted refs before cloning.
@@ -738,12 +1106,7 @@ impl<'a> BuildCommand<'a> {
                     pr.title,
                     pr.head_branch
                 );
-                Ok(Some(ResolvedRef {
-                    input: trimmed.to_string(),
-                    source: RefSource::PullRequest(pr_number),
-                    git_ref: pr.head_branch,
-                    commit_sha: None,
-                }))
+                Ok(Some(ResolvedRef::from_pull_request(&pr, trimmed)))
             }
             Err(e) => {
                 if is_explicit {
@@ -949,6 +1312,7 @@ impl<'a> BuildCommand<'a> {
     /// * `output_dir` - Directory where downloaded assets will be placed
     /// * `reporter` - Progress reporter for receiving build events
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn download_release(
         &self,
         project_info: &crate::projects::Project,
@@ -957,6 +1321,7 @@ impl<'a> BuildCommand<'a> {
         version: Option<&str>,
         variants: &[&str],
         output_dir: &Path,
+        no_cache: bool,
         reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
         let owner = &project_info.owner;
@@ -1032,16 +1397,37 @@ impl<'a> BuildCommand<'a> {
             });
         }
 
-        // Download assets in parallel
-        reporter.report(&BuildEvent::PhaseStarted {
-            phase: BuildPhase::ReleaseDownload,
-            message: format!(
-                "Downloading {} asset(s) from release '{tag}'",
-                matched_assets.len()
-            ),
-        });
+        // The requested asset filenames (order preserved for stable output).
+        let requested_names: Vec<String> = matched_assets.iter().map(|a| a.name.clone()).collect();
 
-        // Create output dir if it doesn't exist
+        // Consult the release cache: copy any already-cached assets and learn
+        // which still need downloading (full hit, partial, or full miss —
+        // mirroring the build cache).
+        let caching = self.store.is_some() && !no_cache;
+        let (cached, to_download_names) = if let (true, Some(store)) = (caching, self.store.clone())
+        {
+            reporter.report(&BuildEvent::PhaseStarted {
+                phase: BuildPhase::Cache,
+                message: format!("Checking cache for release '{tag}'"),
+            });
+            let outcome = cache::reuse_release_assets(
+                store,
+                project_info.name.clone(),
+                tag.to_string(),
+                requested_names.clone(),
+                output_dir.to_path_buf(),
+            )
+            .await;
+            reporter.report(&BuildEvent::PhaseCompleted {
+                phase: BuildPhase::Cache,
+            });
+            (outcome.cached, outcome.to_download)
+        } else {
+            (Vec::new(), requested_names)
+        };
+
+        // Ensure the output dir exists (the no-cache path skips the reuse
+        // helper that would otherwise create it).
         std::fs::create_dir_all(output_dir).map_err(|e| {
             Error::Build(format!(
                 "Failed to create output directory '{}': {e}",
@@ -1049,84 +1435,90 @@ impl<'a> BuildCommand<'a> {
             ))
         })?;
 
-        // Download assets in parallel using tokio::task::JoinSet.
-        //
-        // JoinSet::spawn requires `Future + Send + 'static`, so we use the
-        // standalone `download_asset_owned` function which takes all data by
-        // ownership. Each download runs on its own tokio worker thread.
-        //
-        // On first error, remaining tasks are aborted (JoinSet is dropped).
-        //
-        // Sources:
-        // - JoinSet::spawn: https://docs.rs/tokio/1.49.0/tokio/task/struct.JoinSet.html#method.spawn
-        // - JoinSet::join_next: https://docs.rs/tokio/1.49.0/tokio/task/struct.JoinSet.html#method.join_next
-        let token = self.github.token();
-        let mut download_tasks: JoinSet<Result<(String, Vec<u8>)>> = JoinSet::new();
+        // Assets still needing a download.
+        let to_download: Vec<&ReleaseAsset> = matched_assets
+            .iter()
+            .copied()
+            .filter(|a| to_download_names.contains(&a.name))
+            .collect();
 
-        for asset in &matched_assets {
-            reporter.report(&BuildEvent::StepStarted {
-                step: BuildStep::new(
-                    format!("Downloading {}", &asset.name),
-                    format!("GET {}", &asset.download_url),
+        let mut artifacts: Vec<ProducedArtifact> = Vec::with_capacity(matched_assets.len());
+
+        // Cache-origin artifacts (already copied into output_dir by the reuse
+        // helper). The variant id is derived from the filename so provenance
+        // matches the download path exactly.
+        for asset in cached {
+            let variant_id = builder.variant_from_release_asset(&asset.filename);
+            artifacts.push(
+                ProducedArtifact::new(variant_id, asset.path, asset.filename, asset.size)
+                    .with_origin(ArtifactOrigin::Cache),
+            );
+        }
+
+        // Download the remaining assets in parallel (if any).
+        if !to_download.is_empty() {
+            reporter.report(&BuildEvent::PhaseStarted {
+                phase: BuildPhase::ReleaseDownload,
+                message: format!(
+                    "Downloading {} asset(s) from release '{tag}'",
+                    to_download.len()
                 ),
             });
 
-            download_tasks.spawn(download_asset_owned(
-                token.clone(),
-                owner.to_string(),
-                repo.to_string(),
-                (*asset).clone(),
-            ));
-        }
-
-        // Collect results as they complete. Abort all remaining tasks on
-        // first error to avoid wasting bandwidth.
-        let mut artifacts = Vec::new();
-        let mut variants_built = Vec::new();
-
-        while let Some(join_result) = download_tasks.join_next().await {
-            // Handle JoinError (task panic or cancellation).
-            let download_result =
-                join_result.map_err(|e| Error::Build(format!("Download task failed: {e}")))?;
-
-            // Handle download errors from the HTTP request.
-            let (asset_name, bytes) = download_result?;
-
-            let dest = output_dir.join(&asset_name);
-            std::fs::write(&dest, &bytes).map_err(|e| {
-                Error::Build(format!("Failed to write asset '{}': {e}", dest.display()))
-            })?;
-
-            let variant_id = builder.variant_from_release_asset(&asset_name);
-            if let Some(ref v) = variant_id
-                && !variants_built.contains(v)
-            {
-                variants_built.push(v.clone());
+            // JoinSet::spawn requires `Future + Send + 'static`, so we use the
+            // standalone `download_asset_owned` (takes all data by ownership).
+            // On first error, remaining tasks are aborted (JoinSet is dropped).
+            let token = self.github.token();
+            let mut download_tasks: JoinSet<Result<(String, Vec<u8>)>> = JoinSet::new();
+            for asset in &to_download {
+                reporter.report(&BuildEvent::StepStarted {
+                    step: BuildStep::new(
+                        format!("Downloading {}", &asset.name),
+                        format!("GET {}", &asset.download_url),
+                    ),
+                });
+                download_tasks.spawn(download_asset_owned(
+                    token.clone(),
+                    owner.to_string(),
+                    repo.to_string(),
+                    (*asset).clone(),
+                ));
             }
 
-            reporter.report(&BuildEvent::StepCompleted {
-                step: BuildStep::new(
-                    format!("Downloaded {asset_name}"),
-                    format!("{} bytes", bytes.len()),
-                ),
-            });
+            while let Some(join_result) = download_tasks.join_next().await {
+                // JoinError (task panic/cancellation).
+                let download_result =
+                    join_result.map_err(|e| Error::Build(format!("Download task failed: {e}")))?;
+                // Download errors from the HTTP request.
+                let (asset_name, bytes) = download_result?;
 
-            artifacts.push(ProducedArtifact::new(
-                variant_id,
-                dest,
-                asset_name,
-                bytes.len() as u64,
-            ));
+                let dest = output_dir.join(&asset_name);
+                std::fs::write(&dest, &bytes).map_err(|e| {
+                    Error::Build(format!("Failed to write asset '{}': {e}", dest.display()))
+                })?;
+
+                reporter.report(&BuildEvent::StepCompleted {
+                    step: BuildStep::new(
+                        format!("Downloaded {asset_name}"),
+                        format!("{} bytes", bytes.len()),
+                    ),
+                });
+
+                let variant_id = builder.variant_from_release_asset(&asset_name);
+                artifacts.push(
+                    ProducedArtifact::new(variant_id, dest, asset_name, bytes.len() as u64)
+                        .with_origin(ArtifactOrigin::Downloaded),
+                );
+            }
+
+            reporter.report(&BuildEvent::PhaseCompleted {
+                phase: BuildPhase::ReleaseDownload,
+            });
         }
 
-        reporter.report(&BuildEvent::PhaseCompleted {
-            phase: BuildPhase::ReleaseDownload,
-        });
-
-        // The version is always derived from the release tag, not the CLI --ver arg.
-        // Release assets are pre-built at a specific version embedded in the tag name.
+        // The version is always derived from the release tag, not the CLI --ver
+        // arg. Release assets are pre-built at a fixed version in the tag name.
         let resolved_version = version_from_tag(tag);
-
         if let Some(provided) = version {
             reporter.report(&BuildEvent::Warning(format!(
                 "Ignoring provided version '{provided}': \
@@ -1141,6 +1533,7 @@ impl<'a> BuildCommand<'a> {
             commit_sha: None,
         };
 
+        let variants_built = variants_built(&artifacts);
         let result = BuildResult::new(
             artifacts,
             output_dir.to_path_buf(),
@@ -1153,13 +1546,46 @@ impl<'a> BuildCommand<'a> {
             artifacts: filenames,
         });
 
-        Ok(BuildOutput {
+        let output = BuildOutput {
             result,
             resolved_ref,
             commit: format!("release-{tag}"),
             commit_short: tag.to_string(),
             branch: format!("release/{tag}"),
-        })
+            cache_version_mismatch: false,
+            requested_version: version.map(str::to_string),
+        };
+
+        // Best-effort warm: cache the full delivered asset set under this tag.
+        // Gated on store presence only (like the build path) so `--no-cache`
+        // still refreshes the cache; only a disabled/unopened store skips it.
+        if let Some(store) = self.store.clone() {
+            let mut metadata = ReleaseMetadata::new(&project_info.name, tag);
+            // The version is informational on release rows; an exotic tag can
+            // derive a string the store would reject, which must not prevent
+            // the assets themselves from being cached.
+            metadata.version = storable_version(&output.result.version);
+            metadata.prerelease = release.prerelease;
+            metadata.draft = release.draft;
+            // `variant_id` is left `None`: release assets are cached by
+            // filename (the variant is encoded in the filename, e.g.
+            // `backwpup-pro-en-5.6.8.zip`), and `store_release` ignores it. The
+            // delivered `output` artifacts still carry the resolved variant for
+            // provenance display.
+            let assets: Vec<SourceArtifact> = output
+                .result
+                .artifacts
+                .iter()
+                .map(|a| SourceArtifact {
+                    variant_id: None,
+                    path: a.path.clone(),
+                    target_name: a.filename.clone(),
+                })
+                .collect();
+            cache::store_release(store, metadata, assets).await;
+        }
+
+        Ok(output)
     }
 
     /// Resolve the version based on the builder's [`VersionRequirement`].
@@ -1248,128 +1674,6 @@ impl<'a> BuildCommand<'a> {
             ))),
         }
     }
-
-    /// Execute a build from a specific PR number.
-    ///
-    /// This is a convenience method equivalent to `execute(project, version, "pr:{pr_number}", variants, output_dir, reporter)`.
-    ///
-    /// # Arguments
-    ///
-    /// * `project` - Project name from registry
-    /// * `version` - Version to build, or `None` for auto-detection
-    /// * `pr_number` - Pull request number
-    /// * `variants` - Specific variants to build (empty = all)
-    /// * `output_dir` - Directory where build artifacts will be placed
-    /// * `reporter` - Progress reporter for receiving build events
-    pub async fn execute_pr(
-        &self,
-        project: &str,
-        version: Option<&str>,
-        pr_number: u64,
-        variants: &[&str],
-        output_dir: impl AsRef<Path>,
-        reporter: &dyn ProgressReporter,
-    ) -> Result<BuildOutput> {
-        self.execute(
-            project,
-            version,
-            &format!("pr:{pr_number}"),
-            variants,
-            output_dir,
-            reporter,
-        )
-        .await
-    }
-
-    /// Execute a build from a specific branch.
-    ///
-    /// # Arguments
-    ///
-    /// * `project` - Project name from registry
-    /// * `version` - Version to build, or `None` for auto-detection
-    /// * `branch` - Branch name
-    /// * `variants` - Specific variants to build (empty = all)
-    /// * `output_dir` - Directory where build artifacts will be placed
-    /// * `reporter` - Progress reporter for receiving build events
-    pub async fn execute_branch(
-        &self,
-        project: &str,
-        version: Option<&str>,
-        branch: &str,
-        variants: &[&str],
-        output_dir: impl AsRef<Path>,
-        reporter: &dyn ProgressReporter,
-    ) -> Result<BuildOutput> {
-        self.execute(
-            project,
-            version,
-            &format!("branch:{branch}"),
-            variants,
-            output_dir,
-            reporter,
-        )
-        .await
-    }
-
-    /// Execute a build from a specific tag.
-    ///
-    /// # Arguments
-    ///
-    /// * `project` - Project name from registry
-    /// * `version` - Version to build, or `None` for auto-detection
-    /// * `tag` - Tag name (e.g., "v1.0.0")
-    /// * `variants` - Specific variants to build (empty = all)
-    /// * `output_dir` - Directory where build artifacts will be placed
-    /// * `reporter` - Progress reporter for receiving build events
-    pub async fn execute_tag(
-        &self,
-        project: &str,
-        version: Option<&str>,
-        tag: &str,
-        variants: &[&str],
-        output_dir: impl AsRef<Path>,
-        reporter: &dyn ProgressReporter,
-    ) -> Result<BuildOutput> {
-        self.execute(
-            project,
-            version,
-            &format!("tag:{tag}"),
-            variants,
-            output_dir,
-            reporter,
-        )
-        .await
-    }
-
-    /// Execute a build from a specific commit SHA.
-    ///
-    /// # Arguments
-    ///
-    /// * `project` - Project name from registry
-    /// * `version` - Version to build, or `None` for auto-detection
-    /// * `commit` - Commit SHA (minimum 7 characters)
-    /// * `variants` - Specific variants to build (empty = all)
-    /// * `output_dir` - Directory where build artifacts will be placed
-    /// * `reporter` - Progress reporter for receiving build events
-    pub async fn execute_commit(
-        &self,
-        project: &str,
-        version: Option<&str>,
-        commit: &str,
-        variants: &[&str],
-        output_dir: impl AsRef<Path>,
-        reporter: &dyn ProgressReporter,
-    ) -> Result<BuildOutput> {
-        self.execute(
-            project,
-            version,
-            &format!("commit:{commit}"),
-            variants,
-            output_dir,
-            reporter,
-        )
-        .await
-    }
 }
 
 #[cfg(test)]
@@ -1413,6 +1717,234 @@ mod tests {
         }
     }
 
+    /// Single-output builder that, unlike [`TestBuilder`], advertises a default
+    /// version — used to exercise the "no `--ver` but a builder default exists"
+    /// (case B) path.
+    struct DefaultVersionBuilder;
+
+    impl Builder for DefaultVersionBuilder {
+        fn version_requirement(&self) -> VersionRequirement {
+            VersionRequirement::Required
+        }
+        fn default_version(&self) -> Option<&'static str> {
+            Some("9.99.99")
+        }
+        fn setup_commands(&self) -> Vec<BuildStep> {
+            vec![]
+        }
+        fn build_commands(&self, _: &BuildContext, _: &str, _: &[&str]) -> Vec<BuildStep> {
+            vec![]
+        }
+        fn artifacts(
+            &self,
+            _: &BuildContext,
+            _: &str,
+            _: &[&str],
+        ) -> crate::Result<Vec<BuildArtifact>> {
+            Ok(vec![])
+        }
+    }
+
+    // =========================================================================
+    // Fast-path integration: `try_cache_fast_path` end-to-end against a real
+    // (temp) store, no git/GitHub. Exercises variant-key derivation, lookup,
+    // copy, BuildOutput assembly, and the version-mismatch gating.
+    // =========================================================================
+
+    const TEST_SHA: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    /// Seed a single-output build for `project` at `(version, TEST_SHA)` into a
+    /// fresh temp store. The source file is copied into the store, so the
+    /// returned store owns its own copy.
+    fn seed_single_output(
+        project: &str,
+        version: &str,
+    ) -> (TempDir, std::sync::Arc<apvm_storage::ArtifactStore>) {
+        let cache = TempDir::new().unwrap();
+        let store = apvm_storage::ArtifactStore::open(cache.path()).unwrap();
+        let src = TempDir::new().unwrap();
+        let file = src.path().join("plugin.zip");
+        std::fs::write(&file, b"cached-plugin-bytes").unwrap();
+        store
+            .store(
+                &BuildMetadata::new(
+                    project,
+                    version,
+                    apvm_storage::BuildSource::Commit(TEST_SHA.to_string()),
+                    TEST_SHA,
+                    None,
+                ),
+                &[SourceArtifact {
+                    variant_id: None,
+                    path: file,
+                    target_name: "plugin.zip".to_string(),
+                }],
+            )
+            .unwrap();
+        (cache, std::sync::Arc::new(store))
+    }
+
+    fn single_output_project(name: &str, builder: Box<dyn Builder>) -> Project {
+        Project {
+            name: name.to_string(),
+            repo_url: "https://github.com/test/repo.git".to_string(),
+            owner: "test".to_string(),
+            repo: "repo".to_string(),
+            default_branch: "main".to_string(),
+            is_private: false,
+            has_releases: false,
+            builder,
+        }
+    }
+
+    fn resolved_commit() -> ResolvedRef {
+        ResolvedRef {
+            input: format!("commit:{TEST_SHA}"),
+            source: RefSource::Commit(TEST_SHA.to_string()),
+            git_ref: TEST_SHA.to_string(),
+            commit_sha: Some(TEST_SHA.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_path_full_hit_delivers_from_cache() {
+        let (cache, store) = seed_single_output("test", "1.0.0");
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(cache.path().to_path_buf());
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
+
+        let out = TempDir::new().unwrap();
+        let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path())
+            .version(Some("1.0.0".to_string()));
+        let resolved = resolved_commit();
+        let project_info = registry.get("test").unwrap();
+
+        let output = cmd
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .await
+            .expect("expected a full cache hit");
+
+        assert!(output.from_cache(), "all artifacts should be cache-origin");
+        assert_eq!(output.result.artifacts.len(), 1);
+        assert_eq!(output.result.artifacts[0].origin, ArtifactOrigin::Cache);
+        assert_eq!(output.result.version, "1.0.0");
+        assert!(!output.cache_version_mismatch);
+        assert!(out.path().join("plugin.zip").is_file());
+    }
+
+    #[tokio::test]
+    async fn fast_path_skipped_when_no_cache_flag_set() {
+        let (cache, store) = seed_single_output("test", "1.0.0");
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(cache.path().to_path_buf());
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
+
+        let out = TempDir::new().unwrap();
+        let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path())
+            .version(Some("1.0.0".to_string()))
+            .no_cache(true);
+        let resolved = resolved_commit();
+        let project_info = registry.get("test").unwrap();
+
+        let output = cmd
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .await;
+        assert!(output.is_none(), "--no-cache must bypass the fast path");
+    }
+
+    #[tokio::test]
+    async fn fast_path_no_pin_does_not_warn_on_different_cached_version() {
+        // Case B: the builder default is 9.99.99, the cache holds 5.6.0, and the
+        // user pinned nothing. It's a hit, and there must be NO mismatch warning
+        // (the default version is not something the user "requested").
+        let (cache, store) = seed_single_output("test", "5.6.0");
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project(
+            "test",
+            Box::new(DefaultVersionBuilder),
+        ));
+        let config = Config::new(cache.path().to_path_buf());
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
+
+        let out = TempDir::new().unwrap();
+        // No `.version(...)` → user pinned nothing.
+        let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path());
+        let resolved = resolved_commit();
+        let project_info = registry.get("test").unwrap();
+
+        let output = cmd
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .await
+            .expect("lenient hit expected");
+
+        assert!(output.from_cache());
+        assert_eq!(output.result.version, "5.6.0");
+        assert!(
+            !output.cache_version_mismatch,
+            "no --ver ⇒ no version-mismatch warning (case B)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_path_pinned_version_flags_mismatch() {
+        // Case C: user pinned 2.0.0, cache holds 1.0.0, lenient → hit + mismatch.
+        let (cache, store) = seed_single_output("test", "1.0.0");
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(cache.path().to_path_buf());
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
+
+        let out = TempDir::new().unwrap();
+        let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path())
+            .version(Some("2.0.0".to_string()));
+        let resolved = resolved_commit();
+        let project_info = registry.get("test").unwrap();
+
+        let output = cmd
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .await
+            .expect("lenient hit expected");
+
+        assert_eq!(output.result.version, "1.0.0");
+        assert!(
+            output.cache_version_mismatch,
+            "pinned 2.0.0 but got 1.0.0 ⇒ mismatch (case C)"
+        );
+        assert_eq!(output.requested_version.as_deref(), Some("2.0.0"));
+    }
+
+    #[tokio::test]
+    async fn fast_path_strict_pinned_version_misses() {
+        // Case D precursor: strict + wrong version ⇒ no hit (must rebuild).
+        let (cache, store) = seed_single_output("test", "1.0.0");
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(cache.path().to_path_buf());
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
+
+        let out = TempDir::new().unwrap();
+        let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path())
+            .version(Some("2.0.0".to_string()))
+            .strict_version(true);
+        let resolved = resolved_commit();
+        let project_info = registry.get("test").unwrap();
+
+        let output = cmd
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .await;
+        assert!(
+            output.is_none(),
+            "strict + wrong version ⇒ no fast-path hit"
+        );
+    }
+
     #[tokio::test]
     async fn test_private_repo_fails_without_token() {
         // Setup: Create registry with a PRIVATE project
@@ -1429,23 +1961,20 @@ mod tests {
         });
 
         // Config WITHOUT token
-        let config = Config::new(PathBuf::from("/tmp/builds"));
+        let config = Config::new(PathBuf::from("/tmp/cache"));
 
         // GitHub client (anonymous - no token)
         let github = GitHubClient::anonymous().unwrap();
 
         // Create the command
-        let cmd = BuildCommand::new(&github, &registry, &config);
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
 
         // Execute should fail IMMEDIATELY with PrivateRepoNoToken error
         let output_dir = TempDir::new().unwrap();
         let result = cmd
             .execute(
-                "test-private",
-                Some("1.0.0"),
-                "main",
-                &[],
-                output_dir.path(),
+                BuildRequest::new("test-private", "main", output_dir.path())
+                    .version(Some("1.0.0".to_string())),
                 &NullReporter,
             )
             .await;
@@ -1483,24 +2012,21 @@ mod tests {
         });
 
         // Config WITHOUT token
-        let config = Config::new(PathBuf::from("/tmp/builds"));
+        let config = Config::new(PathBuf::from("/tmp/cache"));
 
         // GitHub client (anonymous - no token)
         let github = GitHubClient::anonymous().unwrap();
 
         // Create the command
-        let cmd = BuildCommand::new(&github, &registry, &config);
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
 
         // Execute should NOT fail with PrivateRepoNoToken error
         // (it will fail later because the repo doesn't exist, but that's fine)
         let output_dir = TempDir::new().unwrap();
         let result = cmd
             .execute(
-                "test-public",
-                Some("1.0.0"),
-                "main",
-                &[],
-                output_dir.path(),
+                BuildRequest::new("test-public", "main", output_dir.path())
+                    .version(Some("1.0.0".to_string())),
                 &NullReporter,
             )
             .await;
@@ -1559,6 +2085,28 @@ mod tests {
         assert_eq!(version_from_tag("develop"), "develop");
         assert_eq!(version_from_tag("main"), "main");
         assert_eq!(version_from_tag("feature/v2"), "feature/v2");
+    }
+
+    // =========================================================================
+    // storable_version tests
+    // =========================================================================
+
+    #[test]
+    fn test_storable_version_accepts_store_safe_strings() {
+        assert_eq!(storable_version("5.6.8"), Some("5.6.8".to_string()));
+        assert_eq!(
+            storable_version("5.6.8-beta.1+build_2"),
+            Some("5.6.8-beta.1+build_2".to_string())
+        );
+        assert_eq!(storable_version("nightly"), Some("nightly".to_string()));
+    }
+
+    #[test]
+    fn test_storable_version_drops_store_unsafe_strings() {
+        assert_eq!(storable_version(""), None);
+        assert_eq!(storable_version("5.6.8 (beta)"), None); // spaces/parens
+        assert_eq!(storable_version("feature/v2"), None); // slash
+        assert_eq!(storable_version(&"9".repeat(65)), None); // too long
     }
 
     // =========================================================================
@@ -1684,6 +2232,8 @@ mod tests {
             commit: commit.to_string(),
             commit_short: commit[..7].to_string(),
             branch: branch.to_string(),
+            cache_version_mismatch: false,
+            requested_version: None,
         }
     }
 
@@ -1702,6 +2252,70 @@ mod tests {
         assert_eq!(meta.version, "3.17.4");
         assert_eq!(meta.commit, "abc1234567890");
         assert_eq!(meta.branch.as_deref(), Some("develop"));
+    }
+
+    // =========================================================================
+    // BuildOutput::from_cache — derived from artifact provenance
+    // =========================================================================
+
+    fn artifact(name: &str, origin: ArtifactOrigin) -> ProducedArtifact {
+        ProducedArtifact::new(None, PathBuf::from(format!("/{name}")), name.to_string(), 1)
+            .with_origin(origin)
+    }
+
+    #[test]
+    fn from_cache_false_when_all_built() {
+        let output = make_build_output(
+            vec![artifact("a.zip", ArtifactOrigin::Built)],
+            "1.0.0",
+            RefSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+        assert!(!output.from_cache());
+    }
+
+    #[test]
+    fn from_cache_true_when_all_cached() {
+        let output = make_build_output(
+            vec![
+                artifact("a.zip", ArtifactOrigin::Cache),
+                artifact("b.zip", ArtifactOrigin::Cache),
+            ],
+            "1.0.0",
+            RefSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+        assert!(output.from_cache());
+    }
+
+    #[test]
+    fn from_cache_false_when_mixed_partial() {
+        // A partial build (some reused, some freshly built) is not "from cache".
+        let output = make_build_output(
+            vec![
+                artifact("a.zip", ArtifactOrigin::Cache),
+                artifact("b.zip", ArtifactOrigin::Built),
+            ],
+            "1.0.0",
+            RefSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+        assert!(!output.from_cache());
+    }
+
+    #[test]
+    fn from_cache_false_when_no_artifacts() {
+        let output = make_build_output(
+            vec![],
+            "1.0.0",
+            RefSource::Branch("develop".into()),
+            "abc1234567890",
+            "develop",
+        );
+        assert!(!output.from_cache());
     }
 
     #[test]

@@ -23,7 +23,7 @@
 //! ```typescript
 //! import { Apvm } from 'apvm-napi';
 //!
-//! // All config fields are optional — buildsDir defaults to a temp directory
+//! // All config fields are optional — cacheDir defaults to ~/.apvm/cache
 //! const apvm = await Apvm.create({});
 //!
 //! const output = await apvm.build({

@@ -2,28 +2,38 @@
 
 The core library for the **Automation Plugin Version Manager**. This crate contains all the heavy logic: git operations, GitHub API integration, build orchestration, version detection, and release downloads. It is consumed by both the [CLI](../cli/README.md) and the [NAPI bindings](../napi/README.md).
 
-The core follows a **composition over integration** philosophy:
+Design principles:
 
 - **Core builds artifacts** — handles git, builds, version detection
-- **Storage is separate** — consumers compose core + storage as needed
-- **No path conventions** — consumers decide directory layout
+- **Caching is built in** — with `Config::cache_enabled` (the default), builds and release downloads are served from and stored to the [`apvm-storage`](../storage/) cache at `Config::cache_dir`; cache failures always degrade to a normal build, never an error
+- **No default paths** — consumers supply the cache directory (the CLI and Node bindings default to `~/.apvm/cache`)
 
 ## Quick Start
 
 ```rust,ignore
-use apvm_core::Apvm;
+use apvm_core::{Apvm, BuildRequest, NullReporter};
 use apvm_config::Config;
 use std::path::PathBuf;
 
-// Create config with explicit paths
-let config = Config::new(PathBuf::from("/var/lib/myapp/builds"));
+// Create config with an explicit cache directory (caching on by default)
+let config = Config::new(PathBuf::from("/var/lib/myapp/cache"));
 let apvm = Apvm::new(config)?;
 
-// BackWPup: version required, specify output directory
-let output = apvm.build("backwpup", Some("5.1.0"), "pr:123", None, "/output").await?;
+// BackWPup: version required, artifacts delivered to the output directory
+let request = BuildRequest::new("backwpup", "pr:123", "/output")
+    .version(Some("5.1.0".to_string()));
+let output = apvm.build(request, &NullReporter).await?;
 
 // WP Rocket: version auto-detected from source
-let output = apvm.build("wp-rocket", None, "pr:456", None, "/output").await?;
+let output = apvm
+    .build(BuildRequest::new("wp-rocket", "pr:456", "/output"), &NullReporter)
+    .await?;
+
+// Provenance: was this served from the cache?
+println!("from cache: {}", output.from_cache());
+for artifact in &output.result.artifacts {
+    println!("  {} ({})", artifact.filename, artifact.origin);
+}
 ```
 
 ## Architecture
@@ -44,7 +54,8 @@ apvm-core/src/
 │       ├── bwu.rs          BackWPup builder
 │       └── wpr.rs          WP Rocket builder
 ├── commands/       High-level command implementations
-│   ├── build.rs        BuildCommand (full build orchestration)
+│   ├── build.rs        BuildCommand + BuildRequest (full build orchestration)
+│   ├── cache.rs        Artifact-cache decisions (lookups, reuse, warming)
 │   └── mod.rs          Re-exports
 ├── git/            Git operations
 │   ├── repository.rs   Low-level git commands
@@ -143,14 +154,21 @@ Implemented in `git::token::resolve_github_token()`.
 The build pipeline is orchestrated by `BuildCommand` and follows these phases:
 
 ```
-Preflight → Clone → Checkout → DependencyCheck → PreBuild → Setup → Build → BuildHook → PostBuild → CollectArtifacts
+Preflight → Cache → Clone → Checkout → [Cache] → DependencyCheck → PreBuild → Setup → Build → BuildHook → PostBuild → CollectArtifacts
 ```
+
+The first `Cache` phase is the pre-clone fast path: when the resolved commit
+is fully cached, the pipeline stops there and delivers the cached artifacts.
+The post-checkout `[Cache]` pass reuses whichever requested variants are
+already cached at the authoritative version and builds only the rest.
 
 For release downloads (e.g., `release:5.6.8`), the pipeline short-circuits to:
 
 ```
-Preflight → ReleaseDownload
+Preflight → Cache → ReleaseDownload
 ```
+
+(`ReleaseDownload` is skipped entirely when every requested asset is cached.)
 
 ### `BuildContext`
 
@@ -165,16 +183,23 @@ Executes shell commands (npm, composer, gulp, etc.) via [`tokio::process::Comman
 ```rust,ignore
 pub struct BuildResult {
     pub artifacts: Vec<ProducedArtifact>,
+    pub build_dir: PathBuf,
     pub version: String,
+    pub variants_built: Vec<String>,
 }
 
 pub struct ProducedArtifact {
+    pub variant_id: Option<String>, // None for single-output plugins
     pub path: PathBuf,
     pub filename: String,
     pub size: u64,
-    pub sha256: String,
+    pub origin: ArtifactOrigin,     // Cache | Built | Downloaded
 }
 ```
+
+`ArtifactOrigin` records where each delivered file came from, so consumers can
+report provenance precisely — including partial builds where some variants
+were reused from the cache and others were built fresh.
 
 ### Progress Reporting
 
@@ -298,14 +323,17 @@ The shared `get_nth_release(owner, repo, index, stable_only)` method underpins t
 
 ## Commands Module
 
-### `BuildCommand`
+### `BuildCommand` and `BuildRequest`
 
-The high-level build orchestrator. It:
+The high-level build orchestrator, driven by a `BuildRequest` (project, git
+ref, output directory, optional version/variants, and the per-call cache
+overrides `no_cache` / `strict_version`). It:
 
 1. Validates the project exists in the registry
 2. Checks if the ref is a release keyword and resolves it via the GitHub API
-3. Checks if the ref is a plain release tag and downloads assets
-4. Falls through to git-based builds (clone → checkout → build → collect)
+3. Checks if the ref is a plain release tag and serves/downloads its assets (cache-aware)
+4. Resolves the ref to a commit **before** cloning and tries the cache fast path
+5. Falls through to git-based builds (clone → checkout → build → collect), reusing any cached variants and warming the cache afterwards
 
 ### `BuildOutput`
 
@@ -313,14 +341,19 @@ The return type of a successful build:
 
 ```rust,ignore
 pub struct BuildOutput {
-    pub result: BuildResult,       // Artifacts + version
-    pub resolved_ref: ResolvedRef, // Git ref metadata
-    pub commit: String,            // Full SHA
-    pub commit_short: String,      // 7-char SHA
-    pub branch: String,            // Checked-out branch
-    pub description: String,       // Human-readable summary
+    pub result: BuildResult,                // Artifacts + version
+    pub resolved_ref: ResolvedRef,          // Git ref metadata
+    pub commit: String,                     // Full SHA
+    pub commit_short: String,               // 7-char SHA
+    pub branch: String,                     // Checked-out branch
+    pub cache_version_mismatch: bool,       // Lenient hit returned another version
+    pub requested_version: Option<String>,  // What the caller pinned, if anything
 }
 ```
+
+Helper methods: `description()` renders a human-readable summary (e.g.
+`PR #123 @ a1b2c3d`), and `from_cache()` is `true` when every delivered
+artifact came from the cache (a partial build is `false`).
 
 ## Configuration I/O
 

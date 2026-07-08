@@ -26,6 +26,9 @@ apvm-storage = { workspace = true }
 napi = { workspace = true }
 napi-derive = { workspace = true }
 
+# Platform directories (resolves the default cache dir, ~/.apvm/cache)
+directories = { workspace = true }
+
 # Async runtime (needs rt-multi-thread for napi async)
 tokio = { workspace = true }
 

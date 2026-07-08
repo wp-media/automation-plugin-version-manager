@@ -98,6 +98,14 @@ pub enum Error {
         available: String,
     },
 
+    /// Artifact cache (storage) error.
+    ///
+    /// Surfaced only where a caller explicitly requests a storage operation
+    /// (e.g. cache maintenance). The build pipeline itself treats cache
+    /// failures as non-fatal and never lets this variant escape.
+    #[error("Storage error: {0}")]
+    Storage(#[from] apvm_storage::Error),
+
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
@@ -105,6 +113,15 @@ pub enum Error {
     /// JSON serialization error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// Cache maintenance error (only CLI).
+    ///
+    /// Used by `apvm cache` subcommands for user-facing failures that are not
+    /// storage-layer errors themselves — e.g. verification finding damaged
+    /// entries (so the command can exit non-zero) or a corrupt database with
+    /// a recovery hint attached.
+    #[error("Cache error: {0}")]
+    Cache(String),
 
     /// Self-update error (only CLI).
     #[error("Update error: {0}")]

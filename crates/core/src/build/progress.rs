@@ -220,6 +220,10 @@ pub enum BuildPhase {
     /// This phase runs before cloning to fail fast when an explicit
     /// reference (e.g., `pr:123`) does not exist.
     Preflight,
+    /// Consulting the artifact cache for a prior build of the resolved commit.
+    ///
+    /// Runs before cloning; a cache hit can skip the clone/build entirely.
+    Cache,
     /// Downloading pre-built assets from a GitHub Release.
     ///
     /// This phase replaces the entire clone → build pipeline when a release
@@ -249,6 +253,7 @@ impl std::fmt::Display for BuildPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Preflight => write!(f, "Verifying reference"),
+            Self::Cache => write!(f, "Checking cache"),
             Self::ReleaseDownload => write!(f, "Downloading release assets"),
             Self::Clone => write!(f, "Cloning repository"),
             Self::Checkout => write!(f, "Checking out ref"),
@@ -396,6 +401,7 @@ mod tests {
     #[test]
     fn test_build_phase_display() {
         assert_eq!(BuildPhase::Preflight.to_string(), "Verifying reference");
+        assert_eq!(BuildPhase::Cache.to_string(), "Checking cache");
         assert_eq!(BuildPhase::Clone.to_string(), "Cloning repository");
         assert_eq!(BuildPhase::Build.to_string(), "Building");
         assert_eq!(

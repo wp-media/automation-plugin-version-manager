@@ -78,7 +78,7 @@ The main entry point. Created via async factory methods.
 Creates an instance using the provided config. If `githubToken` is set, it is used directly.
 
 ```ts
-// Minimal — temp builds dir, no token
+// Minimal — default cache dir (~/.apvm/cache), no token
 const apvm = await Apvm.create();
 
 // With explicit config
@@ -243,8 +243,9 @@ The `gitRef` field in `BuildOptions` supports all the same formats as the CLI:
 
 ```ts
 interface ApvmConfig {
-  buildsDir?: string;    // Artifact storage path (Not stable currently, avoid using it until stable)
-  githubToken?: string;  // GitHub PAT (required for private repos)
+  cacheDir?: string;      // Artifact cache base dir (default: ~/.apvm/cache)
+  cacheEnabled?: boolean; // Whether the artifact cache is active (default: true)
+  githubToken?: string;   // GitHub PAT (required for private repos)
 }
 ```
 
@@ -257,6 +258,8 @@ interface BuildOptions {
   version?: string;       // Required for BackWPup, optional and No-Op for WP Rocket (Embedded version)
   variants?: string[];    // e.g., ["free", "pro-en"]. No-Op for WP Rocket (No variants)
   outputDir: string;      // Absolute path for artifacts to be stored after build
+  noCache?: boolean;      // Bypass the artifact cache for this build (default false)
+  strictVersion?: boolean;// Require a cache hit to match `version` exactly (default false)
 }
 ```
 
@@ -270,6 +273,9 @@ interface JsBuildOutput {
   commitShort: string;          // Short SHA (7 chars)
   branch: string;               // Checked-out branch name
   description: string;          // e.g., "PR #123 @ a1b2c3d"
+  fromCache: boolean;           // true when every artifact came from the cache
+  cacheVersionMismatch: boolean;// true when a cache hit returned a different version than requested
+  requestedVersion?: string;    // the version you asked for (for mismatch reporting)
 }
 ```
 
@@ -286,10 +292,11 @@ interface JsBuildResult {
 
 ```ts
 interface JsProducedArtifact {
-  path: string;      // Full path to the artifact file
-  filename: string;  // File name only (e.g., "wp-rocket-3.17.4.zip")
-  size: number;      // File size in bytes
-  sha256: string;    // SHA-256 hex digest
+  variantId?: string; // Variant (e.g., "free", "pro-en"); undefined for single-output plugins
+  path: string;       // Full path to the artifact file
+  filename: string;   // File name only (e.g., "wp-rocket-3.17.4.zip")
+  size: number;       // File size in bytes
+  origin: string;     // "cache" | "built" | "downloaded"
 }
 ```
 

@@ -11,6 +11,12 @@ pub struct PullRequest {
     pub base_branch: String,
     /// Head branch (source branch with changes).
     pub head_branch: String,
+    /// Head commit SHA (tip of the head branch at the time of the API call).
+    ///
+    /// Populated from the pull request's `head.sha`, enabling a cache lookup
+    /// keyed by commit **before** cloning. `None` only if the API response
+    /// omits it (not expected for a valid PR).
+    pub head_sha: Option<String>,
     /// Repository owner.
     pub owner: String,
     /// Repository name.

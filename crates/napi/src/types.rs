@@ -41,6 +41,8 @@ use napi_derive::napi;
 pub enum JsBuildPhase {
     /// Pre-clone verification of GitHub references (PR existence, etc.).
     Preflight,
+    /// Consulting the artifact cache for a prior build of the resolved commit.
+    Cache,
     /// Downloading pre-built assets from a GitHub Release.
     ReleaseDownload,
     /// Cloning the git repository.
@@ -67,6 +69,7 @@ impl From<apvm_core::BuildPhase> for JsBuildPhase {
     fn from(phase: apvm_core::BuildPhase) -> Self {
         match phase {
             apvm_core::BuildPhase::Preflight => Self::Preflight,
+            apvm_core::BuildPhase::Cache => Self::Cache,
             apvm_core::BuildPhase::ReleaseDownload => Self::ReleaseDownload,
             apvm_core::BuildPhase::Clone => Self::Clone,
             apvm_core::BuildPhase::Checkout => Self::Checkout,
@@ -306,6 +309,11 @@ pub struct JsProducedArtifact {
     /// Note: Represented as a JavaScript `number`. Files larger than 2^53 bytes
     /// (8 PB) would lose precision, which is not a practical concern.
     pub size: f64,
+    /// Where this artifact came from: `"cache"`, `"built"`, or `"downloaded"`.
+    ///
+    /// Lets JS consumers report provenance per artifact — including a partial
+    /// build where some variants are reused from cache and others are built.
+    pub origin: String,
 }
 
 impl From<&apvm_core::build::ProducedArtifact> for JsProducedArtifact {
@@ -315,6 +323,7 @@ impl From<&apvm_core::build::ProducedArtifact> for JsProducedArtifact {
             path: artifact.path.to_string_lossy().to_string(),
             filename: artifact.filename.clone(),
             size: artifact.size as f64,
+            origin: artifact.origin.to_string(),
         }
     }
 }
@@ -401,11 +410,25 @@ pub struct JsBuildOutput {
     ///
     /// Example: `"PR #123 @ a1b2c3d"`, `"branch 'develop' @ e4f5g6h"`
     pub description: String,
+    /// `true` when every artifact was served from the cache (no build ran).
+    ///
+    /// Derived from per-artifact provenance; a partial build (some reused,
+    /// some freshly built) is `false`. See each artifact's `origin`.
+    pub from_cache: bool,
+    /// `true` when a cache hit returned a version different from the one
+    /// requested (only possible without `strictVersion`). When `true`,
+    /// `requestedVersion` is what you asked for and `result.version` is what
+    /// was delivered.
+    pub cache_version_mismatch: bool,
+    /// The version the caller requested (`version` in the build options), if
+    /// any — retained so a version mismatch can be reported.
+    pub requested_version: Option<String>,
 }
 
 impl From<apvm_core::BuildOutput> for JsBuildOutput {
     fn from(output: apvm_core::BuildOutput) -> Self {
         let description = output.description();
+        let from_cache = output.from_cache();
         Self {
             result: JsBuildResult::from(&output.result),
             resolved_ref: JsResolvedRef::from(&output.resolved_ref),
@@ -413,6 +436,9 @@ impl From<apvm_core::BuildOutput> for JsBuildOutput {
             commit_short: output.commit_short.clone(),
             branch: output.branch.clone(),
             description,
+            from_cache,
+            cache_version_mismatch: output.cache_version_mismatch,
+            requested_version: output.requested_version.clone(),
         }
     }
 }
@@ -672,4 +698,17 @@ pub struct BuildOptions {
     /// Must be an absolute path. The directory will be created if it
     /// doesn't exist.
     pub output_dir: String,
+
+    /// Bypass the artifact cache for this build (defaults to `false`).
+    ///
+    /// The build still runs and, unless caching is disabled at the instance
+    /// level (`cacheEnabled: false`), still warms the cache.
+    pub no_cache: Option<bool>,
+
+    /// Require a cache hit to match `version` exactly (defaults to `false`).
+    ///
+    /// Without this, a cached build of the same commit at a different version
+    /// may be reused (with `cacheVersionMismatch` set on the result). Has no
+    /// effect for projects whose version is embedded in source.
+    pub strict_version: Option<bool>,
 }

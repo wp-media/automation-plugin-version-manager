@@ -32,7 +32,7 @@ pub use context::BuildContext;
 pub use progress::{
     BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter,
 };
-pub use result::{BuildResult, ProducedArtifact};
+pub use result::{ArtifactOrigin, BuildResult, ProducedArtifact};
 pub use runner::{BuildOutput, BuildRunner};
 
 // Re-export version detection helpers for convenience

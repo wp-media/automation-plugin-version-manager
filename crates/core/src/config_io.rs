@@ -413,8 +413,8 @@ mod tests {
     use apvm_config::ConfigKey;
     use tempfile::TempDir;
 
-    fn test_config(builds: PathBuf) -> Config {
-        Config::new(builds)
+    fn test_config(cache: PathBuf) -> Config {
+        Config::new(cache)
     }
 
     #[test]
@@ -430,11 +430,11 @@ mod tests {
     fn test_load_or_default_nonexistent_returns_default() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("nonexistent.json");
-        let default = test_config(PathBuf::from("/default/builds"));
+        let default = test_config(PathBuf::from("/default/cache"));
 
         let config = load_config_or_default(&path, default).unwrap();
         assert!(config.github_token.is_none());
-        assert_eq!(config.builds_dir, PathBuf::from("/default/builds"));
+        assert_eq!(config.cache_dir, PathBuf::from("/default/cache"));
     }
 
     #[test]
@@ -443,11 +443,11 @@ mod tests {
         let path = temp.path().join("empty.json");
         fs::write(&path, "").unwrap();
 
-        let default = test_config(PathBuf::from("/default/builds"));
+        let default = test_config(PathBuf::from("/default/cache"));
 
         let config = load_config_or_default(&path, default).unwrap();
         assert!(config.github_token.is_none());
-        assert_eq!(config.builds_dir, PathBuf::from("/default/builds"));
+        assert_eq!(config.cache_dir, PathBuf::from("/default/cache"));
     }
 
     #[test]
@@ -456,7 +456,7 @@ mod tests {
         let path = temp.path().join("config.json");
         fs::write(
             &path,
-            r#"{"github_token": "test-token", "builds_dir": "/test/builds"}"#,
+            r#"{"github_token": "test-token", "cache_dir": "/test/cache"}"#,
         )
         .unwrap();
 
@@ -480,7 +480,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("subdir").join("config.json");
 
-        let config = Config::with_token("my-token", PathBuf::from("/builds"));
+        let config = Config::with_token("my-token", PathBuf::from("/cache"));
         save_config(&config, &path).unwrap();
 
         assert!(path.exists());
@@ -493,15 +493,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("config.json");
 
-        let original = test_config(PathBuf::from("/original/builds"))
+        let original = test_config(PathBuf::from("/original/cache"))
             .set_token("roundtrip-token")
-            .set_builds_dir("/custom/builds");
+            .set_cache_dir("/custom/cache");
 
         save_config(&original, &path).unwrap();
         let loaded = load_config(&path).unwrap();
 
         assert_eq!(loaded.github_token, original.github_token);
-        assert_eq!(loaded.builds_dir, original.builds_dir);
+        assert_eq!(loaded.cache_dir, original.cache_dir);
     }
 
     #[test]
@@ -543,25 +543,25 @@ mod tests {
     fn test_load_config_file_nonexistent_returns_defaults() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("nonexistent.json");
-        let defaults = test_config(PathBuf::from("/default/builds"));
+        let defaults = test_config(PathBuf::from("/default/cache"));
 
         let config = load_config_file(&path, &defaults).unwrap();
         assert!(config.github_token.is_none());
-        assert_eq!(config.builds_dir, PathBuf::from("/default/builds"));
+        assert_eq!(config.cache_dir, PathBuf::from("/default/cache"));
     }
 
     #[test]
     fn test_load_config_file_sparse_merges_with_defaults() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("config.json");
-        // File only has token, no builds_dir
+        // File only has token, no cache_dir
         fs::write(&path, r#"{"github_token": "ghp_test"}"#).unwrap();
 
-        let defaults = test_config(PathBuf::from("/default/builds"));
+        let defaults = test_config(PathBuf::from("/default/cache"));
         let config = load_config_file(&path, &defaults).unwrap();
 
         assert_eq!(config.github_token, Some("ghp_test".to_string()));
-        assert_eq!(config.builds_dir, PathBuf::from("/default/builds"));
+        assert_eq!(config.cache_dir, PathBuf::from("/default/cache"));
     }
 
     #[test]
@@ -581,7 +581,7 @@ mod tests {
 
         let cf = load_config_file_raw(&path).unwrap();
         assert_eq!(cf.github_token, Some("ghp_test".to_string()));
-        assert!(cf.builds_dir.is_none());
+        assert!(cf.cache_dir.is_none());
     }
 
     #[test]
@@ -596,7 +596,7 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("github_token"));
-        assert!(!content.contains("builds_dir"));
+        assert!(!content.contains("cache_dir"));
     }
 
     #[test]
@@ -606,13 +606,13 @@ mod tests {
 
         let mut cf = ConfigFile::default();
         cf.set(ConfigKey::Token, "ghp_roundtrip".to_string());
-        cf.set(ConfigKey::BuildsDir, "/custom/builds".to_string());
+        cf.set(ConfigKey::CacheDir, "/custom/cache".to_string());
 
         save_config_file(&cf, &path).unwrap();
         let loaded = load_config_file_raw(&path).unwrap();
 
         assert_eq!(loaded.github_token, Some("ghp_roundtrip".to_string()));
-        assert_eq!(loaded.builds_dir, Some(PathBuf::from("/custom/builds")));
+        assert_eq!(loaded.cache_dir, Some(PathBuf::from("/custom/cache")));
     }
 
     // =========================================================================

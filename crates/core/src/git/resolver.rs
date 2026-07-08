@@ -48,6 +48,22 @@ pub struct ResolvedRef {
 }
 
 impl ResolvedRef {
+    /// Build a resolved reference from a fetched pull request.
+    ///
+    /// The PR's head SHA becomes [`commit_sha`](Self::commit_sha) so a cache
+    /// lookup can happen **before** cloning, and its head branch becomes the
+    /// [`git_ref`](Self::git_ref) that will be checked out. Shared by both the
+    /// clone-free early-resolve path and the standard resolver so the mapping
+    /// lives in exactly one place.
+    pub(crate) fn from_pull_request(pr: &crate::github::PullRequest, input: &str) -> Self {
+        Self {
+            input: input.to_string(),
+            source: RefSource::PullRequest(pr.number),
+            git_ref: pr.head_branch.clone(),
+            commit_sha: pr.head_sha.clone(),
+        }
+    }
+
     /// Convert to a `BuildSource` for storage operations.
     pub fn into_build_source(self) -> BuildSource {
         self.source.into()
@@ -465,12 +481,7 @@ impl<'a> RefResolver<'a> {
             .await
             .map_err(|e| Error::Git(format!("Failed to fetch PR #{pr_number}: {e}")))?;
 
-        Ok(ResolvedRef {
-            input: input.to_string(),
-            source: RefSource::PullRequest(pr_number),
-            git_ref: pr.head_branch.clone(),
-            commit_sha: None, // Could fetch from PR if needed
-        })
+        Ok(ResolvedRef::from_pull_request(&pr, input))
     }
 
     /// Resolve a tag name.
@@ -1038,6 +1049,62 @@ mod tests {
             commit_sha: None,
         };
         assert_eq!(resolved.detailed_description(), "branch 'develop'");
+    }
+
+    // =========================================================================
+    // ResolvedRef::from_pull_request — PR head SHA becomes the pre-clone commit
+    // =========================================================================
+
+    fn make_pr(
+        number: u64,
+        head_branch: &str,
+        head_sha: Option<&str>,
+    ) -> crate::github::PullRequest {
+        crate::github::PullRequest {
+            number,
+            title: "Some PR".to_string(),
+            base_branch: "trunk".to_string(),
+            head_branch: head_branch.to_string(),
+            head_sha: head_sha.map(str::to_string),
+            owner: "wp-media".to_string(),
+            repo: "wp-rocket".to_string(),
+            html_url: None,
+        }
+    }
+
+    #[test]
+    fn from_pull_request_carries_head_sha_as_commit() {
+        let pr = make_pr(
+            8556,
+            "feature/faster",
+            Some("a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"),
+        );
+        let resolved = ResolvedRef::from_pull_request(&pr, "pr:8556");
+
+        assert_eq!(resolved.input, "pr:8556");
+        assert_eq!(resolved.source, RefSource::PullRequest(8556));
+        assert_eq!(resolved.git_ref, "feature/faster");
+        assert_eq!(
+            resolved.commit_sha.as_deref(),
+            Some("a1b2c3d4e5f60718293a4b5c6d7e8f9012345678")
+        );
+    }
+
+    #[test]
+    fn from_pull_request_uses_pr_number_not_input() {
+        // The source discriminant comes from the fetched PR, not the raw input.
+        let pr = make_pr(42, "develop", Some("deadbeef"));
+        let resolved = ResolvedRef::from_pull_request(&pr, "42");
+        assert_eq!(resolved.source, RefSource::PullRequest(42));
+    }
+
+    #[test]
+    fn from_pull_request_without_head_sha_yields_no_commit() {
+        // A missing head SHA degrades to "no pre-clone cache key", never an error.
+        let pr = make_pr(1, "main", None);
+        let resolved = ResolvedRef::from_pull_request(&pr, "pr:1");
+        assert!(resolved.commit_sha.is_none());
+        assert_eq!(resolved.git_ref, "main");
     }
 
     #[test]

@@ -32,19 +32,19 @@ pub struct ConfigArgs {
 pub enum ConfigAction {
     /// Get a configuration value
     Get {
-        /// Configuration key (e.g., "token", "builds-dir")
+        /// Configuration key: "token", "cache-dir", or "cache"
         key: String,
     },
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., "token", "builds-dir")
+        /// Configuration key: "token", "cache-dir", or "cache"
         key: String,
         /// Value to set
         value: String,
     },
     /// Remove a configuration value (reverts to default)
     Unset {
-        /// Configuration key (e.g., "token", "builds-dir")
+        /// Configuration key: "token", "cache-dir", or "cache"
         key: String,
     },
     /// Show the config file path
@@ -234,7 +234,8 @@ fn validate_key(key: &str) -> apvm_core::Result<()> {
 fn default_for_key(key: ConfigKey) -> String {
     match key {
         ConfigKey::Token => "(not set)".to_string(),
-        ConfigKey::BuildsDir => defaults::default_builds_dir().display().to_string(),
+        ConfigKey::CacheDir => defaults::default_cache_dir().display().to_string(),
+        ConfigKey::Cache => "true".to_string(),
     }
 }
 
@@ -338,16 +339,22 @@ mod tests {
     }
 
     #[test]
-    fn default_for_key_builds_dir_is_absolute() {
-        let default = default_for_key(ConfigKey::BuildsDir);
+    fn default_for_key_cache_dir_is_absolute() {
+        let default = default_for_key(ConfigKey::CacheDir);
         let path = PathBuf::from(&default);
         assert!(path.is_absolute());
     }
 
     #[test]
+    fn default_for_key_cache_is_true() {
+        assert_eq!(default_for_key(ConfigKey::Cache), "true");
+    }
+
+    #[test]
     fn validate_key_known() {
         assert!(validate_key("token").is_ok());
-        assert!(validate_key("builds-dir").is_ok());
+        assert!(validate_key("cache-dir").is_ok());
+        assert!(validate_key("cache").is_ok());
     }
 
     #[test]

@@ -290,7 +290,6 @@ impl Builder for WpRocketBuilder {
     /// On **Unix**, generates 4 shell commands (mkdir, rsync, composer, zip).
     /// On **Windows**, generates only 1 shell command (composer install),
     /// because mkdir/rsync/zip are handled by pure Rust in hooks.
-    #[allow(unused_variables)]
     fn build_commands(
         &self,
         context: &BuildContext,
@@ -304,6 +303,9 @@ impl Builder for WpRocketBuilder {
 
         #[cfg(windows)]
         {
+            // `version` is only consumed by the Unix command set; the Windows
+            // path derives everything it needs from `context`.
+            let _ = version;
             self.build_commands_windows(context)
         }
     }

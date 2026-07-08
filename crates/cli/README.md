@@ -11,6 +11,7 @@ This crate produces the `apvm` binary. All heavy logic is delegated to [`apvm-co
 | `build`     | Build a plugin from a git reference (PR, branch, tag, commit, release)      |
 | `list`      | List all registered plugins                                                 |
 | `info`      | Show detailed information about a plugin (repo, variants, version, tools)   |
+| `cache`     | Inspect and maintain the artifact cache                                     |
 | `config`    | View or change configuration settings                                       |
 | `update`    | Download and install the latest APVM release                                |
 | `uninstall` | Remove the APVM binary from this system                                     |
@@ -33,11 +34,21 @@ apvm build <PLUGIN> <GIT_REF> [OUTPUT] [OPTIONS]
 
 ### Options
 
-| Option                 | Short | Description                                     |
-|------------------------|-------|-------------------------------------------------|
-| `--ver <VERSION>`      | `-v`  | Package version (required for BackWPup)          |
-| `--variants <LIST>`    |       | Comma-separated variants (e.g., `free,pro-en`)  |
-| `--verbose`            |       | Show full command output instead of spinner      |
+| Option              | Short | Description                                                                |
+|---------------------|-------|----------------------------------------------------------------------------|
+| `--ver <VERSION>`   | `-v`  | Package version (required for BackWPup)                                    |
+| `--variants <LIST>` |       | Comma-separated variants (e.g., `free,pro-en`)                             |
+| `--no-cache`        |       | Bypass the artifact cache for this build (still warms it)                  |
+| `--strict-version`  |       | Require a cache hit to match `--ver` exactly (conflicts with `--no-cache`) |
+| `--verbose`         |       | Show full command output instead of spinner                                |
+
+Each artifact's provenance is shown after a build (`built`, `cache`, or
+`downloaded`), with a one-line `Source:` summary. Builds are served from the
+cache when the resolved commit is already built; a partial request reuses the
+cached variants and builds only the rest. `release:` downloads are cached too
+(by tag): a repeated download is served from the cache, and requesting a new
+asset downloads only the missing one. See [Config Command](#config-command)
+for the `cache` / `cache-dir` settings.
 
 ### Git Reference Formats
 
@@ -145,6 +156,44 @@ apvm info backwpup
 apvm info wp-rocket
 ```
 
+## Cache Command
+
+Inspect and maintain the artifact cache (the `cache-dir`, default `~/.apvm/cache`).
+These commands operate on the cache directly and work even when caching is
+turned off (`cache false`).
+
+```sh
+# Usage totals and per-project breakdown
+apvm cache info
+
+# Remove cached entries; scope by kind, project, or age
+apvm cache clean --dry-run                 # preview what would be removed
+apvm cache clean --older-than 30d          # not used in the last 30 days
+apvm cache clean --project backwpup        # one project
+apvm cache clean --builds                  # builds only (keep release downloads)
+apvm cache clean --releases                # release downloads only
+
+# Reconcile the database with disk and sweep leftover temp files
+apvm cache gc
+
+# Verify cached files are intact (add --checksum to re-hash them).
+# Exits non-zero when issues are found, so CI can gate on cache health.
+apvm cache verify
+apvm cache verify --checksum
+
+# Recover a corrupt cache database (quarantine + rebuild the index)
+apvm cache repair
+
+# Remove everything (prompts unless -y)
+apvm cache clear
+apvm cache clear -y
+```
+
+**`--older-than`** accepts `m` (minutes), `h` (hours), `d` (days), `w` (weeks),
+e.g. `12h`, `30d`, `2w`. An entry's "last used" time is refreshed on every cache
+hit, so entries you keep building never age out. `--builds` and `--releases`
+are mutually exclusive (omit both to clean everything).
+
 ## Config Command
 
 Manages the APVM configuration file (`~/.apvm/config.json`).
@@ -155,11 +204,13 @@ apvm config
 
 # Get a specific value
 apvm config get token
-apvm config get builds-dir
+apvm config get cache-dir
+apvm config get cache
 
 # Set a value
 apvm config set token ghp_xxxxxxxxxxxx
-apvm config set builds-dir /path/to/builds
+apvm config set cache-dir /path/to/cache
+apvm config set cache false
 
 # Remove a value (revert to default)
 apvm config unset token
@@ -170,14 +221,16 @@ apvm config path
 
 **Available keys:**
 
-| Key          | Description                                                                           |
-|--------------|---------------------------------------------------------------------------------------|
-| `token`      | GitHub Personal Access Token                                                          |
-| `builds-dir` | Directory to manage built artifact storage (Experimental, avoid it's use until stable)|
+| Key         | Description                                                                             |
+|-------------|-----------------------------------------------------------------------------------------|
+| `token`     | GitHub Personal Access Token                                                            |
+| `cache-dir` | Base directory of the artifact cache                                                    |
+| `cache`     | Whether the artifact cache is active — `true`/`false` (default `true`)                  |
 
 Input values are sanitized before storage:
 
 - **Token**: trimmed, validated against known GitHub token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`). Unrecognized prefixes produce a warning but are still saved.
+- **Cache**: accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`, case-insensitive), normalized to `true`/`false`. Any other value is rejected.
 - **Path**: expanded (`~` resolved), validated as absolute.
 
 ## Update Command
@@ -220,7 +273,7 @@ Removes the `apvm` binary and its containing `bin/` directory. Uses [`self_repla
 - **Unix**: `unlink(2)` — the kernel keeps the inode alive until the process exits.
 - **Windows**: Renames the `.exe` aside, spawns a helper process with `FILE_FLAG_DELETE_ON_CLOSE`.
 
-Does **not** remove configuration files (`~/.apvm/config.json`) or build artifacts (`~/apvm-builds/`).
+Does **not** remove configuration files (`~/.apvm/config.json`) or the artifact cache (`~/.apvm/cache/`).
 
 ## GitHub Token Resolution
 
@@ -240,7 +293,7 @@ A token is **required** for private repositories and PR builds. It is optional f
 |-------------------------|-----------------------------------------------|
 | `~/.apvm/`              | APVM home directory                           |
 | `~/.apvm/config.json`   | Configuration file                            |
-| `~/apvm-builds/`        | Default build artifacts output (experimental) |
+| `~/.apvm/cache/`        | Default artifact cache store                  |
 
 These defaults are determined using the [`directories`](https://docs.rs/directories/6) crate for cross-platform home directory resolution.
 

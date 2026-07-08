@@ -21,11 +21,11 @@
 //! use apvm_config::Config;
 //! use std::path::PathBuf;
 //!
-//! // Create config with explicit paths
-//! let config = Config::new(PathBuf::from("/var/lib/myapp/builds"));
+//! // Create config with an explicit cache directory
+//! let config = Config::new(PathBuf::from("/var/lib/myapp/cache"));
 //!
 //! // Or with a token
-//! let config = Config::with_token("ghp_xxxxxxxxxxxx", PathBuf::from("/builds"));
+//! let config = Config::with_token("ghp_xxxxxxxxxxxx", PathBuf::from("/cache"));
 //! ```
 
 mod config;

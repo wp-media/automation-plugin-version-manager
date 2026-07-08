@@ -38,24 +38,26 @@ pub fn core_error_to_napi(err: apvm_core::Error) -> napi::Error {
         apvm_core::Error::ReleaseNotFound { .. }
         | apvm_core::Error::NoMatchingReleaseAssets { .. } => Status::InvalidArg,
         apvm_core::Error::ReleasesNotAvailable { .. } => Status::InvalidArg,
+        // A storage error carries an inner `apvm_storage::Error`; classify it
+        // with the same rules a direct storage call would use.
+        apvm_core::Error::Storage(inner) => storage_error_status(inner),
+        apvm_core::Error::Cache(_) => Status::GenericFailure,
         apvm_core::Error::Update(_) => Status::GenericFailure,
         apvm_core::Error::Uninstall(_) => Status::GenericFailure,
     };
     napi::Error::new(status, err.to_string())
 }
 
-/// Convert an [`apvm_storage::Error`] into a [`napi::Error`].
+/// Classify an [`apvm_storage::Error`] into an N-API [`Status`].
 ///
 /// Validation failures (`InvalidInput`, `SourceFileMissing`) map to
 /// `InvalidArg` — the caller can fix them by changing arguments. Everything
 /// else (I/O, database, corruption) is a `GenericFailure` the caller can
 /// only report or retry.
-#[allow(dead_code)]
-pub fn storage_error_to_napi(err: apvm_storage::Error) -> napi::Error {
-    let status = match &err {
+fn storage_error_status(err: &apvm_storage::Error) -> Status {
+    match err {
         apvm_storage::Error::InvalidInput { .. }
         | apvm_storage::Error::SourceFileMissing { .. } => Status::InvalidArg,
         _ => Status::GenericFailure,
-    };
-    napi::Error::new(status, err.to_string())
+    }
 }

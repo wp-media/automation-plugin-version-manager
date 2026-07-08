@@ -2,6 +2,7 @@
 //!
 //! Command-line interface for building and managing WordPress plugin versions.
 
+mod color;
 mod commands;
 mod defaults;
 mod paths;
@@ -14,7 +15,7 @@ use clap::{Parser, Subcommand};
 use apvm_core::config_io::load_config_file;
 use apvm_core::{Apvm, Result};
 
-use crate::commands::{BuildArgs, ConfigArgs, InfoArgs};
+use crate::commands::{BuildArgs, CacheArgs, ConfigArgs, InfoArgs};
 use crate::paths::Paths;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,6 +58,8 @@ enum Commands {
     List,
     /// Show detailed information about a plugin
     Info(InfoArgs),
+    /// Inspect and maintain the artifact cache
+    Cache(CacheArgs),
     /// View or change configuration settings
     Config(ConfigArgs),
     /// Update apvm to the latest version
@@ -99,10 +102,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Load paths and default configuration
-    let paths = Paths::new(
-        defaults::default_apvm_dir().clone(),
-        defaults::default_builds_dir().clone(),
-    );
+    let paths = Paths::new(defaults::default_apvm_dir().clone());
     let default_config = paths.to_config();
 
     // Config command doesn't need APVM instance — handle it early
@@ -122,6 +122,13 @@ async fn run() -> Result<()> {
 
     // Load config: file values override defaults, missing fields use defaults
     let config = load_config_file(paths.config_file(), &default_config)?;
+
+    // Cache maintenance operates on the resolved cache directory and needs no
+    // GitHub client — handle it before creating the APVM instance. It works
+    // regardless of the `cache` on/off setting.
+    if let Commands::Cache(args) = &cli.command {
+        return args.execute(&config.cache_dir);
+    }
 
     // Create APVM instance with automatic token resolution
     // This will try: config → GITHUB_TOKEN → GH_TOKEN → gh CLI
@@ -145,6 +152,7 @@ async fn run() -> Result<()> {
         Commands::Info(args) => {
             args.execute(&apvm)?;
         }
+        Commands::Cache(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
         Commands::Update => unreachable!("handled above"),
         Commands::Uninstall { .. } => unreachable!("handled above"),

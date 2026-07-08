@@ -75,6 +75,31 @@ impl BuildResult {
     }
 }
 
+/// Where an artifact delivered to the output directory came from.
+///
+/// Lets consumers report provenance per artifact — including the mixed case
+/// of a partial build where some variants are reused from the cache and
+/// others are freshly built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactOrigin {
+    /// Copied from the artifact cache (a prior build's stored output).
+    Cache,
+    /// Freshly produced by the builder in this run.
+    Built,
+    /// Downloaded from a GitHub Release's pre-built assets.
+    Downloaded,
+}
+
+impl std::fmt::Display for ArtifactOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cache => write!(f, "cache"),
+            Self::Built => write!(f, "built"),
+            Self::Downloaded => write!(f, "downloaded"),
+        }
+    }
+}
+
 /// A single artifact produced by the build.
 ///
 /// Represents a built file (typically a zip or other archive)
@@ -89,10 +114,16 @@ pub struct ProducedArtifact {
     pub filename: String,
     /// File size in bytes.
     pub size: u64,
+    /// Where this artifact came from (built, downloaded, or cache).
+    pub origin: ArtifactOrigin,
 }
 
 impl ProducedArtifact {
     /// Create a new produced artifact.
+    ///
+    /// The [`origin`](Self::origin) defaults to [`ArtifactOrigin::Built`] — the
+    /// builder is the primary producer. Downloaded or cache-sourced artifacts
+    /// override it with [`Self::with_origin`].
     ///
     /// # Arguments
     ///
@@ -106,7 +137,15 @@ impl ProducedArtifact {
             path,
             filename,
             size,
+            origin: ArtifactOrigin::Built,
         }
+    }
+
+    /// Set the artifact's [`origin`](Self::origin) (builder-style).
+    #[must_use]
+    pub fn with_origin(mut self, origin: ArtifactOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Check if this artifact belongs to a specific variant.
@@ -241,6 +280,34 @@ mod tests {
         let artifact = ProducedArtifact::new(None, PathBuf::from("/a.zip"), "a.zip".into(), 100);
         assert!(artifact.is_unvariant());
         assert!(!artifact.is_variant("pro"));
+    }
+
+    // =========================================================================
+    // 6.5 – artifact origin
+    // =========================================================================
+
+    #[test]
+    fn test_new_defaults_origin_to_built() {
+        let artifact = ProducedArtifact::new(None, PathBuf::from("/a.zip"), "a.zip".into(), 100);
+        assert_eq!(artifact.origin, ArtifactOrigin::Built);
+    }
+
+    #[test]
+    fn test_with_origin_overrides() {
+        let downloaded = ProducedArtifact::new(None, PathBuf::from("/a.zip"), "a.zip".into(), 100)
+            .with_origin(ArtifactOrigin::Downloaded);
+        assert_eq!(downloaded.origin, ArtifactOrigin::Downloaded);
+
+        let cached = ProducedArtifact::new(None, PathBuf::from("/a.zip"), "a.zip".into(), 100)
+            .with_origin(ArtifactOrigin::Cache);
+        assert_eq!(cached.origin, ArtifactOrigin::Cache);
+    }
+
+    #[test]
+    fn test_origin_display() {
+        assert_eq!(ArtifactOrigin::Cache.to_string(), "cache");
+        assert_eq!(ArtifactOrigin::Built.to_string(), "built");
+        assert_eq!(ArtifactOrigin::Downloaded.to_string(), "downloaded");
     }
 
     // =========================================================================
