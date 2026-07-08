@@ -636,6 +636,12 @@ impl<'a> BuildCommand<'a> {
             .resolve_reference(early_resolved, project_info, &request.git_ref, reporter)
             .await?;
 
+        // Surface *what* was resolved (branch/tag/commit/PR) before any clone
+        // or cache work, so consumers can display it up front.
+        reporter.report(&BuildEvent::ReferenceResolved {
+            resolved: resolved.clone(),
+        });
+
         // 5. Pre-clone cache fast path (cases A/B/C). On a full hit the
         // artifacts are already delivered — no clone, no build.
         if let Some(output) = self
@@ -1335,6 +1341,18 @@ impl<'a> BuildCommand<'a> {
                 tag: tag.to_string(),
             });
         }
+
+        // Surface the resolved release before downloading, mirroring the
+        // clone/build path's ReferenceResolved event so consumers can display
+        // what is being fetched.
+        reporter.report(&BuildEvent::ReferenceResolved {
+            resolved: ResolvedRef {
+                input: user_input.to_string(),
+                source: RefSource::Release(tag.to_string()),
+                git_ref: tag.to_string(),
+                commit_sha: None,
+            },
+        });
 
         // Fetch the release from GitHub
         reporter.report(&BuildEvent::PhaseStarted {

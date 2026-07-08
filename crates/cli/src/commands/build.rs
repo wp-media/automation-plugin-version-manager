@@ -12,7 +12,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use apvm_core::build::plugins::VersionRequirement;
 use apvm_core::build::progress::{BuildEvent, ClosureReporter};
-use apvm_core::{Apvm, ArtifactOrigin, ProducedArtifact, Result};
+use apvm_core::{Apvm, ArtifactOrigin, ProducedArtifact, RefSource, ResolvedRef, Result};
 
 use crate::color::{self, Color};
 
@@ -186,7 +186,10 @@ impl BuildArgs {
             println!("  Variants: {}", variants.join(", "));
         }
         println!("  Output: {}", output_dir.display());
-        println!();
+        // The resolved reference (branch/tag/commit/PR/release) is printed once
+        // it is known — inside the build, via the ReferenceResolved event — so
+        // it joins this header block above the spinner. A blank line is emitted
+        // before the results summary instead of here.
 
         // 9. Assemble the build request, including per-invocation cache
         //    overrides.
@@ -200,6 +203,9 @@ impl BuildArgs {
         let result = if verbose {
             // Verbose mode: print everything, no spinner
             let reporter = ClosureReporter::new(|event| match event {
+                BuildEvent::ReferenceResolved { resolved } => {
+                    eprintln!("Reference: {}", reference_line(resolved));
+                }
                 BuildEvent::PhaseStarted { phase, message } => {
                     eprintln!("[{}] {}", phase, message);
                 }
@@ -239,6 +245,14 @@ impl BuildArgs {
             let reporter = ClosureReporter::new({
                 let sp = spinner.clone();
                 move |event| match event {
+                    BuildEvent::ReferenceResolved { resolved } => {
+                        // Print above the spinner (suspend hides the bar, prints,
+                        // then redraws) so the line persists in the header block.
+                        let line = reference_line(resolved);
+                        sp.suspend(|| {
+                            println!("  Reference: {}", line);
+                        });
+                    }
                     BuildEvent::PhaseStarted { message, .. } => {
                         sp.set_message(message.clone());
                     }
@@ -265,6 +279,8 @@ impl BuildArgs {
         };
 
         // 10. Show results, including where each artifact came from.
+        //     Blank line separates the live/header area from the summary.
+        println!();
         println!("Build complete: {}", result.description());
         println!("  Commit:  {}", result.commit_short);
         println!("  Version: {}", result.result.version);
@@ -308,6 +324,24 @@ impl BuildArgs {
                 .map(|s| s.to_string())
                 .collect()
         })
+    }
+}
+
+/// One-line, human-readable form of a resolved reference for the pre-build
+/// header, e.g. `branch 'develop' @ 3fb4102`, `tag 'v2.2.9' @ 2c3b49d`,
+/// `PR #123 (branch: feature/x) @ abc1234`, or `release 'v2.3.0'`.
+///
+/// Mirrors the results summary's `description()` format. The short commit is
+/// appended only when it adds information: a `commit` reference already shows
+/// its SHA in the description, and a `release` carries no commit at this stage.
+fn reference_line(resolved: &ResolvedRef) -> String {
+    let description = resolved.detailed_description();
+    match (&resolved.source, resolved.commit_sha.as_deref()) {
+        (RefSource::Commit(_), _) | (_, None) => description,
+        (_, Some(sha)) => {
+            let short: String = sha.chars().take(7).collect();
+            format!("{description} @ {short}")
+        }
     }
 }
 
@@ -408,6 +442,66 @@ mod tests {
     #[test]
     fn source_summary_empty() {
         assert_eq!(source_summary(&[]), "no artifacts");
+    }
+
+    // =========================================================================
+    // reference_line — pre-build resolved-reference display
+    // =========================================================================
+
+    fn resolved(source: RefSource, git_ref: &str, commit: Option<&str>) -> ResolvedRef {
+        ResolvedRef {
+            input: git_ref.to_string(),
+            source,
+            git_ref: git_ref.to_string(),
+            commit_sha: commit.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn reference_line_branch_with_commit_appends_short_sha() {
+        let r = resolved(
+            RefSource::Branch("develop".into()),
+            "develop",
+            Some("3fb4102e5967d1a088916fc8f70e8034765b8455"),
+        );
+        assert_eq!(reference_line(&r), "branch 'develop' @ 3fb4102");
+    }
+
+    #[test]
+    fn reference_line_tag_with_commit_appends_short_sha() {
+        let r = resolved(
+            RefSource::Tag("v2.2.9".into()),
+            "v2.2.9",
+            Some("2c3b49d0000000000000000000000000000000a"),
+        );
+        assert_eq!(reference_line(&r), "tag 'v2.2.9' @ 2c3b49d");
+    }
+
+    #[test]
+    fn reference_line_commit_does_not_duplicate_sha() {
+        // The commit description already contains the short SHA — no " @ ..." suffix.
+        let r = resolved(
+            RefSource::Commit("a1b2c3d4e5f6".into()),
+            "a1b2c3d4e5f6",
+            Some("a1b2c3d4e5f6"),
+        );
+        assert_eq!(reference_line(&r), "commit a1b2c3d");
+    }
+
+    #[test]
+    fn reference_line_release_without_commit() {
+        let r = resolved(RefSource::Release("v2.3.0".into()), "v2.3.0", None);
+        assert_eq!(reference_line(&r), "release 'v2.3.0'");
+    }
+
+    #[test]
+    fn reference_line_pr_includes_branch_and_commit() {
+        let r = resolved(
+            RefSource::PullRequest(123),
+            "feature/x",
+            Some("abc1234def56"),
+        );
+        assert_eq!(reference_line(&r), "PR #123 (branch: feature/x) @ abc1234");
     }
 
     #[test]

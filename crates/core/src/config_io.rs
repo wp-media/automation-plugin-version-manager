@@ -141,6 +141,62 @@ pub fn load_config_file<P: AsRef<Path>>(path: P, defaults: &Config) -> Result<Co
     }
 }
 
+// =============================================================================
+// Environment overrides
+// =============================================================================
+
+/// Environment variable that overrides the resolved artifact-cache directory.
+///
+/// When set to a non-empty value it takes precedence over the cache directory
+/// from the config file, the Node bindings' `cacheDir`, and the built-in
+/// default. Consumers apply it via [`apply_env_overrides`] when they resolve
+/// their effective configuration.
+///
+/// Its primary purpose is isolation: pointing a run (tests, CI, a quick local
+/// experiment) at a throwaway directory so it never warms a developer's real
+/// `~/.apvm/cache`.
+pub const CACHE_DIR_ENV: &str = "APVM_CACHE_DIR";
+
+/// The cache-directory override from [`CACHE_DIR_ENV`], if set to a non-empty
+/// value.
+///
+/// An unset **or empty** variable yields `None` — an accidental
+/// `APVM_CACHE_DIR=` must not silently redirect the cache to the process's
+/// current directory.
+pub fn cache_dir_env_override() -> Option<PathBuf> {
+    match std::env::var_os(CACHE_DIR_ENV) {
+        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        _ => None,
+    }
+}
+
+/// Apply environment-variable overrides to an already-resolved [`Config`].
+///
+/// Currently honors [`CACHE_DIR_ENV`]: when set, it replaces
+/// [`Config::cache_dir`]; all other fields are left untouched. Consumers call
+/// this at the point they finalize configuration (the CLI after loading the
+/// config file, the Node bindings after converting the JS config), so one
+/// environment variable redirects the cache everywhere it is used — including
+/// the CLI `cache` command, which operates on the directory directly rather
+/// than through an [`crate::Apvm`] instance.
+///
+/// The [`crate::Apvm`] constructors intentionally do NOT call this: a caller
+/// that hands the library an explicit [`Config`] gets exactly that config.
+/// Apply this yourself first if you want the same environment behavior.
+pub fn apply_env_overrides(config: Config) -> Config {
+    override_cache_dir(config, cache_dir_env_override())
+}
+
+/// Pure core of [`apply_env_overrides`]: replace the cache directory when an
+/// override is provided. Separated from the environment read so the precedence
+/// logic is testable without mutating process-global state.
+fn override_cache_dir(mut config: Config, cache_dir: Option<PathBuf>) -> Config {
+    if let Some(dir) = cache_dir {
+        config.cache_dir = dir;
+    }
+    config
+}
+
 /// Load a raw [`ConfigFile`] from disk without merging with defaults.
 ///
 /// Returns `Ok(ConfigFile::default())` if the file doesn't exist or is empty.
@@ -656,5 +712,29 @@ mod tests {
 
         let loaded = load_config(&path).unwrap();
         assert_eq!(loaded.github_token, Some("token-2".to_string()));
+    }
+
+    // =========================================================================
+    // Environment overrides (pure precedence logic; no process-env mutation)
+    // =========================================================================
+
+    #[test]
+    fn override_cache_dir_replaces_when_present() {
+        let config =
+            Config::with_token("ghp_x", PathBuf::from("/from/config")).set_cache_enabled(false);
+        let overridden = override_cache_dir(config, Some(PathBuf::from("/from/env")));
+
+        // cache_dir is overridden...
+        assert_eq!(overridden.cache_dir, PathBuf::from("/from/env"));
+        // ...while every other field is preserved untouched.
+        assert_eq!(overridden.github_token.as_deref(), Some("ghp_x"));
+        assert!(!overridden.cache_enabled);
+    }
+
+    #[test]
+    fn override_cache_dir_noop_when_absent() {
+        let config = Config::new(PathBuf::from("/from/config"));
+        let unchanged = override_cache_dir(config, None);
+        assert_eq!(unchanged.cache_dir, PathBuf::from("/from/config"));
     }
 }

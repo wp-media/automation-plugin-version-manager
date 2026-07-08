@@ -239,6 +239,17 @@ Input values are sanitized before storage:
 - **Cache**: accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`, case-insensitive), normalized to `true`/`false`. Any other value is rejected.
 - **Path**: expanded (`~` resolved), validated as absolute.
 
+### Environment Variables
+
+- **`APVM_CACHE_DIR`** — Overrides the artifact cache directory for the current invocation. Takes precedence over the config `cache-dir` and the default `~/.apvm/cache`, and is honored by both builds and the `cache` command. Useful for CI or local testing: point it at a throwaway directory so a run never reads from or warms your real cache.
+- **`GITHUB_TOKEN`** / **`GH_TOKEN`** — Fallback GitHub token when none is in config.
+- **`RUST_LOG`** — Enables logging (`debug`, `trace`, …); implies verbose diagnostics.
+
+```sh
+# Build against an ephemeral cache; your real cache is left untouched
+APVM_CACHE_DIR="$(mktemp -d)" apvm build imagify develop ./out
+```
+
 ## Update Command
 
 ```sh

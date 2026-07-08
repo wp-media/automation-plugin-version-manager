@@ -47,6 +47,8 @@
 
 use std::path::PathBuf;
 
+use crate::git::ResolvedRef;
+
 // =============================================================================
 // Progress Reporter Trait
 // =============================================================================
@@ -161,6 +163,19 @@ pub enum BuildEvent {
     PhaseCompleted {
         /// The phase that completed.
         phase: BuildPhase,
+    },
+
+    /// The input reference was resolved to a concrete source.
+    ///
+    /// Emitted once, early — after the reference is resolved but before the
+    /// clone/download and before the cache is consulted — so consumers can
+    /// surface *what* is being built (branch, tag, commit, pull request, or
+    /// release) without parsing free-text phase messages. For example, the CLI
+    /// prints the resolved reference above its progress spinner.
+    ReferenceResolved {
+        /// The resolved reference: its source kind, the ref that will be
+        /// checked out, and (when known this early) the commit SHA.
+        resolved: ResolvedRef,
     },
 
     /// An individual build step has started.

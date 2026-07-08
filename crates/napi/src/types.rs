@@ -456,6 +456,7 @@ impl From<apvm_core::BuildOutput> for JsBuildOutput {
 ///
 /// | `type`             | Fields Available                              |
 /// |--------------------|-----------------------------------------------|
+/// | `reference_resolved` | `resolvedRef`                               |
 /// | `phase_started`    | `phase`, `message`                            |
 /// | `phase_completed`  | `phase`                                       |
 /// | `step_started`     | `step`                                        |
@@ -474,6 +475,9 @@ impl From<apvm_core::BuildOutput> for JsBuildOutput {
 ///   outputDir: '/tmp',
 ///   onProgress: (event) => {
 ///     switch (event.type) {
+///       case 'reference_resolved':
+///         console.log(`Building ${event.resolvedRef?.source.description}`);
+///         break;
 ///       case 'phase_started':
 ///         console.log(`[${event.phase}] ${event.message}`);
 ///         break;
@@ -497,8 +501,8 @@ impl From<apvm_core::BuildOutput> for JsBuildOutput {
 pub struct JsBuildEvent {
     /// Event type discriminator.
     ///
-    /// One of: `"phase_started"`, `"phase_completed"`, `"step_started"`,
-    /// `"step_completed"`, `"command_output"`, `"warning"`,
+    /// One of: `"reference_resolved"`, `"phase_started"`, `"phase_completed"`,
+    /// `"step_started"`, `"step_completed"`, `"command_output"`, `"warning"`,
     /// `"build_succeeded"`, `"build_failed"`.
     #[napi(js_name = "type")]
     pub kind: String,
@@ -523,11 +527,31 @@ pub struct JsBuildEvent {
 
     /// Failure reason (present for `build_failed` events).
     pub reason: Option<String>,
+
+    /// The resolved reference (present for `reference_resolved` events).
+    ///
+    /// Describes what the input git ref resolved to — its source kind
+    /// (`branch`/`tag`/`commit`/`pull_request`/`release`), the ref that will be
+    /// checked out, and the commit SHA when known this early. Lets consumers
+    /// display *what* is being built as soon as it is known, before the
+    /// clone/download.
+    pub resolved_ref: Option<JsResolvedRef>,
 }
 
 impl From<&apvm_core::BuildEvent> for JsBuildEvent {
     fn from(event: &apvm_core::BuildEvent) -> Self {
         match event {
+            apvm_core::BuildEvent::ReferenceResolved { resolved } => Self {
+                kind: "reference_resolved".to_string(),
+                phase: None,
+                message: None,
+                step: None,
+                stream: None,
+                line: None,
+                artifacts: None,
+                reason: None,
+                resolved_ref: Some(JsResolvedRef::from(resolved)),
+            },
             apvm_core::BuildEvent::PhaseStarted { phase, message } => Self {
                 kind: "phase_started".to_string(),
                 phase: Some(JsBuildPhase::from(*phase)),
@@ -537,6 +561,7 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
                 line: None,
                 artifacts: None,
                 reason: None,
+                resolved_ref: None,
             },
             apvm_core::BuildEvent::PhaseCompleted { phase } => Self {
                 kind: "phase_completed".to_string(),
@@ -547,6 +572,7 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
                 line: None,
                 artifacts: None,
                 reason: None,
+                resolved_ref: None,
             },
             apvm_core::BuildEvent::StepStarted { step } => Self {
                 kind: "step_started".to_string(),
@@ -557,6 +583,7 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
                 line: None,
                 artifacts: None,
                 reason: None,
+                resolved_ref: None,
             },
             apvm_core::BuildEvent::StepCompleted { step } => Self {
                 kind: "step_completed".to_string(),
@@ -567,6 +594,7 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
                 line: None,
                 artifacts: None,
                 reason: None,
+                resolved_ref: None,
             },
             apvm_core::BuildEvent::CommandOutput { stream, line } => Self {
                 kind: "command_output".to_string(),
@@ -577,6 +605,7 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
                 line: Some(line.clone()),
                 artifacts: None,
                 reason: None,
+                resolved_ref: None,
             },
             apvm_core::BuildEvent::Warning(msg) => Self {
                 kind: "warning".to_string(),
@@ -587,6 +616,7 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
                 line: None,
                 artifacts: None,
                 reason: None,
+                resolved_ref: None,
             },
             apvm_core::BuildEvent::BuildSucceeded { artifacts } => Self {
                 kind: "build_succeeded".to_string(),
@@ -602,6 +632,7 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
                         .collect(),
                 ),
                 reason: None,
+                resolved_ref: None,
             },
             apvm_core::BuildEvent::BuildFailed { reason } => Self {
                 kind: "build_failed".to_string(),
@@ -612,6 +643,7 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
                 line: None,
                 artifacts: None,
                 reason: Some(reason.clone()),
+                resolved_ref: None,
             },
         }
     }

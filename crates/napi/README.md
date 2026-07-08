@@ -249,6 +249,11 @@ interface ApvmConfig {
 }
 ```
 
+> The `APVM_CACHE_DIR` environment variable, when set, overrides `cacheDir`
+> (and the default) for every `Apvm` instance in the process. Handy in tests to
+> isolate the cache from the real `~/.apvm/cache` — this package's own test
+> suite uses it (see `__tests__/setup.ts`).
+
 #### `BuildOptions`
 
 ```ts
@@ -338,21 +343,27 @@ interface JsBuildEvent {
   line?: string;              // For command_output
   artifacts?: string[];       // For build_succeeded
   reason?: string;            // For build_failed
+  resolvedRef?: JsResolvedRef; // For reference_resolved
 }
 ```
 
 **Event types:**
 
-| `type`             | Description                    | Key fields              |
-|--------------------|--------------------------------|-------------------------|
-| `phase_started`    | Build phase began              | `phase`, `message`      |
-| `phase_completed`  | Build phase finished           | `phase`                 |
-| `step_started`     | Individual step started        | `step`                  |
-| `step_completed`   | Individual step finished       | `step`                  |
-| `command_output`   | stdout/stderr line             | `stream`, `line`        |
-| `warning`          | Non-fatal warning              | `message`               |
-| `build_succeeded`  | Build completed successfully   | `artifacts`             |
-| `build_failed`     | Build failed                   | `reason`                |
+| `type`               | Description                             | Key fields         |
+|----------------------|-----------------------------------------|--------------------|
+| `reference_resolved` | Input ref resolved to a concrete source | `resolvedRef`      |
+| `phase_started`      | Build phase began                       | `phase`, `message` |
+| `phase_completed`    | Build phase finished                    | `phase`            |
+| `step_started`       | Individual step started                 | `step`             |
+| `step_completed`     | Individual step finished                | `step`             |
+| `command_output`     | stdout/stderr line                      | `stream`, `line`   |
+| `warning`            | Non-fatal warning                       | `message`          |
+| `build_succeeded`    | Build completed successfully            | `artifacts`        |
+| `build_failed`       | Build failed                            | `reason`           |
+
+The `reference_resolved` event fires once, early — after the input ref is
+resolved but before the clone/download — so consumers can display *what* is
+being built (e.g. `event.resolvedRef.source.description` → `"branch 'develop'"`).
 
 **Build phases** (`JsBuildPhase`):
 

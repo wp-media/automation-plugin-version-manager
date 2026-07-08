@@ -254,6 +254,26 @@ apvm config unset token
 apvm config path
 ```
 
+### Environment Variables
+
+- **`APVM_CACHE_DIR`** — Overrides the artifact cache directory for this run.
+  Highest precedence: wins over the config file's `cache-dir` and the default
+  `~/.apvm/cache`. Honored by both the build commands and `apvm cache`.
+- **`GITHUB_TOKEN`** / **`GH_TOKEN`** — GitHub token used when none is set in
+  config (part of token auto-resolution).
+- **`RUST_LOG`** — Enables logging output (`debug`, `trace`, …).
+
+`APVM_CACHE_DIR` is handy for pointing a run at a throwaway cache so it doesn't
+read from or warm your real `~/.apvm/cache` — for example in CI or when testing:
+
+```sh
+# Build against an ephemeral cache; your real cache is left untouched
+APVM_CACHE_DIR="$(mktemp -d)" apvm build imagify develop ./out
+```
+
+It is honored by both the build commands and `apvm cache` (so maintenance
+targets the same directory the build used).
+
 ### Cache Maintenance
 
 ```sh

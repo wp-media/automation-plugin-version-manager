@@ -120,8 +120,14 @@ async fn run() -> Result<()> {
         return commands::uninstall::execute(*yes);
     }
 
-    // Load config: file values override defaults, missing fields use defaults
-    let config = load_config_file(paths.config_file(), &default_config)?;
+    // Load config: file values override defaults, missing fields use defaults.
+    // Then let APVM_CACHE_DIR (if set) override the cache directory — applied
+    // here, before any command runs, so both the `cache` command (which uses
+    // the directory directly) and builds see the same effective location.
+    let config = apvm_core::config_io::apply_env_overrides(load_config_file(
+        paths.config_file(),
+        &default_config,
+    )?);
 
     // Cache maintenance operates on the resolved cache directory and needs no
     // GitHub client — handle it before creating the APVM instance. It works

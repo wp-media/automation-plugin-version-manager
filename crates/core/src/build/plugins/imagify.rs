@@ -153,7 +153,7 @@ impl Builder for ImagifyBuilder {
     // Build Hooks
     // =========================================================================
 
-    /// Remove any Imagify artifacts left in [`ARTIFACT_SUBDIR`] by a previous
+    /// Remove any Imagify artifacts left in `ARTIFACT_SUBDIR` by a previous
     /// build.
     ///
     /// Builds normally run in a fresh, isolated workspace, so there is usually

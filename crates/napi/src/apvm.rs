@@ -109,6 +109,9 @@ impl Apvm {
     pub async fn create(config: Option<ApvmConfig>) -> napi::Result<Self> {
         let config = config.unwrap_or_default();
         let rust_config: apvm_config::Config = config.into();
+        // APVM_CACHE_DIR (if set) overrides the resolved cache directory, so a
+        // single env var can isolate a run (e.g. tests) from ~/.apvm/cache.
+        let rust_config = apvm_core::config_io::apply_env_overrides(rust_config);
         // Octocrab (HTTP client) requires a Tokio runtime during
         // initialization, which is why this factory is async.
         let inner = apvm_core::Apvm::new(rust_config).map_err(core_error_to_napi)?;
@@ -158,6 +161,8 @@ impl Apvm {
     pub async fn create_with_token_resolution(config: Option<ApvmConfig>) -> napi::Result<Self> {
         let config = config.unwrap_or_default();
         let rust_config: apvm_config::Config = config.into();
+        // APVM_CACHE_DIR (if set) overrides the resolved cache directory.
+        let rust_config = apvm_core::config_io::apply_env_overrides(rust_config);
         let inner = apvm_core::Apvm::new_with_token_resolution(rust_config)
             .await
             .map_err(core_error_to_napi)?;
