@@ -16,12 +16,12 @@
  * ```typescript
  * import { Apvm } from 'apvm-napi';
  *
- * // Minimal — no config needed, uses temp dir for builds
+ * // Minimal — no config needed, cache defaults to ~/.apvm/cache
  * const apvm = await Apvm.create({});
  *
- * // Create with explicit builds dir and token
+ * // Create with explicit cache dir and token
  * const apvm = await Apvm.create({
- *   buildsDir: '/var/lib/apvm/builds',
+ *   cacheDir: '/var/lib/apvm/cache',
  *   githubToken: 'ghp_xxxxxxxxxxxx',
  * });
  *
@@ -54,7 +54,8 @@ export declare class Apvm {
    * # Arguments
    *
    * * `config` - Configuration options. All fields are optional:
-   *   - `buildsDir` — where artifacts are stored (uses temp dir if omitted)
+   *   - `cacheDir` — artifact cache base (defaults to `~/.apvm/cache`)
+   *   - `cacheEnabled` — whether the cache is active (defaults to `true`)
    *   - `githubToken` — GitHub PAT for private repos
    *
    * # Throws
@@ -64,12 +65,12 @@ export declare class Apvm {
    * # TypeScript
    *
    * ```typescript
-   * // Minimal — uses a temp directory for builds
+   * // Minimal — cache defaults to ~/.apvm/cache
    * const apvm = await Apvm.create({});
    *
    * // With explicit config
    * const apvm = await Apvm.create({
-   *   buildsDir: '/var/lib/apvm/builds',
+   *   cacheDir: '/var/lib/apvm/cache',
    *   githubToken: 'ghp_xxxxxxxxxxxx',
    * });
    * ```
@@ -92,7 +93,8 @@ export declare class Apvm {
    * # Arguments
    *
    * * `config` - Configuration options. All fields are optional:
-   *   - `buildsDir` — where artifacts are stored (uses temp dir if omitted)
+   *   - `cacheDir` — artifact cache base (defaults to `~/.apvm/cache`)
+   *   - `cacheEnabled` — whether the cache is active (defaults to `true`)
    *   - `githubToken` — if set, skips resolution and uses this token
    *
    * # Throws
@@ -102,12 +104,12 @@ export declare class Apvm {
    * # TypeScript
    *
    * ```typescript
-   * // Minimal — resolves token automatically, uses temp builds dir
+   * // Minimal — resolves token automatically, cache defaults to ~/.apvm/cache
    * const apvm = await Apvm.createWithTokenResolution({});
    *
-   * // With explicit builds dir
+   * // With explicit cache dir
    * const apvm = await Apvm.createWithTokenResolution({
-   *   buildsDir: '/var/lib/apvm/builds',
+   *   cacheDir: '/var/lib/apvm/cache',
    * });
    *
    * console.log('Has token:', apvm.hasToken());
@@ -420,36 +422,45 @@ export declare class Apvm {
  * This is a plain JavaScript object (not a class) that you pass
  * to [`Apvm.create()`] or [`Apvm.createWithTokenResolution()`].
  *
- * All fields are optional — when `buildsDir` is omitted, a temporary
- * directory is created automatically.
+ * All fields are optional — when `cacheDir` is omitted, the cache defaults
+ * to `~/.apvm/cache`.
  *
  * # TypeScript
  *
  * ```typescript
- * // Minimal — temp builds dir, no token
+ * // Minimal — default cache dir (~/.apvm/cache), caching on
  * const apvm = Apvm.create({});
  *
- * // With explicit builds directory
- * const apvm = Apvm.create({ buildsDir: '/var/lib/apvm/builds' });
+ * // With an explicit cache directory
+ * const apvm = Apvm.create({ cacheDir: '/var/lib/apvm/cache' });
  *
  * // Full configuration
  * const config: ApvmConfig = {
- *   buildsDir: '/var/lib/apvm/builds',
+ *   cacheDir: '/var/lib/apvm/cache',
+ *   cacheEnabled: true,
  *   githubToken: 'ghp_xxxxxxxxxxxx',
  * };
  * ```
  */
 export interface ApvmConfig {
   /**
-   * Directory where built artifacts will be stored.
+   * Base directory of the artifact cache (the `apvm-storage` store).
    *
-   * When omitted (`null` or `undefined`), a temporary directory is created
-   * automatically under the system temp path (e.g., `/tmp/apvm-<pid>-<hex>/builds`).
-   * This is ideal for one-off builds where persistent storage is not needed.
+   * When omitted (`null` or `undefined`), defaults to `~/.apvm/cache`.
+   * This is where cached build artifacts and release assets live; it is
+   * distinct from a build's per-invocation `outputDir`.
    *
-   * When provided, must be an absolute path to an existing (or creatable) directory.
+   * When provided, should be an absolute path to an existing (or creatable)
+   * directory.
    */
-  buildsDir?: string
+  cacheDir?: string
+  /**
+   * Whether the artifact cache is active.
+   *
+   * Defaults to `true`. When `false`, builds always run and nothing is
+   * read from or written to the cache.
+   */
+  cacheEnabled?: boolean
   /**
    * GitHub Personal Access Token for API requests.
    *
@@ -546,6 +557,21 @@ export interface BuildOptions {
    * doesn't exist.
    */
   outputDir: string
+  /**
+   * Bypass the artifact cache for this build (defaults to `false`).
+   *
+   * The build still runs and, unless caching is disabled at the instance
+   * level (`cacheEnabled: false`), still warms the cache.
+   */
+  noCache?: boolean
+  /**
+   * Require a cache hit to match `version` exactly (defaults to `false`).
+   *
+   * Without this, a cached build of the same commit at a different version
+   * may be reused (with `cacheVersionMismatch` set on the result). Has no
+   * effect for projects whose version is embedded in source.
+   */
+  strictVersion?: boolean
 }
 
 /**
@@ -660,6 +686,25 @@ export interface JsBuildOutput {
    * Example: `"PR #123 @ a1b2c3d"`, `"branch 'develop' @ e4f5g6h"`
    */
   description: string
+  /**
+   * `true` when every artifact was served from the cache (no build ran).
+   *
+   * Derived from per-artifact provenance; a partial build (some reused,
+   * some freshly built) is `false`. See each artifact's `origin`.
+   */
+  fromCache: boolean
+  /**
+   * `true` when a cache hit returned a version different from the one
+   * requested (only possible without `strictVersion`). When `true`,
+   * `requestedVersion` is what you asked for and `result.version` is what
+   * was delivered.
+   */
+  cacheVersionMismatch: boolean
+  /**
+   * The version the caller requested (`version` in the build options), if
+   * any — retained so a version mismatch can be reported.
+   */
+  requestedVersion?: string
 }
 
 /**
@@ -681,6 +726,8 @@ export interface JsBuildOutput {
 export declare const enum JsBuildPhase {
   /** Pre-clone verification of GitHub references (PR existence, etc.). */
   Preflight = 'Preflight',
+  /** Consulting the artifact cache for a prior build of the resolved commit. */
+  Cache = 'Cache',
   /** Downloading pre-built assets from a GitHub Release. */
   ReleaseDownload = 'ReleaseDownload',
   /** Cloning the git repository. */
@@ -805,6 +852,13 @@ export interface JsProducedArtifact {
    * (8 PB) would lose precision, which is not a practical concern.
    */
   size: number
+  /**
+   * Where this artifact came from: `"cache"`, `"built"`, or `"downloaded"`.
+   *
+   * Lets JS consumers report provenance per artifact — including a partial
+   * build where some variants are reused from cache and others are built.
+   */
+  origin: string
 }
 
 /**
