@@ -508,7 +508,8 @@ export interface BuildOptions {
   /**
    * The project to build.
    *
-   * Must be a registered project name: `"backwpup"` or `"wp-rocket"`.
+   * Must be a registered project name: `"backwpup"`, `"wp-rocket"`, or
+   * `"imagify"`. Call `listProjects()` for the authoritative list.
    */
   project: string
   /**
@@ -584,6 +585,7 @@ export interface BuildOptions {
  *
  * | `type`             | Fields Available                              |
  * |--------------------|-----------------------------------------------|
+ * | `reference_resolved` | `resolvedRef`                               |
  * | `phase_started`    | `phase`, `message`                            |
  * | `phase_completed`  | `phase`                                       |
  * | `step_started`     | `step`                                        |
@@ -602,6 +604,9 @@ export interface BuildOptions {
  *   outputDir: '/tmp',
  *   onProgress: (event) => {
  *     switch (event.type) {
+ *       case 'reference_resolved':
+ *         console.log(`Building ${event.resolvedRef?.source.description}`);
+ *         break;
  *       case 'phase_started':
  *         console.log(`[${event.phase}] ${event.message}`);
  *         break;
@@ -626,8 +631,8 @@ export interface JsBuildEvent {
   /**
    * Event type discriminator.
    *
-   * One of: `"phase_started"`, `"phase_completed"`, `"step_started"`,
-   * `"step_completed"`, `"command_output"`, `"warning"`,
+   * One of: `"reference_resolved"`, `"phase_started"`, `"phase_completed"`,
+   * `"step_started"`, `"step_completed"`, `"command_output"`, `"warning"`,
    * `"build_succeeded"`, `"build_failed"`.
    */
   type: string
@@ -645,6 +650,16 @@ export interface JsBuildEvent {
   artifacts?: Array<string>
   /** Failure reason (present for `build_failed` events). */
   reason?: string
+  /**
+   * The resolved reference (present for `reference_resolved` events).
+   *
+   * Describes what the input git ref resolved to — its source kind
+   * (`branch`/`tag`/`commit`/`pull_request`/`release`), the ref that will be
+   * checked out, and the commit SHA when known this early. Lets consumers
+   * display *what* is being built as soon as it is known, before the
+   * clone/download.
+   */
+  resolvedRef?: JsResolvedRef
 }
 
 /**
