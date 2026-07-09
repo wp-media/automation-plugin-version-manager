@@ -36,14 +36,24 @@
 //! (matching WP Rocket's `wp-rocket-{version}.zip` convention) instead of the
 //! script's default of `imagify.zip`.
 //!
-//! # Requirements
+//! # Requirements & Platform Support
 //!
 //! The packaging script is a Bash script that shells out to `composer`, `npm`,
 //! `curl`, `rsync`, and `zip`. These are declared as required
 //! [`ToolDependency`]s so a missing tool fails early with a clear message
-//! instead of a cryptic error from inside the script. Consequently, Imagify
-//! builds require a Unix-like environment (macOS/Linux, or Windows with a Bash
-//! and the listed tools available in `PATH`, e.g. Git Bash/WSL).
+//! instead of a cryptic error from inside the script.
+//!
+//! That toolchain (`bash`, `rsync`, `zip`) is not available on Windows, so
+//! **Imagify is Unix-only**. [`ensure_platform_supported`](Builder::ensure_platform_supported)
+//! rejects a Windows build up front with an actionable
+//! [`Error::PlatformUnsupported`](crate::error::Error::PlatformUnsupported)
+//! rather than failing partway through the script. Build on macOS or Linux, or
+//! use WSL (Windows Subsystem for Linux). This mirrors the Rust
+//! `imagify_build_e2e` integration test, which is itself `#![cfg(unix)]`.
+//!
+//! (WP Rocket, by contrast, reimplements its packaging natively in Rust and so
+//! builds on Windows; Imagify deliberately reuses the upstream script to avoid
+//! drift, which is what makes it Unix-only.)
 //!
 //! # Variants
 //!
@@ -126,6 +136,34 @@ impl Builder for ImagifyBuilder {
     // =========================================================================
     // Commands and Setup
     // =========================================================================
+
+    /// Imagify can only be built on Unix-like systems.
+    ///
+    /// The build delegates to Imagify's official Bash packaging script
+    /// (`bin/build-zip.sh`), which requires `bash`, `rsync`, and `zip` — none
+    /// of which ship with Windows. Rather than let the build fail partway
+    /// through the script (or fail the up-front tool check with a cryptic
+    /// "missing rsync/zip"), reject Windows here with an actionable error.
+    /// Build on macOS/Linux, or use WSL (Windows Subsystem for Linux).
+    fn ensure_platform_supported(&self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            Err(Error::PlatformUnsupported {
+                project: "imagify".to_string(),
+                platform: std::env::consts::OS.to_string(),
+                reason: "Imagify is packaged by its official Bash script \
+                         (bin/build-zip.sh), which requires a Unix-like \
+                         toolchain (bash, rsync, zip) unavailable on Windows. \
+                         Build on macOS or Linux, or use WSL (Windows \
+                         Subsystem for Linux)."
+                    .to_string(),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
 
     /// Tools the packaging script shells out to.
     ///
@@ -339,6 +377,35 @@ mod tests {
 
         let version = builder().detect_version(dir.path()).unwrap();
         assert_eq!(version, None);
+    }
+
+    // =========================================================================
+    // Platform Support
+    // =========================================================================
+
+    /// On Windows the builder must reject up front with an actionable message
+    /// naming the project and pointing at WSL.
+    #[test]
+    #[cfg(windows)]
+    fn test_ensure_platform_supported_errors_on_windows() {
+        let err = builder().ensure_platform_supported().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("imagify"), "message should name the project");
+        assert!(
+            msg.contains("not supported"),
+            "message should state it is unsupported"
+        );
+        assert!(
+            msg.contains("WSL"),
+            "message should suggest WSL as a remedy"
+        );
+    }
+
+    /// On Unix (macOS/Linux) the builder is supported, so the gate is a no-op.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_ensure_platform_supported_ok_on_unix() {
+        assert!(builder().ensure_platform_supported().is_ok());
     }
 
     // =========================================================================

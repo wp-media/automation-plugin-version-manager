@@ -559,7 +559,8 @@ impl<'a> BuildCommand<'a> {
     /// Execute the build described by `request`, with automatic ref detection.
     ///
     /// Orchestrates the phases and delegates the work (all private helpers):
-    /// 1. Registry lookup + private-repo auth check (fail-fast).
+    /// 1. Registry lookup + platform-support check + private-repo auth check
+    ///    (all fail-fast, before any network or git work).
     /// 2. Early GitHub resolution (`try_early_resolve_github_ref`).
     /// 3. Release refs short-circuit to `download_release`.
     /// 4. Reference resolution (`resolve_reference`).
@@ -580,6 +581,12 @@ impl<'a> BuildCommand<'a> {
     ) -> Result<BuildOutput> {
         // 1. Look up project in registry.
         let project_info = self.registry.get(&request.project)?;
+
+        // Fail fast if this project cannot be built on the current platform,
+        // BEFORE any network or git work. An unsupported host (e.g. Imagify on
+        // Windows, whose packaging script needs a Unix toolchain) gets an
+        // instant, actionable error instead of failing deep inside the build.
+        project_info.builder.ensure_platform_supported()?;
 
         // 2. Validate authentication for private repositories (fail-fast),
         // BEFORE any git operation, so users get a clear, actionable error

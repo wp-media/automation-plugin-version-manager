@@ -19,6 +19,7 @@ use napi::Status;
 /// - `Config` → `InvalidArg`
 /// - `GitHub` → `GenericFailure`
 /// - `Git`, `Build` → `GenericFailure`
+/// - `PlatformUnsupported` → `GenericFailure`
 /// - `Io`, `Json` → `GenericFailure`
 ///
 /// The full error message (including any chained context) is preserved
@@ -33,6 +34,9 @@ pub fn core_error_to_napi(err: apvm_core::Error) -> napi::Error {
         | apvm_core::Error::Git(_)
         | apvm_core::Error::Build(_)
         | apvm_core::Error::Project(_)
+        // Not an argument the caller can fix — it's a host-environment limit —
+        // so a generic failure, not InvalidArg.
+        | apvm_core::Error::PlatformUnsupported { .. }
         | apvm_core::Error::Io(_)
         | apvm_core::Error::Json(_) => Status::GenericFailure,
         apvm_core::Error::ReleaseNotFound { .. }

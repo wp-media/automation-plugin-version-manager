@@ -55,6 +55,27 @@ pub enum Error {
         repo: String,
     },
 
+    /// A project cannot be built on the current platform.
+    ///
+    /// Returned *before* any network or git work when a builder requires a
+    /// toolchain that is unavailable on the host OS. Imagify is the current
+    /// case: its official packaging script (`bin/build-zip.sh`) needs a
+    /// Unix-like environment (`bash`, `rsync`, `zip`), so a Windows build is
+    /// rejected up front with this actionable error instead of failing deep
+    /// inside the script with a cryptic "missing rsync/zip".
+    #[error(
+        "Building '{project}' is not supported on {platform}.\n\
+         {reason}"
+    )]
+    PlatformUnsupported {
+        /// Project that cannot be built on this platform.
+        project: String,
+        /// Current platform, from [`std::env::consts::OS`] (e.g. `"windows"`).
+        platform: String,
+        /// Why it is unsupported and how to proceed.
+        reason: String,
+    },
+
     /// Build error.
     #[error("Build error: {0}")]
     Build(String),

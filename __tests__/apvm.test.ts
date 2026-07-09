@@ -173,7 +173,11 @@ describe('build() basic functionality', () => {
     }
   }, 10 * 60_000);
 
-  it('builds imagify from develop and writes a versioned imagify-<version>.zip artifact', async () => {
+  // Imagify is Unix-only: it delegates packaging to its official Bash script
+  // (bin/build-zip.sh), which needs bash/rsync/zip. Skip on Windows, mirroring
+  // the Rust `imagify_build_e2e` integration test (itself `#![cfg(unix)]`).
+  // The Windows path is covered by the rejection test below.
+  it.skipIf(process.platform === 'win32')('builds imagify from develop and writes a versioned imagify-<version>.zip artifact', async () => {
     let tempRoot = '';
 
     try {
@@ -222,6 +226,20 @@ describe('build() basic functionality', () => {
       }
     }
   }, 10 * 60_000);
+
+  // Windows counterpart of the skipped Imagify build above: the core gate must
+  // reject an Imagify build up front — before any network/clone work — with a
+  // clear, actionable message. No network needed, so this stays fast.
+  it.runIf(process.platform === 'win32')(
+    'rejects an imagify build on Windows with a clear, actionable message',
+    async () => {
+      const apvm = await Apvm.create({});
+      const outputDir = join(tmpdir(), 'apvm-imagify-win-unsupported');
+      await expect(apvm.buildFromBranch('imagify', 'develop', outputDir)).rejects.toThrow(
+        /not supported on/i,
+      );
+    },
+  );
 });
 // =============================================================================
 // Build error handling

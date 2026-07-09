@@ -393,6 +393,43 @@ pub trait Builder: Send + Sync {
     // Commands and Setup
     // =========================================================================
 
+    /// Verify this builder can run on the current platform.
+    ///
+    /// Called by the build pipeline **before** any network or git work (see
+    /// [`BuildCommand::execute`](crate::commands::BuildCommand)), so a build on
+    /// an unsupported host fails fast with a clear, actionable message instead
+    /// of failing deep inside a build step (or not at all).
+    ///
+    /// # Default
+    ///
+    /// Cross-platform — returns `Ok(())`. Override for a builder whose build
+    /// process depends on a toolchain unavailable on some platform (e.g. a
+    /// Unix-only packaging script) and return [`Error::PlatformUnsupported`].
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn ensure_platform_supported(&self) -> Result<()> {
+    ///     #[cfg(windows)]
+    ///     {
+    ///         Err(Error::PlatformUnsupported {
+    ///             project: "my-plugin".to_string(),
+    ///             platform: std::env::consts::OS.to_string(),
+    ///             reason: "requires a Unix-like toolchain; use WSL".to_string(),
+    ///         })
+    ///     }
+    ///     #[cfg(not(windows))]
+    ///     {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// [`Error::PlatformUnsupported`]: crate::error::Error::PlatformUnsupported
+    fn ensure_platform_supported(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Get all tool dependencies for this builder.
     ///
     /// Returns a list of [`ToolDependency`] entries that describe what CLI
@@ -1092,5 +1129,17 @@ mod tests {
         let b = WpRocketBuilder;
         assert!(b.validate_variants(&["anything"]).is_ok());
         assert!(b.validate_variants(&[]).is_ok());
+    }
+
+    // =========================================================================
+    // ensure_platform_supported (trait default)
+    // =========================================================================
+
+    #[test]
+    fn test_default_ensure_platform_supported_is_ok() {
+        // Builders that do not override the default are cross-platform, so the
+        // gate is a no-op on every platform.
+        assert!(WpRocketBuilder.ensure_platform_supported().is_ok());
+        assert!(BackWPupBuilder.ensure_platform_supported().is_ok());
     }
 }
