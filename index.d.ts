@@ -231,6 +231,55 @@ export declare class Apvm {
    */
   build(options: BuildOptions, onProgress?: (err: Error | null, event: JsBuildEvent) => void): Promise<JsBuildOutput>
   /**
+   * Warm the artifact cache for a project without producing any output.
+   *
+   * Runs the **same pipeline** as [`Apvm::build`] — resolve the reference,
+   * reuse whatever is already cached, and build or download only what is
+   * missing — then stores everything into the cache. The one difference is
+   * that **nothing is delivered to an output directory**: this primes the
+   * cache so a later `build()` of the same reference is an instant hit.
+   *
+   * The options type is [`WarmOptions`], deliberately smaller than
+   * [`BuildOptions`]: there is no `outputDir` (nothing is delivered), no
+   * `noCache` (warming *is* a cache operation), and no `strictVersion`
+   * (warming always pins the requested version exactly).
+   *
+   * # Arguments
+   *
+   * * `options` - Warm configuration (project, gitRef, version, variants)
+   * * `on_progress` - Optional progress callback, same shape as `build()`
+   *
+   * # Throws
+   *
+   * - `InvalidArg` if the project is not found
+   * - `InvalidArg` if a private repo has no token
+   * - `GenericFailure` for git, build, or I/O errors
+   *
+   * # Returns
+   *
+   * A [`JsBuildOutput`] describing what was cached. Each artifact's `origin`
+   * distinguishes what was already cached (`"cache"`) from what had to be
+   * `"built"` or `"downloaded"` to warm it — all of which are cached once
+   * this resolves. Artifact paths point at their canonical locations inside
+   * the cache, not an output directory.
+   *
+   * # TypeScript
+   *
+   * ```typescript
+   * // Prime the cache for WP Rocket's develop branch.
+   * await apvm.warmCache({ project: 'wp-rocket', gitRef: 'branch:develop' });
+   *
+   * // A later build of the same ref is then served from the cache.
+   * const output = await apvm.build({
+   *   project: 'wp-rocket',
+   *   gitRef: 'branch:develop',
+   *   outputDir: '/tmp/output',
+   * });
+   * console.log(output.fromCache); // true
+   * ```
+   */
+  warmCache(options: WarmOptions, onProgress?: (err: Error | null, event: JsBuildEvent) => void): Promise<JsBuildOutput>
+  /**
    * Build a project from a pull request number.
    *
    * Convenience method equivalent to `build({ gitRef: 'pr:{prNumber}', ... })`.
@@ -966,4 +1015,84 @@ export interface JsResolvedRef {
   gitRef: string
   /** Full commit SHA, if resolved. */
   commitSha?: string
+}
+
+/**
+ * Options for a cache-warm operation.
+ *
+ * Pass this object to `Apvm.warmCache()`. Warming runs the **same pipeline**
+ * as a build — resolve the ref, reuse whatever is already cached, and build or
+ * download only what is missing — then stores everything into the cache. The
+ * one difference is that it delivers **nothing** to an output directory; its
+ * purpose is to prime the cache so a later `build()` of the same reference is
+ * an instant hit.
+ *
+ * It is therefore a deliberately smaller surface than [`BuildOptions`]:
+ *
+ * - **no `outputDir`** — warming never writes artifacts anywhere but the cache;
+ * - **no `noCache`** — warming *is* a cache operation, so bypassing the cache
+ *   would make it a no-op;
+ * - **no `strictVersion`** — warming always pins the requested version exactly.
+ *
+ * # Required Fields
+ *
+ * - `project` — Project name (`"backwpup"`, `"wp-rocket"`, or `"imagify"`)
+ * - `gitRef` — Reference to warm (same syntax as a build)
+ *
+ * # TypeScript
+ *
+ * ```typescript
+ * // Warm WP Rocket's develop branch into the cache.
+ * await apvm.warmCache({ project: 'wp-rocket', gitRef: 'branch:develop' });
+ *
+ * // Warm a specific BackWPup version + variants, with progress.
+ * await apvm.warmCache(
+ *   {
+ *     project: 'backwpup',
+ *     gitRef: 'pr:123',
+ *     version: '5.1.0',
+ *     variants: ['free', 'pro-en'],
+ *   },
+ *   (err, event) => {
+ *     if (err || !event) return;
+ *     console.log(event.type, event.message);
+ *   },
+ * );
+ * ```
+ */
+export interface WarmOptions {
+  /**
+   * The project to warm.
+   *
+   * Must be a registered project name: `"backwpup"`, `"wp-rocket"`, or
+   * `"imagify"`. Call `listProjects()` for the authoritative list.
+   */
+  project: string
+  /**
+   * Git reference to warm.
+   *
+   * Accepts exactly the same syntax as [`BuildOptions::git_ref`] — automatic
+   * detection or explicit `pr:`/`branch:`/`tag:`/`commit:`/`release:`
+   * prefixes, including the `latest`/`previous` keywords.
+   */
+  gitRef: string
+  /**
+   * Version to warm.
+   *
+   * - **BackWPup**: Required (e.g., `"5.1.0"`)
+   * - **WP Rocket / Imagify**: Optional, auto-detected from source if omitted
+   *
+   * Warming always pins this version exactly (there is no lenient fallback):
+   * warming `"5.1.0"` guarantees `5.1.0` ends up cached.
+   */
+  version?: string
+  /**
+   * Specific variants to warm.
+   *
+   * When `null` or omitted, the builder's default variants are warmed.
+   *
+   * - **BackWPup**: Supports `["free", "pro-de", "pro-en"]`
+   * - **WP Rocket / Imagify**: Have no variants (this field is ignored)
+   */
+  variants?: Array<string>
 }
