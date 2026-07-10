@@ -154,6 +154,29 @@ const output = await apvm.build(
 
 All return `Promise<JsBuildOutput>`.
 
+### Cache Warming
+
+#### `apvm.warmCache(options, onProgress?): Promise<JsBuildOutput>`
+
+Runs the **same pipeline** as `build()` — resolve the ref, reuse whatever is already cached, and build or download only what is missing — then stores everything into the cache. The one difference is that it delivers **nothing** to an output directory; its purpose is to prime the cache so a later `build()` of the same reference is an instant hit.
+
+`WarmOptions` is deliberately smaller than `BuildOptions`: there is **no `outputDir`** (nothing is delivered), **no `noCache`** (warming _is_ a cache operation), and **no `strictVersion`** (warming always pins the requested version exactly).
+
+```ts
+// Prime the cache for WP Rocket's develop branch (no output directory).
+await apvm.warmCache({ project: 'wp-rocket', gitRef: 'branch:develop' });
+
+// A later build of the same ref is then served entirely from the cache.
+const output = await apvm.build({
+  project: 'wp-rocket',
+  gitRef: 'branch:develop',
+  outputDir: '/tmp/output',
+});
+console.log(output.fromCache); // true
+```
+
+The returned `JsBuildOutput` describes what was cached. Each artifact's `origin` distinguishes what was already cached (`"cache"`) from what had to be `"built"` or `"downloaded"` to warm it; artifact `path`s point at their canonical locations inside the cache, not an output directory.
+
 ### Release Download Methods
 
 These methods download pre-built assets directly from GitHub Releases, bypassing the clone → build pipeline entirely. The version is always derived from the release tag — there is no `version` parameter.
@@ -265,6 +288,19 @@ interface BuildOptions {
   outputDir: string;      // Absolute path for artifacts to be stored after build
   noCache?: boolean;      // Bypass the artifact cache for this build (default false)
   strictVersion?: boolean;// Require a cache hit to match `version` exactly (default false)
+}
+```
+
+#### `WarmOptions`
+
+Passed to [`warmCache()`](#apvmwarmcacheoptions-onprogress-promisejsbuildoutput). Deliberately smaller than `BuildOptions`: no `outputDir` (nothing is delivered), no `noCache` (warming _is_ a cache operation), and no `strictVersion` (warming always pins the version exactly).
+
+```ts
+interface WarmOptions {
+  project: string;        // "backwpup", "wp-rocket", or "imagify" currently
+  gitRef: string;         // Any git ref (see above)
+  version?: string;       // Required for BackWPup, optional for WP Rocket / Imagify (Embedded version)
+  variants?: string[];    // e.g., ["free", "pro-en"]. No-Op for WP Rocket / Imagify (No variants)
 }
 ```
 

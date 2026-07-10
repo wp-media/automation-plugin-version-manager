@@ -18,7 +18,7 @@
 //! # Quick Start
 //!
 //! ```ignore
-//! use apvm_core::{Apvm, BuildRequest, NullReporter};
+//! use apvm_core::{Apvm, BuildRequest, WarmRequest, NullReporter};
 //! use apvm_config::Config;
 //! use std::path::PathBuf;
 //!
@@ -39,6 +39,13 @@
 //! // Artifacts are delivered to the output directory. When caching is enabled
 //! // (the default), the build is served from / written to the cache configured
 //! // via `config.cache_dir`.
+//!
+//! // Warm the cache without producing output: same pipeline, but nothing is
+//! // delivered to an output directory. A later `build` of the same ref is then
+//! // a cache hit. `WarmRequest` has no output_dir / no_cache / strict_version.
+//! let _ = apvm
+//!     .warm_cache(WarmRequest::new("wp-rocket", "branch:develop"), &NullReporter)
+//!     .await?;
 //! ```
 
 pub mod build;
@@ -59,7 +66,7 @@ pub use build::progress::{
     BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter,
 };
 pub use build::{ArtifactOrigin, ProducedArtifact};
-pub use commands::{BuildOutput, BuildRequest};
+pub use commands::{BuildOutput, BuildRequest, WarmRequest};
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 
 use std::path::Path;
@@ -366,7 +373,60 @@ impl Apvm {
             &self.config,
             self.store.clone(),
         );
-        cmd.execute(request, reporter).await
+        // `false` = deliver artifacts to the output directory (a normal build).
+        cmd.execute(request, reporter, false).await
+    }
+
+    /// Warm the artifact cache for a project without producing any output.
+    ///
+    /// Runs the **same pipeline** as [`Apvm::build`] — resolve the ref, then
+    /// serve/partially-reuse from the cache, clone + build the missing
+    /// variants, or download release assets — and stores everything into the
+    /// cache. The only difference is that **nothing is delivered to an output
+    /// directory**: this primes the cache so that a later [`Apvm::build`] of the
+    /// same reference is a fast cache hit.
+    ///
+    /// The request type is [`WarmRequest`], deliberately smaller than
+    /// [`BuildRequest`]: there is no output directory (nothing is delivered), no
+    /// cache-bypass (warming *is* a cache operation), and no version-strictness
+    /// toggle (warming always pins the requested version exactly). See
+    /// [`WarmRequest`] for the rationale.
+    ///
+    /// # Returns
+    ///
+    /// A [`BuildOutput`] describing what was cached. Each artifact's
+    /// [`origin`](build::ProducedArtifact::origin) distinguishes what was
+    /// **already cached** ([`ArtifactOrigin::Cache`]) from what had to be
+    /// **built** ([`ArtifactOrigin::Built`]) or **downloaded**
+    /// ([`ArtifactOrigin::Downloaded`]) — all of which are cached once this
+    /// returns. When the cache is active, artifact paths point at their
+    /// canonical locations inside the cache (never an output directory).
+    ///
+    /// # Note
+    ///
+    /// If the cache is disabled (`Config::cache_enabled == false`) or the store
+    /// could not be opened, the pipeline still runs but caches nothing; a
+    /// [`BuildEvent::Warning`] is emitted to the reporter in that case, and
+    /// because there is no cache to point at, the returned artifact paths are
+    /// not durable (they reference a temporary workspace that is cleaned up).
+    /// Inspect [`Apvm::cache_active`] up front if you need warming to be
+    /// meaningful.
+    pub async fn warm_cache(
+        &self,
+        request: WarmRequest,
+        reporter: &dyn build::progress::ProgressReporter,
+    ) -> Result<commands::BuildOutput> {
+        let cmd = commands::BuildCommand::new(
+            &self.github,
+            &self.registry,
+            &self.config,
+            self.store.clone(),
+        );
+        // `true` = warm-only: run the whole pipeline but deliver nothing to an
+        // output directory. `WarmRequest::into_build_request` supplies the
+        // fixed `output_dir = ""`, `no_cache = false`, `strict_version = true`.
+        cmd.execute(request.into_build_request(), reporter, true)
+            .await
     }
 
     /// Shared helper for the `build_from_*` conveniences: assemble a

@@ -35,6 +35,10 @@
 //! });
 //!
 //! console.log(`Built ${output.artifacts.length} artifacts`);
+//!
+//! // Prime the cache without producing output — same pipeline, no outputDir.
+//! // A later build of the same ref is then served from the cache.
+//! await apvm.warmCache({ project: 'wp-rocket', gitRef: 'branch:develop' });
 //! ```
 
 mod apvm;

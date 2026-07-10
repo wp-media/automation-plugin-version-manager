@@ -25,7 +25,7 @@ use napi_derive::napi;
 use crate::config::ApvmConfig;
 use crate::error::core_error_to_napi;
 use crate::progress::JsProgressReporter;
-use crate::types::{BuildOptions, JsBuildEvent, JsBuildOutput, JsReleaseSelector};
+use crate::types::{BuildOptions, JsBuildEvent, JsBuildOutput, JsReleaseSelector, WarmOptions};
 
 /// Main APVM instance for building WordPress plugins.
 ///
@@ -316,6 +316,88 @@ impl Apvm {
             None => {
                 let reporter = apvm_core::NullReporter;
                 apvm.build(request, &reporter)
+                    .await
+                    .map_err(core_error_to_napi)?
+            }
+        };
+
+        Ok(JsBuildOutput::from(output))
+    }
+
+    /// Warm the artifact cache for a project without producing any output.
+    ///
+    /// Runs the **same pipeline** as [`Apvm::build`] — resolve the reference,
+    /// reuse whatever is already cached, and build or download only what is
+    /// missing — then stores everything into the cache. The one difference is
+    /// that **nothing is delivered to an output directory**: this primes the
+    /// cache so a later `build()` of the same reference is an instant hit.
+    ///
+    /// The options type is [`WarmOptions`], deliberately smaller than
+    /// [`BuildOptions`]: there is no `outputDir` (nothing is delivered), no
+    /// `noCache` (warming *is* a cache operation), and no `strictVersion`
+    /// (warming always pins the requested version exactly).
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Warm configuration (project, gitRef, version, variants)
+    /// * `on_progress` - Optional progress callback, same shape as `build()`
+    ///
+    /// # Throws
+    ///
+    /// - `InvalidArg` if the project is not found
+    /// - `InvalidArg` if a private repo has no token
+    /// - `GenericFailure` for git, build, or I/O errors
+    ///
+    /// # Returns
+    ///
+    /// A [`JsBuildOutput`] describing what was cached. Each artifact's `origin`
+    /// distinguishes what was already cached (`"cache"`) from what had to be
+    /// `"built"` or `"downloaded"` to warm it — all of which are cached once
+    /// this resolves. Artifact paths point at their canonical locations inside
+    /// the cache, not an output directory.
+    ///
+    /// # TypeScript
+    ///
+    /// ```typescript
+    /// // Prime the cache for WP Rocket's develop branch.
+    /// await apvm.warmCache({ project: 'wp-rocket', gitRef: 'branch:develop' });
+    ///
+    /// // A later build of the same ref is then served from the cache.
+    /// const output = await apvm.build({
+    ///   project: 'wp-rocket',
+    ///   gitRef: 'branch:develop',
+    ///   outputDir: '/tmp/output',
+    /// });
+    /// console.log(output.fromCache); // true
+    /// ```
+    #[napi(
+        ts_args_type = "options: WarmOptions, onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+    )]
+    pub async fn warm_cache(
+        &self,
+        options: WarmOptions,
+        on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
+    ) -> napi::Result<JsBuildOutput> {
+        let apvm = Arc::clone(&self.inner);
+
+        // Assemble the core warm request. There is intentionally no output
+        // directory, cache-bypass, or version-strictness knob here — warming
+        // always delivers nothing, consults + populates the cache, and pins the
+        // version exactly.
+        let request = apvm_core::WarmRequest::new(options.project, options.git_ref)
+            .version(options.version)
+            .variants(options.variants.unwrap_or_default());
+
+        let output = match on_progress {
+            Some(callback) => {
+                let reporter = JsProgressReporter::new(callback);
+                apvm.warm_cache(request, &reporter)
+                    .await
+                    .map_err(core_error_to_napi)?
+            }
+            None => {
+                let reporter = apvm_core::NullReporter;
+                apvm.warm_cache(request, &reporter)
                     .await
                     .map_err(core_error_to_napi)?
             }

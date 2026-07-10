@@ -12,13 +12,22 @@
 //!   the blocking SQLite + file I/O on [`tokio::task::spawn_blocking`] and
 //!   treat **every** failure as a cache miss (or a skipped warm). A cache
 //!   problem must never fail a build whose artifacts are otherwise fine.
+//!
+//! # `deliver` (build) vs. warm-only
+//!
+//! The reuse helpers take a `deliver` flag. When `true` (a normal build) a
+//! cached artifact is copied into the output directory and the returned
+//! artifact points there. When `false` (cache warming) nothing is copied and
+//! the output directory is never touched — the returned artifact references
+//! the file already in the cache. This is what lets `warm_cache` run the exact
+//! same pipeline as `build` while delivering nothing to an output directory.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use apvm_storage::{
     ArtifactStore, BuildMetadata, LookupKey, LookupRequest, LookupResult, ReleaseMetadata,
-    SourceArtifact, StoredBuild, VersionMatch,
+    SourceArtifact, StoredBuild, StoredRelease, VersionMatch,
 };
 
 use crate::build::plugins::Builder;
@@ -78,7 +87,12 @@ pub(crate) struct FastPathHit {
 }
 
 /// Pre-clone fast path (behavior-matrix cases A/B/C): look the commit up and,
-/// on a full hit, copy the requested variants into `output_dir`.
+/// on a full hit, materialize the requested variants.
+///
+/// With `deliver = true` the variants are copied into `output_dir`; with
+/// `deliver = false` (cache warming) nothing is copied and `output_dir` is
+/// ignored — the returned artifacts reference the files already in the cache,
+/// which is all a warm needs since the commit is already fully cached.
 ///
 /// Returns `None` on a miss, on any storage/copy error (treated as a miss), or
 /// if the blocking task panics — in every case the caller proceeds to build
@@ -92,6 +106,7 @@ pub(crate) async fn fast_path_lookup_and_copy(
     strict: bool,
     keys: Vec<Option<String>>,
     output_dir: PathBuf,
+    deliver: bool,
 ) -> Option<FastPathHit> {
     let task = tokio::task::spawn_blocking(move || -> std::io::Result<Option<FastPathHit>> {
         let mut request = LookupRequest::new(&project, LookupKey::Commit(&commit));
@@ -118,7 +133,7 @@ pub(crate) async fn fast_path_lookup_and_copy(
             }
         };
 
-        let artifacts = copy_variants(&hit.build, &keys, &output_dir)?;
+        let artifacts = collect_variants(&hit.build, &keys, &output_dir, deliver)?;
         Ok(Some(FastPathHit {
             commit: hit.build.commit.clone(),
             version: hit.build.version.clone(),
@@ -149,9 +164,12 @@ pub(crate) struct ReuseOutcome {
 }
 
 /// Post-checkout partial reuse (behavior-matrix cases D/E/F): for the
-/// authoritative `(version, commit)`, copy whichever requested variants are
-/// already cached and healthy into `output_dir`, and report the rest as
-/// needing a build.
+/// authoritative `(version, commit)`, find whichever requested variants are
+/// already cached and healthy, and report the rest as needing a build.
+///
+/// With `deliver = true` the cached variants are copied into `output_dir`;
+/// with `deliver = false` (cache warming) nothing is copied and `output_dir`
+/// is ignored — the reused artifacts reference the files already in the cache.
 ///
 /// Any storage failure, or a per-variant copy failure, degrades safely: the
 /// affected variants are simply added to `to_build` (a copy failure never
@@ -163,6 +181,7 @@ pub(crate) async fn reuse_and_copy(
     commit: String,
     keys: Vec<Option<String>>,
     output_dir: PathBuf,
+    deliver: bool,
 ) -> ReuseOutcome {
     let fallback = keys.clone();
     let task = tokio::task::spawn_blocking(move || {
@@ -182,7 +201,9 @@ pub(crate) async fn reuse_and_copy(
                 };
             }
         };
-        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        // Only a delivering build needs the output directory; warming never
+        // writes there.
+        if deliver && let Err(e) = std::fs::create_dir_all(&output_dir) {
             tracing::warn!(error = %e, "failed to prepare output dir; building all variants");
             return ReuseOutcome {
                 reused: Vec::new(),
@@ -194,6 +215,11 @@ pub(crate) async fn reuse_and_copy(
         let mut to_build = Vec::new();
         for key in keys {
             match build.artifact(key.as_deref()) {
+                Some(artifact) if !deliver => {
+                    // Warm: the file is already in the cache; reference it in
+                    // place without copying anything to an output directory.
+                    reused.push(cache_artifact(artifact, artifact.path.clone()));
+                }
                 Some(artifact) => {
                     let dest = output_dir.join(&artifact.filename);
                     match std::fs::copy(&artifact.path, &dest) {
@@ -226,23 +252,37 @@ pub(crate) async fn reuse_and_copy(
 /// recopied, so passing the full requested set (reused + built) simply keeps
 /// the row complete and refreshes its last-used timestamp. Never fails the
 /// build; storage errors are logged and swallowed.
+///
+/// Returns the resulting [`StoredBuild`] on success (its artifacts carry their
+/// canonical in-cache paths), or `None` when there was nothing to store or the
+/// warm failed. `warm_cache` uses the returned build to re-point its output
+/// artifacts at the cache; a normal build ignores the return value.
 pub(crate) async fn store_build(
     store: Arc<ArtifactStore>,
     metadata: BuildMetadata,
     artifacts: Vec<SourceArtifact>,
-) {
+) -> Option<StoredBuild> {
     if artifacts.is_empty() {
-        return;
+        return None;
     }
     let task = tokio::task::spawn_blocking(move || store.store(&metadata, &artifacts));
     match task.await {
-        Ok(Ok(outcome)) => tracing::debug!(
-            newly_stored = outcome.newly_stored.len(),
-            reused = outcome.reused.len(),
-            "warmed artifact cache"
-        ),
-        Ok(Err(e)) => tracing::warn!(error = %e, "failed to warm artifact cache"),
-        Err(e) => tracing::warn!(error = %e, "cache store task failed"),
+        Ok(Ok(outcome)) => {
+            tracing::debug!(
+                newly_stored = outcome.newly_stored.len(),
+                reused = outcome.reused.len(),
+                "warmed artifact cache"
+            );
+            Some(outcome.build)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "failed to warm artifact cache");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cache store task failed");
+            None
+        }
     }
 }
 
@@ -276,8 +316,12 @@ pub(crate) struct ReleaseReuseOutcome {
     pub to_download: Vec<String>,
 }
 
-/// Copy whichever requested release assets are already cached (by exact tag +
-/// filename) into `output_dir`, and report the rest as needing a download.
+/// Find whichever requested release assets are already cached (by exact tag +
+/// filename), and report the rest as needing a download.
+///
+/// With `deliver = true` the cached assets are copied into `output_dir`; with
+/// `deliver = false` (cache warming) nothing is copied and `output_dir` is
+/// ignored — the returned assets reference the files already in the cache.
 ///
 /// `requested` is the set of asset filenames the caller wants — already
 /// filtered to the requested variants, since each variant is a distinct
@@ -290,6 +334,7 @@ pub(crate) async fn reuse_release_assets(
     tag: String,
     requested: Vec<String>,
     output_dir: PathBuf,
+    deliver: bool,
 ) -> ReleaseReuseOutcome {
     let fallback = requested.clone();
     let task = tokio::task::spawn_blocking(move || {
@@ -309,7 +354,9 @@ pub(crate) async fn reuse_release_assets(
                 };
             }
         };
-        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        // Only a delivering download needs the output directory; warming never
+        // writes there.
+        if deliver && let Err(e) = std::fs::create_dir_all(&output_dir) {
             tracing::warn!(error = %e, "failed to prepare output dir; downloading all assets");
             return ReleaseReuseOutcome {
                 cached: Vec::new(),
@@ -321,6 +368,14 @@ pub(crate) async fn reuse_release_assets(
         let mut to_download = Vec::new();
         for name in requested {
             match release.assets.iter().find(|asset| asset.filename == name) {
+                Some(asset) if !deliver => {
+                    // Warm: the asset is already cached; reference it in place.
+                    cached.push(CachedAsset {
+                        filename: asset.filename.clone(),
+                        path: asset.path.clone(),
+                        size: asset.size_bytes,
+                    });
+                }
                 Some(asset) => {
                     let dest = output_dir.join(&asset.filename);
                     match std::fs::copy(&asset.path, &dest) {
@@ -357,38 +412,60 @@ pub(crate) async fn reuse_release_assets(
 ///
 /// Idempotent and self-healing, mirroring [`store_build`]; already-cached
 /// assets are recognized and not recopied. Never fails the download.
+///
+/// Returns the resulting [`StoredRelease`] on success (its assets carry their
+/// canonical in-cache paths), or `None` when there was nothing to store or the
+/// warm failed. `warm_cache` uses the returned release to re-point its output
+/// artifacts at the cache; a normal download ignores the return value.
 pub(crate) async fn store_release(
     store: Arc<ArtifactStore>,
     metadata: ReleaseMetadata,
     assets: Vec<SourceArtifact>,
-) {
+) -> Option<StoredRelease> {
     if assets.is_empty() {
-        return;
+        return None;
     }
     let task = tokio::task::spawn_blocking(move || store.store_release(&metadata, &assets));
     match task.await {
-        Ok(Ok(outcome)) => tracing::debug!(
-            newly_stored = outcome.newly_stored.len(),
-            reused = outcome.reused.len(),
-            "warmed release cache"
-        ),
-        Ok(Err(e)) => tracing::warn!(error = %e, "failed to warm release cache"),
-        Err(e) => tracing::warn!(error = %e, "release store task failed"),
+        Ok(Ok(outcome)) => {
+            tracing::debug!(
+                newly_stored = outcome.newly_stored.len(),
+                reused = outcome.reused.len(),
+                "warmed release cache"
+            );
+            Some(outcome.release)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "failed to warm release cache");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "release store task failed");
+            None
+        }
     }
 }
 
-/// Copy every `key` from a stored build into `output_dir`, returning
-/// cache-origin [`ProducedArtifact`]s.
+/// Materialize every `key` from a stored build into cache-origin
+/// [`ProducedArtifact`]s.
+///
+/// With `deliver = true` each variant is copied into `output_dir` and the
+/// returned artifact points there. With `deliver = false` (cache warming)
+/// nothing is copied and `output_dir` is untouched — the returned artifact
+/// references the file already in the cache.
 ///
 /// Errors if a key is absent (defensive — the fast path's `require_variants`
 /// should guarantee presence) or a copy fails, so the caller can fall back to
 /// building.
-fn copy_variants(
+fn collect_variants(
     build: &StoredBuild,
     keys: &[Option<String>],
     output_dir: &Path,
+    deliver: bool,
 ) -> std::io::Result<Vec<ProducedArtifact>> {
-    std::fs::create_dir_all(output_dir)?;
+    if deliver {
+        std::fs::create_dir_all(output_dir)?;
+    }
     let mut produced = Vec::with_capacity(keys.len());
     for key in keys {
         let artifact = build.artifact(key.as_deref()).ok_or_else(|| {
@@ -397,9 +474,14 @@ fn copy_variants(
                 format!("cached build is missing variant {key:?}"),
             )
         })?;
-        let dest = output_dir.join(&artifact.filename);
-        std::fs::copy(&artifact.path, &dest)?;
-        produced.push(cache_artifact(artifact, dest));
+        let path = if deliver {
+            let dest = output_dir.join(&artifact.filename);
+            std::fs::copy(&artifact.path, &dest)?;
+            dest
+        } else {
+            artifact.path.clone()
+        };
+        produced.push(cache_artifact(artifact, path));
     }
     Ok(produced)
 }
@@ -581,6 +663,7 @@ mod tests {
             false,
             keys,
             out.path().to_path_buf(),
+            true,
         )
         .await
         .expect("expected a full cache hit");
@@ -616,6 +699,7 @@ mod tests {
             false,
             keys,
             out.path().to_path_buf(),
+            true,
         )
         .await;
 
@@ -645,6 +729,7 @@ mod tests {
             false,
             keys,
             out.path().to_path_buf(),
+            true,
         )
         .await
         .expect("lenient hit expected");
@@ -674,6 +759,7 @@ mod tests {
             true, // strict
             keys,
             out.path().to_path_buf(),
+            true,
         )
         .await;
 
@@ -700,6 +786,7 @@ mod tests {
             "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string(),
             keys,
             out.path().to_path_buf(),
+            true,
         )
         .await;
 
@@ -728,6 +815,7 @@ mod tests {
             "ffffffffffffffffffffffffffffffffffffffff".to_string(),
             keys.clone(),
             out.path().to_path_buf(),
+            true,
         )
         .await;
 
@@ -812,6 +900,7 @@ mod tests {
             "v5.6.8".to_string(),
             vec![FREE.to_string(), PRO_EN.to_string(), PRO_DE.to_string()],
             out.path().to_path_buf(),
+            true,
         )
         .await;
 
@@ -835,6 +924,7 @@ mod tests {
             "v5.6.8".to_string(),
             vec![FREE.to_string(), PRO_EN.to_string()],
             out.path().to_path_buf(),
+            true,
         )
         .await;
 
@@ -858,6 +948,7 @@ mod tests {
             "v5.6.8".to_string(),
             vec![PRO_EN.to_string()],
             out.path().to_path_buf(),
+            true,
         )
         .await;
 
@@ -881,6 +972,7 @@ mod tests {
             "v9.9.9".to_string(),
             requested.clone(),
             out.path().to_path_buf(),
+            true,
         )
         .await;
 
@@ -906,5 +998,117 @@ mod tests {
         store_release(Arc::clone(&store), metadata, assets).await;
 
         assert!(store.has_release("backwpup", "v5.6.8").unwrap());
+    }
+
+    // ---- warm mode (`deliver = false`): reference the cache, write nothing ----
+
+    /// The output directory must be empty (contain no entries).
+    fn assert_output_empty(dir: &std::path::Path) {
+        assert!(
+            std::fs::read_dir(dir).unwrap().next().is_none(),
+            "warm mode must not write anything to the output directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_path_warm_references_cache_without_copying() {
+        let (base, store) = seed_store(
+            &[(Some("free"), "free.zip"), (Some("pro-en"), "pro-en.zip")],
+            "5.6.0",
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        );
+        let out = tempfile::tempdir().unwrap();
+        let keys = vec![Some("free".to_string()), Some("pro-en".to_string())];
+
+        let hit = fast_path_lookup_and_copy(
+            store,
+            "backwpup".to_string(),
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string(),
+            Some("5.6.0".to_string()),
+            true, // warming always pins strictly
+            keys,
+            out.path().to_path_buf(),
+            false, // deliver = false → warm
+        )
+        .await
+        .expect("full hit expected");
+
+        assert_eq!(hit.artifacts.len(), 2);
+        assert!(
+            hit.artifacts
+                .iter()
+                .all(|a| a.origin == ArtifactOrigin::Cache)
+        );
+        // Every artifact references the file already inside the cache...
+        for artifact in &hit.artifacts {
+            assert!(
+                artifact.path.starts_with(base.path()),
+                "warm artifact must reference the in-cache file, got {}",
+                artifact.path.display()
+            );
+            assert!(artifact.path.is_file(), "referenced cache file must exist");
+        }
+        // ...and nothing was copied to the output directory.
+        assert_output_empty(out.path());
+    }
+
+    #[tokio::test]
+    async fn reuse_warm_references_cache_without_copying() {
+        let (base, store) = seed_store(
+            &[(Some("free"), "free.zip")],
+            "5.6.0",
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        );
+        let out = tempfile::tempdir().unwrap();
+        let keys = vec![Some("free".to_string()), Some("pro-en".to_string())];
+
+        let outcome = reuse_and_copy(
+            store,
+            "backwpup".to_string(),
+            "5.6.0".to_string(),
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string(),
+            keys,
+            out.path().to_path_buf(),
+            false, // warm
+        )
+        .await;
+
+        assert_eq!(outcome.reused.len(), 1, "free is cached and reused");
+        assert_eq!(outcome.reused[0].variant_id.as_deref(), Some("free"));
+        assert_eq!(outcome.reused[0].origin, ArtifactOrigin::Cache);
+        assert!(
+            outcome.reused[0].path.starts_with(base.path()),
+            "reused artifact must reference the in-cache file"
+        );
+        assert_eq!(outcome.to_build, vec![Some("pro-en".to_string())]);
+        assert_output_empty(out.path());
+    }
+
+    #[tokio::test]
+    async fn release_reuse_warm_references_cache_without_copying() {
+        let (base, store) = seed_release("backwpup", "v5.6.8", &[FREE, PRO_EN]);
+        let out = tempfile::tempdir().unwrap();
+
+        let outcome = reuse_release_assets(
+            store,
+            "backwpup".to_string(),
+            "v5.6.8".to_string(),
+            vec![FREE.to_string(), PRO_EN.to_string()],
+            out.path().to_path_buf(),
+            false, // warm
+        )
+        .await;
+
+        assert_eq!(outcome.cached.len(), 2);
+        assert!(outcome.to_download.is_empty(), "both assets already cached");
+        for asset in &outcome.cached {
+            assert!(
+                asset.path.starts_with(base.path()),
+                "warm asset must reference the cached file, got {}",
+                asset.path.display()
+            );
+            assert!(asset.path.is_file(), "referenced cache file must exist");
+        }
+        assert_output_empty(out.path());
     }
 }

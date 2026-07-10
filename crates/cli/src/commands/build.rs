@@ -95,6 +95,9 @@ pub struct BuildArgs {
     pub variants: Option<Vec<String>>,
 
     /// Output directory for build artifacts
+    ///
+    /// Ignored (with a warning) when `--warm-cache` is set: warming delivers
+    /// nothing to an output directory.
     #[arg(default_value = ".")]
     pub output: PathBuf,
 
@@ -107,9 +110,25 @@ pub struct BuildArgs {
     /// rebuilding instead of serving a different cached version
     ///
     /// Modifies how the cache is read, so it cannot be combined with
-    /// `--no-cache` (which skips cache reads entirely).
+    /// `--no-cache` (which skips cache reads entirely). Redundant with
+    /// `--warm-cache`, which always pins the version exactly.
     #[arg(long, conflicts_with = "no_cache")]
     pub strict_version: bool,
+
+    /// Warm the artifact cache instead of producing output
+    ///
+    /// Runs the exact same pipeline as a normal build — resolve the reference,
+    /// reuse whatever is already cached, and build or download only what is
+    /// missing — then stores everything into the cache. The one difference is
+    /// that it delivers nothing to an output directory; its purpose is to prime
+    /// the cache so a later build of the same reference is an instant hit.
+    ///
+    /// Cannot be combined with `--no-cache` (warming *is* a cache operation). An
+    /// output directory is accepted but ignored (with a warning): the version
+    /// is always pinned exactly, so `--strict-version` also has no effect but
+    /// is likewise accepted rather than rejected.
+    #[arg(long = "warm-cache", conflicts_with = "no_cache")]
+    pub warm_cache: bool,
 }
 
 impl BuildArgs {
@@ -130,6 +149,18 @@ impl BuildArgs {
         }
 
         trimmed.to_string()
+    }
+
+    /// Whether `--output`/`[OUTPUT]` was passed explicitly rather than left at
+    /// its default (`.`).
+    ///
+    /// Used to decide whether to warn that `--warm-cache` ignores it, mirroring
+    /// the redundant-`--strict-version` note below. This is a textual
+    /// comparison against the default value — a user who explicitly types `.`
+    /// is (harmlessly) treated the same as one who passed nothing, since the
+    /// resulting behavior is identical either way.
+    fn output_was_explicit(&self) -> bool {
+        self.output != std::path::Path::new(".")
     }
 
     /// Execute the build command.
@@ -165,40 +196,60 @@ impl BuildArgs {
             );
         }
 
-        // 6. Resolve output directory to absolute path
-        //    canonicalize() expands "." to full path and resolves symlinks
-        let output_dir = self.output.canonicalize().unwrap_or_else(|_| {
-            // If canonicalize fails (path doesn't exist), use absolute path
-            std::env::current_dir()
-                .map(|cwd| cwd.join(&self.output))
-                .unwrap_or_else(|_| self.output.clone())
-        });
+        // 6. Resolve output directory to an absolute path. Warming delivers
+        //    nothing, so an explicitly passed output directory is accepted but
+        //    ignored — flagged with a warning rather than rejected outright, the
+        //    same treatment as the redundant `--strict-version` below.
+        //    canonicalize() expands "." to a full path and resolves symlinks.
+        if self.warm_cache && self.output_was_explicit() {
+            eprintln!(
+                "Note: output directory '{}' is ignored with --warm-cache (nothing is delivered)",
+                self.output.display()
+            );
+        }
+        let output_dir = if self.warm_cache {
+            PathBuf::new()
+        } else {
+            self.output.canonicalize().unwrap_or_else(|_| {
+                // If canonicalize fails (path doesn't exist), use absolute path
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&self.output))
+                    .unwrap_or_else(|_| self.output.clone())
+            })
+        };
+
+        // 6b. `--strict-version` is implied by warming (the version is always
+        //     pinned exactly), so flag the redundancy instead of silently
+        //     ignoring it.
+        if self.warm_cache && self.strict_version {
+            eprintln!(
+                "Note: --strict-version is redundant with --warm-cache (the version is always pinned)"
+            );
+        }
 
         // 7. Normalize the git ref
         let git_ref = self.normalize_ref();
 
-        // 8. Show what we're building
-        println!("Building {} from {}", self.plugin, git_ref);
+        // 8. Show what we're doing.
+        if self.warm_cache {
+            println!("Warming cache for {} from {}", self.plugin, git_ref);
+        } else {
+            println!("Building {} from {}", self.plugin, git_ref);
+        }
         if let Some(ref v) = version {
             println!("  Version: {}", v);
         }
         if !variants.is_empty() {
             println!("  Variants: {}", variants.join(", "));
         }
-        println!("  Output: {}", output_dir.display());
+        // Warming has no output directory to report.
+        if !self.warm_cache {
+            println!("  Output: {}", output_dir.display());
+        }
         // The resolved reference (branch/tag/commit/PR/release) is printed once
         // it is known — inside the build, via the ReferenceResolved event — so
         // it joins this header block above the spinner. A blank line is emitted
         // before the results summary instead of here.
-
-        // 9. Assemble the build request, including per-invocation cache
-        //    overrides.
-        let request =
-            apvm_core::BuildRequest::new(self.plugin.clone(), git_ref, output_dir.clone())
-                .version(version.clone())
-                .variants(variants.clone())
-                .no_cache(self.no_cache)
-                .strict_version(self.strict_version);
 
         let result = if verbose {
             // Verbose mode: print everything, no spinner
@@ -230,7 +281,15 @@ impl BuildArgs {
                 _ => {}
             });
 
-            apvm.build(request, &reporter).await?
+            self.dispatch(
+                apvm,
+                version.clone(),
+                variants.clone(),
+                git_ref.clone(),
+                output_dir.clone(),
+                &reporter,
+            )
+            .await?
         } else {
             // Normal mode: spinner with step descriptions
             let spinner = ProgressBar::new_spinner();
@@ -272,15 +331,67 @@ impl BuildArgs {
                 }
             });
 
-            let result = apvm.build(request, &reporter).await;
+            let result = self
+                .dispatch(
+                    apvm,
+                    version.clone(),
+                    variants.clone(),
+                    git_ref.clone(),
+                    output_dir.clone(),
+                    &reporter,
+                )
+                .await;
 
             spinner.finish_and_clear();
             result?
         };
 
-        // 10. Show results, including where each artifact came from.
-        //     Blank line separates the live/header area from the summary.
+        // 10. Show results. A blank line separates the live/header area from
+        //     the summary, which differs for a build vs. a cache warm.
         println!();
+        if self.warm_cache {
+            Self::print_warm_summary(&result);
+        } else {
+            Self::print_build_summary(&result);
+        }
+
+        Ok(())
+    }
+
+    /// Run the requested operation — a normal build, or a cache warm when
+    /// `--warm-cache` was passed — sharing the caller's progress reporter.
+    ///
+    /// Warming builds a [`apvm_core::WarmRequest`] (no output directory, no
+    /// `--no-cache`, version always pinned) and delivers nothing to
+    /// `output_dir`; a build builds a [`apvm_core::BuildRequest`] with the
+    /// per-invocation cache overrides. Both return a
+    /// [`apvm_core::BuildOutput`].
+    async fn dispatch(
+        &self,
+        apvm: &Apvm,
+        version: Option<String>,
+        variants: Vec<String>,
+        git_ref: String,
+        output_dir: PathBuf,
+        reporter: &dyn apvm_core::build::progress::ProgressReporter,
+    ) -> Result<apvm_core::BuildOutput> {
+        if self.warm_cache {
+            let request = apvm_core::WarmRequest::new(self.plugin.clone(), git_ref)
+                .version(version)
+                .variants(variants);
+            apvm.warm_cache(request, reporter).await
+        } else {
+            let request = apvm_core::BuildRequest::new(self.plugin.clone(), git_ref, output_dir)
+                .version(version)
+                .variants(variants)
+                .no_cache(self.no_cache)
+                .strict_version(self.strict_version);
+            apvm.build(request, reporter).await
+        }
+    }
+
+    /// Print the results summary for a normal build.
+    fn print_build_summary(result: &apvm_core::BuildOutput) {
         println!("Build complete: {}", result.description());
         println!("  Commit:  {}", result.commit_short);
         println!("  Version: {}", result.result.version);
@@ -309,8 +420,28 @@ impl BuildArgs {
         }
 
         println!("  Source: {}", source_summary(&result.result.artifacts));
+    }
 
-        Ok(())
+    /// Print the results summary for a cache warm.
+    ///
+    /// Nothing was delivered to an output directory — every listed artifact is
+    /// now in the cache. The per-artifact label distinguishes what was already
+    /// cached (`reused`) from what had to be `built` or `downloaded` to warm it.
+    fn print_warm_summary(result: &apvm_core::BuildOutput) {
+        println!("Cache warmed: {}", result.description());
+        println!("  Commit:  {}", result.commit_short);
+        println!("  Version: {}", result.result.version);
+        println!("  Artifacts (now cached):");
+        for artifact in &result.result.artifacts {
+            // Pad the plain label first so ANSI codes never affect alignment.
+            let label = format!("{:<10}", warm_origin_label(artifact.origin));
+            println!(
+                "    {} {}",
+                color::paint(&label, origin_color(artifact.origin)),
+                artifact.filename
+            );
+        }
+        println!("  Summary: {}", warm_summary(&result.result.artifacts));
     }
 
     /// Resolve variants to use.
@@ -392,6 +523,55 @@ fn source_summary(artifacts: &[ProducedArtifact]) -> String {
     parts.join(", ")
 }
 
+/// The label shown for an artifact's provenance in a cache-warm summary.
+///
+/// A warm always ends with the artifact cached, so the label describes how it
+/// got there: `reused` (already cached), `built` (built to warm the cache), or
+/// `downloaded` (fetched from a release to warm the cache).
+fn warm_origin_label(origin: ArtifactOrigin) -> &'static str {
+    match origin {
+        ArtifactOrigin::Cache => "reused",
+        ArtifactOrigin::Built => "built",
+        ArtifactOrigin::Downloaded => "downloaded",
+    }
+}
+
+/// One-line summary for a cache warm, e.g. `already fully cached`,
+/// `2 built (now cached)`, or `1 reused, 1 built (now cached)`.
+///
+/// When every artifact was `reused` the cache was already complete and the
+/// warm was a no-op; otherwise the freshly built/downloaded artifacts are the
+/// ones that were added, and the whole set is now cached.
+fn warm_summary(artifacts: &[ProducedArtifact]) -> String {
+    let (mut built, mut reused, mut downloaded) = (0usize, 0usize, 0usize);
+    for artifact in artifacts {
+        match artifact.origin {
+            ArtifactOrigin::Built => built += 1,
+            ArtifactOrigin::Cache => reused += 1,
+            ArtifactOrigin::Downloaded => downloaded += 1,
+        }
+    }
+    let total = artifacts.len();
+    if total == 0 {
+        return "nothing to warm".to_string();
+    }
+    if reused == total {
+        // Everything was already present — the warm changed nothing.
+        return "already fully cached".to_string();
+    }
+    let mut parts = Vec::new();
+    if reused > 0 {
+        parts.push(format!("{reused} reused"));
+    }
+    if built > 0 {
+        parts.push(format!("{built} built"));
+    }
+    if downloaded > 0 {
+        parts.push(format!("{downloaded} downloaded"));
+    }
+    format!("{} (now cached)", parts.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +585,7 @@ mod tests {
             output: PathBuf::from("."),
             no_cache: false,
             strict_version: false,
+            warm_cache: false,
         }
     }
 
@@ -442,6 +623,154 @@ mod tests {
     #[test]
     fn source_summary_empty() {
         assert_eq!(source_summary(&[]), "no artifacts");
+    }
+
+    // =========================================================================
+    // warm_origin_label / warm_summary — cache-warm provenance display
+    // =========================================================================
+
+    #[test]
+    fn warm_origin_label_maps_each_origin() {
+        assert_eq!(warm_origin_label(ArtifactOrigin::Cache), "reused");
+        assert_eq!(warm_origin_label(ArtifactOrigin::Built), "built");
+        assert_eq!(warm_origin_label(ArtifactOrigin::Downloaded), "downloaded");
+    }
+
+    #[test]
+    fn warm_summary_all_reused_is_already_cached() {
+        // Everything was already in the cache → the warm was a no-op.
+        let all_cached = [
+            artifact(ArtifactOrigin::Cache),
+            artifact(ArtifactOrigin::Cache),
+        ];
+        assert_eq!(warm_summary(&all_cached), "already fully cached");
+    }
+
+    #[test]
+    fn warm_summary_all_built_now_cached() {
+        assert_eq!(
+            warm_summary(&[artifact(ArtifactOrigin::Built)]),
+            "1 built (now cached)"
+        );
+    }
+
+    #[test]
+    fn warm_summary_mixed_lists_each_and_marks_cached() {
+        let mixed = [
+            artifact(ArtifactOrigin::Cache),
+            artifact(ArtifactOrigin::Built),
+            artifact(ArtifactOrigin::Downloaded),
+        ];
+        assert_eq!(
+            warm_summary(&mixed),
+            "1 reused, 1 built, 1 downloaded (now cached)"
+        );
+    }
+
+    #[test]
+    fn warm_summary_empty() {
+        assert_eq!(warm_summary(&[]), "nothing to warm");
+    }
+
+    // =========================================================================
+    // --warm-cache CLI wiring (clap conflicts + redundant-value handling)
+    // =========================================================================
+
+    use clap::Parser;
+
+    /// Test-only parser wrapper so we can exercise `BuildArgs` clap wiring
+    /// (conflicts, defaults) exactly as the real `apvm build` subcommand does.
+    #[derive(Parser)]
+    struct WarmTestCli {
+        #[command(flatten)]
+        args: BuildArgs,
+    }
+
+    #[test]
+    fn warm_cache_conflicts_with_no_cache() {
+        // `--no-cache` bypasses reads and `--warm-cache` *is* a cache
+        // operation — genuinely contradictory, so this stays a hard error.
+        let res = WarmTestCli::try_parse_from([
+            "apvm",
+            "backwpup",
+            "develop",
+            "--warm-cache",
+            "--no-cache",
+        ]);
+        assert!(res.is_err(), "--warm-cache must conflict with --no-cache");
+    }
+
+    #[test]
+    fn warm_cache_accepts_explicit_output_as_redundant() {
+        // An explicit output directory alongside --warm-cache is NOT a clap
+        // error: it parses fine, is preserved on the struct (execute() is
+        // what warns and ignores it — see `output_was_explicit` below), so a
+        // typo'd or leftover output arg never blocks the warm.
+        let cli =
+            WarmTestCli::try_parse_from(["apvm", "backwpup", "develop", "./out", "--warm-cache"])
+                .expect("--warm-cache with an explicit output directory must parse");
+        assert!(cli.args.warm_cache);
+        assert_eq!(cli.args.output, PathBuf::from("./out"));
+    }
+
+    #[test]
+    fn warm_cache_alone_parses_with_defaulted_output() {
+        let cli = WarmTestCli::try_parse_from(["apvm", "backwpup", "develop", "--warm-cache"])
+            .expect("--warm-cache with a defaulted output must parse");
+        assert!(cli.args.warm_cache);
+        assert!(!cli.args.no_cache);
+        assert_eq!(cli.args.output, PathBuf::from("."));
+    }
+
+    #[test]
+    fn build_accepts_explicit_output_without_warm_cache() {
+        let cli = WarmTestCli::try_parse_from(["apvm", "backwpup", "develop", "./out"])
+            .expect("a normal build accepts an output directory");
+        assert!(!cli.args.warm_cache);
+        assert_eq!(cli.args.output, PathBuf::from("./out"));
+    }
+
+    #[test]
+    fn warm_cache_allows_redundant_strict_version() {
+        // `--strict-version` is a no-op with `--warm-cache`, not a conflict.
+        let cli = WarmTestCli::try_parse_from([
+            "apvm",
+            "backwpup",
+            "develop",
+            "--warm-cache",
+            "--strict-version",
+        ])
+        .expect("--warm-cache with --strict-version must parse (strict is a no-op)");
+        assert!(cli.args.warm_cache);
+        assert!(cli.args.strict_version);
+    }
+
+    // =========================================================================
+    // output_was_explicit — drives the "ignored with --warm-cache" note
+    // =========================================================================
+
+    #[test]
+    fn output_was_explicit_false_for_defaulted_output() {
+        // Mirrors what clap leaves on the struct when --output/[OUTPUT] is
+        // omitted (default_value = ".").
+        assert!(!build_args("develop").output_was_explicit());
+    }
+
+    #[test]
+    fn output_was_explicit_true_for_a_custom_path() {
+        let mut args = build_args("develop");
+        args.output = PathBuf::from("./dist");
+        assert!(args.output_was_explicit());
+    }
+
+    #[test]
+    fn output_was_explicit_false_when_user_types_the_default_literally() {
+        // Known, accepted false-negative: typing "." explicitly is
+        // indistinguishable from the default and produces identical behavior
+        // either way, so no warning is expected here.
+        let mut args = build_args("develop");
+        args.output = PathBuf::from(".");
+        assert!(!args.output_was_explicit());
     }
 
     // =========================================================================

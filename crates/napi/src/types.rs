@@ -745,3 +745,81 @@ pub struct BuildOptions {
     /// effect for projects whose version is embedded in source.
     pub strict_version: Option<bool>,
 }
+
+// =============================================================================
+// Warm Options (Input Object)
+// =============================================================================
+
+/// Options for a cache-warm operation.
+///
+/// Pass this object to `Apvm.warmCache()`. Warming runs the **same pipeline**
+/// as a build — resolve the ref, reuse whatever is already cached, and build or
+/// download only what is missing — then stores everything into the cache. The
+/// one difference is that it delivers **nothing** to an output directory; its
+/// purpose is to prime the cache so a later `build()` of the same reference is
+/// an instant hit.
+///
+/// It is therefore a deliberately smaller surface than [`BuildOptions`]:
+///
+/// - **no `outputDir`** — warming never writes artifacts anywhere but the cache;
+/// - **no `noCache`** — warming *is* a cache operation, so bypassing the cache
+///   would make it a no-op;
+/// - **no `strictVersion`** — warming always pins the requested version exactly.
+///
+/// # Required Fields
+///
+/// - `project` — Project name (`"backwpup"`, `"wp-rocket"`, or `"imagify"`)
+/// - `gitRef` — Reference to warm (same syntax as a build)
+///
+/// # TypeScript
+///
+/// ```typescript
+/// // Warm WP Rocket's develop branch into the cache.
+/// await apvm.warmCache({ project: 'wp-rocket', gitRef: 'branch:develop' });
+///
+/// // Warm a specific BackWPup version + variants, with progress.
+/// await apvm.warmCache(
+///   {
+///     project: 'backwpup',
+///     gitRef: 'pr:123',
+///     version: '5.1.0',
+///     variants: ['free', 'pro-en'],
+///   },
+///   (err, event) => {
+///     if (err || !event) return;
+///     console.log(event.type, event.message);
+///   },
+/// );
+/// ```
+#[napi(object)]
+pub struct WarmOptions {
+    /// The project to warm.
+    ///
+    /// Must be a registered project name: `"backwpup"`, `"wp-rocket"`, or
+    /// `"imagify"`. Call `listProjects()` for the authoritative list.
+    pub project: String,
+
+    /// Git reference to warm.
+    ///
+    /// Accepts exactly the same syntax as [`BuildOptions::git_ref`] — automatic
+    /// detection or explicit `pr:`/`branch:`/`tag:`/`commit:`/`release:`
+    /// prefixes, including the `latest`/`previous` keywords.
+    pub git_ref: String,
+
+    /// Version to warm.
+    ///
+    /// - **BackWPup**: Required (e.g., `"5.1.0"`)
+    /// - **WP Rocket / Imagify**: Optional, auto-detected from source if omitted
+    ///
+    /// Warming always pins this version exactly (there is no lenient fallback):
+    /// warming `"5.1.0"` guarantees `5.1.0` ends up cached.
+    pub version: Option<String>,
+
+    /// Specific variants to warm.
+    ///
+    /// When `null` or omitted, the builder's default variants are warmed.
+    ///
+    /// - **BackWPup**: Supports `["free", "pro-de", "pro-en"]`
+    /// - **WP Rocket / Imagify**: Have no variants (this field is ignored)
+    pub variants: Option<Vec<String>>,
+}

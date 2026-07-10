@@ -28,7 +28,7 @@ For extended CLI documentation, see the [CLI crate README](crates/cli/README.md)
 - **Special keyword refs** — use `tag:latest-stable`, `tag:latest`, `release:latest-stable`, `release:latest` (and their `previous-*` variants) to dynamically resolve the most recent tags or releases without knowing the exact version
 - **Automatic ref detection** — `v1.0.0` resolves to a tag, `develop` to a branch, `123` to PR #123, and version-like inputs (e.g., `5.6.8`) are checked against GitHub Releases first (when the plugin supports releases)
 - **Multi-variant builds** — e.g., BackWPup produces `free`, `pro-de`, and `pro-en` variants. You can choose which ones to build (`free` and `pro-en` are the defaults for BackWPup)
-- **Persistent artifact cache** — builds and release downloads are cached (SQLite-indexed, on by default): rebuilding the same commit is served from the cache, and a partial request reuses cached variants and builds only the rest. Per-artifact provenance (`built`/`cache`/`downloaded`), `--no-cache` / `--strict-version` overrides, and an `apvm cache` maintenance command
+- **Persistent artifact cache** — builds and release downloads are cached (SQLite-indexed, on by default): rebuilding the same commit is served from the cache, and a partial request reuses cached variants and builds only the rest. Per-artifact provenance (`built`/`cache`/`downloaded`), `--no-cache` / `--strict-version` overrides, a `--warm-cache` mode that primes the cache without producing output, and an `apvm cache` maintenance command
 - **Version handling** — required, embedded (auto-detected), or optional per plugin (BackWPup requires a version at build time; WP Rocket auto-detects it from source)
 - **Self-update** — `apvm update` downloads and replaces the binary with the latest release, verifying SHA-256 checksums
 - **Self-uninstall** — `apvm uninstall` cleanly removes the binary and its directory (with `-y`/`--yes` to skip confirmation)
@@ -213,6 +213,23 @@ apvm build imagify develop ./dist     # choose an output directory
 | `release:previous-latest`| Previous non-draft release                               |
 
 Tags are sorted by creation date (most recent first). Releases are fetched from the [GitHub Releases API](https://docs.github.com/en/rest/releases/releases). Drafts are always excluded from release keywords.
+
+### Warm the Cache
+
+`--warm-cache` runs the **same pipeline** as a build — resolve the ref, reuse whatever is already cached, and build or download only what is missing — then stores everything into the cache. The one difference is that it produces **no output**: nothing is written to an output directory. Use it to prime the cache so a later build of the same reference is an instant hit.
+
+```sh
+# Prime the cache for a branch (no output directory is written)
+apvm build backwpup develop -v 5.1.0 --warm-cache
+
+# Warm specific variants
+apvm build backwpup 123 -v 5.1.0 --variants free,pro-en --warm-cache
+
+# Warm a release's pre-built assets into the cache
+apvm build backwpup release:5.6.8 --warm-cache
+```
+
+The summary distinguishes what was already cached (`reused`) from what had to be `built` or `downloaded` to warm it — all of which are cached afterwards. `--warm-cache` cannot be combined with `--no-cache` (warming _is_ a cache operation — this is a hard error). An output directory and `--strict-version` are both no-ops with `--warm-cache` rather than errors: passing either is accepted and simply ignored, with a note printed to explain why.
 
 ### List Plugins
 

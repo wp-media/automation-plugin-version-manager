@@ -443,3 +443,82 @@ describe('Apvm.create() config edge cases', () => {
     expect(apvm).toBeInstanceOf(Apvm);
   });
 });
+
+// =============================================================================
+// warmCache() — primes the cache, delivers no output
+// =============================================================================
+
+describe('warmCache() basic functionality', () => {
+  it('warms wp-rocket from develop, then a build of the same ref is a full cache hit', async () => {
+    let tempRoot = '';
+    try {
+      tempRoot = await mkdtemp(join(tmpdir(), 'apvm-warm-it-'));
+      const apvm = await Apvm.create({});
+
+      // Warm the cache. There is no outputDir — warming delivers nothing.
+      const warm = await apvm.warmCache({ project: 'wp-rocket', gitRef: 'branch:develop' });
+      expect(warm).toBeTruthy();
+      expect(warm.result).toBeTruthy();
+      expect(warm.result.artifacts.length).toBeGreaterThan(0);
+      expect(warm.commit.length).toBeGreaterThan(0);
+      // No version pinned ⇒ no possibility of a version mismatch.
+      expect(warm.cacheVersionMismatch).toBe(false);
+
+      for (const artifact of warm.result.artifacts) {
+        // Provenance distinguishes reused vs. freshly built/downloaded — all
+        // are cached once the warm resolves.
+        expect(['built', 'cache', 'downloaded']).toContain(artifact.origin);
+        // Every warmed artifact exists on disk (inside the cache).
+        const fileStat = await stat(artifact.path);
+        expect(fileStat.isFile()).toBe(true);
+        expect(fileStat.size).toBeGreaterThan(0);
+      }
+
+      // A subsequent build of the same ref must be served entirely from the
+      // cache — proof the warm populated it.
+      const outputDir = join(tempRoot, 'output');
+      const build = await apvm.buildFromBranch('wp-rocket', 'develop', outputDir);
+      expect(build.fromCache).toBe(true);
+      for (const artifact of build.result.artifacts) {
+        expect(artifact.origin).toBe('cache');
+      }
+    } finally {
+      if (tempRoot) {
+        await rm(tempRoot, { recursive: true, force: true });
+      }
+    }
+  }, 10 * 60_000);
+});
+
+describe('warmCache() error handling', () => {
+  it('rejects with error for unknown project', async () => {
+    const apvm = await Apvm.create({});
+    await expect(
+      apvm.warmCache({ project: 'nonexistent-plugin', gitRef: 'branch:develop' }),
+    ).rejects.toThrow();
+  });
+
+  it('rejects with error for empty project name', async () => {
+    const apvm = await Apvm.create({});
+    await expect(apvm.warmCache({ project: '', gitRef: 'branch:develop' })).rejects.toThrow();
+  });
+
+  it('rejects with error for empty gitRef', async () => {
+    const apvm = await Apvm.create({});
+    await expect(apvm.warmCache({ project: 'wp-rocket', gitRef: '' })).rejects.toThrow();
+  });
+
+  it('accepts version and variants in options (signature check)', async () => {
+    const apvm = await Apvm.create({});
+    // Rejects because the project doesn't exist, but proves the option shape
+    // (project, gitRef, version, variants — no outputDir/noCache/strictVersion).
+    await expect(
+      apvm.warmCache({
+        project: 'nonexistent-plugin',
+        gitRef: 'pr:1',
+        version: '5.1.0',
+        variants: ['free'],
+      }),
+    ).rejects.toThrow();
+  });
+});

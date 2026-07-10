@@ -3,4 +3,6 @@
 mod build;
 mod cache;
 
-pub use build::{BuildCommand, BuildMetadata, BuildOutput, BuildRequest, SourceArtifact};
+pub use build::{
+    BuildCommand, BuildMetadata, BuildOutput, BuildRequest, SourceArtifact, WarmRequest,
+};

@@ -13,7 +13,7 @@ use crate::github::client::download_asset_owned;
 use crate::github::{GitHubClient, ReleaseAsset};
 use crate::projects::{Project, ProjectRegistry};
 use apvm_config::Config;
-use apvm_storage::{ArtifactStore, ReleaseMetadata};
+use apvm_storage::{ArtifactStore, ReleaseMetadata, StoredArtifact};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -109,6 +109,100 @@ impl BuildRequest {
     }
 }
 
+/// A request to warm the artifact cache for a project.
+///
+/// Warming runs the **exact same pipeline** as a [`BuildRequest`] — resolve the
+/// ref, then either serve/partially-reuse from the cache, clone + build the
+/// missing variants, or download release assets — and stores everything into
+/// the cache. The one difference is that it delivers **nothing** to an output
+/// directory: its purpose is to populate the cache, not to produce files for a
+/// caller.
+///
+/// That intent is encoded in the type: `WarmRequest` is deliberately a smaller
+/// surface than [`BuildRequest`], omitting the three fields that would either
+/// be meaningless or actively defeat warming:
+///
+/// - **no `output_dir`** — warming never writes artifacts anywhere but the
+///   cache, so there is no output directory to accept;
+/// - **no `no_cache`** — warming *is* a cache operation; bypassing the cache
+///   would make it a no-op;
+/// - **no `strict_version`** — warming always pins the requested version
+///   exactly (an implicit `strict_version = true`), so warming version `X`
+///   guarantees `X` is what ends up cached rather than accepting a different
+///   cached version of the same commit.
+///
+/// Construct with [`WarmRequest::new`] and refine with the chainable setters.
+///
+/// ```ignore
+/// use apvm_core::WarmRequest;
+///
+/// // Warm BackWPup 5.1.0 from PR #123 (only the `free` variant).
+/// let request = WarmRequest::new("backwpup", "pr:123")
+///     .version(Some("5.1.0".to_string()))
+///     .variants(vec!["free".to_string()]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct WarmRequest {
+    /// Project name from the registry.
+    pub project: String,
+    /// Version to warm, or `None` to auto-detect / use the builder default.
+    pub version: Option<String>,
+    /// Git reference: PR number, branch, tag, commit, or release.
+    pub git_ref: String,
+    /// Variants to warm; empty means the builder's default set (all).
+    pub variants: Vec<String>,
+}
+
+impl WarmRequest {
+    /// Create a warm request with the required fields; no version pin and the
+    /// builder's default variant set.
+    pub fn new(project: impl Into<String>, git_ref: impl Into<String>) -> Self {
+        Self {
+            project: project.into(),
+            version: None,
+            git_ref: git_ref.into(),
+            variants: Vec::new(),
+        }
+    }
+
+    /// Pin the version to warm (`None` clears any pin).
+    #[must_use]
+    pub fn version(mut self, version: Option<String>) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Set the variants to warm (empty = builder defaults).
+    #[must_use]
+    pub fn variants(mut self, variants: Vec<String>) -> Self {
+        self.variants = variants;
+        self
+    }
+
+    /// Lower a [`WarmRequest`] onto the [`BuildRequest`] the pipeline runs.
+    ///
+    /// The fields `WarmRequest` deliberately omits are filled with the only
+    /// values that make sense for warming — and, crucially, the command is run
+    /// with its `warm_cache` flag set, which is what actually guarantees the
+    /// output directory is never touched (the `output_dir` below is never read):
+    ///
+    /// - `output_dir = ""` — never read in warm mode; warming copies nothing to
+    ///   an output directory;
+    /// - `no_cache = false` — warming must consult and populate the cache;
+    /// - `strict_version = true` — warming always pins the requested version.
+    pub(crate) fn into_build_request(self) -> BuildRequest {
+        BuildRequest {
+            project: self.project,
+            version: self.version,
+            git_ref: self.git_ref,
+            variants: self.variants,
+            output_dir: PathBuf::new(),
+            no_cache: false,
+            strict_version: true,
+        }
+    }
+}
+
 /// Extended build result with git metadata.
 ///
 /// Contains the build artifacts plus all the metadata needed
@@ -183,7 +277,7 @@ impl BuildOutput {
         format!(
             "{} @ {}",
             self.resolved_ref.detailed_description(),
-            &self.commit_short
+            self.commit_short
         )
     }
 
@@ -495,6 +589,23 @@ fn warn_version_mismatch(reporter: &dyn ProgressReporter, requested: &str, got: 
     )));
 }
 
+/// Re-point delivered artifacts at their canonical in-cache paths.
+///
+/// Warm-cache runs keep no output directory, so once the artifacts are stored,
+/// their source paths — a soon-to-be-deleted workspace for freshly built
+/// variants, a throwaway temp dir for freshly downloaded release assets — are
+/// swapped for the stable locations inside the cache. Origins are left
+/// untouched, so the result still distinguishes what was reused from what was
+/// freshly built/downloaded. Matching is by filename, which is unique within a
+/// stored build or release.
+fn repoint_to_cache(artifacts: &mut [ProducedArtifact], stored: &[StoredArtifact]) {
+    for artifact in artifacts.iter_mut() {
+        if let Some(found) = stored.iter().find(|s| s.filename == artifact.filename) {
+            artifact.path = found.path.clone();
+        }
+    }
+}
+
 /// Command to build a project from any git reference.
 ///
 /// Supports automatic detection of reference types:
@@ -569,6 +680,16 @@ impl<'a> BuildCommand<'a> {
     /// 6. Clone → checkout → build → collect (`run_clone_build`), which also
     ///    does post-checkout partial reuse and best-effort cache warming.
     ///
+    /// # Warm mode
+    ///
+    /// When `warm_cache` is `true` the pipeline runs identically but delivers
+    /// **nothing** to `request.output_dir` (which is empty and ignored): the
+    /// fast path / partial reuse copy nothing, freshly built or downloaded
+    /// artifacts are only stored into the cache, and the returned artifacts are
+    /// re-pointed at their canonical in-cache paths. `build()` always passes
+    /// `false`; only `warm_cache()` passes `true`, so the delivering behavior of
+    /// `build()` can never be turned off through a [`BuildRequest`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::PrivateRepoNoToken`] if the project's repository is
@@ -578,6 +699,7 @@ impl<'a> BuildCommand<'a> {
         &self,
         request: BuildRequest,
         reporter: &dyn ProgressReporter,
+        warm_cache: bool,
     ) -> Result<BuildOutput> {
         // 1. Look up project in registry.
         let project_info = self.registry.get(&request.project)?;
@@ -597,10 +719,27 @@ impl<'a> BuildCommand<'a> {
             });
         }
 
+        // Warming needs a cache to warm. If the store is unavailable (disabled
+        // by config, or it could not be opened) the pipeline still runs to
+        // completion but populates nothing — warn so the caller isn't misled
+        // into thinking the cache is now primed.
+        if warm_cache && self.store.is_none() {
+            reporter.report(&BuildEvent::Warning(
+                "cache warming was requested, but the artifact cache is disabled or unavailable; \
+                 nothing will be cached"
+                    .to_string(),
+            ));
+        }
+
         // `--strict-version` has no meaning for embedded-version builders (the
         // version comes from source and is deterministic per commit), so report
-        // it as ignored rather than silently doing nothing.
-        if request.strict_version && project_info.builder.version_requirement().is_embedded() {
+        // it as ignored rather than silently doing nothing. In warm mode the
+        // strict pin is implicit (not something the caller passed), so there is
+        // nothing to report as ignored.
+        if !warm_cache
+            && request.strict_version
+            && project_info.builder.version_requirement().is_embedded()
+        {
             reporter.report(&BuildEvent::Warning(format!(
                 "--strict-version ignored: '{}' derives its version from source",
                 project_info.name
@@ -633,6 +772,7 @@ impl<'a> BuildCommand<'a> {
                     &variants,
                     request.output_dir.as_path(),
                     request.no_cache,
+                    warm_cache,
                     reporter,
                 )
                 .await;
@@ -650,9 +790,10 @@ impl<'a> BuildCommand<'a> {
         });
 
         // 5. Pre-clone cache fast path (cases A/B/C). On a full hit the
-        // artifacts are already delivered — no clone, no build.
+        // artifacts are already delivered (or, when warming, already fully
+        // cached) — no clone, no build.
         if let Some(output) = self
-            .try_cache_fast_path(&request, project_info, &resolved, reporter)
+            .try_cache_fast_path(&request, project_info, &resolved, reporter, warm_cache)
             .await
         {
             return Ok(output);
@@ -660,24 +801,29 @@ impl<'a> BuildCommand<'a> {
 
         // 6. Clone → checkout → build → collect (with post-checkout partial
         // reuse and best-effort cache warming inside).
-        self.run_clone_build(&request, project_info, resolved, reporter)
+        self.run_clone_build(&request, project_info, resolved, reporter, warm_cache)
             .await
     }
 
     /// Pre-clone cache fast path (behavior-matrix cases A/B/C).
     ///
     /// Returns `Some(output)` only on a **full** hit — every requested variant
-    /// present for the resolved commit — with the artifacts already copied into
-    /// the output directory. Returns `None` (build normally) when caching is
-    /// off/`--no-cache`, the commit SHA isn't known pre-clone, or the lookup
-    /// misses / errors. A lenient hit at a different version than requested is
-    /// still a hit, but flags [`BuildOutput::cache_version_mismatch`] and warns.
+    /// present for the resolved commit. In a normal build the artifacts are
+    /// copied into the output directory; when warming (`warm_cache`) nothing is
+    /// copied — a full hit means the commit is already fully cached, so the
+    /// returned artifacts simply reference the cache. Returns `None` (build
+    /// normally) when caching is off/`--no-cache`, the commit SHA isn't known
+    /// pre-clone, or the lookup misses / errors. A lenient hit at a different
+    /// version than requested is still a hit, but flags
+    /// [`BuildOutput::cache_version_mismatch`] and warns. (Warming pins the
+    /// version strictly, so that lenient case never arises for a warm.)
     async fn try_cache_fast_path(
         &self,
         request: &BuildRequest,
         project_info: &Project,
         resolved: &ResolvedRef,
         reporter: &dyn ProgressReporter,
+        warm_cache: bool,
     ) -> Option<BuildOutput> {
         let store = match &self.store {
             Some(store) if !request.no_cache => Arc::clone(store),
@@ -705,6 +851,7 @@ impl<'a> BuildCommand<'a> {
             request.strict_version,
             keys,
             request.output_dir.clone(),
+            !warm_cache,
         )
         .await;
         reporter.report(&BuildEvent::PhaseCompleted {
@@ -811,12 +958,19 @@ impl<'a> BuildCommand<'a> {
     /// stored best-effort. The workspace is a temporary directory that is
     /// auto-cleaned when it drops, so artifacts are collected to the output
     /// directory before it goes out of scope.
+    ///
+    /// When `warm_cache` is set nothing is collected to an output directory:
+    /// reused variants reference the cache in place, freshly built variants stay
+    /// in the (still-live) workspace only long enough for the best-effort warm
+    /// to copy them into the cache, and the returned artifacts are then
+    /// re-pointed at their canonical in-cache paths.
     async fn run_clone_build(
         &self,
         request: &BuildRequest,
         project_info: &Project,
         resolved: ResolvedRef,
         reporter: &dyn ProgressReporter,
+        warm_cache: bool,
     ) -> Result<BuildOutput> {
         let output_dir = request.output_dir.as_path();
         let builder = project_info.builder.as_ref();
@@ -910,6 +1064,7 @@ impl<'a> BuildCommand<'a> {
                 commit.clone(),
                 keys.clone(),
                 output_dir.to_path_buf(),
+                !warm_cache,
             )
             .await;
             reporter.report(&BuildEvent::PhaseCompleted {
@@ -950,19 +1105,27 @@ impl<'a> BuildCommand<'a> {
                 .execute_build(builder, &resolved_version, &build_variant_strs)
                 .await?;
 
-            // Collect built artifacts to output_dir BEFORE workspace cleanup,
-            // then repoint their paths and merge (they keep origin `Built`).
-            let built_paths: Vec<_> = built.artifacts.iter().map(|a| a.path.clone()).collect();
-            workspace.collect_artifacts(&built_paths, output_dir)?;
-            for mut artifact in built.artifacts {
-                artifact.path = output_dir.join(&artifact.filename);
-                artifacts.push(artifact);
+            if warm_cache {
+                // Warm: deliver nothing. The freshly built files stay in the
+                // (still-live) workspace so the best-effort warm below can copy
+                // them into the cache; their paths are re-pointed to the cache
+                // afterwards. Origin stays `Built`.
+                artifacts.extend(built.artifacts);
+            } else {
+                // Collect built artifacts to output_dir BEFORE workspace cleanup,
+                // then repoint their paths and merge (they keep origin `Built`).
+                let built_paths: Vec<_> = built.artifacts.iter().map(|a| a.path.clone()).collect();
+                workspace.collect_artifacts(&built_paths, output_dir)?;
+                for mut artifact in built.artifacts {
+                    artifact.path = output_dir.join(&artifact.filename);
+                    artifacts.push(artifact);
+                }
             }
         }
 
         // Workspace is automatically cleaned up when it goes out of scope.
         let variants_built = variants_built(&artifacts);
-        let output = BuildOutput {
+        let mut output = BuildOutput {
             result: BuildResult::new(
                 artifacts,
                 output_dir.to_path_buf(),
@@ -983,13 +1146,21 @@ impl<'a> BuildCommand<'a> {
         // still writes, keeping the cache fresh. Only a store that could not be
         // opened / disabled config (`store == None`) skips warming. Idempotent:
         // reused files are recognized, not recopied; never fails the build.
+        //
+        // In warm mode this store is the whole point (built artifacts are still
+        // in the workspace and copied in here), and the returned build lets us
+        // re-point the delivered artifacts at their stable in-cache paths before
+        // the workspace is dropped.
         if let Some(store) = self.store.clone() {
-            cache::store_build(
+            let stored = cache::store_build(
                 store,
                 output.to_build_metadata(&request.project),
                 output.to_source_artifacts(),
             )
             .await;
+            if warm_cache && let Some(stored) = stored {
+                repoint_to_cache(&mut output.result.artifacts, &stored.artifacts);
+            }
         }
 
         Ok(output)
@@ -1323,8 +1494,12 @@ impl<'a> BuildCommand<'a> {
     /// * `version` - User-provided version override (will be ignored with a warning)
     /// * `variants` - Requested variants (empty = all matching assets)
     /// * `output_dir` - Directory where downloaded assets will be placed
+    ///   (ignored when `warm_cache` is set — nothing is delivered)
+    /// * `no_cache` - Skip *reading* the cache (the download still warms it)
+    /// * `warm_cache` - Warm-only: deliver nothing; cached assets are referenced
+    ///   in place and freshly downloaded ones go to a temp dir just long enough
+    ///   to be copied into the cache
     /// * `reporter` - Progress reporter for receiving build events
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     async fn download_release(
         &self,
@@ -1335,6 +1510,7 @@ impl<'a> BuildCommand<'a> {
         variants: &[&str],
         output_dir: &Path,
         no_cache: bool,
+        warm_cache: bool,
         reporter: &dyn ProgressReporter,
     ) -> Result<BuildOutput> {
         let owner = &project_info.owner;
@@ -1441,6 +1617,7 @@ impl<'a> BuildCommand<'a> {
                 tag.to_string(),
                 requested_names.clone(),
                 output_dir.to_path_buf(),
+                !warm_cache,
             )
             .await;
             reporter.report(&BuildEvent::PhaseCompleted {
@@ -1451,14 +1628,32 @@ impl<'a> BuildCommand<'a> {
             (Vec::new(), requested_names)
         };
 
-        // Ensure the output dir exists (the no-cache path skips the reuse
-        // helper that would otherwise create it).
-        std::fs::create_dir_all(output_dir).map_err(|e| {
-            Error::Build(format!(
-                "Failed to create output directory '{}': {e}",
-                output_dir.display()
-            ))
-        })?;
+        // Warming delivers nothing to the output directory: freshly downloaded
+        // assets land in a throwaway temp dir just long enough for the cache to
+        // copy them in (the temp dir lives until this function returns, after
+        // the warm below). A normal download writes straight to the output dir,
+        // creating it first (the no-cache path skips the reuse helper that would
+        // otherwise create it).
+        let warm_tmp = if warm_cache {
+            Some(
+                tempfile::Builder::new()
+                    .prefix("apvm-warm-")
+                    .tempdir()
+                    .map_err(Error::Io)?,
+            )
+        } else {
+            std::fs::create_dir_all(output_dir).map_err(|e| {
+                Error::Build(format!(
+                    "Failed to create output directory '{}': {e}",
+                    output_dir.display()
+                ))
+            })?;
+            None
+        };
+        let download_dir: &Path = match &warm_tmp {
+            Some(tmp) => tmp.path(),
+            None => output_dir,
+        };
 
         // Assets still needing a download.
         let to_download: Vec<&ReleaseAsset> = matched_assets
@@ -1469,8 +1664,9 @@ impl<'a> BuildCommand<'a> {
 
         let mut artifacts: Vec<ProducedArtifact> = Vec::with_capacity(matched_assets.len());
 
-        // Cache-origin artifacts (already copied into output_dir by the reuse
-        // helper). The variant id is derived from the filename so provenance
+        // Cache-origin artifacts: copied into output_dir by the reuse helper
+        // for a normal download, or referenced in place in the cache when
+        // warming. The variant id is derived from the filename so provenance
         // matches the download path exactly.
         for asset in cached {
             let variant_id = builder.variant_from_release_asset(&asset.filename);
@@ -1498,8 +1694,8 @@ impl<'a> BuildCommand<'a> {
             for asset in &to_download {
                 reporter.report(&BuildEvent::StepStarted {
                     step: BuildStep::new(
-                        format!("Downloading {}", &asset.name),
-                        format!("GET {}", &asset.download_url),
+                        format!("Downloading {}", asset.name),
+                        format!("GET {}", asset.download_url),
                     ),
                 });
                 download_tasks.spawn(download_asset_owned(
@@ -1517,7 +1713,9 @@ impl<'a> BuildCommand<'a> {
                 // Download errors from the HTTP request.
                 let (asset_name, bytes) = download_result?;
 
-                let dest = output_dir.join(&asset_name);
+                // Warming writes to the temp dir; a normal download to the
+                // output dir (both are `download_dir`).
+                let dest = download_dir.join(&asset_name);
                 std::fs::write(&dest, &bytes).map_err(|e| {
                     Error::Build(format!("Failed to write asset '{}': {e}", dest.display()))
                 })?;
@@ -1571,7 +1769,7 @@ impl<'a> BuildCommand<'a> {
             artifacts: filenames,
         });
 
-        let output = BuildOutput {
+        let mut output = BuildOutput {
             result,
             resolved_ref,
             commit: format!("release-{tag}"),
@@ -1584,6 +1782,11 @@ impl<'a> BuildCommand<'a> {
         // Best-effort warm: cache the full delivered asset set under this tag.
         // Gated on store presence only (like the build path) so `--no-cache`
         // still refreshes the cache; only a disabled/unopened store skips it.
+        //
+        // In warm mode this is the whole point (freshly downloaded assets live
+        // in the temp dir and are copied in here), and the returned release lets
+        // us re-point the delivered artifacts at their stable in-cache paths
+        // before the temp dir is dropped.
         if let Some(store) = self.store.clone() {
             let mut metadata = ReleaseMetadata::new(&project_info.name, tag);
             // The version is informational on release rows; an exotic tag can
@@ -1607,7 +1810,10 @@ impl<'a> BuildCommand<'a> {
                     target_name: a.filename.clone(),
                 })
                 .collect();
-            cache::store_release(store, metadata, assets).await;
+            let stored = cache::store_release(store, metadata, assets).await;
+            if warm_cache && let Some(stored) = stored {
+                repoint_to_cache(&mut output.result.artifacts, &stored.assets);
+            }
         }
 
         Ok(output)
@@ -1847,7 +2053,7 @@ mod tests {
         let project_info = registry.get("test").unwrap();
 
         let output = cmd
-            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, false)
             .await
             .expect("expected a full cache hit");
 
@@ -1876,7 +2082,7 @@ mod tests {
         let project_info = registry.get("test").unwrap();
 
         let output = cmd
-            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, false)
             .await;
         assert!(output.is_none(), "--no-cache must bypass the fast path");
     }
@@ -1903,7 +2109,7 @@ mod tests {
         let project_info = registry.get("test").unwrap();
 
         let output = cmd
-            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, false)
             .await
             .expect("lenient hit expected");
 
@@ -1932,7 +2138,7 @@ mod tests {
         let project_info = registry.get("test").unwrap();
 
         let output = cmd
-            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, false)
             .await
             .expect("lenient hit expected");
 
@@ -1962,11 +2168,77 @@ mod tests {
         let project_info = registry.get("test").unwrap();
 
         let output = cmd
-            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter)
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, false)
             .await;
         assert!(
             output.is_none(),
             "strict + wrong version ⇒ no fast-path hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_path_warm_hit_references_cache_without_output() {
+        // A warm-mode full hit: the commit is already cached, so the artifacts
+        // reference the cache and NOTHING is written to the output directory.
+        let (cache, store) = seed_single_output("test", "1.0.0");
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(cache.path().to_path_buf());
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
+
+        let out = TempDir::new().unwrap();
+        // Warming pins the version strictly (mirrors `WarmRequest`).
+        let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path())
+            .version(Some("1.0.0".to_string()))
+            .strict_version(true);
+        let resolved = resolved_commit();
+        let project_info = registry.get("test").unwrap();
+
+        let output = cmd
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, true)
+            .await
+            .expect("expected a full cache hit");
+
+        assert!(output.from_cache());
+        assert_eq!(output.result.artifacts.len(), 1);
+        assert_eq!(output.result.artifacts[0].origin, ArtifactOrigin::Cache);
+        // The artifact references the in-cache file, not the output directory.
+        assert!(
+            output.result.artifacts[0].path.starts_with(cache.path()),
+            "warm artifact must reference the in-cache file"
+        );
+        assert!(output.result.artifacts[0].path.is_file());
+        // Nothing was written to the output directory.
+        assert!(
+            std::fs::read_dir(out.path()).unwrap().next().is_none(),
+            "warm fast-path must not write to the output directory"
+        );
+    }
+
+    #[test]
+    fn warm_request_into_build_request_sets_fixed_defaults() {
+        let request = WarmRequest::new("backwpup", "pr:123")
+            .version(Some("5.1.0".to_string()))
+            .variants(vec!["free".to_string()])
+            .into_build_request();
+
+        // Carried-over fields.
+        assert_eq!(request.project, "backwpup");
+        assert_eq!(request.git_ref, "pr:123");
+        assert_eq!(request.version.as_deref(), Some("5.1.0"));
+        assert_eq!(request.variants, vec!["free".to_string()]);
+
+        // The three fields `WarmRequest` omits get their only sensible warm
+        // values — this is what makes warming impossible to misconfigure.
+        assert_eq!(request.output_dir, PathBuf::new(), "no output directory");
+        assert!(
+            !request.no_cache,
+            "warming must consult + populate the cache"
+        );
+        assert!(
+            request.strict_version,
+            "warming always pins the requested version exactly"
         );
     }
 
@@ -2001,6 +2273,7 @@ mod tests {
                 BuildRequest::new("test-private", "main", output_dir.path())
                     .version(Some("1.0.0".to_string())),
                 &NullReporter,
+                false,
             )
             .await;
 
@@ -2053,6 +2326,7 @@ mod tests {
                 BuildRequest::new("test-public", "main", output_dir.path())
                     .version(Some("1.0.0".to_string())),
                 &NullReporter,
+                false,
             )
             .await;
 
