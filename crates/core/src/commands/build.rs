@@ -731,6 +731,21 @@ impl<'a> BuildCommand<'a> {
             ));
         }
 
+        // strict_version with no version is a contradiction: it would either
+        // silently pin to the builder's default (never what the caller asked
+        // for) or make the strict check a no-op. Warm mode's implicit pin
+        // always carries a version, and embedded builders ignore
+        // strict_version entirely (handled below), so neither is affected.
+        if !warm_cache
+            && request.strict_version
+            && request.version.is_none()
+            && !project_info.builder.version_requirement().is_embedded()
+        {
+            return Err(Error::StrictVersionRequiresVersion {
+                project: project_info.name.clone(),
+            });
+        }
+
         // `--strict-version` has no meaning for embedded-version builders (the
         // version comes from source and is deterministic per commit), so report
         // it as ignored rather than silently doing nothing. In warm mode the
@@ -1976,6 +1991,31 @@ mod tests {
         }
     }
 
+    /// Builder whose version is derived from source (like Imagify) — used to
+    /// confirm `--strict-version`'s "no version" guard leaves embedded-version
+    /// builders alone (they already get their own "ignored" treatment).
+    struct EmbeddedTestBuilder;
+
+    impl Builder for EmbeddedTestBuilder {
+        fn version_requirement(&self) -> VersionRequirement {
+            VersionRequirement::Embedded
+        }
+        fn setup_commands(&self) -> Vec<BuildStep> {
+            vec![]
+        }
+        fn build_commands(&self, _: &BuildContext, _: &str, _: &[&str]) -> Vec<BuildStep> {
+            vec![]
+        }
+        fn artifacts(
+            &self,
+            _: &BuildContext,
+            _: &str,
+            _: &[&str],
+        ) -> crate::Result<Vec<BuildArtifact>> {
+            Ok(vec![])
+        }
+    }
+
     // =========================================================================
     // Fast-path integration: `try_cache_fast_path` end-to-end against a real
     // (temp) store, no git/GitHub. Exercises variant-key derivation, lookup,
@@ -2340,6 +2380,168 @@ mod tests {
             );
         }
         // If it somehow succeeds (shouldn't with fake repo), that's also fine
+    }
+
+    // =========================================================================
+    // `--strict-version` (`strict_version`) requires an explicit version.
+    //
+    // Every case here resolves *before* any network/git work (registry lookup,
+    // platform check, private-repo check, then this guard), so — unlike
+    // `test_public_repo_does_not_require_token` above — a fake, nonexistent
+    // repo never risks a real network call for the failing cases.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn strict_version_without_version_fails_fast() {
+        // The exact contradiction reported: --strict-version with no --ver.
+        // Must fail immediately with a specific, actionable error instead of
+        // silently treating "no version" as "no constraint".
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(PathBuf::from("/tmp/cache"));
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
+
+        let output_dir = TempDir::new().unwrap();
+        let result = cmd
+            .execute(
+                BuildRequest::new("test", "main", output_dir.path()).strict_version(true),
+                &NullReporter,
+                false,
+            )
+            .await;
+
+        let err = result.expect_err("strict_version with no version must fail fast");
+        assert!(
+            matches!(err, Error::StrictVersionRequiresVersion { ref project } if project == "test"),
+            "expected StrictVersionRequiresVersion, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("strict_version"),
+            "error should name strict_version: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_version_without_version_fails_fast_even_with_builder_default() {
+        // The reported BackWPup scenario: a builder default version exists,
+        // but strict_version must NOT be allowed to silently pin to it —
+        // that default was never something the caller actually requested.
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project(
+            "test",
+            Box::new(DefaultVersionBuilder),
+        ));
+        let config = Config::new(PathBuf::from("/tmp/cache"));
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
+
+        let output_dir = TempDir::new().unwrap();
+        let result = cmd
+            .execute(
+                BuildRequest::new("test", "main", output_dir.path()).strict_version(true),
+                &NullReporter,
+                false,
+            )
+            .await;
+
+        let err = result.expect_err("strict_version with no version must fail fast");
+        assert!(
+            matches!(err, Error::StrictVersionRequiresVersion { .. }),
+            "expected StrictVersionRequiresVersion, got: {err:?}"
+        );
+        // The builder's default must never leak into the error as if it were
+        // the pinned version.
+        assert!(!err.to_string().contains("9.99.99"));
+    }
+
+    #[tokio::test]
+    async fn strict_version_with_version_passes_the_guard() {
+        // Pairing --strict-version with an explicit --ver must not trip the
+        // new guard (it will fail later resolving the fake repo over the
+        // network, same as `test_public_repo_does_not_require_token` — that's
+        // an unrelated, acceptable failure for this fake project).
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(PathBuf::from("/tmp/cache"));
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
+
+        let output_dir = TempDir::new().unwrap();
+        let result = cmd
+            .execute(
+                BuildRequest::new("test", "main", output_dir.path())
+                    .version(Some("1.0.0".to_string()))
+                    .strict_version(true),
+                &NullReporter,
+                false,
+            )
+            .await;
+
+        if let Err(e) = result {
+            assert!(
+                !matches!(e, Error::StrictVersionRequiresVersion { .. }),
+                "an explicit version must satisfy the guard, got: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_version_without_version_ignored_for_embedded_builder() {
+        // Embedded-version builders (e.g. Imagify) already treat
+        // --strict-version as a no-op regardless of --ver, reported via its
+        // own "ignored" warning — the new guard must not turn that into a
+        // hard error.
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(EmbeddedTestBuilder)));
+        let config = Config::new(PathBuf::from("/tmp/cache"));
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
+
+        let output_dir = TempDir::new().unwrap();
+        let result = cmd
+            .execute(
+                BuildRequest::new("test", "main", output_dir.path()).strict_version(true),
+                &NullReporter,
+                false,
+            )
+            .await;
+
+        if let Err(e) = result {
+            assert!(
+                !matches!(e, Error::StrictVersionRequiresVersion { .. }),
+                "embedded-version builders must be exempt from the guard, got: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_version_without_version_allowed_in_warm_mode() {
+        // `WarmRequest::into_build_request` always sets `strict_version: true`
+        // with no way for the caller to pass it explicitly — the guard must
+        // only fire for a caller-supplied `--strict-version`, never for warm
+        // mode's implicit one.
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(PathBuf::from("/tmp/cache"));
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
+
+        let output_dir = TempDir::new().unwrap();
+        let result = cmd
+            .execute(
+                BuildRequest::new("test", "main", output_dir.path()).strict_version(true),
+                &NullReporter,
+                true, // warm_cache
+            )
+            .await;
+
+        if let Err(e) = result {
+            assert!(
+                !matches!(e, Error::StrictVersionRequiresVersion { .. }),
+                "warm mode's implicit strict_version must not require a version, got: {e}"
+            );
+        }
     }
 
     // =========================================================================

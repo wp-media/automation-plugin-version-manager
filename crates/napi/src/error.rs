@@ -16,6 +16,7 @@ use napi::Status;
 ///
 /// - `ProjectNotFound`, `RepositoryNotFound` → `InvalidArg`
 /// - `PrivateRepoNoToken` → `InvalidArg` (with descriptive message)
+/// - `StrictVersionRequiresVersion` → `InvalidArg` (caller can fix by passing a version)
 /// - `Config` → `InvalidArg`
 /// - `GitHub` → `GenericFailure`
 /// - `Git`, `Build` → `GenericFailure`
@@ -29,6 +30,7 @@ pub fn core_error_to_napi(err: apvm_core::Error) -> napi::Error {
         apvm_core::Error::ProjectNotFound(_) => Status::InvalidArg,
         apvm_core::Error::RepositoryNotFound(_) => Status::InvalidArg,
         apvm_core::Error::PrivateRepoNoToken { .. } => Status::InvalidArg,
+        apvm_core::Error::StrictVersionRequiresVersion { .. } => Status::InvalidArg,
         apvm_core::Error::Config(_) => Status::InvalidArg,
         apvm_core::Error::GitHub(_)
         | apvm_core::Error::Git(_)

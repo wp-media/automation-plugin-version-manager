@@ -80,6 +80,14 @@ pub enum Error {
     #[error("Build error: {0}")]
     Build(String),
 
+    /// `strict_version` requested with no version to pin to — would otherwise
+    /// silently match a version the caller never asked for, or become a no-op.
+    #[error("'{project}': strict_version requires a version — pass one, or disable strict_version")]
+    StrictVersionRequiresVersion {
+        /// The project the request was made for.
+        project: String,
+    },
+
     /// No release found for a given tag.
     #[error("No GitHub release found for tag '{tag}' in {repo}")]
     ReleaseNotFound {

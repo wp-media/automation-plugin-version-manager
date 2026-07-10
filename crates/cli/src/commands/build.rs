@@ -109,9 +109,10 @@ pub struct BuildArgs {
     /// Require a cache hit to match the requested version (`--ver`) exactly,
     /// rebuilding instead of serving a different cached version
     ///
-    /// Modifies how the cache is read, so it cannot be combined with
-    /// `--no-cache` (which skips cache reads entirely). Redundant with
-    /// `--warm-cache`, which always pins the version exactly.
+    /// Requires `--ver` — rejected otherwise, rather than silently falling
+    /// back to the plugin's default version. Cannot combine with `--no-cache`
+    /// (skips cache reads). Redundant with `--warm-cache` (always pins
+    /// exactly, and unlike here, works without `--ver`).
     #[arg(long, conflicts_with = "no_cache")]
     pub strict_version: bool,
 
@@ -375,7 +376,7 @@ impl BuildArgs {
         output_dir: PathBuf,
         reporter: &dyn apvm_core::build::progress::ProgressReporter,
     ) -> Result<apvm_core::BuildOutput> {
-        if self.warm_cache {
+        let result = if self.warm_cache {
             let request = apvm_core::WarmRequest::new(self.plugin.clone(), git_ref)
                 .version(version)
                 .variants(variants);
@@ -387,6 +388,20 @@ impl BuildArgs {
                 .no_cache(self.no_cache)
                 .strict_version(self.strict_version);
             apvm.build(request, reporter).await
+        };
+        result.map_err(Self::with_cli_hint)
+    }
+
+    /// Reword [`apvm_core::Error::StrictVersionRequiresVersion`] with the CLI
+    /// flags that fix it; every other error passes through unchanged.
+    fn with_cli_hint(err: apvm_core::Error) -> apvm_core::Error {
+        match err {
+            apvm_core::Error::StrictVersionRequiresVersion { project } => {
+                apvm_core::Error::Build(format!(
+                    "--strict-version needs --ver for '{project}' — pass --ver X.Y.Z, or drop --strict-version"
+                ))
+            }
+            other => other,
         }
     }
 
@@ -592,6 +607,31 @@ mod tests {
     fn artifact(origin: ArtifactOrigin) -> ProducedArtifact {
         ProducedArtifact::new(None, PathBuf::from("/x.zip"), "x.zip".to_string(), 1)
             .with_origin(origin)
+    }
+
+    // =========================================================================
+    // with_cli_hint — rewrites core errors into CLI-flag-specific hints
+    // =========================================================================
+
+    #[test]
+    fn with_cli_hint_rewrites_strict_version_error_with_flag_names() {
+        let err = apvm_core::Error::StrictVersionRequiresVersion {
+            project: "backwpup".to_string(),
+        };
+        let msg = BuildArgs::with_cli_hint(err).to_string();
+        assert!(msg.contains("--ver"), "expected --ver in: {msg}");
+        assert!(
+            msg.contains("--strict-version"),
+            "expected --strict-version in: {msg}"
+        );
+        assert!(msg.contains("backwpup"), "expected project name in: {msg}");
+    }
+
+    #[test]
+    fn with_cli_hint_leaves_other_errors_unchanged() {
+        let err = apvm_core::Error::Build("some other failure".to_string());
+        let msg = BuildArgs::with_cli_hint(err).to_string();
+        assert_eq!(msg, "Build error: some other failure");
     }
 
     #[test]
