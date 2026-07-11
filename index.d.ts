@@ -240,9 +240,8 @@ export declare class Apvm {
    * cache so a later `build()` of the same reference is an instant hit.
    *
    * The options type is [`WarmOptions`], deliberately smaller than
-   * [`BuildOptions`]: there is no `outputDir` (nothing is delivered), no
-   * `noCache` (warming *is* a cache operation), and no `strictVersion`
-   * (warming always pins the requested version exactly).
+   * [`BuildOptions`]: there is no `outputDir` (nothing is delivered) and no
+   * `noCache` (warming *is* a cache operation).
    *
    * # Arguments
    *
@@ -588,7 +587,10 @@ export interface BuildOptions {
    * Version to build.
    *
    * - **BackWPup**: Required (e.g., `"5.1.0"`)
-   * - **WP Rocket**: Optional, auto-detected from source code if omitted
+   * - **WP Rocket / Imagify**: Optional — auto-detected from source when
+   *   omitted, or, when provided and the build path is taken, rewritten into
+   *   the plugin's source so the artifact carries the requested version
+   *   (reported via [`JsBuildOutput::version_override`]).
    */
   version?: string
   /**
@@ -614,14 +616,6 @@ export interface BuildOptions {
    * level (`cacheEnabled: false`), still warms the cache.
    */
   noCache?: boolean
-  /**
-   * Require a cache hit to match `version` exactly (defaults to `false`).
-   *
-   * Without this, a cached build of the same commit at a different version
-   * may be reused (with `cacheVersionMismatch` set on the result). Has no
-   * effect for projects whose version is embedded in source.
-   */
-  strictVersion?: boolean
 }
 
 /**
@@ -758,17 +752,12 @@ export interface JsBuildOutput {
    */
   fromCache: boolean
   /**
-   * `true` when a cache hit returned a version different from the one
-   * requested (only possible without `strictVersion`). When `true`,
-   * `requestedVersion` is what you asked for and `result.version` is what
-   * was delivered.
+   * Set when the build rewrote the plugin's source version to the requested
+   * version (WP Rocket / Imagify). `null` when no override happened: no
+   * version was pinned, artifacts came from the cache, the pinned version
+   * already matched source, or the plugin does not support overrides.
    */
-  cacheVersionMismatch: boolean
-  /**
-   * The version the caller requested (`version` in the build options), if
-   * any — retained so a version mismatch can be reported.
-   */
-  requestedVersion?: string
+  versionOverride?: JsVersionOverride
 }
 
 /**
@@ -1018,6 +1007,37 @@ export interface JsResolvedRef {
 }
 
 /**
+ * A version override applied to a plugin's source before building.
+ *
+ * Present on [`JsBuildOutput::version_override`] when a build rewrote the
+ * plugin's source version to the requested version (WP Rocket / Imagify). Lets
+ * JS consumers surface that the delivered artifact carries a version different
+ * from the one in source.
+ *
+ * # TypeScript
+ *
+ * ```typescript
+ * if (output.versionOverride) {
+ *   const o = output.versionOverride;
+ *   console.log(`Overrode ${o.from} → ${o.to} in ${o.file} (${o.sites.join(', ')})`);
+ * }
+ * ```
+ */
+export interface JsVersionOverride {
+  /** Filename of the plugin file that was rewritten (e.g. `"wp-rocket.php"`). */
+  file: string
+  /** The version found in source before the override. */
+  from: string
+  /** The version written in its place (the caller's requested version). */
+  to: string
+  /**
+   * Human-readable labels of the declarations rewritten in `file`,
+   * e.g. `["Version: header", "WP_ROCKET_VERSION"]`.
+   */
+  sites: Array<string>
+}
+
+/**
  * Options for a cache-warm operation.
  *
  * Pass this object to `Apvm.warmCache()`. Warming runs the **same pipeline**
@@ -1031,8 +1051,7 @@ export interface JsResolvedRef {
  *
  * - **no `outputDir`** — warming never writes artifacts anywhere but the cache;
  * - **no `noCache`** — warming *is* a cache operation, so bypassing the cache
- *   would make it a no-op;
- * - **no `strictVersion`** — warming always pins the requested version exactly.
+ *   would make it a no-op.
  *
  * # Required Fields
  *
