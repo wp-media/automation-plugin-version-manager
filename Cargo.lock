@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "apvm"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "apvm-config",
  "apvm-core",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "apvm-config"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "apvm-core"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "apvm-config",
  "apvm-storage",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "apvm-napi"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "apvm-config",
  "apvm-core",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "apvm-storage"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "chrono",
  "rusqlite",
