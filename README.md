@@ -377,7 +377,7 @@ crates/
 ### Architecture
 
 - **Config** — pure `serde` types for configuration. No file I/O, no hardcoded paths.
-- **Core** — orchestrates builds (resolve ref → cache fast path → clone → checkout → detect version → build → collect artifacts), downloads from GitHub Releases, integrates the artifact cache (serve on hit, reuse partial variants, warm after builds), git operations, and GitHub API via [octocrab](https://docs.rs/octocrab/0.49). For extended documentation, see the [Core crate README](crates/core/README.md).
+- **Core** — orchestrates builds (resolve ref → cache fast path → clone → checkout → detect version → build → collect artifacts), downloads from GitHub Releases, integrates the artifact cache (serve on hit, reuse partial variants, warm after builds), git operations, and GitHub API via [octocrab](https://docs.rs/octocrab/0.54). For extended documentation, see the [Core crate README](crates/core/README.md).
 - **Storage** — the SQLite-backed artifact cache: one embedded database indexes builds (keyed by project/version/commit, per-variant artifacts) and release assets (keyed by tag/filename), with health-checked lookups, LRU-style aging, and maintenance operations (clean, gc, verify, repair). For extended documentation, see the [Storage crate README](crates/storage/README.md).
 - **NAPI** — Node.js bindings via [napi-rs](https://napi.rs/). Exposes the core library as a native addon with async support on the tokio runtime. For extended documentation, see the [NAPI crate README](crates/napi/README.md).
 - **CLI** — owns default paths (`~/.apvm`, `~/.apvm/cache`), provides progress display via [indicatif](https://docs.rs/indicatif/0.18), and delegates all logic to core. For extended documentation, see the [CLI crate README](crates/cli/README.md).
@@ -404,7 +404,7 @@ npm test
 |----------------------|---------|--------------------------------|
 | [clap](https://docs.rs/clap/4)             | 4       | CLI argument parsing           |
 | [tokio](https://docs.rs/tokio/1)           | 1       | Async runtime                  |
-| [octocrab](https://docs.rs/octocrab/0.49)  | 0.49    | GitHub API client              |
+| [octocrab](https://docs.rs/octocrab/0.54)  | 0.54    | GitHub API client              |
 | [reqwest](https://docs.rs/reqwest/0.13)    | 0.13    | HTTP client (release asset downloads) |
 | [serde](https://docs.rs/serde/1)           | 1       | Serialization/deserialization  |
 | [napi](https://docs.rs/napi/3)             | 3       | Node.js N-API bindings         |

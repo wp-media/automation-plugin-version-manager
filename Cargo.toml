@@ -18,8 +18,8 @@ authors = ["Sandy Figueroa <sandy@wp-media.me>"]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "sync"] }
 
 # GitHub API client
-# https://crates.io/crates/octocrab — pre-1.0, 0.49.x is compatible range
-octocrab = "0.49"
+# https://crates.io/crates/octocrab — pre-1.0, 0.54.x is compatible range
+octocrab = "0.54"
 
 # Serialization
 # https://docs.rs/serde/1 — SemVer stable since 1.0

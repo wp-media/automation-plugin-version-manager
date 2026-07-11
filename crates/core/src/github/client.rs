@@ -89,7 +89,7 @@ impl GitHubClient {
     /// - GitHub REST API — Get a commit:
     ///   <https://docs.github.com/en/rest/commits/commits#get-a-commit>
     /// - octocrab `commits().get()`:
-    ///   <https://docs.rs/octocrab/0.49/octocrab/commits/struct.CommitHandler.html#method.get>
+    ///   <https://docs.rs/octocrab/0.54/octocrab/commits/struct.CommitHandler.html#method.get>
     pub async fn get_commit_sha(
         &self,
         owner: &str,
@@ -217,7 +217,7 @@ impl GitHubClient {
     /// - GitHub REST API:
     ///   <https://docs.github.com/en/rest/releases/releases#get-the-latest-release>
     /// - octocrab `get_latest()`:
-    ///   <https://docs.rs/octocrab/0.49/octocrab/repos/struct.ReleasesHandler.html#method.get_latest>
+    ///   <https://docs.rs/octocrab/0.54/octocrab/repos/struct.ReleasesHandler.html#method.get_latest>
     pub async fn get_latest_stable_release(
         &self,
         owner: &str,
@@ -246,9 +246,9 @@ impl GitHubClient {
     /// - GitHub REST API — List releases:
     ///   <https://docs.github.com/en/rest/releases/releases#list-releases>
     /// - octocrab `list().per_page().send()`:
-    ///   <https://docs.rs/octocrab/0.49/octocrab/repos/releases/struct.ReleasesHandler.html#method.list>
+    ///   <https://docs.rs/octocrab/0.54/octocrab/repos/releases/struct.ReleasesHandler.html#method.list>
     /// - octocrab `Page<T>` (field `items: Vec<T>`):
-    ///   <https://docs.rs/octocrab/0.49/octocrab/struct.Page.html>
+    ///   <https://docs.rs/octocrab/0.54/octocrab/struct.Page.html>
     pub async fn get_previous_stable_release(
         &self,
         owner: &str,
@@ -345,7 +345,7 @@ impl GitHubClient {
     /// # Sources
     ///
     /// - octocrab `Release` model:
-    ///   <https://docs.rs/octocrab/0.49/octocrab/models/repos/struct.Release.html>
+    ///   <https://docs.rs/octocrab/0.54/octocrab/models/repos/struct.Release.html>
     fn convert_release(release: &octocrab::models::repos::Release) -> Release {
         let assets = release
             .assets

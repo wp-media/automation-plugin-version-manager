@@ -302,7 +302,7 @@ Manages a temporary directory for build operations using [`tempfile::TempDir`](h
 
 ### `GitHubClient`
 
-Wraps [octocrab](https://docs.rs/octocrab/0.49) with methods for:
+Wraps [octocrab](https://docs.rs/octocrab/0.54) with methods for:
 
 | Method                        | Description                                          | API Endpoint |
 |-------------------------------|------------------------------------------------------|-------------|
@@ -392,7 +392,7 @@ All library code returns `Result<T>` (alias for `Result<T, Error>`). **No panics
 
 | Crate                                            | Version | Purpose                           |
 |--------------------------------------------------|---------|-----------------------------------|
-| [octocrab](https://docs.rs/octocrab/0.49)       | 0.49    | GitHub API client                 |
+| [octocrab](https://docs.rs/octocrab/0.54)       | 0.54    | GitHub API client                 |
 | [tokio](https://docs.rs/tokio/1)                | 1       | Async runtime                     |
 | [reqwest](https://docs.rs/reqwest/0.13)         | 0.13    | HTTP downloads (native-tls)       |
 | [serde](https://docs.rs/serde/1)                | 1       | Serialization                     |

@@ -87,7 +87,7 @@ const apvm = await Apvm.create({
 });
 ```
 
-> **Why is `create()` async?** The underlying HTTP client ([octocrab](https://docs.rs/octocrab/0.49)) requires a [Tokio](https://docs.rs/tokio/1) runtime during initialization.
+> **Why is `create()` async?** The underlying HTTP client ([octocrab](https://docs.rs/octocrab/0.54)) requires a [Tokio](https://docs.rs/tokio/1) runtime during initialization.
 
 #### `Apvm.createWithTokenResolution(config?): Promise<Apvm>`
 
