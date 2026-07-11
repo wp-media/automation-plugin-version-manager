@@ -6,10 +6,15 @@
 //!
 //! # Version Handling
 //!
-//! This builder uses [`VersionRequirement::Embedded`] because:
-//! - The version lives in the `wp-rocket.php` plugin header (`Version: X.Y.Z`)
-//! - The build process does not inject or modify the version
-//! - The version in the output matches whatever is in the checked-out source
+//! This builder uses [`VersionRequirement::Optional`]:
+//! - When no version is passed, the version is auto-detected from the
+//!   `wp-rocket.php` plugin header (`Version: X.Y.Z`) — the build packages the
+//!   source as-is.
+//! - When a version is passed and the build path is taken,
+//!   [`apply_version_override`](Builder::apply_version_override) rewrites both
+//!   the `Version:` header and the `WP_ROCKET_VERSION` runtime constant in
+//!   `wp-rocket.php` (never the unrelated `WP_ROCKET_LASTVERSION`) so the
+//!   produced artifact carries the requested version everywhere it is declared.
 //!
 //! # Build Process
 //!
@@ -38,14 +43,20 @@ use super::super::fs::ExclusionPattern;
 use super::super::fs::{copy_dir_with_exclusions, create_zip_archive};
 use super::super::progress::{BuildEvent, BuildStep, ProgressReporter};
 use super::{
-    BuildArtifact, Builder, ToolDependency, VersionRequirement, detect_wordpress_plugin_version,
+    BuildArtifact, Builder, ToolDependency, VersionOverride, VersionRequirement,
+    detect_wordpress_plugin_version, rewrite_wordpress_plugin_version,
 };
 
 /// Builder for the WP Rocket project.
 pub struct WpRocketBuilder;
 
-/// Main plugin PHP file used for version detection.
+/// Main plugin PHP file used for version detection and override.
 const PLUGIN_FILE: &str = "wp-rocket.php";
+
+/// Runtime version constant defined in [`PLUGIN_FILE`], rewritten alongside the
+/// header when a version override is applied. The unrelated
+/// `WP_ROCKET_LASTVERSION` constant is intentionally left untouched.
+const VERSION_CONSTANT: &str = "WP_ROCKET_VERSION";
 
 /// Glob pattern for matching any versioned WP Rocket artifact.
 ///
@@ -122,13 +133,12 @@ impl Builder for WpRocketBuilder {
     // Version Handling
     // =========================================================================
 
-    /// WP Rocket uses embedded version from the plugin header.
-    ///
-    /// The `wp-rocket.php` file contains a standard WordPress plugin header
-    /// with a `Version:` field. The build process packages files as-is
-    /// without modifying the version.
+    /// WP Rocket's version lives in the `wp-rocket.php` plugin header, so it is
+    /// [`Optional`](VersionRequirement::Optional): auto-detected when no version
+    /// is passed, or overridden into the source when one is (see
+    /// [`apply_version_override`](Self::apply_version_override)).
     fn version_requirement(&self) -> VersionRequirement {
-        VersionRequirement::Embedded
+        VersionRequirement::Optional
     }
 
     /// Detect version from the `wp-rocket.php` plugin header.
@@ -137,6 +147,30 @@ impl Builder for WpRocketBuilder {
     /// plugin file in the checked-out repository.
     fn detect_version(&self, working_dir: &Path) -> Result<Option<String>> {
         detect_wordpress_plugin_version(&working_dir.join(PLUGIN_FILE))
+    }
+
+    /// The single file [`detect_version`](Self::detect_version) reads, enabling
+    /// pre-clone version detection.
+    fn version_source_files(&self) -> Vec<&'static str> {
+        vec![PLUGIN_FILE]
+    }
+
+    /// Rewrite the requested version into `wp-rocket.php` before packaging.
+    ///
+    /// Overrides both the `Version:` header and the `WP_ROCKET_VERSION` runtime
+    /// constant (leaving `WP_ROCKET_LASTVERSION` untouched) so the produced zip
+    /// carries `version` everywhere it is declared. A no-op when the source
+    /// already matches; errors if either declaration is missing.
+    fn apply_version_override(
+        &self,
+        working_dir: &Path,
+        version: &str,
+    ) -> Result<Option<VersionOverride>> {
+        rewrite_wordpress_plugin_version(
+            &working_dir.join(PLUGIN_FILE),
+            version,
+            Some(VERSION_CONSTANT),
+        )
     }
 
     // =========================================================================
@@ -572,10 +606,66 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_version_requirement_is_embedded() {
+    fn test_version_requirement_is_optional() {
         assert_eq!(
             builder().version_requirement(),
-            VersionRequirement::Embedded
+            VersionRequirement::Optional
+        );
+    }
+
+    #[test]
+    fn test_version_source_files_is_the_plugin_file() {
+        // Must be exactly the file `detect_version` reads, so pre-clone
+        // detection agrees with a full checkout.
+        assert_eq!(builder().version_source_files(), vec![PLUGIN_FILE]);
+    }
+
+    #[test]
+    fn test_apply_version_override_rewrites_header_and_constant() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(PLUGIN_FILE),
+            "<?php\n * Version: 3.23\ndefine( 'WP_ROCKET_VERSION', '3.23' );\n\
+             define( 'WP_ROCKET_LASTVERSION', '3.22.1' );\n",
+        )
+        .unwrap();
+
+        let applied = builder()
+            .apply_version_override(dir.path(), "3.99.0")
+            .unwrap()
+            .expect("override applied");
+        assert_eq!(applied.file, PLUGIN_FILE);
+        assert_eq!(applied.from, "3.23");
+        assert_eq!(applied.to, "3.99.0");
+
+        let rewritten = std::fs::read_to_string(dir.path().join(PLUGIN_FILE)).unwrap();
+        assert!(rewritten.contains(" * Version: 3.99.0"));
+        assert!(rewritten.contains("define( 'WP_ROCKET_VERSION', '3.99.0' );"));
+        assert!(rewritten.contains("define( 'WP_ROCKET_LASTVERSION', '3.22.1' );"));
+    }
+
+    #[test]
+    fn test_apply_version_override_noop_when_matching() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(PLUGIN_FILE),
+            "<?php\n * Version: 3.23\ndefine( 'WP_ROCKET_VERSION', '3.23' );\n",
+        )
+        .unwrap();
+        let applied = builder()
+            .apply_version_override(dir.path(), "3.23")
+            .unwrap();
+        assert!(applied.is_none());
+    }
+
+    #[test]
+    fn test_apply_version_override_errors_without_source() {
+        // No wp-rocket.php present → cannot honor the requested version.
+        let dir = TempDir::new().unwrap();
+        assert!(
+            builder()
+                .apply_version_override(dir.path(), "3.99.0")
+                .is_err()
         );
     }
 

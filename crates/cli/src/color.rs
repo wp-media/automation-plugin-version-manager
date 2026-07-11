@@ -24,8 +24,6 @@ pub enum Color {
     Cyan,
     /// Downloaded release assets.
     Blue,
-    /// Attention/ambiguity (e.g. a cache version mismatch).
-    Yellow,
 }
 
 impl Color {
@@ -34,7 +32,6 @@ impl Color {
             Color::Green => "32",
             Color::Cyan => "36",
             Color::Blue => "34",
-            Color::Yellow => "33",
         }
     }
 }

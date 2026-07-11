@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use apvm_storage::{
     ArtifactStore, BuildMetadata, LookupKey, LookupRequest, LookupResult, ReleaseMetadata,
-    SourceArtifact, StoredBuild, StoredRelease, VersionMatch,
+    SourceArtifact, StoredBuild, StoredRelease,
 };
 
 use crate::build::plugins::Builder;
@@ -59,17 +59,39 @@ pub(crate) fn variant_keys(builder: &dyn Builder, requested: &[&str]) -> Vec<Opt
 /// The version a build can be predicted to produce **before** checkout, for the
 /// pre-clone cache lookup.
 ///
-/// Returns `None` for [`Embedded`](crate::build::plugins::VersionRequirement::Embedded)
-/// builders — their version is derived from source and cannot be known before
-/// checkout, so the lookup is left version-unpinned. Otherwise the caller's
-/// `version`, falling back to the builder's default version.
+/// Mirrors [`resolve_version`](crate::commands::build) so the predicted key
+/// matches what the build will actually produce:
+///
+/// - an explicit `version` (`--ver`) is always what will be built;
+/// - otherwise only [`Required`](crate::build::plugins::VersionRequirement::Required)
+///   builders fall back to their default (that is the version their build uses);
+/// - [`Optional`](crate::build::plugins::VersionRequirement::Optional) and
+///   [`Embedded`](crate::build::plugins::VersionRequirement::Embedded) builders
+///   derive the version from source, which cannot be known here — so they return
+///   `None`. The caller can still learn it pre-clone by fetching the source
+///   version file(s) (see `version_source_files`), or otherwise falls back to a
+///   post-checkout lookup.
 pub(crate) fn predicted_version(builder: &dyn Builder, version: Option<&str>) -> Option<String> {
-    if builder.version_requirement().is_embedded() {
+    let requirement = builder.version_requirement();
+
+    // Embedded ignores `--ver` entirely and derives the version from source,
+    // so nothing is predictable here regardless of what the caller passed.
+    if requirement.is_embedded() {
         return None;
     }
-    version
-        .map(str::to_string)
-        .or_else(|| builder.default_version().map(str::to_string))
+
+    // Required/Optional honor an explicit `--ver`.
+    if let Some(v) = version {
+        return Some(v.to_string());
+    }
+
+    // No `--ver`: only a `Required` builder falls back to its default (that is
+    // the version its build uses); an `Optional` builder detects from source
+    // and is not predictable statically.
+    if requirement.is_required() {
+        return builder.default_version().map(str::to_string);
+    }
+    None
 }
 
 /// A successful pre-clone cache hit whose artifacts are already in the output
@@ -77,17 +99,19 @@ pub(crate) fn predicted_version(builder: &dyn Builder, version: Option<&str>) ->
 pub(crate) struct FastPathHit {
     /// Full commit SHA of the cached build that was delivered.
     pub commit: String,
-    /// Version of the cached build actually delivered.
+    /// Version of the cached build delivered. Equals the requested version
+    /// (a hit requires an exact version match, or no version was requested).
     pub version: String,
-    /// Whether that version equals the one the caller pinned (always `true`
-    /// when nothing was pinned; `false` only for a lenient fallback hit).
-    pub version_matched: bool,
     /// The artifacts copied into the output directory (origin = `Cache`).
     pub artifacts: Vec<ProducedArtifact>,
 }
 
-/// Pre-clone fast path (behavior-matrix cases A/B/C): look the commit up and,
+/// Pre-clone fast path (behavior-matrix cases A/B): look the commit up and,
 /// on a full hit, materialize the requested variants.
+///
+/// A hit requires the cached build to match `version` exactly (when one is
+/// supplied); a build of the same commit at a different version is a miss, so
+/// the caller rebuilds/downloads at the requested version.
 ///
 /// With `deliver = true` the variants are copied into `output_dir`; with
 /// `deliver = false` (cache warming) nothing is copied and `output_dir` is
@@ -97,13 +121,11 @@ pub(crate) struct FastPathHit {
 /// Returns `None` on a miss, on any storage/copy error (treated as a miss), or
 /// if the blocking task panics — in every case the caller proceeds to build
 /// normally, so the cache is never able to break a build.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn fast_path_lookup_and_copy(
     store: Arc<ArtifactStore>,
     project: String,
     commit: String,
     version: Option<String>,
-    strict: bool,
     keys: Vec<Option<String>>,
     output_dir: PathBuf,
     deliver: bool,
@@ -113,13 +135,7 @@ pub(crate) async fn fast_path_lookup_and_copy(
         if let Some(v) = &version {
             request = request.version(v);
         }
-        request = request
-            .version_match(if strict {
-                VersionMatch::Strict
-            } else {
-                VersionMatch::Lenient
-            })
-            .require_variants(&keys);
+        request = request.require_variants(&keys);
 
         let hit = match store.lookup_build(&request) {
             Ok(LookupResult::Hit(hit)) => hit,
@@ -137,7 +153,6 @@ pub(crate) async fn fast_path_lookup_and_copy(
         Ok(Some(FastPathHit {
             commit: hit.build.commit.clone(),
             version: hit.build.version.clone(),
-            version_matched: hit.version_matched,
             artifacts,
         }))
     });
@@ -563,6 +578,25 @@ mod tests {
         }
     }
 
+    fn optional_no_default() -> FakeBuilder {
+        FakeBuilder {
+            variants: vec![],
+            requirement: VersionRequirement::Optional,
+            default_version: None,
+        }
+    }
+
+    /// Optional builder that *advertises* a default — used to confirm the
+    /// default is NOT used as the predicted version (Optional detects from
+    /// source, so the default would be a wrong cache key).
+    fn optional_with_default() -> FakeBuilder {
+        FakeBuilder {
+            variants: vec![],
+            requirement: VersionRequirement::Optional,
+            default_version: Some("9.99.99"),
+        }
+    }
+
     // ---- variant_keys -----------------------------------------------------
 
     #[test]
@@ -597,8 +631,11 @@ mod tests {
 
     #[test]
     fn predicted_version_embedded_is_none() {
+        // Embedded derives its version from source and ignores `--ver`, so it
+        // is never predictable — with or without an explicit version.
         let b = single_output_embedded();
         assert_eq!(predicted_version(&b, Some("3.0.0")), None);
+        assert_eq!(predicted_version(&b, None), None);
     }
 
     #[test]
@@ -608,7 +645,32 @@ mod tests {
             predicted_version(&b, Some("5.1.0")),
             Some("5.1.0".to_string())
         );
+        // Required builder with no `--ver` falls back to its default.
         assert_eq!(predicted_version(&b, None), Some("9.99.99".to_string()));
+    }
+
+    #[test]
+    fn predicted_version_optional_never_uses_default() {
+        // Optional builders detect from source when no `--ver` is given, so the
+        // default must NOT become the predicted key (it would mismatch what the
+        // build actually produces). An explicit `--ver` is still honored.
+        let no_default = optional_no_default();
+        assert_eq!(predicted_version(&no_default, None), None);
+        assert_eq!(
+            predicted_version(&no_default, Some("3.17.4")),
+            Some("3.17.4".to_string())
+        );
+
+        let with_default = optional_with_default();
+        assert_eq!(
+            predicted_version(&with_default, None),
+            None,
+            "an Optional builder's default is not the version it builds"
+        );
+        assert_eq!(
+            predicted_version(&with_default, Some("3.17.4")),
+            Some("3.17.4".to_string())
+        );
     }
 
     // ---- store-backed helpers (temp ArtifactStore, no git/GitHub) ---------
@@ -660,7 +722,6 @@ mod tests {
             "backwpup".to_string(),
             "a1b2c3d".to_string(), // short SHA still matches
             Some("5.6.0".to_string()),
-            false,
             keys,
             out.path().to_path_buf(),
             true,
@@ -669,7 +730,6 @@ mod tests {
         .expect("expected a full cache hit");
 
         assert_eq!(hit.version, "5.6.0");
-        assert!(hit.version_matched);
         assert_eq!(hit.artifacts.len(), 2);
         assert!(
             hit.artifacts
@@ -696,7 +756,6 @@ mod tests {
             "backwpup".to_string(),
             "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string(),
             Some("5.6.0".to_string()),
-            false,
             keys,
             out.path().to_path_buf(),
             true,
@@ -711,38 +770,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_path_lenient_reports_version_mismatch() {
-        let (_base, store) = seed_store(
-            &[(Some("free"), "free.zip")],
-            "5.6.0",
-            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-        );
-        let out = tempfile::tempdir().unwrap();
-        let keys = vec![Some("free".to_string())];
-
-        // Pin a different version, lenient → hits the cached 5.6.0 but flags mismatch.
-        let hit = fast_path_lookup_and_copy(
-            store,
-            "backwpup".to_string(),
-            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string(),
-            Some("9.9.9".to_string()),
-            false,
-            keys,
-            out.path().to_path_buf(),
-            true,
-        )
-        .await
-        .expect("lenient hit expected");
-
-        assert_eq!(hit.version, "5.6.0");
-        assert!(
-            !hit.version_matched,
-            "delivered version differs from requested"
-        );
-    }
-
-    #[tokio::test]
-    async fn fast_path_strict_misses_on_version_mismatch() {
+    async fn fast_path_misses_on_version_mismatch() {
+        // The cache holds this commit at 5.6.0; pinning a different version must
+        // MISS (a build at another version is never served in its place), so the
+        // caller rebuilds/downloads at the requested version.
         let (_base, store) = seed_store(
             &[(Some("free"), "free.zip")],
             "5.6.0",
@@ -756,7 +787,6 @@ mod tests {
             "backwpup".to_string(),
             "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string(),
             Some("9.9.9".to_string()),
-            true, // strict
             keys,
             out.path().to_path_buf(),
             true,
@@ -765,7 +795,11 @@ mod tests {
 
         assert!(
             hit.is_none(),
-            "strict mode must not accept a different version"
+            "a different cached version must not be served"
+        );
+        assert!(
+            !out.path().join("free.zip").exists(),
+            "a version mismatch must not copy anything"
         );
     }
 
@@ -1025,7 +1059,6 @@ mod tests {
             "backwpup".to_string(),
             "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string(),
             Some("5.6.0".to_string()),
-            true, // warming always pins strictly
             keys,
             out.path().to_path_buf(),
             false, // deliver = false → warm

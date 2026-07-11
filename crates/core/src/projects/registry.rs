@@ -75,8 +75,9 @@ impl ProjectRegistry {
             builder: Box::new(WpRocketBuilder),
         });
 
-        // Imagify is a public repository whose version is embedded in the
-        // `imagify.php` plugin header. Its GitHub Releases carry no downloadable
+        // Imagify is a public repository whose version lives in the
+        // `imagify.php` plugin header (auto-detected, or overridden into source
+        // when `--ver` is passed). Its GitHub Releases carry no downloadable
         // assets (distribution goes to WordPress.org SVN), so `has_releases` is
         // false: a specific released version is built from its tag
         // (e.g. `tag:v2.3.0`) rather than downloaded.
@@ -184,12 +185,14 @@ mod tests {
         assert_eq!(project.repo, "imagify-plugin");
         assert_eq!(project.owner, "wp-media");
         assert_eq!(project.default_branch, DEFAULT_BRANCH_NAME);
-        // Public repo with an embedded version and no downloadable release assets.
+        // Public repo whose version is in imagify.php (optional: auto-detected,
+        // or overridden into source when --ver is passed), with no downloadable
+        // release assets.
         assert!(!project.is_private);
         assert!(!project.has_releases);
         assert!(
-            project.builder.version_requirement().is_embedded(),
-            "imagify version is embedded in imagify.php"
+            project.builder.version_requirement().is_optional(),
+            "imagify version is auto-detected from / overridden into imagify.php"
         );
     }
 

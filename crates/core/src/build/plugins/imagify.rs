@@ -6,14 +6,16 @@
 //!
 //! # Version Handling
 //!
-//! This builder uses [`VersionRequirement::Embedded`] because:
-//! - The version lives in the `imagify.php` plugin header (`Version: X.Y.Z`)
-//! - The build process does not inject or modify the version
-//! - The version in the output matches whatever is in the checked-out source
-//!
-//! Any version passed on the command line is therefore ignored (a warning is
-//! logged) and the version detected from source is used instead — identical to
-//! the WP Rocket builder.
+//! This builder uses [`VersionRequirement::Optional`]:
+//! - When no version is passed, it is auto-detected from the `imagify.php`
+//!   plugin header (`Version: X.Y.Z`) and the packaging script ships the source
+//!   as-is.
+//! - When a version is passed and the build path is taken,
+//!   [`apply_version_override`](Builder::apply_version_override) rewrites both
+//!   the `Version:` header and the `IMAGIFY_VERSION` runtime constant in
+//!   `imagify.php` before the packaging script runs, so the produced artifact
+//!   carries the requested version everywhere it is declared — identical to the
+//!   WP Rocket builder.
 //!
 //! # Build Process
 //!
@@ -76,14 +78,19 @@ use crate::error::Error;
 use super::super::BuildContext;
 use super::super::progress::{BuildEvent, BuildStep, ProgressReporter};
 use super::{
-    BuildArtifact, Builder, ToolDependency, VersionRequirement, detect_wordpress_plugin_version,
+    BuildArtifact, Builder, ToolDependency, VersionOverride, VersionRequirement,
+    detect_wordpress_plugin_version, rewrite_wordpress_plugin_version,
 };
 
 /// Builder for the Imagify project.
 pub struct ImagifyBuilder;
 
-/// Main plugin PHP file used for version detection.
+/// Main plugin PHP file used for version detection and override.
 const PLUGIN_FILE: &str = "imagify.php";
+
+/// Runtime version constant defined in [`PLUGIN_FILE`], rewritten alongside the
+/// header when a version override is applied.
+const VERSION_CONSTANT: &str = "IMAGIFY_VERSION";
 
 /// Path (relative to the repository root) of the official packaging script.
 const BUILD_SCRIPT: &str = "bin/build-zip.sh";
@@ -116,13 +123,12 @@ impl Builder for ImagifyBuilder {
     // Version Handling
     // =========================================================================
 
-    /// Imagify uses the embedded version from the plugin header.
-    ///
-    /// The `imagify.php` file contains a standard WordPress plugin header with a
-    /// `Version:` field. The packaging script packages files as-is without
-    /// modifying the version, so any provided version is ignored.
+    /// Imagify's version lives in the `imagify.php` plugin header, so it is
+    /// [`Optional`](VersionRequirement::Optional): auto-detected when no version
+    /// is passed, or overridden into the source when one is (see
+    /// [`apply_version_override`](Self::apply_version_override)).
     fn version_requirement(&self) -> VersionRequirement {
-        VersionRequirement::Embedded
+        VersionRequirement::Optional
     }
 
     /// Detect version from the `imagify.php` plugin header.
@@ -131,6 +137,31 @@ impl Builder for ImagifyBuilder {
     /// in the checked-out repository.
     fn detect_version(&self, working_dir: &Path) -> Result<Option<String>> {
         detect_wordpress_plugin_version(&working_dir.join(PLUGIN_FILE))
+    }
+
+    /// The single file [`detect_version`](Self::detect_version) reads, enabling
+    /// pre-clone version detection.
+    fn version_source_files(&self) -> Vec<&'static str> {
+        vec![PLUGIN_FILE]
+    }
+
+    /// Rewrite the requested version into `imagify.php` before packaging.
+    ///
+    /// Overrides both the `Version:` header and the `IMAGIFY_VERSION` runtime
+    /// constant so the produced zip carries `version` everywhere it is declared.
+    /// Runs before the packaging script rsyncs the source, so the rewrite flows
+    /// into the artifact. A no-op when the source already matches; errors if
+    /// either declaration is missing.
+    fn apply_version_override(
+        &self,
+        working_dir: &Path,
+        version: &str,
+    ) -> Result<Option<VersionOverride>> {
+        rewrite_wordpress_plugin_version(
+            &working_dir.join(PLUGIN_FILE),
+            version,
+            Some(VERSION_CONSTANT),
+        )
     }
 
     // =========================================================================
@@ -323,10 +354,67 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_version_requirement_is_embedded() {
+    fn test_version_requirement_is_optional() {
         assert_eq!(
             builder().version_requirement(),
-            VersionRequirement::Embedded
+            VersionRequirement::Optional
+        );
+    }
+
+    #[test]
+    fn test_version_source_files_is_the_plugin_file() {
+        // Must be exactly the file `detect_version` reads, so pre-clone
+        // detection agrees with a full checkout.
+        assert_eq!(builder().version_source_files(), vec![PLUGIN_FILE]);
+    }
+
+    #[test]
+    fn test_apply_version_override_rewrites_header_and_constant() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(PLUGIN_FILE),
+            "<?php\n * Version: 2.3.0\ndefine( 'IMAGIFY_VERSION', '2.3.0' );\n",
+        )
+        .unwrap();
+
+        let applied = builder()
+            .apply_version_override(dir.path(), "2.9.9")
+            .unwrap()
+            .expect("override applied");
+        assert_eq!(applied.file, PLUGIN_FILE);
+        assert_eq!(applied.from, "2.3.0");
+        assert_eq!(applied.to, "2.9.9");
+        assert_eq!(
+            applied.sites,
+            vec!["Version: header".to_string(), "IMAGIFY_VERSION".to_string()]
+        );
+
+        let rewritten = std::fs::read_to_string(dir.path().join(PLUGIN_FILE)).unwrap();
+        assert!(rewritten.contains(" * Version: 2.9.9"));
+        assert!(rewritten.contains("define( 'IMAGIFY_VERSION', '2.9.9' );"));
+    }
+
+    #[test]
+    fn test_apply_version_override_noop_when_matching() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(PLUGIN_FILE),
+            "<?php\n * Version: 2.3.0\ndefine( 'IMAGIFY_VERSION', '2.3.0' );\n",
+        )
+        .unwrap();
+        let applied = builder()
+            .apply_version_override(dir.path(), "2.3.0")
+            .unwrap();
+        assert!(applied.is_none());
+    }
+
+    #[test]
+    fn test_apply_version_override_errors_without_source() {
+        let dir = TempDir::new().unwrap();
+        assert!(
+            builder()
+                .apply_version_override(dir.path(), "2.9.9")
+                .is_err()
         );
     }
 

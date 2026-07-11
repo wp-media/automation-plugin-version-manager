@@ -28,8 +28,8 @@ For extended CLI documentation, see the [CLI crate README](crates/cli/README.md)
 - **Special keyword refs** — use `tag:latest-stable`, `tag:latest`, `release:latest-stable`, `release:latest` (and their `previous-*` variants) to dynamically resolve the most recent tags or releases without knowing the exact version
 - **Automatic ref detection** — `v1.0.0` resolves to a tag, `develop` to a branch, `123` to PR #123, and version-like inputs (e.g., `5.6.8`) are checked against GitHub Releases first (when the plugin supports releases)
 - **Multi-variant builds** — e.g., BackWPup produces `free`, `pro-de`, and `pro-en` variants. You can choose which ones to build (`free` and `pro-en` are the defaults for BackWPup)
-- **Persistent artifact cache** — builds and release downloads are cached (SQLite-indexed, on by default): rebuilding the same commit is served from the cache, and a partial request reuses cached variants and builds only the rest. Per-artifact provenance (`built`/`cache`/`downloaded`), `--no-cache` / `--strict-version` overrides, a `--warm-cache` mode that primes the cache without producing output, and an `apvm cache` maintenance command
-- **Version handling** — required, embedded (auto-detected), or optional per plugin (BackWPup requires a version at build time; WP Rocket auto-detects it from source)
+- **Persistent artifact cache** — builds and release downloads are cached (SQLite-indexed, on by default): rebuilding the same commit **at the same version** is served from the cache, and a partial request reuses cached variants and builds only the rest. Per-artifact provenance (`built`/`cache`/`downloaded`), a `--no-cache` override, a `--warm-cache` mode that primes the cache without producing output, and an `apvm cache` maintenance command
+- **Version handling** — required or optional per plugin (BackWPup requires a version at build time; WP Rocket and Imagify auto-detect it from source, and when you pass `--ver` the requested version is rewritten into the plugin's source so the built artifact actually carries it)
 - **Self-update** — `apvm update` downloads and replaces the binary with the latest release, verifying SHA-256 checksums
 - **Self-uninstall** — `apvm uninstall` cleanly removes the binary and its directory (with `-y`/`--yes` to skip confirmation)
 - **GitHub token auto-resolution** — automatically finds tokens from config, `GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token`, or the gh CLI config file
@@ -39,8 +39,8 @@ For extended CLI documentation, see the [CLI crate README](crates/cli/README.md)
 | Plugin    | Variants             | Version  | Releases | Repository |
 |-----------|----------------------|----------|----------|------------|
 | BackWPup  | free, pro-de, pro-en | Required | Yes      | Private    |
-| WP Rocket | (single)             | Embedded | No       | Public     |
-| Imagify   | (single)             | Embedded | No¹      | Public     |
+| WP Rocket | (single)             | Optional | No       | Public     |
+| Imagify   | (single)             | Optional | No¹      | Public     |
 
 ¹ Imagify publishes GitHub Releases (git tags), but they carry no downloadable
 build assets — distribution goes to WordPress.org. Build a specific released
@@ -175,17 +175,26 @@ apvm build backwpup 123 -v 5.1.0 ./dist
 apvm --verbose build backwpup 123 -v 5.1.0
 ```
 
-For embedded-version plugins (WP Rocket, Imagify) the version is auto-detected
-from source, so `-v` is unnecessary (any value passed is ignored) and the
-artifact is named automatically (e.g. `imagify-<version>.zip`):
+For WP Rocket and Imagify the version lives in the plugin's source, so `-v` is
+optional: omit it and the version is auto-detected (the artifact is named
+automatically, e.g. `imagify-<version>.zip`). Pass `-v` to **override** it — the
+requested version is rewritten into the plugin's main PHP file (both the
+`Version:` header and the runtime version constant) before packaging, so the
+built artifact actually carries it:
 
 ```sh
-# Imagify — public repo, embedded version, single artifact
-apvm build imagify develop            # build from the develop branch
+# Imagify — public repo, version in source, single artifact
+apvm build imagify develop            # build from develop, version auto-detected
 apvm build imagify tag:v2.3.0         # build a specific released version from its tag
 apvm build imagify pr:123             # build from a pull request
 apvm build imagify develop ./dist     # choose an output directory
+apvm build imagify develop -v 2.9.9   # override: artifact + source report 2.9.9
 ```
+
+When a version is auto-detected (no `-v`), or when a cached build of the same
+commit is reused, no rewrite happens. A cache hit requires the commit **and**
+the version to match: a cached build of the same commit at a *different* version
+is never served in its place — apvm rebuilds at the requested version instead.
 
 **Ref auto-detection rules:**
 
@@ -229,7 +238,7 @@ apvm build backwpup 123 -v 5.1.0 --variants free,pro-en --warm-cache
 apvm build backwpup release:5.6.8 --warm-cache
 ```
 
-The summary distinguishes what was already cached (`reused`) from what had to be `built` or `downloaded` to warm it — all of which are cached afterwards. `--warm-cache` cannot be combined with `--no-cache` (warming _is_ a cache operation — this is a hard error). An output directory and `--strict-version` are both no-ops with `--warm-cache` rather than errors: passing either is accepted and simply ignored, with a note printed to explain why.
+The summary distinguishes what was already cached (`reused`) from what had to be `built` or `downloaded` to warm it — all of which are cached afterwards. `--warm-cache` cannot be combined with `--no-cache` (warming _is_ a cache operation — this is a hard error). An output directory is a no-op with `--warm-cache` rather than an error: passing one is accepted and simply ignored, with a note printed to explain why.
 
 ### List Plugins
 

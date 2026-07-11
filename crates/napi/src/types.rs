@@ -371,6 +371,49 @@ impl From<&apvm_core::build::BuildResult> for JsBuildResult {
 }
 
 // =============================================================================
+// Version Override (Plain Object)
+// =============================================================================
+
+/// A version override applied to a plugin's source before building.
+///
+/// Present on [`JsBuildOutput::version_override`] when a build rewrote the
+/// plugin's source version to the requested version (WP Rocket / Imagify). Lets
+/// JS consumers surface that the delivered artifact carries a version different
+/// from the one in source.
+///
+/// # TypeScript
+///
+/// ```typescript
+/// if (output.versionOverride) {
+///   const o = output.versionOverride;
+///   console.log(`Overrode ${o.from} → ${o.to} in ${o.file} (${o.sites.join(', ')})`);
+/// }
+/// ```
+#[napi(object)]
+pub struct JsVersionOverride {
+    /// Filename of the plugin file that was rewritten (e.g. `"wp-rocket.php"`).
+    pub file: String,
+    /// The version found in source before the override.
+    pub from: String,
+    /// The version written in its place (the caller's requested version).
+    pub to: String,
+    /// Human-readable labels of the declarations rewritten in `file`,
+    /// e.g. `["Version: header", "WP_ROCKET_VERSION"]`.
+    pub sites: Vec<String>,
+}
+
+impl From<&apvm_core::VersionOverride> for JsVersionOverride {
+    fn from(value: &apvm_core::VersionOverride) -> Self {
+        Self {
+            file: value.file.clone(),
+            from: value.from.clone(),
+            to: value.to.clone(),
+            sites: value.sites.clone(),
+        }
+    }
+}
+
+// =============================================================================
 // Build Output (Plain Object)
 // =============================================================================
 
@@ -415,14 +458,11 @@ pub struct JsBuildOutput {
     /// Derived from per-artifact provenance; a partial build (some reused,
     /// some freshly built) is `false`. See each artifact's `origin`.
     pub from_cache: bool,
-    /// `true` when a cache hit returned a version different from the one
-    /// requested (only possible without `strictVersion`). When `true`,
-    /// `requestedVersion` is what you asked for and `result.version` is what
-    /// was delivered.
-    pub cache_version_mismatch: bool,
-    /// The version the caller requested (`version` in the build options), if
-    /// any — retained so a version mismatch can be reported.
-    pub requested_version: Option<String>,
+    /// Set when the build rewrote the plugin's source version to the requested
+    /// version (WP Rocket / Imagify). `null` when no override happened: no
+    /// version was pinned, artifacts came from the cache, the pinned version
+    /// already matched source, or the plugin does not support overrides.
+    pub version_override: Option<JsVersionOverride>,
 }
 
 impl From<apvm_core::BuildOutput> for JsBuildOutput {
@@ -437,8 +477,10 @@ impl From<apvm_core::BuildOutput> for JsBuildOutput {
             branch: output.branch.clone(),
             description,
             from_cache,
-            cache_version_mismatch: output.cache_version_mismatch,
-            requested_version: output.requested_version.clone(),
+            version_override: output
+                .version_override
+                .as_ref()
+                .map(JsVersionOverride::from),
         }
     }
 }
@@ -715,7 +757,10 @@ pub struct BuildOptions {
     /// Version to build.
     ///
     /// - **BackWPup**: Required (e.g., `"5.1.0"`)
-    /// - **WP Rocket**: Optional, auto-detected from source code if omitted
+    /// - **WP Rocket / Imagify**: Optional — auto-detected from source when
+    ///   omitted, or, when provided and the build path is taken, rewritten into
+    ///   the plugin's source so the artifact carries the requested version
+    ///   (reported via [`JsBuildOutput::version_override`]).
     pub version: Option<String>,
 
     /// Specific variants to build.
@@ -737,13 +782,6 @@ pub struct BuildOptions {
     /// The build still runs and, unless caching is disabled at the instance
     /// level (`cacheEnabled: false`), still warms the cache.
     pub no_cache: Option<bool>,
-
-    /// Require a cache hit to match `version` exactly (defaults to `false`).
-    ///
-    /// Without this, a cached build of the same commit at a different version
-    /// may be reused (with `cacheVersionMismatch` set on the result). Has no
-    /// effect for projects whose version is embedded in source.
-    pub strict_version: Option<bool>,
 }
 
 // =============================================================================
@@ -763,8 +801,7 @@ pub struct BuildOptions {
 ///
 /// - **no `outputDir`** — warming never writes artifacts anywhere but the cache;
 /// - **no `noCache`** — warming *is* a cache operation, so bypassing the cache
-///   would make it a no-op;
-/// - **no `strictVersion`** — warming always pins the requested version exactly.
+///   would make it a no-op.
 ///
 /// # Required Fields
 ///

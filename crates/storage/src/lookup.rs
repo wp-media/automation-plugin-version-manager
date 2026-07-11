@@ -1,16 +1,12 @@
-//! High-level cache lookup with version-match semantics.
+//! High-level cache lookup with exact version-match semantics.
 //!
-//! Some plugins are version-aware: the requested version string is baked
-//! into the built artifact (BackWPup stamps it into the zip and the plugin
-//! headers), so a build of the *right commit* at the *wrong version* may or
-//! may not be an acceptable cache hit:
-//!
-//! - [`VersionMatch::Strict`] — only a build of the exact requested version
-//!   counts. Use for version-stamping plugins when the version matters
-//!   (e.g. testing data migrations).
-//! - [`VersionMatch::Lenient`] — any healthy build of the commit counts;
-//!   an exact-version build is preferred and [`LookupHit::version_matched`]
-//!   reports which case occurred.
+//! A cached build satisfies a request only when it is a healthy build of the
+//! requested key **at the requested version**. Many plugins are version-aware
+//! (the version string is baked into the artifact — BackWPup stamps it into the
+//! zip and the plugin headers; WP Rocket / Imagify rewrite it into their
+//! source), so a build of the *right commit* at the *wrong version* is a
+//! genuinely different artifact and must never be served in its place. When no
+//! version is requested, any healthy build of the key is accepted.
 //!
 //! On a miss, [`MissReason`] says *why* — not cached at all, only other
 //! versions cached, required variants missing, or files damaged — so a
@@ -24,18 +20,6 @@ use crate::error::Result;
 use crate::paths;
 use crate::store::{ArtifactStore, artifacts_healthy, touch_build_quiet};
 use crate::types::{BuildSource, StoredBuild};
-
-/// How strictly the requested version must match the cached build's version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VersionMatch {
-    /// Only exact-version builds are hits; other versions of the same
-    /// commit produce [`MissReason::VersionMismatch`].
-    Strict,
-    /// Any healthy build of the key is a hit; exact-version builds are
-    /// preferred when available.
-    #[default]
-    Lenient,
-}
 
 /// What to look up: a commit or a source reference.
 #[derive(Debug, Clone, Copy)]
@@ -57,38 +41,30 @@ pub struct LookupRequest<'a> {
     pub project: &'a str,
     /// What to search by.
     pub key: LookupKey<'a>,
-    /// Requested version, if the caller has one.
+    /// Requested version, if the caller has one. When set, only a build at
+    /// exactly this version is a hit; when `None`, any healthy build of the
+    /// key is accepted.
     pub version: Option<&'a str>,
-    /// How strictly `version` must match. Defaults to [`VersionMatch::Lenient`].
-    pub version_match: VersionMatch,
     /// Variants that must be present and healthy for a hit (`None` entries
     /// mean the variant-less artifact). Empty = any healthy artifact set.
     pub required_variants: &'a [Option<String>],
 }
 
 impl<'a> LookupRequest<'a> {
-    /// A lenient request with no version pin and no variant requirements.
+    /// A request with no version pin and no variant requirements.
     pub fn new(project: &'a str, key: LookupKey<'a>) -> Self {
         Self {
             project,
             key,
             version: None,
-            version_match: VersionMatch::Lenient,
             required_variants: &[],
         }
     }
 
-    /// Pin the requested version.
+    /// Pin the requested version. Only a build at exactly this version hits.
     #[must_use]
     pub fn version(mut self, version: &'a str) -> Self {
         self.version = Some(version);
-        self
-    }
-
-    /// Set the version-match policy.
-    #[must_use]
-    pub fn version_match(mut self, version_match: VersionMatch) -> Self {
-        self.version_match = version_match;
         self
     }
 
@@ -103,12 +79,9 @@ impl<'a> LookupRequest<'a> {
 /// A successful lookup.
 #[derive(Debug, Clone)]
 pub struct LookupHit {
-    /// The healthy cached build.
+    /// The healthy cached build. Its version equals the requested version
+    /// (when one was requested).
     pub build: StoredBuild,
-    /// `true` when the build's version equals the requested version (always
-    /// `true` when no version was requested). `false` only happens under
-    /// [`VersionMatch::Lenient`].
-    pub version_matched: bool,
 }
 
 /// Why a lookup missed.
@@ -116,8 +89,8 @@ pub struct LookupHit {
 pub enum MissReason {
     /// Nothing is cached for the key.
     NotCached,
-    /// Builds of the key exist, but none at the requested version
-    /// (strict mode). `available` lists the cached versions, newest first.
+    /// Builds of the key exist, but none at the requested version.
+    /// `available` lists the cached versions, newest first.
     VersionMismatch {
         /// Versions of the key that *are* cached.
         available: Vec<String>,
@@ -209,33 +182,29 @@ impl ArtifactStore {
             return Ok(LookupResult::Miss(MissReason::Incomplete));
         }
 
-        let matches_version =
-            |candidate: &Candidate| request.version.is_none_or(|v| candidate.build.version == v);
-
-        // Preference order over candidate indices (already newest-first):
-        // strict considers only exact-version candidates; lenient prefers
-        // them but falls back to the rest.
-        let mut order: Vec<usize> = (0..candidates.len())
-            .filter(|&i| matches_version(&candidates[i]))
+        // A hit requires the version to match exactly. Consider only
+        // version-matching candidates (all of them when no version was
+        // requested); they are already ordered newest-first.
+        let matching: Vec<usize> = (0..candidates.len())
+            .filter(|&i| {
+                request
+                    .version
+                    .is_none_or(|v| candidates[i].build.version == v)
+            })
             .collect();
-        if request.version_match == VersionMatch::Lenient {
-            order.extend((0..candidates.len()).filter(|&i| !matches_version(&candidates[i])));
-        }
 
-        if let Some(&picked) = order
+        if let Some(&picked) = matching
             .iter()
             .find(|&&i| candidates[i].files_ok && candidates[i].missing_variants.is_empty())
         {
             let candidate = candidates.swap_remove(picked);
             touch_build_quiet(&conn, candidate.build.id, db::to_ms(Utc::now()));
-            let version_matched = request.version.is_none_or(|v| candidate.build.version == v);
             return Ok(LookupResult::Hit(LookupHit {
                 build: candidate.build,
-                version_matched,
             }));
         }
 
-        Ok(LookupResult::Miss(miss_reason(&candidates, &order)))
+        Ok(LookupResult::Miss(miss_reason(&candidates, &matching)))
     }
 }
 
@@ -261,15 +230,18 @@ fn evaluate(build: StoredBuild, required_variants: &[Option<String>]) -> Candida
 }
 
 /// Explain the best-available candidate's shortfall, most actionable first.
-fn miss_reason(candidates: &[Candidate], order: &[usize]) -> MissReason {
-    if order.is_empty() {
-        // Strict mode and no candidate at the requested version.
+///
+/// `matching` are the indices of candidates at the requested version (all
+/// candidates when no version was requested).
+fn miss_reason(candidates: &[Candidate], matching: &[usize]) -> MissReason {
+    if matching.is_empty() {
+        // The key is cached, but never at the requested version.
         return MissReason::VersionMismatch {
             available: available_versions(candidates),
         };
     }
     // Files intact but variants missing → tell the caller what to build.
-    let fewest_missing = order
+    let fewest_missing = matching
         .iter()
         .map(|&i| &candidates[i])
         .filter(|candidate| candidate.files_ok && !candidate.missing_variants.is_empty())

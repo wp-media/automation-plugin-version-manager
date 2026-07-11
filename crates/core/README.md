@@ -327,12 +327,12 @@ The shared `get_nth_release(owner, repo, index, stable_only)` method underpins t
 
 The high-level build orchestrator, driven by a `BuildRequest` (project, git
 ref, output directory, optional version/variants, and the per-call cache
-overrides `no_cache` / `strict_version`). It:
+override `no_cache`). It:
 
 1. Validates the project exists in the registry
 2. Checks if the ref is a release keyword and resolves it via the GitHub API
 3. Checks if the ref is a plain release tag and serves/downloads its assets (cache-aware)
-4. Resolves the ref to a commit **before** cloning and tries the cache fast path
+4. Resolves the ref to a commit **before** cloning and tries the cache fast path. A hit requires the commit **and** version to match; when the version isn't known statically (a source-versioned plugin built without `--ver`), it is detected pre-clone by fetching just the plugin's version file at the commit (no clone), so a repeat build of the same commit still hits the cache
 5. Falls through to git-based builds (clone → checkout → build → collect), reusing any cached variants and warming the cache afterwards
 
 ### `BuildOutput`
@@ -346,8 +346,7 @@ pub struct BuildOutput {
     pub commit: String,                     // Full SHA
     pub commit_short: String,               // 7-char SHA
     pub branch: String,                     // Checked-out branch
-    pub cache_version_mismatch: bool,       // Lenient hit returned another version
-    pub requested_version: Option<String>,  // What the caller pinned, if anything
+    pub version_override: Option<VersionOverride>, // Set if the source version was rewritten
 }
 ```
 

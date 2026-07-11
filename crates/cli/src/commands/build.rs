@@ -106,16 +106,6 @@ pub struct BuildArgs {
     #[arg(long)]
     pub no_cache: bool,
 
-    /// Require a cache hit to match the requested version (`--ver`) exactly,
-    /// rebuilding instead of serving a different cached version
-    ///
-    /// Requires `--ver` — rejected otherwise, rather than silently falling
-    /// back to the plugin's default version. Cannot combine with `--no-cache`
-    /// (skips cache reads). Redundant with `--warm-cache` (always pins
-    /// exactly, and unlike here, works without `--ver`).
-    #[arg(long, conflicts_with = "no_cache")]
-    pub strict_version: bool,
-
     /// Warm the artifact cache instead of producing output
     ///
     /// Runs the exact same pipeline as a normal build — resolve the reference,
@@ -125,9 +115,7 @@ pub struct BuildArgs {
     /// the cache so a later build of the same reference is an instant hit.
     ///
     /// Cannot be combined with `--no-cache` (warming *is* a cache operation). An
-    /// output directory is accepted but ignored (with a warning): the version
-    /// is always pinned exactly, so `--strict-version` also has no effect but
-    /// is likewise accepted rather than rejected.
+    /// output directory is accepted but ignored (with a warning).
     #[arg(long = "warm-cache", conflicts_with = "no_cache")]
     pub warm_cache: bool,
 }
@@ -155,13 +143,26 @@ impl BuildArgs {
     /// Whether `--output`/`[OUTPUT]` was passed explicitly rather than left at
     /// its default (`.`).
     ///
-    /// Used to decide whether to warn that `--warm-cache` ignores it, mirroring
-    /// the redundant-`--strict-version` note below. This is a textual
-    /// comparison against the default value — a user who explicitly types `.`
+    /// Used to decide whether to warn that `--warm-cache` ignores it. This is a
+    /// textual comparison against the default value — a user who explicitly types `.`
     /// is (harmlessly) treated the same as one who passed nothing, since the
     /// resulting behavior is identical either way.
     fn output_was_explicit(&self) -> bool {
         self.output != std::path::Path::new(".")
+    }
+
+    /// Whether `--ver` is structurally ignored by `builder` — its version
+    /// comes only from source, never from a build parameter. Known before any
+    /// network or build work, unlike a release/cache version mismatch (which
+    /// depends on ref resolution and is reported later instead).
+    fn version_ignored(&self, builder: &dyn apvm_core::build::plugins::Builder) -> bool {
+        self.version.is_some() && builder.version_requirement() == VersionRequirement::Embedded
+    }
+
+    /// Whether `--variants` is structurally ignored by `builder` — a
+    /// single-variant plugin has nothing to select between.
+    fn variants_ignored(&self, builder: &dyn apvm_core::build::plugins::Builder) -> bool {
+        self.variants.is_some() && !builder.has_variants()
     }
 
     /// Execute the build command.
@@ -178,8 +179,11 @@ impl BuildArgs {
         //    so that download_release() can distinguish "user provided" from "no version".
         let version = self.version.clone();
 
-        // 3. Check for unnecessary version parameter
-        if self.version.is_some() && builder.version_requirement() == VersionRequirement::Embedded {
+        // 3. Check for unnecessary version parameter. Captured as a bool (not
+        //    just a warning) so the header below can skip echoing a value that
+        //    will not be honored.
+        let version_ignored = self.version_ignored(builder);
+        if version_ignored {
             eprintln!(
                 "Warning: --ver ignored for '{}' (version is embedded in source)",
                 self.plugin
@@ -189,8 +193,10 @@ impl BuildArgs {
         // 4. Determine variants (CLI arg > builder default > all)
         let variants = self.resolve_variants(builder);
 
-        // 5. Check for unnecessary variants parameter
-        if self.variants.is_some() && !builder.has_variants() {
+        // 5. Check for unnecessary variants parameter (same treatment as
+        //    version above).
+        let variants_ignored = self.variants_ignored(builder);
+        if variants_ignored {
             eprintln!(
                 "Warning: --variants ignored for '{}' (single-variant plugin)",
                 self.plugin
@@ -199,8 +205,7 @@ impl BuildArgs {
 
         // 6. Resolve output directory to an absolute path. Warming delivers
         //    nothing, so an explicitly passed output directory is accepted but
-        //    ignored — flagged with a warning rather than rejected outright, the
-        //    same treatment as the redundant `--strict-version` below.
+        //    ignored — flagged with a warning rather than rejected outright.
         //    canonicalize() expands "." to a full path and resolves symlinks.
         if self.warm_cache && self.output_was_explicit() {
             eprintln!(
@@ -219,15 +224,6 @@ impl BuildArgs {
             })
         };
 
-        // 6b. `--strict-version` is implied by warming (the version is always
-        //     pinned exactly), so flag the redundancy instead of silently
-        //     ignoring it.
-        if self.warm_cache && self.strict_version {
-            eprintln!(
-                "Note: --strict-version is redundant with --warm-cache (the version is always pinned)"
-            );
-        }
-
         // 7. Normalize the git ref
         let git_ref = self.normalize_ref();
 
@@ -237,10 +233,15 @@ impl BuildArgs {
         } else {
             println!("Building {} from {}", self.plugin, git_ref);
         }
-        if let Some(ref v) = version {
+        // Only echo parameters that will actually be honored — one that was
+        // just flagged as ignored above must not then appear here as if it
+        // were in effect.
+        if let Some(ref v) = version
+            && !version_ignored
+        {
             println!("  Version: {}", v);
         }
-        if !variants.is_empty() {
+        if !variants.is_empty() && !variants_ignored {
             println!("  Variants: {}", variants.join(", "));
         }
         // Warming has no output directory to report.
@@ -376,7 +377,7 @@ impl BuildArgs {
         output_dir: PathBuf,
         reporter: &dyn apvm_core::build::progress::ProgressReporter,
     ) -> Result<apvm_core::BuildOutput> {
-        let result = if self.warm_cache {
+        if self.warm_cache {
             let request = apvm_core::WarmRequest::new(self.plugin.clone(), git_ref)
                 .version(version)
                 .variants(variants);
@@ -385,23 +386,24 @@ impl BuildArgs {
             let request = apvm_core::BuildRequest::new(self.plugin.clone(), git_ref, output_dir)
                 .version(version)
                 .variants(variants)
-                .no_cache(self.no_cache)
-                .strict_version(self.strict_version);
+                .no_cache(self.no_cache);
             apvm.build(request, reporter).await
-        };
-        result.map_err(Self::with_cli_hint)
+        }
     }
 
-    /// Reword [`apvm_core::Error::StrictVersionRequiresVersion`] with the CLI
-    /// flags that fix it; every other error passes through unchanged.
-    fn with_cli_hint(err: apvm_core::Error) -> apvm_core::Error {
-        match err {
-            apvm_core::Error::StrictVersionRequiresVersion { project } => {
-                apvm_core::Error::Build(format!(
-                    "--strict-version needs --ver for '{project}' — pass --ver X.Y.Z, or drop --strict-version"
-                ))
-            }
-            other => other,
+    /// Print a one-line notice when the build rewrote the plugin's source
+    /// version to the requested `--ver` (WP Rocket / Imagify). Nothing is
+    /// printed when no override happened.
+    fn print_version_override(result: &apvm_core::BuildOutput) {
+        if let Some(vo) = &result.version_override {
+            let msg = format!(
+                "  Overrode source version {} → {} in {} ({})",
+                vo.from,
+                vo.to,
+                vo.file,
+                vo.sites.join(", ")
+            );
+            println!("{}", color::paint(&msg, Color::Cyan));
         }
     }
 
@@ -410,6 +412,7 @@ impl BuildArgs {
         println!("Build complete: {}", result.description());
         println!("  Commit:  {}", result.commit_short);
         println!("  Version: {}", result.result.version);
+        Self::print_version_override(result);
         println!("  Artifacts:");
         for artifact in &result.result.artifacts {
             // Pad the plain label first so ANSI codes never affect alignment.
@@ -419,19 +422,6 @@ impl BuildArgs {
                 color::paint(&label, origin_color(artifact.origin)),
                 artifact.filename
             );
-        }
-
-        // A cache hit that returned a different version than the user pinned
-        // is the one genuinely surprising case — draw attention to it (yellow)
-        // and offer the remedy, above the neutral provenance summary.
-        if result.cache_version_mismatch {
-            let requested = result.requested_version.as_deref().unwrap_or("(requested)");
-            let got = &result.result.version;
-            let msg = format!(
-                "⚠ Requested version {requested} but the cache holds this commit as {got}.\n  \
-                 Returning the cached {got} artifacts. Pass --strict-version to rebuild at {requested}, if specific version is required.",
-            );
-            println!("{}", color::paint(&msg, Color::Yellow));
         }
 
         println!("  Source: {}", source_summary(&result.result.artifacts));
@@ -446,6 +436,7 @@ impl BuildArgs {
         println!("Cache warmed: {}", result.description());
         println!("  Commit:  {}", result.commit_short);
         println!("  Version: {}", result.result.version);
+        Self::print_version_override(result);
         println!("  Artifacts (now cached):");
         for artifact in &result.result.artifacts {
             // Pad the plain label first so ANSI codes never affect alignment.
@@ -599,7 +590,6 @@ mod tests {
             variants: None,
             output: PathBuf::from("."),
             no_cache: false,
-            strict_version: false,
             warm_cache: false,
         }
     }
@@ -607,31 +597,6 @@ mod tests {
     fn artifact(origin: ArtifactOrigin) -> ProducedArtifact {
         ProducedArtifact::new(None, PathBuf::from("/x.zip"), "x.zip".to_string(), 1)
             .with_origin(origin)
-    }
-
-    // =========================================================================
-    // with_cli_hint — rewrites core errors into CLI-flag-specific hints
-    // =========================================================================
-
-    #[test]
-    fn with_cli_hint_rewrites_strict_version_error_with_flag_names() {
-        let err = apvm_core::Error::StrictVersionRequiresVersion {
-            project: "backwpup".to_string(),
-        };
-        let msg = BuildArgs::with_cli_hint(err).to_string();
-        assert!(msg.contains("--ver"), "expected --ver in: {msg}");
-        assert!(
-            msg.contains("--strict-version"),
-            "expected --strict-version in: {msg}"
-        );
-        assert!(msg.contains("backwpup"), "expected project name in: {msg}");
-    }
-
-    #[test]
-    fn with_cli_hint_leaves_other_errors_unchanged() {
-        let err = apvm_core::Error::Build("some other failure".to_string());
-        let msg = BuildArgs::with_cli_hint(err).to_string();
-        assert_eq!(msg, "Build error: some other failure");
     }
 
     #[test]
@@ -770,21 +735,6 @@ mod tests {
         assert_eq!(cli.args.output, PathBuf::from("./out"));
     }
 
-    #[test]
-    fn warm_cache_allows_redundant_strict_version() {
-        // `--strict-version` is a no-op with `--warm-cache`, not a conflict.
-        let cli = WarmTestCli::try_parse_from([
-            "apvm",
-            "backwpup",
-            "develop",
-            "--warm-cache",
-            "--strict-version",
-        ])
-        .expect("--warm-cache with --strict-version must parse (strict is a no-op)");
-        assert!(cli.args.warm_cache);
-        assert!(cli.args.strict_version);
-    }
-
     // =========================================================================
     // output_was_explicit — drives the "ignored with --warm-cache" note
     // =========================================================================
@@ -811,6 +761,97 @@ mod tests {
         let mut args = build_args("develop");
         args.output = PathBuf::from(".");
         assert!(!args.output_was_explicit());
+    }
+
+    // =========================================================================
+    // version_ignored / variants_ignored — drive both the "ignored" warning
+    // AND whether the pre-build header echoes the (unhonored) parameter.
+    // =========================================================================
+
+    /// Minimal builder with an embedded version, standing in for a plugin
+    /// whose version always comes from source (no real registered builder is
+    /// `Embedded` since WP Rocket/Imagify moved to `Optional`).
+    struct EmbeddedTestBuilder;
+
+    impl apvm_core::build::plugins::Builder for EmbeddedTestBuilder {
+        fn version_requirement(&self) -> VersionRequirement {
+            VersionRequirement::Embedded
+        }
+        fn setup_commands(&self) -> Vec<apvm_core::build::progress::BuildStep> {
+            vec![]
+        }
+        fn build_commands(
+            &self,
+            _: &apvm_core::build::BuildContext,
+            _: &str,
+            _: &[&str],
+        ) -> Vec<apvm_core::build::progress::BuildStep> {
+            vec![]
+        }
+        fn artifacts(
+            &self,
+            _: &apvm_core::build::BuildContext,
+            _: &str,
+            _: &[&str],
+        ) -> apvm_core::Result<Vec<apvm_core::build::plugins::BuildArtifact>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn version_ignored_true_only_when_version_passed_and_embedded() {
+        let mut args = build_args("develop");
+        args.version = Some("1.2.3".to_string());
+        assert!(
+            args.version_ignored(&EmbeddedTestBuilder),
+            "a passed version must be ignored for an Embedded builder"
+        );
+    }
+
+    #[test]
+    fn version_ignored_false_when_no_version_passed() {
+        // Embedded, but nothing was passed to ignore in the first place.
+        assert!(!build_args("develop").version_ignored(&EmbeddedTestBuilder));
+    }
+
+    #[test]
+    fn version_ignored_false_for_optional_builders() {
+        // WP Rocket / Imagify are Optional (post-checkout override), so a
+        // passed version is honored, not ignored.
+        let mut args = build_args("develop");
+        args.version = Some("3.99.0".to_string());
+        assert!(!args.version_ignored(&apvm_core::build::plugins::WpRocketBuilder));
+        assert!(!args.version_ignored(&apvm_core::build::plugins::ImagifyBuilder));
+    }
+
+    #[test]
+    fn version_ignored_false_for_required_builder() {
+        // BackWPup requires a version — passing one is expected, not ignored.
+        let mut args = build_args("develop");
+        args.version = Some("5.1.0".to_string());
+        assert!(!args.version_ignored(&apvm_core::build::plugins::BackWPupBuilder));
+    }
+
+    #[test]
+    fn variants_ignored_true_for_single_variant_builders() {
+        // WP Rocket and Imagify have no variants to select between.
+        let mut args = build_args("develop");
+        args.variants = Some(vec!["free".to_string()]);
+        assert!(args.variants_ignored(&apvm_core::build::plugins::WpRocketBuilder));
+        assert!(args.variants_ignored(&apvm_core::build::plugins::ImagifyBuilder));
+    }
+
+    #[test]
+    fn variants_ignored_false_when_no_variants_passed() {
+        let args = build_args("develop");
+        assert!(!args.variants_ignored(&apvm_core::build::plugins::ImagifyBuilder));
+    }
+
+    #[test]
+    fn variants_ignored_false_for_multi_variant_builder() {
+        let mut args = build_args("develop");
+        args.variants = Some(vec!["free".to_string(), "pro-en".to_string()]);
+        assert!(!args.variants_ignored(&apvm_core::build::plugins::BackWPupBuilder));
     }
 
     // =========================================================================

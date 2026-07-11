@@ -160,7 +160,7 @@ All return `Promise<JsBuildOutput>`.
 
 Runs the **same pipeline** as `build()` — resolve the ref, reuse whatever is already cached, and build or download only what is missing — then stores everything into the cache. The one difference is that it delivers **nothing** to an output directory; its purpose is to prime the cache so a later `build()` of the same reference is an instant hit.
 
-`WarmOptions` is deliberately smaller than `BuildOptions`: there is **no `outputDir`** (nothing is delivered), **no `noCache`** (warming _is_ a cache operation), and **no `strictVersion`** (warming always pins the requested version exactly).
+`WarmOptions` is deliberately smaller than `BuildOptions`: there is **no `outputDir`** (nothing is delivered) and **no `noCache`** (warming _is_ a cache operation).
 
 ```ts
 // Prime the cache for WP Rocket's develop branch (no output directory).
@@ -287,13 +287,12 @@ interface BuildOptions {
   variants?: string[];    // e.g., ["free", "pro-en"]. No-Op for WP Rocket / Imagify (No variants)
   outputDir: string;      // Absolute path for artifacts to be stored after build
   noCache?: boolean;      // Bypass the artifact cache for this build (default false)
-  strictVersion?: boolean;// Require a cache hit to match `version` exactly (default false)
 }
 ```
 
 #### `WarmOptions`
 
-Passed to [`warmCache()`](#apvmwarmcacheoptions-onprogress-promisejsbuildoutput). Deliberately smaller than `BuildOptions`: no `outputDir` (nothing is delivered), no `noCache` (warming _is_ a cache operation), and no `strictVersion` (warming always pins the version exactly).
+Passed to [`warmCache()`](#apvmwarmcacheoptions-onprogress-promisejsbuildoutput). Deliberately smaller than `BuildOptions`: no `outputDir` (nothing is delivered) and no `noCache` (warming _is_ a cache operation).
 
 ```ts
 interface WarmOptions {
@@ -315,8 +314,7 @@ interface JsBuildOutput {
   branch: string;               // Checked-out branch name
   description: string;          // e.g., "PR #123 @ a1b2c3d"
   fromCache: boolean;           // true when every artifact came from the cache
-  cacheVersionMismatch: boolean;// true when a cache hit returned a different version than requested
-  requestedVersion?: string;    // the version you asked for (for mismatch reporting)
+  versionOverride?: JsVersionOverride; // set if the source version was rewritten
 }
 ```
 

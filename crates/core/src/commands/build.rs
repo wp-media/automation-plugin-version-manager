@@ -3,7 +3,7 @@
 //! This module provides the main build command that handles building a project
 //! from any git reference (PR, branch, tag, or commit) with automatic detection.
 
-use crate::build::plugins::VersionRequirement;
+use crate::build::plugins::{VersionOverride, VersionRequirement};
 use crate::build::progress::{BuildEvent, BuildPhase, BuildStep, ProgressReporter};
 use crate::build::{ArtifactOrigin, BuildResult, BuildRunner, ProducedArtifact};
 use crate::commands::cache;
@@ -47,13 +47,6 @@ pub struct BuildRequest {
     /// Skip the artifact cache for this build. The build still runs and (unless
     /// caching is globally disabled) still warms the cache. Default `false`.
     pub no_cache: bool,
-    /// Require a cache hit to match the requested version exactly; otherwise a
-    /// different cached version may be served (with a warning). Default `false`.
-    ///
-    /// Only affects cache *reads*: it has no effect for embedded-version
-    /// builders (reported as ignored) and is inert when combined with
-    /// [`no_cache`](Self::no_cache), since no cache read happens then.
-    pub strict_version: bool,
 }
 
 impl BuildRequest {
@@ -71,7 +64,6 @@ impl BuildRequest {
             variants: Vec::new(),
             output_dir: output_dir.into(),
             no_cache: false,
-            strict_version: false,
         }
     }
 
@@ -96,13 +88,6 @@ impl BuildRequest {
         self
     }
 
-    /// Require an exact-version cache hit.
-    #[must_use]
-    pub fn strict_version(mut self, strict_version: bool) -> Self {
-        self.strict_version = strict_version;
-        self
-    }
-
     /// Borrow the variants as `&str` slices for the builder API.
     fn variant_refs(&self) -> Vec<&str> {
         self.variants.iter().map(String::as_str).collect()
@@ -119,17 +104,13 @@ impl BuildRequest {
 /// caller.
 ///
 /// That intent is encoded in the type: `WarmRequest` is deliberately a smaller
-/// surface than [`BuildRequest`], omitting the three fields that would either
+/// surface than [`BuildRequest`], omitting the two fields that would either
 /// be meaningless or actively defeat warming:
 ///
 /// - **no `output_dir`** — warming never writes artifacts anywhere but the
 ///   cache, so there is no output directory to accept;
 /// - **no `no_cache`** — warming *is* a cache operation; bypassing the cache
-///   would make it a no-op;
-/// - **no `strict_version`** — warming always pins the requested version
-///   exactly (an implicit `strict_version = true`), so warming version `X`
-///   guarantees `X` is what ends up cached rather than accepting a different
-///   cached version of the same commit.
+///   would make it a no-op.
 ///
 /// Construct with [`WarmRequest::new`] and refine with the chainable setters.
 ///
@@ -188,8 +169,7 @@ impl WarmRequest {
     ///
     /// - `output_dir = ""` — never read in warm mode; warming copies nothing to
     ///   an output directory;
-    /// - `no_cache = false` — warming must consult and populate the cache;
-    /// - `strict_version = true` — warming always pins the requested version.
+    /// - `no_cache = false` — warming must consult and populate the cache.
     pub(crate) fn into_build_request(self) -> BuildRequest {
         BuildRequest {
             project: self.project,
@@ -198,7 +178,6 @@ impl WarmRequest {
             variants: self.variants,
             output_dir: PathBuf::new(),
             no_cache: false,
-            strict_version: true,
         }
     }
 }
@@ -239,13 +218,12 @@ pub struct BuildOutput {
     pub commit_short: String,
     /// Branch name that was checked out.
     pub branch: String,
-    /// `true` when a lenient cache hit returned a version different from the
-    /// one the caller requested. Always `false` unless served from the cache.
-    pub cache_version_mismatch: bool,
-    /// The version the caller requested (`--ver`), if any. Retained so a
-    /// version mismatch can be reported against what was actually delivered
-    /// (`result.version`).
-    pub requested_version: Option<String>,
+    /// Set when the builder rewrote the source version to the caller's
+    /// requested version during this build (WP Rocket / Imagify). `None` when no
+    /// override happened: no version was pinned, the artifacts were served from
+    /// the cache (no build ran), the pinned version already matched source, or
+    /// the builder does not support overrides.
+    pub version_override: Option<VersionOverride>,
 }
 
 impl BuildOutput {
@@ -580,13 +558,28 @@ fn variants_built(artifacts: &[ProducedArtifact]) -> Vec<String> {
     seen
 }
 
-/// Emit the case-C version-mismatch warning: the caller pinned `requested`
-/// but the cache served `got`. Points at `--strict-version` as the remedy.
-fn warn_version_mismatch(reporter: &dyn ProgressReporter, requested: &str, got: &str) {
-    reporter.report(&BuildEvent::Warning(format!(
-        "Requested version {requested} but the cache holds this commit as {got}. \
-         Returning the cached {got} artifacts. Pass --strict-version to rebuild at {requested}."
-    )));
+/// Detect a version from already-fetched source files by materializing them
+/// into a temporary directory that mirrors their repo-relative layout, then
+/// delegating to the builder's own
+/// [`detect_version`](crate::build::plugins::Builder::detect_version).
+///
+/// Reusing `detect_version` (rather than re-implementing parsing) guarantees
+/// the pre-clone detection agrees with the post-checkout resolution. Returns
+/// `None` on any I/O failure or when no version is found — the caller then
+/// clones, so a miss is always safe.
+fn detect_version_from_files(
+    builder: &dyn crate::build::plugins::Builder,
+    files: &[(&str, Vec<u8>)],
+) -> Option<String> {
+    let tmp = tempfile::tempdir().ok()?;
+    for (path, bytes) in files {
+        let dest = tmp.path().join(path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        std::fs::write(&dest, bytes).ok()?;
+    }
+    builder.detect_version(tmp.path()).ok().flatten()
 }
 
 /// Re-point delivered artifacts at their canonical in-cache paths.
@@ -731,36 +724,6 @@ impl<'a> BuildCommand<'a> {
             ));
         }
 
-        // strict_version with no version is a contradiction: it would either
-        // silently pin to the builder's default (never what the caller asked
-        // for) or make the strict check a no-op. Warm mode's implicit pin
-        // always carries a version, and embedded builders ignore
-        // strict_version entirely (handled below), so neither is affected.
-        if !warm_cache
-            && request.strict_version
-            && request.version.is_none()
-            && !project_info.builder.version_requirement().is_embedded()
-        {
-            return Err(Error::StrictVersionRequiresVersion {
-                project: project_info.name.clone(),
-            });
-        }
-
-        // `--strict-version` has no meaning for embedded-version builders (the
-        // version comes from source and is deterministic per commit), so report
-        // it as ignored rather than silently doing nothing. In warm mode the
-        // strict pin is implicit (not something the caller passed), so there is
-        // nothing to report as ignored.
-        if !warm_cache
-            && request.strict_version
-            && project_info.builder.version_requirement().is_embedded()
-        {
-            reporter.report(&BuildEvent::Warning(format!(
-                "--strict-version ignored: '{}' derives its version from source",
-                project_info.name
-            )));
-        }
-
         // 3. Early-resolve GitHub refs that don't need a local repo (PRs,
         // releases, version-as-release). See `try_early_resolve_github_ref`.
         let early_resolved = self
@@ -820,18 +783,23 @@ impl<'a> BuildCommand<'a> {
             .await
     }
 
-    /// Pre-clone cache fast path (behavior-matrix cases A/B/C).
+    /// Pre-clone cache fast path (behavior-matrix cases A/B).
     ///
     /// Returns `Some(output)` only on a **full** hit — every requested variant
-    /// present for the resolved commit. In a normal build the artifacts are
-    /// copied into the output directory; when warming (`warm_cache`) nothing is
-    /// copied — a full hit means the commit is already fully cached, so the
-    /// returned artifacts simply reference the cache. Returns `None` (build
-    /// normally) when caching is off/`--no-cache`, the commit SHA isn't known
-    /// pre-clone, or the lookup misses / errors. A lenient hit at a different
-    /// version than requested is still a hit, but flags
-    /// [`BuildOutput::cache_version_mismatch`] and warns. (Warming pins the
-    /// version strictly, so that lenient case never arises for a warm.)
+    /// present for the resolved commit **at the requested version**. In a normal
+    /// build the artifacts are copied into the output directory; when warming
+    /// (`warm_cache`) nothing is copied — a full hit means the commit is already
+    /// fully cached, so the returned artifacts simply reference the cache.
+    ///
+    /// Returns `None` (build normally) when caching is off/`--no-cache`, the
+    /// commit SHA isn't known pre-clone, the lookup misses / errors, or **the
+    /// version to build cannot be determined before checkout**. A hit requires
+    /// an exact `(commit, version)` match, so the version must be known here.
+    /// When it isn't predictable statically (a source-versioned builder with no
+    /// `--ver`), [`detect_version_pre_clone`](Self::detect_version_pre_clone)
+    /// fetches the source version file(s) at the commit and reads it without
+    /// cloning; only if that also fails is the fast path skipped so the build
+    /// clones and the post-checkout reuse path decides the hit instead.
     async fn try_cache_fast_path(
         &self,
         request: &BuildRequest,
@@ -849,7 +817,19 @@ impl<'a> BuildCommand<'a> {
         let commit = resolved.commit_sha.clone()?;
         let builder = project_info.builder.as_ref();
         let keys = cache::variant_keys(builder, &request.variant_refs());
-        let predicted = cache::predicted_version(builder, request.version.as_deref());
+        // A hit requires an exact version match. When the version can't be
+        // predicted statically (a source-versioned builder with no `--ver`),
+        // learn it cheaply by fetching the source version file(s) at this
+        // commit — no clone. If even that can't determine it, skip the fast
+        // path and let the post-checkout reuse decide against the authoritative
+        // source version.
+        let predicted = match cache::predicted_version(builder, request.version.as_deref()) {
+            Some(version) => version,
+            None => {
+                self.detect_version_pre_clone(project_info, &commit, reporter)
+                    .await?
+            }
+        };
 
         reporter.report(&BuildEvent::PhaseStarted {
             phase: BuildPhase::Cache,
@@ -862,8 +842,7 @@ impl<'a> BuildCommand<'a> {
             store,
             request.project.clone(),
             commit,
-            predicted.clone(),
-            request.strict_version,
+            Some(predicted),
             keys,
             request.output_dir.clone(),
             !warm_cache,
@@ -874,19 +853,6 @@ impl<'a> BuildCommand<'a> {
         });
 
         let hit = hit?;
-
-        // Case C: a lenient hit returned a version other than the one the user
-        // pinned. Gate on the *user's* `--ver` (`request.version`) — not on
-        // `predicted`, which can hold a builder default the user never asked
-        // for (case B: no pin ⇒ no warning, whatever version the cache holds).
-        let cache_version_mismatch = request.version.is_some() && !hit.version_matched;
-        if cache_version_mismatch {
-            warn_version_mismatch(
-                reporter,
-                request.version.as_deref().unwrap_or_default(),
-                &hit.version,
-            );
-        }
 
         let artifact_paths = hit.artifacts.iter().map(|a| a.path.clone()).collect();
         reporter.report(&BuildEvent::BuildSucceeded {
@@ -906,9 +872,86 @@ impl<'a> BuildCommand<'a> {
             commit_short: hit.commit.chars().take(7).collect(),
             commit: hit.commit,
             branch: branch_label(resolved),
-            cache_version_mismatch,
-            requested_version: request.version.clone(),
+            // A cache hit never builds, so no source rewrite happens.
+            version_override: None,
         })
+    }
+
+    /// Detect the version **before cloning** by fetching the builder's version
+    /// source file(s) at `commit` and running the builder's own
+    /// [`detect_version`](crate::build::plugins::Builder::detect_version) over
+    /// them.
+    ///
+    /// This lets a source-versioned builder (WP Rocket / Imagify, whose version
+    /// cannot be predicted statically) still take the pre-clone cache fast path.
+    /// A commit is immutable, so the version read here is exactly the one a full
+    /// build of that commit would produce — the cache key is correct, and no
+    /// source override is needed later (source already carries this version).
+    ///
+    /// Best-effort: returns `None` when the builder declares no version files,
+    /// or on any fetch/parse failure (missing file, network/auth error), and the
+    /// caller falls back to cloning. It never errors — a detection miss must
+    /// never break a build.
+    async fn detect_version_pre_clone(
+        &self,
+        project_info: &Project,
+        commit: &str,
+        reporter: &dyn ProgressReporter,
+    ) -> Option<String> {
+        let files = project_info.builder.version_source_files();
+        if files.is_empty() {
+            return None;
+        }
+
+        reporter.report(&BuildEvent::PhaseStarted {
+            phase: BuildPhase::Preflight,
+            message: format!(
+                "Detecting version at {}",
+                commit.chars().take(7).collect::<String>()
+            ),
+        });
+        let detected = self
+            .fetch_and_detect_version(project_info, commit, &files)
+            .await;
+        reporter.report(&BuildEvent::PhaseCompleted {
+            phase: BuildPhase::Preflight,
+        });
+
+        if let Some(version) = &detected {
+            tracing::info!(%version, %commit, "detected version before cloning");
+        }
+        detected
+    }
+
+    /// Fetch `files` at `commit` and detect the version from them. Split from
+    /// [`detect_version_pre_clone`](Self::detect_version_pre_clone) so the fetch
+    /// (network) and the parsing (pure, unit-tested via
+    /// [`detect_version_from_files`]) stay separable.
+    async fn fetch_and_detect_version(
+        &self,
+        project_info: &Project,
+        commit: &str,
+        files: &[&str],
+    ) -> Option<String> {
+        let mut fetched: Vec<(&str, Vec<u8>)> = Vec::with_capacity(files.len());
+        for path in files {
+            match self
+                .github
+                .get_file_content(&project_info.owner, &project_info.repo, path, commit)
+                .await
+            {
+                Ok(Some(bytes)) => fetched.push((path, bytes)),
+                Ok(None) => {
+                    tracing::debug!(%path, %commit, "version file absent; cannot detect pre-clone");
+                    return None;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, %path, "pre-clone version fetch failed; will clone");
+                    return None;
+                }
+            }
+        }
+        detect_version_from_files(project_info.builder.as_ref(), &fetched)
     }
 
     /// Resolve a git reference to a concrete commit **before** cloning.
@@ -1090,6 +1133,9 @@ impl<'a> BuildCommand<'a> {
             (Vec::new(), keys)
         };
 
+        // Records a source version rewrite when it happens in the build path.
+        let mut version_override: Option<VersionOverride> = None;
+
         // Build only the variants not served from the cache (if any).
         let mut artifacts = reused;
         if to_build.is_empty() {
@@ -1113,6 +1159,26 @@ impl<'a> BuildCommand<'a> {
             // builder these are the concrete variant ids still needed.
             let build_variant_strs: Vec<&str> =
                 to_build.iter().filter_map(|k| k.as_deref()).collect();
+
+            // When the caller pinned a version and we are about to build,
+            // rewrite it into the checked-out source (before packaging) so the
+            // artifact carries the requested version instead of the source's.
+            // A no-op for builders without an override or when the version
+            // already matches; a hard error if it was requested but could not
+            // be applied, so a mislabeled artifact is never shipped.
+            if request.version.is_some()
+                && let Some(applied) =
+                    builder.apply_version_override(repo.path(), &resolved_version)?
+            {
+                reporter.report(&BuildEvent::Warning(format!(
+                    "Overrode {} version {} → {} ({}) to match the requested --ver",
+                    applied.file,
+                    applied.from,
+                    applied.to,
+                    applied.sites.join(", ")
+                )));
+                version_override = Some(applied);
+            }
 
             let build_context = workspace.to_build_context();
             let mut runner = BuildRunner::with_reporter(build_context, reporter);
@@ -1151,8 +1217,7 @@ impl<'a> BuildCommand<'a> {
             commit,
             commit_short,
             branch,
-            cache_version_mismatch: false,
-            requested_version: request.version.clone(),
+            version_override,
         };
 
         // Best-effort warm: record the full delivered set under its
@@ -1790,8 +1855,8 @@ impl<'a> BuildCommand<'a> {
             commit: format!("release-{tag}"),
             commit_short: tag.to_string(),
             branch: format!("release/{tag}"),
-            cache_version_mismatch: false,
-            requested_version: version.map(str::to_string),
+            // Release assets are pre-built; no source is checked out or rewritten.
+            version_override: None,
         };
 
         // Best-effort warm: cache the full delivered asset set under this tag.
@@ -1991,14 +2056,15 @@ mod tests {
         }
     }
 
-    /// Builder whose version is derived from source (like Imagify) — used to
-    /// confirm `--strict-version`'s "no version" guard leaves embedded-version
-    /// builders alone (they already get their own "ignored" treatment).
-    struct EmbeddedTestBuilder;
+    /// Optional-version builder with no default (like WP Rocket / Imagify):
+    /// with no `--ver`, the version comes from source and is unknown before
+    /// checkout, so [`cache::predicted_version`] returns `None` and the
+    /// pre-clone fast path is skipped.
+    struct OptionalNoDefaultBuilder;
 
-    impl Builder for EmbeddedTestBuilder {
+    impl Builder for OptionalNoDefaultBuilder {
         fn version_requirement(&self) -> VersionRequirement {
-            VersionRequirement::Embedded
+            VersionRequirement::Optional
         }
         fn setup_commands(&self) -> Vec<BuildStep> {
             vec![]
@@ -2019,7 +2085,7 @@ mod tests {
     // =========================================================================
     // Fast-path integration: `try_cache_fast_path` end-to-end against a real
     // (temp) store, no git/GitHub. Exercises variant-key derivation, lookup,
-    // copy, BuildOutput assembly, and the version-mismatch gating.
+    // copy, BuildOutput assembly, and the exact-version gating.
     // =========================================================================
 
     const TEST_SHA: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
@@ -2101,7 +2167,6 @@ mod tests {
         assert_eq!(output.result.artifacts.len(), 1);
         assert_eq!(output.result.artifacts[0].origin, ArtifactOrigin::Cache);
         assert_eq!(output.result.version, "1.0.0");
-        assert!(!output.cache_version_mismatch);
         assert!(out.path().join("plugin.zip").is_file());
     }
 
@@ -2128,10 +2193,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_path_no_pin_does_not_warn_on_different_cached_version() {
-        // Case B: the builder default is 9.99.99, the cache holds 5.6.0, and the
-        // user pinned nothing. It's a hit, and there must be NO mismatch warning
-        // (the default version is not something the user "requested").
+    async fn fast_path_no_pin_with_builder_default_misses_a_different_version() {
+        // No `--ver`, but the builder has a default (9.99.99). The cache holds
+        // 5.6.0, so the predicted-and-required version (9.99.99) does not match:
+        // the fast path misses and the caller rebuilds at the default version.
         let (cache, store) = seed_single_output("test", "5.6.0");
         let mut registry = ProjectRegistry::new();
         registry.register(single_output_project(
@@ -2143,27 +2208,59 @@ mod tests {
         let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
 
         let out = TempDir::new().unwrap();
-        // No `.version(...)` → user pinned nothing.
+        // No `.version(...)` → the builder default (9.99.99) is what would build.
         let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path());
         let resolved = resolved_commit();
         let project_info = registry.get("test").unwrap();
 
         let output = cmd
             .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, false)
-            .await
-            .expect("lenient hit expected");
+            .await;
 
-        assert!(output.from_cache());
-        assert_eq!(output.result.version, "5.6.0");
         assert!(
-            !output.cache_version_mismatch,
-            "no --ver ⇒ no version-mismatch warning (case B)"
+            output.is_none(),
+            "cached 5.6.0 must not satisfy a default-9.99.99 build"
+        );
+        assert!(
+            std::fs::read_dir(out.path()).unwrap().next().is_none(),
+            "a version mismatch must not deliver anything"
         );
     }
 
     #[tokio::test]
-    async fn fast_path_pinned_version_flags_mismatch() {
-        // Case C: user pinned 2.0.0, cache holds 1.0.0, lenient → hit + mismatch.
+    async fn fast_path_no_predictable_version_skips_the_fast_path() {
+        // An optional-version builder with no default and no `--ver`: the
+        // version cannot be known before checkout, so the fast path is skipped
+        // entirely (the caller clones and lets post-checkout reuse decide),
+        // even though the commit IS cached.
+        let (cache, store) = seed_single_output("test", "1.0.0");
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project(
+            "test",
+            Box::new(OptionalNoDefaultBuilder),
+        ));
+        let config = Config::new(cache.path().to_path_buf());
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
+
+        let out = TempDir::new().unwrap();
+        let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path());
+        let resolved = resolved_commit();
+        let project_info = registry.get("test").unwrap();
+
+        let output = cmd
+            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, false)
+            .await;
+        assert!(
+            output.is_none(),
+            "an unpredictable version must skip the pre-clone fast path"
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_path_pinned_wrong_version_misses() {
+        // User pinned 2.0.0, cache holds 1.0.0 → miss (a different cached
+        // version is never served), so the caller rebuilds at 2.0.0.
         let (cache, store) = seed_single_output("test", "1.0.0");
         let mut registry = ProjectRegistry::new();
         registry.register(single_output_project("test", Box::new(TestBuilder)));
@@ -2179,40 +2276,14 @@ mod tests {
 
         let output = cmd
             .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, false)
-            .await
-            .expect("lenient hit expected");
-
-        assert_eq!(output.result.version, "1.0.0");
-        assert!(
-            output.cache_version_mismatch,
-            "pinned 2.0.0 but got 1.0.0 ⇒ mismatch (case C)"
-        );
-        assert_eq!(output.requested_version.as_deref(), Some("2.0.0"));
-    }
-
-    #[tokio::test]
-    async fn fast_path_strict_pinned_version_misses() {
-        // Case D precursor: strict + wrong version ⇒ no hit (must rebuild).
-        let (cache, store) = seed_single_output("test", "1.0.0");
-        let mut registry = ProjectRegistry::new();
-        registry.register(single_output_project("test", Box::new(TestBuilder)));
-        let config = Config::new(cache.path().to_path_buf());
-        let github = GitHubClient::anonymous().unwrap();
-        let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
-
-        let out = TempDir::new().unwrap();
-        let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path())
-            .version(Some("2.0.0".to_string()))
-            .strict_version(true);
-        let resolved = resolved_commit();
-        let project_info = registry.get("test").unwrap();
-
-        let output = cmd
-            .try_cache_fast_path(&request, project_info, &resolved, &NullReporter, false)
             .await;
         assert!(
             output.is_none(),
-            "strict + wrong version ⇒ no fast-path hit"
+            "pinned 2.0.0 but cache holds 1.0.0 ⇒ miss"
+        );
+        assert!(
+            std::fs::read_dir(out.path()).unwrap().next().is_none(),
+            "a version mismatch must not deliver anything"
         );
     }
 
@@ -2228,10 +2299,8 @@ mod tests {
         let cmd = BuildCommand::new(&github, &registry, &config, Some(store));
 
         let out = TempDir::new().unwrap();
-        // Warming pins the version strictly (mirrors `WarmRequest`).
         let request = BuildRequest::new("test", format!("commit:{TEST_SHA}"), out.path())
-            .version(Some("1.0.0".to_string()))
-            .strict_version(true);
+            .version(Some("1.0.0".to_string()));
         let resolved = resolved_commit();
         let project_info = registry.get("test").unwrap();
 
@@ -2256,6 +2325,60 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Pre-clone version detection: parse fetched source files with the real
+    // builder's `detect_version`, and the empty-files short-circuit (no network).
+    // =========================================================================
+
+    #[test]
+    fn detect_version_from_files_reads_the_plugin_header() {
+        // The real WP Rocket builder reads `wp-rocket.php`; feeding it that file
+        // (as it would be fetched at a commit) yields the header version — the
+        // same result a full checkout would produce.
+        let php = "<?php\n/**\n * Plugin Name: WP Rocket\n * Version: 3.17.4\n */\n";
+        let files = vec![("wp-rocket.php", php.as_bytes().to_vec())];
+        let version = detect_version_from_files(&crate::build::plugins::WpRocketBuilder, &files);
+        assert_eq!(version.as_deref(), Some("3.17.4"));
+    }
+
+    #[test]
+    fn detect_version_from_files_none_when_header_missing() {
+        // A file present but with no version header → no detection (the caller
+        // then clones), never a panic or a bogus version.
+        let files = vec![("wp-rocket.php", b"<?php // no header\n".to_vec())];
+        let version = detect_version_from_files(&crate::build::plugins::WpRocketBuilder, &files);
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn detect_version_from_files_none_when_wrong_file_supplied() {
+        // Supplying an unrelated file (not the one `detect_version` reads) must
+        // not yield a version — the builder looks for `wp-rocket.php`.
+        let files = vec![("README.md", b"# unrelated\nVersion: 9.9.9\n".to_vec())];
+        let version = detect_version_from_files(&crate::build::plugins::WpRocketBuilder, &files);
+        assert_eq!(version, None);
+    }
+
+    #[tokio::test]
+    async fn detect_version_pre_clone_short_circuits_without_version_files() {
+        // A builder that declares no version source files never touches the
+        // network — detection returns None immediately and the caller clones.
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(PathBuf::from("/tmp/cache"));
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
+        let project_info = registry.get("test").unwrap();
+
+        let detected = cmd
+            .detect_version_pre_clone(project_info, TEST_SHA, &NullReporter)
+            .await;
+        assert!(
+            detected.is_none(),
+            "no version_source_files ⇒ no detection, no network call"
+        );
+    }
+
     #[test]
     fn warm_request_into_build_request_sets_fixed_defaults() {
         let request = WarmRequest::new("backwpup", "pr:123")
@@ -2269,16 +2392,12 @@ mod tests {
         assert_eq!(request.version.as_deref(), Some("5.1.0"));
         assert_eq!(request.variants, vec!["free".to_string()]);
 
-        // The three fields `WarmRequest` omits get their only sensible warm
+        // The two fields `WarmRequest` omits get their only sensible warm
         // values — this is what makes warming impossible to misconfigure.
         assert_eq!(request.output_dir, PathBuf::new(), "no output directory");
         assert!(
             !request.no_cache,
             "warming must consult + populate the cache"
-        );
-        assert!(
-            request.strict_version,
-            "warming always pins the requested version exactly"
         );
     }
 
@@ -2380,168 +2499,6 @@ mod tests {
             );
         }
         // If it somehow succeeds (shouldn't with fake repo), that's also fine
-    }
-
-    // =========================================================================
-    // `--strict-version` (`strict_version`) requires an explicit version.
-    //
-    // Every case here resolves *before* any network/git work (registry lookup,
-    // platform check, private-repo check, then this guard), so — unlike
-    // `test_public_repo_does_not_require_token` above — a fake, nonexistent
-    // repo never risks a real network call for the failing cases.
-    // =========================================================================
-
-    #[tokio::test]
-    async fn strict_version_without_version_fails_fast() {
-        // The exact contradiction reported: --strict-version with no --ver.
-        // Must fail immediately with a specific, actionable error instead of
-        // silently treating "no version" as "no constraint".
-        let mut registry = ProjectRegistry::new();
-        registry.register(single_output_project("test", Box::new(TestBuilder)));
-        let config = Config::new(PathBuf::from("/tmp/cache"));
-        let github = GitHubClient::anonymous().unwrap();
-        let cmd = BuildCommand::new(&github, &registry, &config, None);
-
-        let output_dir = TempDir::new().unwrap();
-        let result = cmd
-            .execute(
-                BuildRequest::new("test", "main", output_dir.path()).strict_version(true),
-                &NullReporter,
-                false,
-            )
-            .await;
-
-        let err = result.expect_err("strict_version with no version must fail fast");
-        assert!(
-            matches!(err, Error::StrictVersionRequiresVersion { ref project } if project == "test"),
-            "expected StrictVersionRequiresVersion, got: {err:?}"
-        );
-        assert!(
-            err.to_string().contains("strict_version"),
-            "error should name strict_version: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn strict_version_without_version_fails_fast_even_with_builder_default() {
-        // The reported BackWPup scenario: a builder default version exists,
-        // but strict_version must NOT be allowed to silently pin to it —
-        // that default was never something the caller actually requested.
-        let mut registry = ProjectRegistry::new();
-        registry.register(single_output_project(
-            "test",
-            Box::new(DefaultVersionBuilder),
-        ));
-        let config = Config::new(PathBuf::from("/tmp/cache"));
-        let github = GitHubClient::anonymous().unwrap();
-        let cmd = BuildCommand::new(&github, &registry, &config, None);
-
-        let output_dir = TempDir::new().unwrap();
-        let result = cmd
-            .execute(
-                BuildRequest::new("test", "main", output_dir.path()).strict_version(true),
-                &NullReporter,
-                false,
-            )
-            .await;
-
-        let err = result.expect_err("strict_version with no version must fail fast");
-        assert!(
-            matches!(err, Error::StrictVersionRequiresVersion { .. }),
-            "expected StrictVersionRequiresVersion, got: {err:?}"
-        );
-        // The builder's default must never leak into the error as if it were
-        // the pinned version.
-        assert!(!err.to_string().contains("9.99.99"));
-    }
-
-    #[tokio::test]
-    async fn strict_version_with_version_passes_the_guard() {
-        // Pairing --strict-version with an explicit --ver must not trip the
-        // new guard (it will fail later resolving the fake repo over the
-        // network, same as `test_public_repo_does_not_require_token` — that's
-        // an unrelated, acceptable failure for this fake project).
-        let mut registry = ProjectRegistry::new();
-        registry.register(single_output_project("test", Box::new(TestBuilder)));
-        let config = Config::new(PathBuf::from("/tmp/cache"));
-        let github = GitHubClient::anonymous().unwrap();
-        let cmd = BuildCommand::new(&github, &registry, &config, None);
-
-        let output_dir = TempDir::new().unwrap();
-        let result = cmd
-            .execute(
-                BuildRequest::new("test", "main", output_dir.path())
-                    .version(Some("1.0.0".to_string()))
-                    .strict_version(true),
-                &NullReporter,
-                false,
-            )
-            .await;
-
-        if let Err(e) = result {
-            assert!(
-                !matches!(e, Error::StrictVersionRequiresVersion { .. }),
-                "an explicit version must satisfy the guard, got: {e}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn strict_version_without_version_ignored_for_embedded_builder() {
-        // Embedded-version builders (e.g. Imagify) already treat
-        // --strict-version as a no-op regardless of --ver, reported via its
-        // own "ignored" warning — the new guard must not turn that into a
-        // hard error.
-        let mut registry = ProjectRegistry::new();
-        registry.register(single_output_project("test", Box::new(EmbeddedTestBuilder)));
-        let config = Config::new(PathBuf::from("/tmp/cache"));
-        let github = GitHubClient::anonymous().unwrap();
-        let cmd = BuildCommand::new(&github, &registry, &config, None);
-
-        let output_dir = TempDir::new().unwrap();
-        let result = cmd
-            .execute(
-                BuildRequest::new("test", "main", output_dir.path()).strict_version(true),
-                &NullReporter,
-                false,
-            )
-            .await;
-
-        if let Err(e) = result {
-            assert!(
-                !matches!(e, Error::StrictVersionRequiresVersion { .. }),
-                "embedded-version builders must be exempt from the guard, got: {e}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn strict_version_without_version_allowed_in_warm_mode() {
-        // `WarmRequest::into_build_request` always sets `strict_version: true`
-        // with no way for the caller to pass it explicitly — the guard must
-        // only fire for a caller-supplied `--strict-version`, never for warm
-        // mode's implicit one.
-        let mut registry = ProjectRegistry::new();
-        registry.register(single_output_project("test", Box::new(TestBuilder)));
-        let config = Config::new(PathBuf::from("/tmp/cache"));
-        let github = GitHubClient::anonymous().unwrap();
-        let cmd = BuildCommand::new(&github, &registry, &config, None);
-
-        let output_dir = TempDir::new().unwrap();
-        let result = cmd
-            .execute(
-                BuildRequest::new("test", "main", output_dir.path()).strict_version(true),
-                &NullReporter,
-                true, // warm_cache
-            )
-            .await;
-
-        if let Err(e) = result {
-            assert!(
-                !matches!(e, Error::StrictVersionRequiresVersion { .. }),
-                "warm mode's implicit strict_version must not require a version, got: {e}"
-            );
-        }
     }
 
     // =========================================================================
@@ -2733,8 +2690,7 @@ mod tests {
             commit: commit.to_string(),
             commit_short: commit[..7].to_string(),
             branch: branch.to_string(),
-            cache_version_mismatch: false,
-            requested_version: None,
+            version_override: None,
         }
     }
 

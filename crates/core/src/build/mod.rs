@@ -35,8 +35,11 @@ pub use progress::{
 pub use result::{ArtifactOrigin, BuildResult, ProducedArtifact};
 pub use runner::{BuildOutput, BuildRunner};
 
-// Re-export version detection helpers for convenience
-pub use plugins::{detect_wordpress_plugin_version, detect_wordpress_readme_version};
+// Re-export version detection + override helpers for convenience
+pub use plugins::{
+    detect_wordpress_plugin_version, detect_wordpress_readme_version,
+    rewrite_wordpress_plugin_version,
+};
 
-// Re-export VersionRequirement for consumers
-pub use plugins::VersionRequirement;
+// Re-export VersionRequirement and VersionOverride for consumers
+pub use plugins::{VersionOverride, VersionRequirement};

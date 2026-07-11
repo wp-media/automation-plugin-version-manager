@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use apvm_storage::{
     ArtifactStore, BuildMetadata, BuildSource, CleanOptions, CleanTarget, Error, LookupKey,
     LookupRequest, LookupResult, MissReason, ReleaseMetadata, SourceArtifact, VerifyMode,
-    VerifyProblem, VersionMatch,
+    VerifyProblem,
 };
 use chrono::{Duration, Utc};
 
@@ -256,11 +256,11 @@ fn sources_link_and_relink_correctly() {
 }
 
 // ============================================================================
-// Lookup semantics (the BackWPup strict-version case)
+// Lookup semantics (exact version matching)
 // ============================================================================
 
 #[test]
-fn lookup_strict_and_lenient_version_matching() {
+fn lookup_requires_exact_version_match() {
     let (_root, store, scratch) = make_store();
     let artifacts = vec![
         artifact(&scratch, "free.zip", b"free", Some("free")),
@@ -270,37 +270,33 @@ fn lookup_strict_and_lenient_version_matching() {
         .store(&metadata("backwpup", "5.5.9", COMMIT_A), &artifacts)
         .unwrap();
 
-    // Strict + wrong version → VersionMismatch listing what exists.
-    let strict = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"))
-        .version("5.6.0")
-        .version_match(VersionMatch::Strict);
-    match store.lookup_build(&strict).unwrap() {
+    // Wrong version → miss (never served in place of the requested version),
+    // listing what exists so the caller knows to rebuild.
+    let wrong = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d")).version("5.6.0");
+    match store.lookup_build(&wrong).unwrap() {
         LookupResult::Miss(MissReason::VersionMismatch { available }) => {
             assert_eq!(available, vec!["5.5.9".to_string()]);
         }
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
 
-    // Lenient + wrong version → hit, flagged as version-mismatched.
-    let lenient = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d")).version("5.6.0");
-    let hit = store
-        .lookup_build(&lenient)
-        .unwrap()
-        .hit()
-        .expect("lenient hit");
-    assert!(!hit.version_matched);
-    assert_eq!(hit.build.version, "5.5.9");
-
-    // Strict + right version → clean hit.
-    let exact = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"))
-        .version("5.5.9")
-        .version_match(VersionMatch::Strict);
+    // Right version → clean hit.
+    let exact = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d")).version("5.5.9");
     let hit = store
         .lookup_build(&exact)
         .unwrap()
         .hit()
-        .expect("strict hit");
-    assert!(hit.version_matched);
+        .expect("exact hit");
+    assert_eq!(hit.build.version, "5.5.9");
+
+    // No version requested → any healthy build of the key is accepted.
+    let any = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"));
+    let hit = store
+        .lookup_build(&any)
+        .unwrap()
+        .hit()
+        .expect("unpinned hit");
+    assert_eq!(hit.build.version, "5.5.9");
 
     // Source keys work the same way.
     let branch = BuildSource::Branch("develop".to_string());
@@ -1372,7 +1368,7 @@ fn storing_a_second_variant_later_preserves_the_first() {
 // ============================================================================
 
 #[test]
-fn strict_rebuild_of_another_version_coexists_with_the_original() {
+fn rebuild_of_another_version_coexists_with_the_original() {
     let (_root, store, scratch) = make_store();
 
     // Cached: the commit built as 5.6.0.
@@ -1389,19 +1385,17 @@ fn strict_rebuild_of_another_version_coexists_with_the_original() {
         v56.build.dir.display()
     );
 
-    // Strict lookup for the same commit at 5.7.0: miss, telling the caller
-    // which versions ARE cached (so it knows to rebuild).
-    let strict_57 = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"))
-        .version("5.7.0")
-        .version_match(VersionMatch::Strict);
-    match store.lookup_build(&strict_57).unwrap() {
+    // Lookup for the same commit at 5.7.0: miss, telling the caller which
+    // versions ARE cached (so it knows to rebuild).
+    let miss_57 = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d")).version("5.7.0");
+    match store.lookup_build(&miss_57).unwrap() {
         LookupResult::Miss(MissReason::VersionMismatch { available }) => {
             assert_eq!(available, vec!["5.6.0".to_string()]);
         }
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
 
-    // The strict caller rebuilds and stores 5.7.0 of the same commit.
+    // The caller rebuilds and stores 5.7.0 of the same commit.
     let v57 = store
         .store(
             &metadata("backwpup", "5.7.0", COMMIT_A),
@@ -1433,32 +1427,21 @@ fn strict_rebuild_of_another_version_coexists_with_the_original() {
         "5.7.0"
     );
 
-    // With both cached, a strict lookup at each version hits cleanly...
+    // With both cached, a lookup at each version hits its own build cleanly.
     for version in ["5.6.0", "5.7.0"] {
-        let strict = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"))
-            .version(version)
-            .version_match(VersionMatch::Strict);
+        let exact = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d")).version(version);
         let hit = store
-            .lookup_build(&strict)
+            .lookup_build(&exact)
             .unwrap()
             .hit()
-            .unwrap_or_else(|| panic!("strict hit expected for {version}"));
-        assert!(hit.version_matched);
+            .unwrap_or_else(|| panic!("exact hit expected for {version}"));
         assert_eq!(hit.build.version, version);
     }
 
-    // ...and a lenient lookup prefers the exact-version build over the other.
-    let lenient_57 = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d")).version("5.7.0");
-    let hit = store.lookup_build(&lenient_57).unwrap().hit().unwrap();
-    assert!(hit.version_matched);
-    assert_eq!(hit.build.version, "5.7.0");
-
-    // A strict miss for a THIRD, uncached version lists both cached versions,
+    // A miss for a THIRD, uncached version lists both cached versions,
     // newest first.
-    let strict_58 = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"))
-        .version("5.8.0")
-        .version_match(VersionMatch::Strict);
-    match store.lookup_build(&strict_58).unwrap() {
+    let miss_58 = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d")).version("5.8.0");
+    match store.lookup_build(&miss_58).unwrap() {
         LookupResult::Miss(MissReason::VersionMismatch { available }) => {
             assert_eq!(available, vec!["5.7.0".to_string(), "5.6.0".to_string()]);
         }

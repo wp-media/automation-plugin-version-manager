@@ -109,6 +109,79 @@ impl GitHubClient {
         }
     }
 
+    /// Fetch the raw bytes of a single file at a git ref (commit SHA, branch,
+    /// or tag) via the GitHub "Get repository content" API.
+    ///
+    /// Authenticated when a token is present, so it works for private repos and
+    /// uses the higher authenticated rate limit. The `application/vnd.github.raw`
+    /// media type returns the file bytes directly (no base64) and serves files up
+    /// to 100 MB (the ~1 MB cap applies only to the base64 JSON form) — ample for
+    /// the plugin header files this is used for.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(bytes))` — the file exists at `git_ref`
+    /// - `Ok(None)` — the file or ref does not exist (HTTP 404), so callers can
+    ///   treat "not found" as "cannot fetch" without special-casing errors
+    /// - `Err(_)` — transport/auth/rate-limit failure
+    ///
+    /// # Sources
+    ///
+    /// - GitHub REST API — Get repository content:
+    ///   <https://docs.github.com/en/rest/repos/contents#get-repository-content>
+    pub async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        // `path` and `git_ref` come from trusted builder constants and resolved
+        // commit SHAs (no spaces or reserved characters), so they are safe to
+        // interpolate directly into the URL.
+        let url =
+            format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+
+        // `Client::builder().build()` surfaces a TLS-init failure as an error
+        // rather than panicking (as `Client::new()` would), keeping this library
+        // path panic-free.
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| crate::error::Error::Build(format!("Failed to build HTTP client: {e}")))?;
+        let mut request = client
+            .get(&url)
+            .header("Accept", "application/vnd.github.raw")
+            .header("User-Agent", "apvm");
+
+        if let Some(token) = self.token.as_deref() {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let response = request.send().await.map_err(|e| {
+            crate::error::Error::Build(format!("Failed to request '{path}' at {git_ref}: {e}"))
+        })?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(crate::error::Error::Build(format!(
+                "Failed to fetch '{path}' at {git_ref}: HTTP {}",
+                response.status()
+            )));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| {
+                crate::error::Error::Build(format!("Failed to read '{path}' at {git_ref}: {e}"))
+            })?
+            .to_vec();
+
+        Ok(Some(bytes))
+    }
+
     /// Fetch a release by tag name.
     ///
     /// Returns `None` if no release exists for the given tag.

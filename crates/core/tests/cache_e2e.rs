@@ -26,13 +26,15 @@
 use std::path::Path;
 use std::process::Command;
 
-use apvm_core::build::BuildContext;
 use apvm_core::build::plugins::{BuildArtifact, BuildVariant, Builder, VersionRequirement};
 use apvm_core::build::progress::BuildStep;
+use apvm_core::build::{
+    BuildContext, detect_wordpress_plugin_version, rewrite_wordpress_plugin_version,
+};
 use apvm_core::projects::Project;
 use apvm_core::{
     Apvm, ArtifactOrigin, BuildEvent, BuildOutput, BuildRequest, ClosureReporter, Config,
-    NullReporter, WarmRequest,
+    NullReporter, VersionOverride, WarmRequest,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,6 +134,57 @@ impl Builder for MultiBuilder {
     }
 }
 
+/// Optional-version builder with a WordPress-style `plugin.php`, exercising the
+/// post-checkout version override end-to-end. `build_commands` copies the
+/// (possibly rewritten) plugin file into the artifact, so the artifact's bytes
+/// reveal whether the override reached the package before it was zipped.
+struct OverrideBuilder;
+
+const OVR_PLUGIN_FILE: &str = "plugin.php";
+const OVR_CONSTANT: &str = "MY_PLUGIN_VERSION";
+
+impl Builder for OverrideBuilder {
+    fn version_requirement(&self) -> VersionRequirement {
+        VersionRequirement::Optional
+    }
+    fn detect_version(&self, working_dir: &Path) -> apvm_core::Result<Option<String>> {
+        detect_wordpress_plugin_version(&working_dir.join(OVR_PLUGIN_FILE))
+    }
+    fn apply_version_override(
+        &self,
+        working_dir: &Path,
+        version: &str,
+    ) -> apvm_core::Result<Option<VersionOverride>> {
+        rewrite_wordpress_plugin_version(
+            &working_dir.join(OVR_PLUGIN_FILE),
+            version,
+            Some(OVR_CONSTANT),
+        )
+    }
+    fn setup_commands(&self) -> Vec<BuildStep> {
+        vec![]
+    }
+    fn build_commands(&self, _: &BuildContext, _version: &str, _: &[&str]) -> Vec<BuildStep> {
+        // Package the checked-out (possibly rewritten) source into the artifact.
+        vec![BuildStep::new(
+            "package",
+            format!("cp {OVR_PLUGIN_FILE} myplugin.zip"),
+        )]
+    }
+    fn artifacts(
+        &self,
+        _: &BuildContext,
+        _: &str,
+        _: &[&str],
+    ) -> apvm_core::Result<Vec<BuildArtifact>> {
+        Ok(vec![BuildArtifact {
+            variant_id: None,
+            source_path: "myplugin.zip".to_string(),
+            target_name: "myplugin.zip".to_string(),
+        }])
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixture helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,6 +208,28 @@ fn init_repo() -> tempfile::TempDir {
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-m", "init"]);
     // Normalize the branch name regardless of the machine's init.defaultBranch.
+    git(repo.path(), &["branch", "-M", "main"]);
+    repo
+}
+
+/// Like [`init_repo`], but seeds a WordPress-style `plugin.php` carrying
+/// `version` in both its `Version:` header and its `MY_PLUGIN_VERSION` constant,
+/// for exercising the post-checkout version override.
+fn init_repo_with_plugin(version: &str) -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("tempdir");
+    git(repo.path(), &["init"]);
+    git(repo.path(), &["config", "user.email", "test@apvm.dev"]);
+    git(repo.path(), &["config", "user.name", "apvm-test"]);
+    std::fs::write(
+        repo.path().join(OVR_PLUGIN_FILE),
+        format!(
+            "<?php\n/**\n * Plugin Name: Demo\n * Version: {version}\n */\n\
+             define( 'MY_PLUGIN_VERSION', '{version}' );\n"
+        ),
+    )
+    .expect("write plugin.php");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "init"]);
     git(repo.path(), &["branch", "-M", "main"]);
     repo
 }
@@ -215,7 +290,6 @@ async fn no_cache_build_warms_then_next_build_hits() {
         .expect("build 1");
     assert!(!build1.from_cache(), "first build must be fresh");
     assert_eq!(origin_of(&build1, None), ArtifactOrigin::Built);
-    assert!(!build1.cache_version_mismatch);
     assert!(out1.path().join("myplugin.zip").is_file());
 
     // Build 2: same commit → pre-clone fast-path hit (proves build 1 warmed).
@@ -510,4 +584,219 @@ async fn warm_cache_with_caching_disabled_warns_and_builds() {
             .any(|m| m.contains("disabled or unavailable")),
         "expected a cache-disabled warning, got: {warnings:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Version override (WP Rocket / Imagify style): a pinned --ver is rewritten into
+// the checked-out source before packaging, end-to-end through the real pipeline.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reads the delivered `myplugin.zip` (which is the packaged plugin.php).
+fn delivered_source(out: &Path) -> String {
+    std::fs::read_to_string(out.join("myplugin.zip")).expect("artifact delivered")
+}
+
+/// Pinning a version that differs from source rewrites both the header and the
+/// constant in the checked-out source, so the packaged artifact carries it — and
+/// the rewrite is reported on the build output.
+#[tokio::test]
+async fn version_override_rewrites_source_when_ver_differs() {
+    let repo = init_repo_with_plugin("1.0.0");
+    let cache = tempfile::tempdir().unwrap();
+    let apvm = apvm_for(
+        repo.path(),
+        &cache.path().join("store"),
+        "ovr",
+        Box::new(OverrideBuilder),
+    );
+
+    let out = tempfile::tempdir().unwrap();
+    let build = apvm
+        .build(
+            BuildRequest::new("ovr", "branch:main", out.path()).version(Some("9.9.9".to_string())),
+            &NullReporter,
+        )
+        .await
+        .expect("build");
+
+    // The override is reported...
+    let ovr = build
+        .version_override
+        .expect("an override must be reported when --ver differs from source");
+    assert_eq!(ovr.file, "plugin.php");
+    assert_eq!(ovr.from, "1.0.0");
+    assert_eq!(ovr.to, "9.9.9");
+    assert_eq!(build.result.version, "9.9.9");
+
+    // ...and it reached the packaged artifact, in both declarations.
+    let packaged = delivered_source(out.path());
+    assert!(packaged.contains(" * Version: 9.9.9"));
+    assert!(packaged.contains("define( 'MY_PLUGIN_VERSION', '9.9.9' );"));
+    assert!(
+        !packaged.contains("1.0.0"),
+        "no source version should remain"
+    );
+}
+
+/// No rewrite happens when it is not needed: a `--ver` equal to source is a
+/// no-op, and omitting `--ver` auto-detects the source version.
+#[tokio::test]
+async fn version_override_absent_when_not_needed() {
+    let repo = init_repo_with_plugin("1.0.0");
+
+    // (a) --ver equals the source version → no override reported.
+    let cache_a = tempfile::tempdir().unwrap();
+    let apvm_a = apvm_for(
+        repo.path(),
+        &cache_a.path().join("store"),
+        "ovr",
+        Box::new(OverrideBuilder),
+    );
+    let out_a = tempfile::tempdir().unwrap();
+    let matched = apvm_a
+        .build(
+            BuildRequest::new("ovr", "branch:main", out_a.path())
+                .version(Some("1.0.0".to_string())),
+            &NullReporter,
+        )
+        .await
+        .expect("build (matching --ver)");
+    assert!(
+        matched.version_override.is_none(),
+        "a --ver equal to source must not override"
+    );
+    assert_eq!(matched.result.version, "1.0.0");
+
+    // (b) no --ver → version auto-detected from source, no override. A separate
+    //     cache keeps this a genuine build rather than a hit on (a).
+    let cache_b = tempfile::tempdir().unwrap();
+    let apvm_b = apvm_for(
+        repo.path(),
+        &cache_b.path().join("store"),
+        "ovr",
+        Box::new(OverrideBuilder),
+    );
+    let out_b = tempfile::tempdir().unwrap();
+    let detected = apvm_b
+        .build(
+            BuildRequest::new("ovr", "branch:main", out_b.path()),
+            &NullReporter,
+        )
+        .await
+        .expect("build (auto-detect)");
+    assert!(
+        detected.version_override.is_none(),
+        "omitting --ver must not override"
+    );
+    assert_eq!(detected.result.version, "1.0.0");
+}
+
+/// A cache hit requires both commit AND version to match: a cached build of
+/// the same commit at a *different* version is never served in its place —
+/// the caller rebuilds at the requested version, rewriting the source.
+#[tokio::test]
+async fn version_mismatch_against_cache_forces_a_rebuild() {
+    let repo = init_repo_with_plugin("1.0.0");
+    let cache = tempfile::tempdir().unwrap();
+    let apvm = apvm_for(
+        repo.path(),
+        &cache.path().join("store"),
+        "ovr",
+        Box::new(OverrideBuilder),
+    );
+    let req = |out: &Path, ver: &str| {
+        BuildRequest::new("ovr", "branch:main", out).version(Some(ver.to_string()))
+    };
+
+    // 1. Build 1.0.0 → the cache holds this commit at 1.0.0.
+    let out1 = tempfile::tempdir().unwrap();
+    let first = apvm
+        .build(req(out1.path(), "1.0.0"), &NullReporter)
+        .await
+        .expect("build 1");
+    assert_eq!(first.result.version, "1.0.0");
+
+    // 2. Request 2.0.0 of the SAME commit → the cached 1.0.0 must NOT be
+    //    served; the build rebuilds at 2.0.0 and rewrites the source.
+    let out2 = tempfile::tempdir().unwrap();
+    let rebuilt = apvm
+        .build(req(out2.path(), "2.0.0"), &NullReporter)
+        .await
+        .expect("build 2");
+    assert!(
+        !rebuilt.from_cache(),
+        "a version mismatch must rebuild, not serve the cached 1.0.0"
+    );
+    let ovr = rebuilt
+        .version_override
+        .expect("the rebuild must override the source to 2.0.0");
+    assert_eq!(ovr.from, "1.0.0");
+    assert_eq!(ovr.to, "2.0.0");
+    assert_eq!(rebuilt.result.version, "2.0.0");
+    let packaged = delivered_source(out2.path());
+    assert!(packaged.contains(" * Version: 2.0.0"));
+    assert!(packaged.contains("define( 'MY_PLUGIN_VERSION', '2.0.0' );"));
+
+    // 3. Re-request 1.0.0 → the original cached build IS served (exact match).
+    let out3 = tempfile::tempdir().unwrap();
+    let hit = apvm
+        .build(req(out3.path(), "1.0.0"), &NullReporter)
+        .await
+        .expect("build 3");
+    assert!(
+        hit.from_cache(),
+        "an exact (commit, version) match is a hit"
+    );
+    assert_eq!(hit.result.version, "1.0.0");
+}
+
+/// An optional-version builder built **without `--ver`** (version comes from
+/// source): the first build clones, detects the version, and caches it; a
+/// second identical build reuses it from the cache.
+///
+/// This exercises the post-checkout reuse path — the graceful fallback when the
+/// pre-clone GitHub version fetch is unavailable (it targets api.github.com,
+/// which the local fixture repo is not), proving that no-`--ver` optional builds
+/// still cache-hit correctly on the exact `(commit, source-version)` key with no
+/// source override.
+#[tokio::test]
+async fn optional_no_ver_second_build_reuses_from_cache() {
+    let repo = init_repo_with_plugin("1.0.0");
+    let cache = tempfile::tempdir().unwrap();
+    let apvm = apvm_for(
+        repo.path(),
+        &cache.path().join("store"),
+        "ovr",
+        Box::new(OverrideBuilder),
+    );
+    let req = |out: &Path| BuildRequest::new("ovr", "branch:main", out);
+
+    // Build 1: no --ver → clone, detect 1.0.0 from source, build, cache it.
+    let out1 = tempfile::tempdir().unwrap();
+    let first = apvm
+        .build(req(out1.path()), &NullReporter)
+        .await
+        .expect("build 1");
+    assert!(!first.from_cache(), "first build must be fresh");
+    assert_eq!(
+        first.result.version, "1.0.0",
+        "version is auto-detected from source"
+    );
+    assert!(
+        first.version_override.is_none(),
+        "omitting --ver must not override the source version"
+    );
+
+    // Build 2: same ref, still no --ver → the cached (commit, 1.0.0) is reused.
+    let out2 = tempfile::tempdir().unwrap();
+    let second = apvm
+        .build(req(out2.path()), &NullReporter)
+        .await
+        .expect("build 2");
+    assert!(
+        second.from_cache(),
+        "a second identical no-ver build must reuse the cache"
+    );
+    assert_eq!(second.result.version, "1.0.0");
+    assert_eq!(first.commit, second.commit, "same commit both builds");
 }

@@ -303,8 +303,7 @@ impl Apvm {
             apvm_core::BuildRequest::new(options.project, options.git_ref, options.output_dir)
                 .version(options.version)
                 .variants(options.variants.unwrap_or_default())
-                .no_cache(options.no_cache.unwrap_or(false))
-                .strict_version(options.strict_version.unwrap_or(false));
+                .no_cache(options.no_cache.unwrap_or(false));
 
         let output = match on_progress {
             Some(callback) => {
@@ -333,9 +332,8 @@ impl Apvm {
     /// cache so a later `build()` of the same reference is an instant hit.
     ///
     /// The options type is [`WarmOptions`], deliberately smaller than
-    /// [`BuildOptions`]: there is no `outputDir` (nothing is delivered), no
-    /// `noCache` (warming *is* a cache operation), and no `strictVersion`
-    /// (warming always pins the requested version exactly).
+    /// [`BuildOptions`]: there is no `outputDir` (nothing is delivered) and no
+    /// `noCache` (warming *is* a cache operation).
     ///
     /// # Arguments
     ///
@@ -381,9 +379,8 @@ impl Apvm {
         let apvm = Arc::clone(&self.inner);
 
         // Assemble the core warm request. There is intentionally no output
-        // directory, cache-bypass, or version-strictness knob here — warming
-        // always delivers nothing, consults + populates the cache, and pins the
-        // version exactly.
+        // directory and no cache-bypass knob here — warming always delivers
+        // nothing and consults + populates the cache.
         let request = apvm_core::WarmRequest::new(options.project, options.git_ref)
             .version(options.version)
             .variants(options.variants.unwrap_or_default());
@@ -451,7 +448,6 @@ impl Apvm {
                 variants,
                 output_dir,
                 no_cache: None,
-                strict_version: None,
             },
             on_progress,
         )
@@ -498,7 +494,6 @@ impl Apvm {
                 variants,
                 output_dir,
                 no_cache: None,
-                strict_version: None,
             },
             on_progress,
         )
@@ -545,7 +540,6 @@ impl Apvm {
                 variants,
                 output_dir,
                 no_cache: None,
-                strict_version: None,
             },
             on_progress,
         )
@@ -592,7 +586,6 @@ impl Apvm {
                 variants,
                 output_dir,
                 no_cache: None,
-                strict_version: None,
             },
             on_progress,
         )
@@ -655,7 +648,6 @@ impl Apvm {
                 variants,
                 output_dir,
                 no_cache: None,
-                strict_version: None,
             },
             on_progress,
         )
@@ -731,7 +723,6 @@ impl Apvm {
                 variants,
                 output_dir,
                 no_cache: None,
-                strict_version: None,
             },
             on_progress,
         )

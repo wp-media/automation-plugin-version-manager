@@ -144,10 +144,9 @@ describe('build() basic functionality', () => {
       expect(output.commit.length).toBeGreaterThan(0);
       expect(output.commitShort.length).toBeGreaterThan(0);
 
-      // Cache metadata: no version was pinned, so a mismatch is impossible;
-      // fromCache depends on the machine's cache state, but must be a boolean.
+      // Cache metadata: fromCache depends on the machine's cache state, but
+      // must be a boolean.
       expect(typeof output.fromCache).toBe('boolean');
-      expect(output.cacheVersionMismatch).toBe(false);
       for (const artifact of output.result.artifacts) {
         expect(['built', 'cache', 'downloaded']).toContain(artifact.origin);
       }
@@ -195,10 +194,9 @@ describe('build() basic functionality', () => {
       expect(output.commit.length).toBeGreaterThan(0);
       expect(output.commitShort.length).toBeGreaterThan(0);
 
-      // Version is embedded (auto-detected from imagify.php), so no pin and no
-      // possibility of a version mismatch.
+      // No version pinned, so it is auto-detected from imagify.php with no
+      // source override.
       expect(typeof output.fromCache).toBe('boolean');
-      expect(output.cacheVersionMismatch).toBe(false);
 
       const outputDirResolved = resolve(outputDir);
       const artifactsInOutput = await readdir(outputDir);
@@ -461,8 +459,6 @@ describe('warmCache() basic functionality', () => {
       expect(warm.result).toBeTruthy();
       expect(warm.result.artifacts.length).toBeGreaterThan(0);
       expect(warm.commit.length).toBeGreaterThan(0);
-      // No version pinned ⇒ no possibility of a version mismatch.
-      expect(warm.cacheVersionMismatch).toBe(false);
 
       for (const artifact of warm.result.artifacts) {
         // Provenance distinguishes reused vs. freshly built/downloaded — all
@@ -511,7 +507,7 @@ describe('warmCache() error handling', () => {
   it('accepts version and variants in options (signature check)', async () => {
     const apvm = await Apvm.create({});
     // Rejects because the project doesn't exist, but proves the option shape
-    // (project, gitRef, version, variants — no outputDir/noCache/strictVersion).
+    // (project, gitRef, version, variants — WarmOptions has no outputDir/noCache).
     await expect(
       apvm.warmCache({
         project: 'nonexistent-plugin',

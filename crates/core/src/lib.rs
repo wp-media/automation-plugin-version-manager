@@ -42,7 +42,7 @@
 //!
 //! // Warm the cache without producing output: same pipeline, but nothing is
 //! // delivered to an output directory. A later `build` of the same ref is then
-//! // a cache hit. `WarmRequest` has no output_dir / no_cache / strict_version.
+//! // a cache hit. `WarmRequest` has no output_dir / no_cache.
 //! let _ = apvm
 //!     .warm_cache(WarmRequest::new("wp-rocket", "branch:develop"), &NullReporter)
 //!     .await?;
@@ -65,7 +65,7 @@ pub use build::BuildContext;
 pub use build::progress::{
     BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter,
 };
-pub use build::{ArtifactOrigin, ProducedArtifact};
+pub use build::{ArtifactOrigin, ProducedArtifact, VersionOverride};
 pub use commands::{BuildOutput, BuildRequest, WarmRequest};
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 
@@ -424,7 +424,7 @@ impl Apvm {
         );
         // `true` = warm-only: run the whole pipeline but deliver nothing to an
         // output directory. `WarmRequest::into_build_request` supplies the
-        // fixed `output_dir = ""`, `no_cache = false`, `strict_version = true`.
+        // fixed `output_dir = ""`, `no_cache = false`.
         cmd.execute(request.into_build_request(), reporter, true)
             .await
     }

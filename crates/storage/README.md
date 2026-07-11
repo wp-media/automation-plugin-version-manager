@@ -54,7 +54,7 @@ All tables are `STRICT`; deletes cascade; timestamps are epoch milliseconds
 ```rust,no_run
 use apvm_storage::{
     ArtifactStore, BuildMetadata, BuildSource, CleanOptions, CleanTarget, LookupKey,
-    LookupRequest, SourceArtifact, VerifyMode, VersionMatch,
+    LookupRequest, SourceArtifact, VerifyMode,
 };
 
 fn main() -> apvm_storage::Result<()> {
@@ -74,13 +74,12 @@ fn main() -> apvm_storage::Result<()> {
     }];
     store.store(&metadata, &artifacts)?;
 
-    // Cache lookup with version semantics. BackWPup stamps the version into
-    // the artifact, so version-critical flows use Strict; others use the
-    // default Lenient and check `version_matched` on the hit.
+    // Cache lookup with exact version matching. A build of the same commit at
+    // a different version is a miss (the version is baked into the artifact),
+    // so the caller rebuilds at the requested version.
     let required = vec![Some("pro-en".to_string())];
     let request = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"))
         .version("5.6.0")
-        .version_match(VersionMatch::Strict)
         .require_variants(&required);
     if let Some(hit) = store.lookup_build(&request)?.hit() {
         println!("cached at {}", hit.build.dir.display());

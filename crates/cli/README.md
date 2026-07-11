@@ -39,7 +39,6 @@ apvm build <PLUGIN> <GIT_REF> [OUTPUT] [OPTIONS]
 | `--ver <VERSION>`   | `-v`  | Package version (required for BackWPup)                                    |
 | `--variants <LIST>` |       | Comma-separated variants (e.g., `free,pro-en`)                             |
 | `--no-cache`        |       | Bypass the artifact cache for this build (still warms it)                  |
-| `--strict-version`  |       | Require a cache hit to match `--ver` exactly (conflicts with `--no-cache`) |
 | `--verbose`         |       | Show full command output instead of spinner                                |
 
 Each artifact's provenance is shown after a build (`built`, `cache`, or

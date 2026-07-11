@@ -48,7 +48,6 @@
 //! ```
 //! use apvm_storage::{
 //!     ArtifactStore, BuildMetadata, BuildSource, LookupKey, LookupRequest, SourceArtifact,
-//!     VersionMatch,
 //! };
 //!
 //! # fn main() -> apvm_storage::Result<()> {
@@ -72,10 +71,9 @@
 //! }];
 //! store.store(&metadata, &artifacts)?;
 //!
-//! // Cache hit by short commit — strict version matching (the BackWPup case).
+//! // Cache hit by short commit — the version must match exactly.
 //! let request = LookupRequest::new("backwpup", LookupKey::Commit("a1b2c3d"))
-//!     .version("5.6.0")
-//!     .version_match(VersionMatch::Strict);
+//!     .version("5.6.0");
 //! assert!(store.lookup_build(&request)?.is_hit());
 //!
 //! // Disk accounting and cleanup are first-class.
@@ -98,7 +96,7 @@ mod store;
 mod types;
 
 pub use error::{Error, Result};
-pub use lookup::{LookupHit, LookupKey, LookupRequest, LookupResult, MissReason, VersionMatch};
+pub use lookup::{LookupHit, LookupKey, LookupRequest, LookupResult, MissReason};
 pub use maintenance::{
     CleanOptions, CleanReport, CleanTarget, GcReport, IssueContext, ProjectUsage, RepairReport,
     UsageReport, VerifyIssue, VerifyMode, VerifyProblem,
