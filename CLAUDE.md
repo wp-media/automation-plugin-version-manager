@@ -96,5 +96,6 @@ The napi crate's `.node` binaries, `index.js`, and `.d.ts` files are build outpu
 - A new env var is introduced (`APVM_CACHE_DIR`, `GITHUB_TOKEN`, `GH_TOKEN`, `RUST_LOG`, `NO_COLOR`, …) or an existing one's precedence/scope changes.
 - A new plugin or a plugin's `version_requirement` / `default_variants` / tool dependencies change (see the plugin-specific quick-reference table).
 - A new `ConfigKey` is added in `crates/config` (currently `token`, `cache-dir`, `cache`).
+- Project versioning changes (e.g., `3.0.0` → `3.1.0`) or a new release is cut.
 
 Source of truth is always the binary itself: re-run `apvm <command> --help` (or read `crates/cli/src/commands/*.rs` + `crates/cli/README.md`) and reconcile the skill against it. Note the skill's `name` is `apvm-cli` (project-scoped, lives under `.claude/skills/`).
