@@ -119,10 +119,7 @@ impl SkillArgs {
 ///    is not inside a git repository.
 /// 3. Write the embedded skill files, replacing any existing installation.
 fn install(global: bool, verbose: bool) -> Result<()> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| Error::Skill(format!("Could not determine the current directory: {e}")))?;
-    let home = resolve_home_dir()?;
-    let dest = fs_ops::resolve_dest_dir(global, &home, &cwd);
+    let (dest, local_cwd) = resolve_dest(global)?;
 
     let scope = if global {
         "globally"
@@ -144,7 +141,9 @@ fn install(global: bool, verbose: bool) -> Result<()> {
     }
 
     // Informational only — a missing repository never cancels the install.
-    if !global && fs_ops::find_git_root(&cwd).is_none() {
+    if let Some(cwd) = &local_cwd
+        && fs_ops::find_git_root(cwd).is_none()
+    {
         warn(&format!(
             "{} does not appear to be inside a git repository — \
              installing the project-local skill anyway.",
@@ -175,10 +174,7 @@ fn install(global: bool, verbose: bool) -> Result<()> {
 /// left untouched. Running it when the skill is not installed is a no-op
 /// that still succeeds (the desired state is already reached).
 fn uninstall(global: bool, verbose: bool) -> Result<()> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| Error::Skill(format!("Could not determine the current directory: {e}")))?;
-    let home = resolve_home_dir()?;
-    let dest = fs_ops::resolve_dest_dir(global, &home, &cwd);
+    let (dest, _local_cwd) = resolve_dest(global)?;
 
     let scope = if global {
         "globally"
@@ -239,6 +235,30 @@ pub(crate) fn remove_installation(dir: &Path) -> Result<UninstallOutcome> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the destination skill directory for the requested scope.
+///
+/// The current directory is consulted **only** for project-local operations
+/// (returned as `Some(cwd)` for the git-repository check) — global installs
+/// and uninstalls must keep working even when the working directory has been
+/// deleted or is unreadable (e.g. `apvm update` spawning
+/// `skill install --global` from an arbitrary cwd).
+///
+/// # Errors
+///
+/// Returns [`Error::Skill`] when the home directory cannot be determined,
+/// or — for local scope only — when the current directory cannot be read.
+fn resolve_dest(global: bool) -> Result<(PathBuf, Option<PathBuf>)> {
+    let home = resolve_home_dir()?;
+    if global {
+        return Ok((fs_ops::resolve_dest_dir(true, &home, Path::new("")), None));
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::Skill(format!("Could not determine the current directory: {e}")))?;
+    let dest = fs_ops::resolve_dest_dir(false, &home, &cwd);
+    Ok((dest, Some(cwd)))
+}
 
 /// Resolve the user's home directory (for the global skill location).
 ///

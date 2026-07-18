@@ -149,6 +149,11 @@ pub fn install_skill_files(dest: &Path, files: &[EmbeddedFile]) -> Result<()> {
     fs::create_dir_all(parent)
         .map_err(|e| Error::Skill(format!("Failed to create {}: {e}", parent.display())))?;
 
+    // Fixed (dot-prefixed) staging name, deliberately: a leftover from a
+    // crashed run is swept by the next install instead of accumulating.
+    // Two *concurrent* installs of the same destination could race on it,
+    // but the loser fails loudly (rename of a vanished directory) and a
+    // re-run heals — never silent corruption outside this directory.
     let staging = parent.join(format!(".{SKILL_NAME}.staging"));
     let result = stage_and_swap(&staging, dest, files);
     if result.is_err() {

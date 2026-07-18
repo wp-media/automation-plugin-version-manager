@@ -378,6 +378,23 @@ pub async fn execute() -> Result<()> {
             .map_err(|e| Error::Update(format!("Failed to set executable permission: {e}")))?;
     }
 
+    // Capture the executable path BEFORE the replacement. `self_replace`
+    // renames the new binary over this path, unlinking the old inode — and
+    // on Linux `current_exe()` reads `/proc/self/exe`, which after the
+    // unlink resolves to "<path> (deleted)": a pathname that no longer
+    // exists, so it could not be spawned in step 7. Captured now, the path
+    // is clean, and the old and new binaries share it by construction.
+    //
+    // Sources:
+    // - proc_pid_exe(5): "If the pathname has been unlinked, the symbolic
+    //   link will contain the string ' (deleted)' appended to the original
+    //   pathname." <https://man7.org/linux/man-pages/man5/proc_pid_exe.5.html>
+    // - self-replace (Unix): `fs::rename(tmp, env::current_exe()?)`.
+    //   <https://docs.rs/self-replace/1/src/self_replace/unix.rs.html>
+    // Kept as a `Result`: a failure here only degrades the optional skill
+    // refresh (step 7 warns), it must not abort the binary update itself.
+    let exe_path = std::env::current_exe();
+
     self_replace::self_replace(temp_file.path()).map_err(|e| {
         Error::Update(format!(
             "Failed to replace the binary: {e}\n\
@@ -396,15 +413,16 @@ pub async fn execute() -> Result<()> {
     // ── 7. Refresh the installed global Claude Code skill ────────────────
     //
     // Only when one is already installed — updating never installs the
-    // skill on its own. Delegated to the NEW binary because this process
-    // still runs the old code (and embeds the old skill files), while
-    // `self_replace` has already placed the new binary at the executable's
-    // path. Non-fatal: the binary update above already succeeded.
+    // skill on its own. Delegated to the NEW binary (spawned via the
+    // pre-replacement `exe_path`, which now holds it) because this process
+    // still runs the old code and embeds the old skill files. Non-fatal:
+    // the binary update above already succeeded.
     if let Some(skill_dir) = super::skill::detect_global_installation() {
         info("Refreshing the installed Claude Code skill...");
-        let refreshed = std::env::current_exe()
-            .map_err(|e| format!("could not locate the new binary: {e}"))
-            .and_then(|exe| run_skill_refresh(&exe));
+        let refreshed = exe_path
+            .as_deref()
+            .map_err(|e| format!("could not locate the binary path: {e}"))
+            .and_then(run_skill_refresh);
         match refreshed {
             Ok(()) => success(&format!(
                 "Claude Code skill refreshed ({})",

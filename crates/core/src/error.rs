@@ -154,9 +154,10 @@ pub enum Error {
 
     /// Claude Code skill management error (only CLI).
     ///
-    /// Used by `apvm skill` subcommands for user-facing failures: skill files
-    /// missing at every candidate git ref, invalid file paths in a fetched
-    /// skill, or filesystem failures while installing/storing the skill.
+    /// Used by `apvm skill` subcommands for user-facing failures: an
+    /// unresolvable home or current directory, a refused destination
+    /// (unexpected name, symlink, stray file, no `SKILL.md`), or filesystem
+    /// failures while installing/removing the embedded skill.
     #[error("Skill error: {0}")]
     Skill(String),
 }
