@@ -7,6 +7,7 @@ You are an expert Rust developer specializing in APIs (Libs) and CLI tools. Your
 ## Core Principles
 
 ### Code Quality Standards
+- **Production Bar**: Every change ships production-ready — clear, clean, stable, safe, secure, and robust, following best practices, properly tested and properly documented. Keep logic separate from I/O and side effects so most code is unit-testable
 - **SOLID Principles**: Write clean, single-responsibility code that's easy to test and maintain
 - **DRY (Don't Repeat Yourself)**: Extract reusable logic into dedicated methods or classes
 - **KISS (Keep It Simple)**: Prefer simple, clear solutions over complex abstractions
@@ -90,12 +91,14 @@ The napi crate's `.node` binaries, `index.js`, and `.d.ts` files are build outpu
 
 `.claude/skills/apvm-cli/SKILL.md` (plus `references/git-refs.md`) mirrors the CLI surface and **must be updated in the same change as the code** whenever any of the following change:
 
-- A subcommand is added/removed/renamed: `build`, `list`, `info`, `cache` (+ its `info|clean|gc|verify|repair|clear` sub-commands), `config` (+ `get|set|unset|path`), `update`, `uninstall`.
-- An argument/flag is added/removed/renamed (e.g., `--ver`/`-v`, `--variants`, `--no-cache`, `--warm-cache`, `--older-than`, `--project`, `--dry-run`, `--builds`, `--releases`, `--checksum`, `-y`/`--yes`, `--verbose`).
-- Behavior, defaults, error messages, sanitization, or output format of any command change (e.g., cache `info` layout, build `Source:` summary, `Reference:` line, config masking rules).
+- A subcommand is added/removed/renamed: `build`, `list`, `info`, `cache` (+ its `info|clean|gc|verify|repair|clear` sub-commands), `config` (+ `get|set|unset|path`), `skill` (+ `install|uninstall`), `update`, `uninstall`.
+- An argument/flag is added/removed/renamed (e.g., `--ver`/`-v`, `--variants`, `--no-cache`, `--warm-cache`, `--older-than`, `--project`, `--dry-run`, `--builds`, `--releases`, `--checksum`, `-y`/`--yes`, `-g`/`--global`, `--verbose`).
+- Behavior, defaults, error messages, sanitization, or output format of any command change (e.g., cache `info` layout, build `Source:` summary, `Reference:` line, config masking rules, `skill install` source-resolution order or destination paths).
 - A new env var is introduced (`APVM_CACHE_DIR`, `GITHUB_TOKEN`, `GH_TOKEN`, `RUST_LOG`, `NO_COLOR`, …) or an existing one's precedence/scope changes.
 - A new plugin or a plugin's `version_requirement` / `default_variants` / tool dependencies change (see the plugin-specific quick-reference table).
 - A new `ConfigKey` is added in `crates/config` (currently `token`, `cache-dir`, `cache`).
 - Project versioning changes (e.g., `3.0.0` → `3.1.0`) or a new release is cut.
 
 Source of truth is always the binary itself: re-run `apvm <command> --help` (or read `crates/cli/src/commands/*.rs` + `crates/cli/README.md`) and reconcile the skill against it. Note the skill's `name` is `apvm-cli` (project-scoped, lives under `.claude/skills/`).
+
+The skill files are **embedded into the CLI binary at compile time** (`crates/cli/src/commands/skill/embedded.rs`, used by `apvm skill install`). When a file is added to or removed from `.claude/skills/apvm-cli/`, update the `SKILL_FILES` list there — the `embedded_list_matches_repo_directory` unit test fails otherwise. Content-only edits need no action. A companion test also requires `SKILL.md` to mention the current crate version, so version bumps force the skill's version line to be updated.

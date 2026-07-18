@@ -69,6 +69,11 @@ fn error_msg(msg: &str) {
     eprintln!("\x1b[31merror\x1b[0m {msg}");
 }
 
+/// Yellow warn prefix.
+fn warn(msg: &str) {
+    eprintln!("\x1b[33mwarn\x1b[0m  {msg}");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Platform detection
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,6 +239,11 @@ async fn make_github_client() -> Result<GitHubClient> {
 /// 4. Download the binary and checksums
 /// 5. Verify SHA-256 integrity
 /// 6. Atomically replace the running binary via `self-replace`
+/// 7. Refresh the **installed global** Claude Code skill
+///    (`~/.claude/skills/apvm-cli`) when — and only when — one is present,
+///    by running `skill install --global` with the **new** binary (this
+///    process still executes the old code and embeds the old skill files).
+///    Non-fatal: a failure warns and suggests the manual command.
 ///
 /// # Errors
 ///
@@ -382,10 +392,66 @@ pub async fn execute() -> Result<()> {
     })?;
 
     success(&format!("Updated successfully: {current} → {latest}"));
+
+    // ── 7. Refresh the installed global Claude Code skill ────────────────
+    //
+    // Only when one is already installed — updating never installs the
+    // skill on its own. Delegated to the NEW binary because this process
+    // still runs the old code (and embeds the old skill files), while
+    // `self_replace` has already placed the new binary at the executable's
+    // path. Non-fatal: the binary update above already succeeded.
+    if let Some(skill_dir) = super::skill::detect_global_installation() {
+        info("Refreshing the installed Claude Code skill...");
+        let refreshed = std::env::current_exe()
+            .map_err(|e| format!("could not locate the new binary: {e}"))
+            .and_then(|exe| run_skill_refresh(&exe));
+        match refreshed {
+            Ok(()) => success(&format!(
+                "Claude Code skill refreshed ({})",
+                skill_dir.display()
+            )),
+            Err(e) => warn(&format!(
+                "Could not refresh the installed Claude Code skill: {e}\n      \
+                 Run 'apvm skill install --global' to refresh it manually."
+            )),
+        }
+    }
+
     eprintln!();
     info("Restart your shell or run 'apvm --version' to verify.");
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Skill refresh
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Arguments passed to the new binary to refresh the global skill.
+const SKILL_REFRESH_ARGS: [&str; 3] = ["skill", "install", "--global"];
+
+/// Run `<new_binary> skill install --global` and report the result.
+///
+/// The child's output is captured (not shown): on success the update flow
+/// prints its own confirmation, and on failure the child's stderr is folded
+/// into the returned error string.
+///
+/// # Errors
+///
+/// Returns a human-readable description when the child cannot be spawned or
+/// exits non-zero.
+fn run_skill_refresh(new_binary: &std::path::Path) -> std::result::Result<(), String> {
+    let output = std::process::Command::new(new_binary)
+        .args(SKILL_REFRESH_ARGS)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run the new binary: {e}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!("{}: {}", output.status, stderr.trim()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -648,6 +714,61 @@ mod tests {
             hash,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+    }
+
+    // ── run_skill_refresh ────────────────────────────────────────────────
+
+    #[test]
+    fn skill_refresh_args_target_the_global_install() {
+        assert_eq!(SKILL_REFRESH_ARGS, ["skill", "install", "--global"]);
+    }
+
+    #[test]
+    fn run_skill_refresh_errors_on_missing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-binary");
+
+        let err = run_skill_refresh(&missing).unwrap_err();
+        assert!(
+            err.contains("failed to run the new binary"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Write an executable shell script and return its path (Unix only —
+    /// Windows cannot execute shebang scripts, and the real child there is
+    /// always a `.exe`).
+    #[cfg(unix)]
+    fn write_script(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-apvm");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_skill_refresh_succeeds_on_zero_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Also prove the expected arguments are forwarded to the child.
+        let script = write_script(
+            tmp.path(),
+            r#"[ "$1 $2 $3" = "skill install --global" ] || exit 9
+exit 0"#,
+        );
+
+        assert_eq!(run_skill_refresh(&script), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_skill_refresh_reports_child_stderr_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_script(tmp.path(), "echo 'boom' >&2\nexit 1");
+
+        let err = run_skill_refresh(&script).unwrap_err();
+        assert!(err.contains("boom"), "stderr not surfaced: {err}");
     }
 
     // ── test helpers ─────────────────────────────────────────────────────

@@ -13,7 +13,9 @@ Built for developers and QA engineers who need to quickly build plugins from spe
 | `build`     | Build a plugin from a git reference (PR, branch, tag, commit, release) |
 | `list`      | List all available plugins                           |
 | `info`      | Show detailed information about a plugin             |
+| `cache`     | Inspect and maintain the artifact cache              |
 | `config`    | View or change configuration settings                |
+| `skill`     | Install or remove the Claude Code skill for apvm     |
 | `update`    | Update apvm to the latest version                    |
 | `uninstall` | Uninstall apvm from this system                      |
 
@@ -30,7 +32,8 @@ For extended CLI documentation, see the [CLI crate README](crates/cli/README.md)
 - **Multi-variant builds** — e.g., BackWPup produces `free`, `pro-de`, and `pro-en` variants. You can choose which ones to build (`free` and `pro-en` are the defaults for BackWPup)
 - **Persistent artifact cache** — builds and release downloads are cached (SQLite-indexed, on by default): rebuilding the same commit **at the same version** is served from the cache, and a partial request reuses cached variants and builds only the rest. Per-artifact provenance (`built`/`cache`/`downloaded`), a `--no-cache` override, a `--warm-cache` mode that primes the cache without producing output, and an `apvm cache` maintenance command
 - **Version handling** — required or optional per plugin (BackWPup requires a version at build time; WP Rocket and Imagify auto-detect it from source, and when you pass `--ver` the requested version is rewritten into the plugin's source so the built artifact actually carries it)
-- **Self-update** — `apvm update` downloads and replaces the binary with the latest release, verifying SHA-256 checksums
+- **Claude Code skill** — `apvm skill install` installs the bundled [Claude Code skill](https://code.claude.com/docs/en/skills) (`apvm-cli`) into the current project (`./.claude/skills/`) or globally with `-g` (`~/.claude/skills/`), so Claude knows the full CLI surface. The skill is embedded in the binary — no network needed, always version-matched
+- **Self-update** — `apvm update` downloads and replaces the binary with the latest release, verifying SHA-256 checksums (and refreshes the installed global Claude Code skill, when present)
 - **Self-uninstall** — `apvm uninstall` cleanly removes the binary and its directory (with `-y`/`--yes` to skip confirmation)
 - **GitHub token auto-resolution** — automatically finds tokens from config, `GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token`, or the gh CLI config file
 
@@ -322,13 +325,29 @@ apvm cache clear -y
 See the [CLI crate README](crates/cli/README.md#cache-command) for the full
 cache command reference.
 
+### Install the Claude Code Skill
+
+```sh
+# Into the current project (./.claude/skills/apvm-cli/)
+apvm skill install
+
+# Globally, for all projects (~/.claude/skills/apvm-cli/)
+apvm skill install -g
+
+# Remove it again (same -g/--global scoping; only the apvm-cli skill is removed)
+apvm skill uninstall
+apvm skill uninstall -g
+```
+
+Installs the bundled `apvm-cli` [Claude Code skill](https://code.claude.com/docs/en/skills) so Claude knows the full CLI surface. The skill files are embedded in the binary at compile time, so the command works offline and the installed skill always matches the binary version. Existing installations are replaced; `uninstall` removes only the `apvm-cli` skill directory, never `.claude/` or other skills. See the [CLI crate README](crates/cli/README.md#skill-command) for details.
+
 ### Update
 
 ```sh
 apvm update
 ```
 
-Downloads the latest release from GitHub, verifies the SHA-256 checksum, and atomically replaces the running binary. Supports macOS (arm64/x64), Linux (x64/arm64), and Windows (x64).
+Downloads the latest release from GitHub, verifies the SHA-256 checksum, and atomically replaces the running binary. If the global Claude Code skill (`~/.claude/skills/apvm-cli/`) is installed, it is refreshed to match the new version (project-local copies: re-run `apvm skill install` per project). Supports macOS (arm64/x64), Linux (x64/arm64), and Windows (x64).
 
 ### Uninstall
 
@@ -340,7 +359,7 @@ apvm uninstall
 apvm uninstall -y
 ```
 
-Removes the `apvm` binary and its `bin/` directory. Does not remove configuration or build artifacts.
+Removes the `apvm` binary and its `bin/` directory, plus the global Claude Code skill (`~/.claude/skills/apvm-cli/`) if installed. Does not remove configuration, build artifacts, or project-local skills (use `apvm skill uninstall` inside each project first).
 
 ### GitHub Token Resolution
 

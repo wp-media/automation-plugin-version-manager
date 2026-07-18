@@ -55,9 +55,6 @@ self-replace = { workspace = true }
 # SHA-256 checksums (for update integrity verification)
 sha2 = { workspace = true }
 
-# HTTP client (for downloading release assets during update)
-reqwest = { workspace = true }
-
 # Temporary files (for staging downloaded binaries)
 tempfile = { workspace = true }
 

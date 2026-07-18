@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use apvm_core::config_io::load_config_file;
 use apvm_core::{Apvm, Result};
 
-use crate::commands::{BuildArgs, CacheArgs, ConfigArgs, InfoArgs};
+use crate::commands::{BuildArgs, CacheArgs, ConfigArgs, InfoArgs, SkillArgs};
 use crate::paths::Paths;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -62,6 +62,8 @@ enum Commands {
     Cache(CacheArgs),
     /// View or change configuration settings
     Config(ConfigArgs),
+    /// Install or remove the Claude Code skill for apvm (project-local or global)
+    Skill(SkillArgs),
     /// Update apvm to the latest version
     Update,
     /// Uninstall apvm from this system
@@ -115,6 +117,12 @@ async fn run() -> Result<()> {
         return commands::update::execute().await;
     }
 
+    // Skill command is self-contained (embedded files, no network) — handle
+    // it early
+    if let Commands::Skill(args) = &cli.command {
+        return args.execute(cli.verbose);
+    }
+
     // Uninstall command is self-contained — handle it early
     if let Commands::Uninstall { yes } = &cli.command {
         return commands::uninstall::execute(*yes);
@@ -160,6 +168,7 @@ async fn run() -> Result<()> {
         }
         Commands::Cache(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
+        Commands::Skill(_) => unreachable!("handled above"),
         Commands::Update => unreachable!("handled above"),
         Commands::Uninstall { .. } => unreachable!("handled above"),
     }

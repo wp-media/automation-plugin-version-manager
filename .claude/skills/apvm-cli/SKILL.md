@@ -1,7 +1,7 @@
 ---
 name: apvm-cli
-description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
-when_to_use: Trigger on requests like "build backwpup from PR 123", "what plugins does apvm know about", "clean the apvm cache", "set my GitHub token for apvm", "update apvm", "download the latest release of imagify", or any direct `apvm <subcommand>` invocation. Also trigger when the user references a plugin artifact path under `~/.apvm/` or asks about the WP Media plugin version manager.
+description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm skill` (install/uninstall this Claude Code skill), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
+when_to_use: Trigger on requests like "build backwpup from PR 123", "what plugins does apvm know about", "clean the apvm cache", "set my GitHub token for apvm", "update apvm", "download the latest release of imagify", "install the apvm skill", or any direct `apvm <subcommand>` invocation. Also trigger when the user references a plugin artifact path under `~/.apvm/` or asks about the WP Media plugin version manager.
 allowed-tools: Bash(apvm *)
 ---
 
@@ -15,7 +15,7 @@ SQLite-indexed artifact cache. This skill is the authoritative reference for
 its command surface; treat the source-of-truth as `apvm <command> --help` and
 `crates/cli/src/commands/*.rs`.
 
-Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.0.0**.
+Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.1.0**.
 
 ---
 
@@ -241,6 +241,38 @@ apvm config unset token
 
 ---
 
+### `apvm skill <SUBCMD> [-g|--global]`
+
+Installs or removes **this very skill** (`apvm-cli`) as a
+[Claude Code skill](https://code.claude.com/docs/en/skills). Mostly for
+humans setting up a machine or project — but run it if the user asks.
+
+| Subcommand  | Effect on `./.claude/skills/apvm-cli/` (default) or `~/.claude/skills/apvm-cli/` (`-g`/`--global`) |
+|-------------|------------------------------------------------------------------------------|
+| `install`   | Write the skill there (directories created, existing install replaced)       |
+| `uninstall` | Remove exactly that directory — parents and other skills are never touched   |
+
+Behavior notes:
+
+- The skill files are **embedded in the binary at compile time** — the
+  command is fully self-contained (no network, works offline) and the
+  installed skill always matches the binary version exactly.
+- A project `install` outside a git repository prints a **warning** but still
+  installs (informational only).
+- `uninstall` succeeds (exit 0) when the skill is not installed — idempotent.
+  It **refuses** (exit 1) to remove a path that is a symlink, a file, or a
+  directory without a `SKILL.md`, telling you to delete it manually.
+
+```sh
+apvm skill install              # this project (./.claude/skills/apvm-cli)
+apvm skill install -g           # all projects (~/.claude/skills/apvm-cli)
+apvm skill uninstall            # remove from this project
+apvm skill uninstall --global   # remove the all-projects installation
+apvm --verbose skill install    # also list the embedded files
+```
+
+---
+
 ### `apvm update`
 
 Self-update. Fetches the **latest GitHub Release** from
@@ -262,12 +294,22 @@ Supported artifact names:
 For an unsupported `(os, arch)` pair, the command tells you to install from
 source: `cargo install --path crates/cli`.
 
+When the **global** Claude Code skill (`~/.claude/skills/apvm-cli/`) is
+installed, a successful update also refreshes it (via the new binary's
+`skill install --global`; non-fatal — a failure only warns). Project-local
+copies are not touched: re-run `apvm skill install` inside each project.
+
 ---
 
 ### `apvm uninstall [-y]`
 
 Removes the `apvm` binary and its containing `bin/` directory
-(`~/.apvm/bin/`). Does **not** remove `config.json` or the cache.
+(`~/.apvm/bin/`), plus the **global** Claude Code skill
+(`~/.claude/skills/apvm-cli/`) when installed (non-fatal: a refusal —
+symlink, stray file, no `SKILL.md` — only warns). Does **not** remove
+`config.json`, the cache, or **project-local** skills
+(`./.claude/skills/apvm-cli` in individual repos) — remove those per project
+with `apvm skill uninstall` *before* uninstalling the binary.
 
 - **Unix:** `unlink(2)` — kernel keeps the inode alive until the process exits.
 - **Windows:** renames the `.exe` aside and spawns a helper with
@@ -321,7 +363,7 @@ Required for private repos and PR builds. Recommended for public repos
 ## Verification commands
 
 ```sh
-apvm --version              # 3.0.0 (or current)
+apvm --version              # 3.1.0 (or current)
 apvm list                   # registered plugins
 apvm info <plugin>          # version requirement, variants, tool deps
 apvm config path            # config file location

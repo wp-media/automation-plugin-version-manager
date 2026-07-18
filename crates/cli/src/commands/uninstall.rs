@@ -1,8 +1,13 @@
 //! Self-uninstall command implementation.
 //!
-//! Removes the APVM binary from disk. On Unix the file is unlinked
-//! immediately; on Windows a helper process deletes it after the current
-//! process exits.
+//! Removes the APVM binary from disk, plus the **global** Claude Code skill
+//! (`~/.claude/skills/apvm-cli`) when installed — a leftover skill would
+//! keep steering Claude toward a CLI that no longer exists. Project-local
+//! skills live in arbitrary repositories and cannot be discovered from here;
+//! they are removed per project with `apvm skill uninstall`.
+//!
+//! On Unix the binary file is unlinked immediately; on Windows a helper
+//! process deletes it after the current process exits.
 //!
 //! # Cross-platform binary deletion
 //!
@@ -63,6 +68,11 @@ fn bold(msg: &str) -> String {
 /// Yellow text.
 fn yellow(msg: &str) -> String {
     format!("\x1b[33m{msg}\x1b[0m")
+}
+
+/// Yellow warn prefix.
+fn warn(msg: &str) {
+    eprintln!("\x1b[33mwarn\x1b[0m  {msg}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,12 +158,15 @@ fn confirm(prompt: &str) -> Result<bool> {
 ///
 /// # Steps
 ///
-/// 1. Resolve the path of the running binary
+/// 1. Resolve the path of the running binary and detect the global
+///    Claude Code skill installation (if any)
 /// 2. Show what will be removed and what will be kept
 /// 3. Ask the user for confirmation (unless `--yes`)
-/// 4. Delete the binary via `self_replace::self_delete_outside_path`
-/// 5. Attempt to remove the now-empty `bin/` directory
-/// 6. Print success message
+/// 4. Remove the global Claude Code skill (non-fatal: a refusal — symlink,
+///    stray file, no `SKILL.md` — only warns, the uninstall continues)
+/// 5. Delete the binary via `self_replace::self_delete_outside_path`
+/// 6. Attempt to remove the now-empty `bin/` directory
+/// 7. Print success message
 ///
 /// # Errors
 ///
@@ -162,6 +175,7 @@ pub fn execute(skip_confirm: bool) -> Result<()> {
     // ── 1. Resolve paths ─────────────────────────────────────────────────
     let exe_path = resolve_exe_path()?;
     let bin_dir = resolve_bin_dir(&exe_path)?;
+    let global_skill = super::skill::detect_global_installation();
 
     // ── 2. Display plan ──────────────────────────────────────────────────
     eprintln!();
@@ -175,6 +189,14 @@ pub fn execute(skip_confirm: bool) -> Result<()> {
     eprintln!("  The following will be {}:", bold("removed"));
     eprintln!();
     eprintln!("    {}  {}", dim("Binary :"), exe_path.display());
+    if let Some(skill_dir) = &global_skill {
+        eprintln!(
+            "    {}  {}  {}",
+            dim("Skill  :"),
+            skill_dir.display(),
+            dim("(global Claude Code skill)")
+        );
+    }
     eprintln!();
 
     eprintln!(
@@ -191,6 +213,10 @@ pub fn execute(skip_confirm: bool) -> Result<()> {
         "    {}  Configuration directory (~/.apvm/)",
         dim("Config :"),
     );
+    eprintln!(
+        "    {}  Project-local Claude Code skills (./.claude/skills/apvm-cli)",
+        dim("Skills :"),
+    );
     eprintln!();
     eprintln!(
         "  {}",
@@ -198,8 +224,13 @@ pub fn execute(skip_confirm: bool) -> Result<()> {
     );
     eprintln!(
         "  {}",
-        dim("PATH entries that point to non-existent directories.")
+        dim("PATH entries that point to non-existent directories. Project-local")
     );
+    eprintln!(
+        "  {}",
+        dim("skills can be removed per project with 'apvm skill uninstall'")
+    );
+    eprintln!("  {}", dim("(before uninstalling the binary)."));
 
     // ── 3. Confirm ───────────────────────────────────────────────────────
     if !skip_confirm {
@@ -216,7 +247,30 @@ pub fn execute(skip_confirm: bool) -> Result<()> {
         }
     }
 
-    // ── 4. Delete the binary ─────────────────────────────────────────────
+    // ── 4. Remove the global Claude Code skill ───────────────────────────
+    //
+    // Done *before* the binary goes away so a failure can still be retried
+    // with `apvm skill uninstall -g`. Non-fatal: the guarded removal refuses
+    // symlinks, stray files, and directories without a SKILL.md — in those
+    // cases the uninstall proceeds and the user is pointed at manual cleanup.
+    if let Some(skill_dir) = &global_skill {
+        eprintln!();
+        match super::skill::remove_installation(skill_dir) {
+            Ok(super::skill::UninstallOutcome::Removed) => {
+                success("Removed the global Claude Code skill.");
+            }
+            // Disappeared between the plan display and now — nothing to do.
+            Ok(super::skill::UninstallOutcome::NotInstalled) => {}
+            Err(e) => {
+                warn(&format!(
+                    "Could not remove the global Claude Code skill: {e}\n      \
+                     Continuing with the uninstall."
+                ));
+            }
+        }
+    }
+
+    // ── 5. Delete the binary ─────────────────────────────────────────────
     //
     // self_replace::self_delete_outside_path(bin_dir):
     //   Unix:    calls unlink(2) — immediate deletion; process continues via inode.
@@ -242,7 +296,7 @@ pub fn execute(skip_confirm: bool) -> Result<()> {
 
     success("Binary removed successfully.");
 
-    // ── 5. Clean up empty bin/ directory ─────────────────────────────────
+    // ── 6. Clean up empty bin/ directory ─────────────────────────────────
     //
     // std::fs::remove_dir removes an *empty* directory only.
     // If the user placed other files inside bin/, this silently fails.
@@ -260,7 +314,7 @@ pub fn execute(skip_confirm: bool) -> Result<()> {
         }
     }
 
-    // ── 6. Print success ─────────────────────────────────────────────────
+    // ── 7. Print success ─────────────────────────────────────────────────
     eprintln!();
     success(&format!("apvm {} has been uninstalled.", CURRENT_VERSION));
     eprintln!();

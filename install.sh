@@ -6,7 +6,9 @@
 # https://github.com/wp-media/automation-plugin-version-manager
 #
 # Downloads the latest pre-built APVM CLI binary for the current platform
-# and installs it to ~/.apvm/bin/ (or $APVM_INSTALL/bin/).
+# and installs it to ~/.apvm/bin/ (or $APVM_INSTALL/bin/). The binary embeds
+# the matching Claude Code skill — run `apvm skill install` to add it to a
+# project (no network needed).
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/wp-media/automation-plugin-version-manager/develop/install.sh | sh
@@ -449,6 +451,7 @@ main() {
     printf "\n"
     printf "  ${DIM}Version :${RESET}  %s\n" "$version_output"
     printf "  ${DIM}Binary  :${RESET}  %s\n" "${BIN_DIR}/${BINARY_NAME}"
+    printf "  ${DIM}Tip     :${RESET}  Run ${BOLD}apvm skill install${RESET} to add the Claude Code skill to a project.\n"
 
     # Show PATH instructions if needed
     case ":${PATH}:" in

@@ -13,6 +13,7 @@ This crate produces the `apvm` binary. All heavy logic is delegated to [`apvm-co
 | `info`      | Show detailed information about a plugin (repo, variants, version, tools)   |
 | `cache`     | Inspect and maintain the artifact cache                                     |
 | `config`    | View or change configuration settings                                       |
+| `skill`     | Install or remove the Claude Code skill for apvm (project-local or global)  |
 | `update`    | Download and install the latest APVM release                                |
 | `uninstall` | Remove the APVM binary from this system                                     |
 
@@ -249,6 +250,46 @@ Input values are sanitized before storage:
 APVM_CACHE_DIR="$(mktemp -d)" apvm build imagify develop ./out
 ```
 
+## Skill Command
+
+APVM ships a [Claude Code skill](https://code.claude.com/docs/en/skills)
+(`apvm-cli`) that teaches Claude the full CLI surface. The skill files are
+**embedded in the binary at compile time** ([`include_str!`](https://doc.rust-lang.org/std/macro.include_str.html)
+in `src/commands/skill/embedded.rs`), so the command is fully self-contained:
+no network access, works offline, and the installed skill always matches the
+binary version exactly — both come from the same commit.
+
+```sh
+# Install for the current project → ./.claude/skills/apvm-cli/
+apvm skill install
+
+# Install globally (all projects) → ~/.claude/skills/apvm-cli/
+apvm skill install -g
+apvm skill install --global
+
+# Remove it again (same -g/--global scoping)
+apvm skill uninstall
+apvm skill uninstall -g
+
+# Also list the embedded files
+apvm --verbose skill install
+```
+
+Behavior:
+
+- Missing directories are created; an existing installation is **replaced**
+  (stale files are removed). The write is staged, so a mid-write failure
+  never leaves a half-written skill behind.
+- A project-local install outside a git repository prints a warning but still
+  proceeds — the check is informational only.
+- After `apvm update`, re-run `apvm skill install` to refresh installed
+  copies: the new binary carries the skill matching its version.
+- `uninstall` removes **exactly** the `apvm-cli` skill directory — never its
+  parents (`.claude/`, `skills/`) or sibling skills. It succeeds when the
+  skill is not installed (idempotent), and refuses to remove a path that is a
+  symlink, a plain file, or a directory without a `SKILL.md` (it points you
+  to delete such content manually instead of guessing).
+
 ## Update Command
 
 ```sh
@@ -262,6 +303,15 @@ Self-updates the `apvm` binary:
 3. Downloads the platform-appropriate binary
 4. Verifies its SHA-256 checksum against `checksums.txt`
 5. Atomically replaces the running binary via [self-replace](https://docs.rs/self-replace/1)
+6. Refreshes the **installed global** Claude Code skill
+   (`~/.claude/skills/apvm-cli/`) when — and only when — one is present, by
+   running `skill install --global` with the freshly installed binary (the
+   running process still embeds the old skill files). Non-fatal: a failure
+   warns and suggests the manual command.
+
+Project-local skill copies (`./.claude/skills/apvm-cli` in individual
+repositories) are not discoverable from here — re-run `apvm skill install`
+inside a project to refresh its copy.
 
 **Supported platforms:**
 
@@ -284,12 +334,20 @@ apvm uninstall -y
 apvm uninstall --yes
 ```
 
-Removes the `apvm` binary and its containing `bin/` directory. Uses [`self_replace::self_delete_outside_path`](https://docs.rs/self-replace/1/self_replace/fn.self_delete_outside_path.html) for cross-platform binary deletion:
+Removes the `apvm` binary and its containing `bin/` directory, plus the
+**global** Claude Code skill (`~/.claude/skills/apvm-cli/`) when installed —
+a leftover skill would keep steering Claude toward a CLI that no longer
+exists. Skill removal is non-fatal: if it is refused (symlink, stray file,
+no `SKILL.md`), the uninstall warns and continues. Uses
+[`self_replace::self_delete_outside_path`](https://docs.rs/self-replace/1/self_replace/fn.self_delete_outside_path.html) for cross-platform binary deletion:
 
 - **Unix**: `unlink(2)` — the kernel keeps the inode alive until the process exits.
 - **Windows**: Renames the `.exe` aside, spawns a helper process with `FILE_FLAG_DELETE_ON_CLOSE`.
 
-Does **not** remove configuration files (`~/.apvm/config.json`) or the artifact cache (`~/.apvm/cache/`).
+Does **not** remove configuration files (`~/.apvm/config.json`), the artifact
+cache (`~/.apvm/cache/`), or **project-local** skills
+(`./.claude/skills/apvm-cli` in individual repositories) — remove those per
+project with `apvm skill uninstall` before uninstalling the binary.
 
 ## GitHub Token Resolution
 
@@ -362,7 +420,6 @@ cargo build
 | [tracing-subscriber](https://docs.rs/tracing-subscriber/0.3) | 0.3 | Log formatting and filtering |
 | [semver](https://docs.rs/semver/1)                | 1       | Version comparison for updates    |
 | [self-replace](https://docs.rs/self-replace/1)    | 1       | Atomic binary self-replacement    |
-| [reqwest](https://docs.rs/reqwest/0.13)           | 0.13    | HTTP downloads (native-tls)       |
 | [sha2](https://docs.rs/sha2/0.11)                 | 0.11    | SHA-256 checksum verification     |
 | [directories](https://docs.rs/directories/6)      | 6       | Platform home directory           |
 | [tempfile](https://docs.rs/tempfile/3)             | 3       | Staging downloaded binaries       |

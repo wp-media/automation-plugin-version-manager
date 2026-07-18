@@ -151,6 +151,14 @@ pub enum Error {
     /// Self-uninstall error (only CLI).
     #[error("Uninstall error: {0}")]
     Uninstall(String),
+
+    /// Claude Code skill management error (only CLI).
+    ///
+    /// Used by `apvm skill` subcommands for user-facing failures: skill files
+    /// missing at every candidate git ref, invalid file paths in a fetched
+    /// skill, or filesystem failures while installing/storing the skill.
+    #[error("Skill error: {0}")]
+    Skill(String),
 }
 
 /// Result type alias using our Error type.

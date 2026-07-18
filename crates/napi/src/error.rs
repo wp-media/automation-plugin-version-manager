@@ -48,6 +48,9 @@ pub fn core_error_to_napi(err: apvm_core::Error) -> napi::Error {
         apvm_core::Error::Cache(_) => Status::GenericFailure,
         apvm_core::Error::Update(_) => Status::GenericFailure,
         apvm_core::Error::Uninstall(_) => Status::GenericFailure,
+        // CLI-only (skill management is not exposed through the bindings),
+        // but mapped anyway so the conversion stays total.
+        apvm_core::Error::Skill(_) => Status::GenericFailure,
     };
     napi::Error::new(status, err.to_string())
 }
