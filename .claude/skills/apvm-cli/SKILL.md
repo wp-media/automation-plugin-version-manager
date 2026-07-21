@@ -15,7 +15,7 @@ SQLite-indexed artifact cache. This skill is the authoritative reference for
 its command surface; treat the source-of-truth as `apvm <command> --help` and
 `crates/cli/src/commands/*.rs`.
 
-Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.1.0**.
+Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.1.1**.
 
 ---
 
@@ -31,9 +31,12 @@ Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.1.0**
 - **`APVM_CACHE_DIR=<path>`** — override the cache directory for one
   invocation. Takes precedence over the config `cache-dir` and the default
   `~/.apvm/cache`. Honored by both `apvm build` and `apvm cache`.
-  **Always set this to a throwaway directory during local development /
-  testing** to avoid warming the developer's real cache
-  (`APVM_CACHE_DIR="$(mktemp -d)" apvm ...`).
+  **Prefer the user's real cache — do not set this by default.** The user's
+  configured cache (or `~/.apvm/cache`) is the intended target for normal use,
+  so builds are reused across invocations. Only override `APVM_CACHE_DIR` when
+  the user, a system prompt, or a `CLAUDE.md` explicitly says to use an isolated
+  cache (e.g. developing/testing *apvm itself*, where a throwaway dir avoids
+  warming the developer's real cache: `APVM_CACHE_DIR="$(mktemp -d)" apvm ...`).
 
 ### Default paths
 
@@ -62,7 +65,14 @@ Build a plugin from a git reference. This is the primary command.
 | `-v`, `--ver <VER>` | Package version. Required for BackWPup; optional for WP Rocket / Imagify (auto-detected from source). Ignored with a warning when the plugin embeds its version. |
 | `--variants <LIST>` | Comma-separated variants to build (BackWPup defaults: `free,pro-en`). Ignored when the plugin has no variants. |
 | `--no-cache`        | Bypass the artifact cache for this build (still warms it unless `cache` is off in config).          |
-| `--warm-cache`      | Prime the cache without producing output. **Conflicts with `--no-cache`** (warming *is* caching).     |
+| `--warm-cache`      | Prime the cache **without producing output** — same build, but no artifacts are written to `[OUTPUT]`. **Conflicts with `--no-cache`** (warming *is* caching). |
+
+> **A normal build already caches.** You do **not** need `--warm-cache` to
+> persist what you built — every successful `apvm build` writes its artifacts to
+> the cache (unless `cache` is off in config). `--warm-cache` is *only* for the
+> case where you want to populate the cache but do **not** want the built files
+> delivered to an output directory (e.g. pre-warming CI, or seeding the cache
+> for a later build). If you want the artifacts on disk, run a normal build.
 
 After a build you get: `Build complete: ...`, `Commit: <short>`, `Version: ...`,
 a per-artifact provenance line (`built` / `cache` / `downloaded`), and a
