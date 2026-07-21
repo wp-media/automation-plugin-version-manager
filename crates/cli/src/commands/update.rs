@@ -29,6 +29,8 @@ use sha2::{Digest, Sha256};
 use apvm_core::error::{Error, Result};
 use apvm_core::github::{GitHubClient, Release, ReleaseAsset};
 
+use crate::paths::Paths;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,6 +228,76 @@ async fn make_github_client() -> Result<GitHubClient> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Version resolution (shared by the update command and the background notifier)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse this binary's compile-time version into a [`semver::Version`].
+///
+/// Shared by [`execute`] and [`fetch_latest_version`] so both compare against
+/// exactly the same current version. Infallible in practice (a release build
+/// always has a valid `CARGO_PKG_VERSION`), but surfaced as a `Result` rather
+/// than panicking, per the project's no-`unwrap` policy.
+pub(crate) fn current_version() -> Result<semver::Version> {
+    semver::Version::parse(CURRENT_VERSION).map_err(|e| {
+        Error::Update(format!(
+            "Failed to parse current version '{CURRENT_VERSION}': {e}"
+        ))
+    })
+}
+
+/// Parse the SemVer version carried by a release's tag (`cli/vX.Y.Z`).
+fn release_version(release: &Release) -> Result<semver::Version> {
+    let latest_tag = extract_version_from_tag(&release.tag_name);
+    semver::Version::parse(latest_tag).map_err(|e| {
+        Error::Update(format!(
+            "Failed to parse release version '{}' (from tag '{}'): {e}",
+            latest_tag, release.tag_name
+        ))
+    })
+}
+
+/// Fetch the latest **stable** APVM release using an existing client.
+///
+/// The single "latest release" lookup shared by the self-update flow (which
+/// then downloads the release's assets with the same client) and the background
+/// notifier (which only reads its version). Keeping it in one place means both
+/// look at the same repository coordinates and the same "latest stable"
+/// semantics.
+///
+/// # Errors
+///
+/// Returns `Error::Update` when the repository has no releases, or propagates
+/// the underlying `Error::GitHub` on a transport/auth/rate-limit failure.
+async fn latest_release_with(github: &GitHubClient) -> Result<Release> {
+    github
+        .get_latest_stable_release(REPO_OWNER, REPO_NAME)
+        .await?
+        .ok_or_else(|| {
+            Error::Update(format!(
+                "No releases found for {REPO_OWNER}/{REPO_NAME}.\n\
+                 This is unexpected — please report it at:\n\
+                 https://github.com/{REPO_OWNER}/{REPO_NAME}/issues"
+            ))
+        })
+}
+
+/// Resolve the latest stable version published on GitHub.
+///
+/// This is the reusable entry point for the background update check: it runs
+/// exactly the same fetch + version-parse the `update` command uses, without
+/// downloading or replacing anything. Callers compare the result against
+/// [`current_version`] to decide whether to notify the user.
+///
+/// # Errors
+///
+/// Propagates any error from client construction, the release lookup, or
+/// version parsing.
+pub(crate) async fn fetch_latest_version() -> Result<semver::Version> {
+    let github = make_github_client().await?;
+    release_version(&latest_release_with(&github).await?)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -250,21 +322,13 @@ async fn make_github_client() -> Result<GitHubClient> {
 /// Returns `Error::Update` for all update-specific failures (network, checksum
 /// mismatch, platform not supported, etc.). Other errors (`Error::GitHub`,
 /// `Error::Io`) propagate from underlying operations.
-pub async fn execute() -> Result<()> {
+pub async fn execute(paths: &Paths) -> Result<()> {
     info("Checking for updates...");
 
     // ── 1. Fetch latest release ──────────────────────────────────────────
+    // One client is reused for the release lookup and the asset downloads below.
     let github = make_github_client().await?;
-    let release = github
-        .get_latest_stable_release(REPO_OWNER, REPO_NAME)
-        .await?
-        .ok_or_else(|| {
-            Error::Update(format!(
-                "No releases found for {REPO_OWNER}/{REPO_NAME}.\n\
-                 This is unexpected — please report it at:\n\
-                 https://github.com/{REPO_OWNER}/{REPO_NAME}/issues"
-            ))
-        })?;
+    let release = latest_release_with(&github).await?;
 
     // ── 2. Parse and compare versions ────────────────────────────────────
     //
@@ -272,19 +336,14 @@ pub async fn execute() -> Result<()> {
     //   https://docs.rs/semver/1/semver/struct.Version.html#method.parse
     // semver::Version implements Ord for correct SemVer comparison:
     //   https://docs.rs/semver/1/semver/struct.Version.html#total-ordering
-    let current = semver::Version::parse(CURRENT_VERSION).map_err(|e| {
-        Error::Update(format!(
-            "Failed to parse current version '{CURRENT_VERSION}': {e}"
-        ))
-    })?;
+    let current = current_version()?;
+    let latest = release_version(&release)?;
 
-    let latest_tag = extract_version_from_tag(&release.tag_name);
-    let latest = semver::Version::parse(latest_tag).map_err(|e| {
-        Error::Update(format!(
-            "Failed to parse release version '{}' (from tag '{}'): {e}",
-            latest_tag, release.tag_name
-        ))
-    })?;
+    // Record this check so the background update notifier stays in sync: it
+    // reads the same state file, and stamping it here prevents an immediate
+    // re-notification on the next invocation. Best-effort — a persistence
+    // failure must never derail the update itself.
+    crate::update_check::record_check(paths, &latest);
 
     eprintln!();
     success(&format!("Current version: {current}"));
@@ -706,6 +765,34 @@ mod tests {
             result.is_ok(),
             "CARGO_PKG_VERSION '{CURRENT_VERSION}' should be valid semver, got: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn current_version_helper_matches_cargo_pkg_version() {
+        // The shared helper used by both `execute` and the background notifier
+        // must resolve to exactly the compile-time version.
+        let v = current_version().expect("current_version should parse");
+        assert_eq!(v, semver::Version::parse(CURRENT_VERSION).unwrap());
+    }
+
+    #[test]
+    fn release_version_parses_tag_of_release() {
+        // `release_version` must strip the `cli/v` prefix and parse the rest,
+        // yielding the same value the update flow compares against.
+        let release = make_test_release(); // tag_name = "cli/v1.3.0"
+        let v = release_version(&release).expect("release_version should parse");
+        assert_eq!(v, semver::Version::parse("1.3.0").unwrap());
+    }
+
+    #[test]
+    fn release_version_errors_on_unparseable_tag() {
+        let mut release = make_test_release();
+        release.tag_name = "cli/vnot-a-version".to_string();
+        let err = release_version(&release).unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to parse release version"),
+            "unexpected error: {err}"
         );
     }
 

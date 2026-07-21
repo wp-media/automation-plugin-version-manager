@@ -244,6 +244,7 @@ Input values are sanitized before storage:
 - **`APVM_CACHE_DIR`** — Overrides the artifact cache directory for the current invocation. Takes precedence over the config `cache-dir` and the default `~/.apvm/cache`, and is honored by both builds and the `cache` command. Useful for CI or local testing: point it at a throwaway directory so a run never reads from or warms your real cache.
 - **`GITHUB_TOKEN`** / **`GH_TOKEN`** — Fallback GitHub token when none is in config.
 - **`RUST_LOG`** — Enables logging (`debug`, `trace`, …); implies verbose diagnostics.
+- **`APVM_NO_UPDATE_CHECK`** — Set to any non-empty value to disable the automatic background update check and its notice (see [Update Command](#update-command)).
 
 ```sh
 # Build against an ephemeral cache; your real cache is left untouched
@@ -313,6 +314,24 @@ Project-local skill copies (`./.claude/skills/apvm-cli` in individual
 repositories) are not discoverable from here — re-run `apvm skill install`
 inside a project to refresh its copy.
 
+A successful run also records the checked version and timestamp in
+`~/.apvm/update-check.json`, keeping the automatic notice below in sync.
+
+### Automatic background update check
+
+Every command **except** `update` and `uninstall` runs the same latest-release
+lookup **in the background**, without blocking, and — when a newer release is
+found — prints a compact colored notice to stderr as the last output,
+suggesting `apvm update`. It never self-updates and never changes the exit code
+(only `apvm update` itself can fail).
+
+The network lookup is **throttled to once per hour** via
+`~/.apvm/update-check.json`; within that window the notice is served from the
+cached result, so nearly every invocation does no network work. The check runs
+concurrently with your command under a short timeout, so an unreachable GitHub
+never stalls the CLI. It is skipped when stderr is not a TTY (pipes/CI) and can
+be disabled with `APVM_NO_UPDATE_CHECK=1`.
+
 **Supported platforms:**
 
 | OS      | Architecture | Artifact name              |
@@ -363,11 +382,12 @@ A token is **required** for private repositories and PR builds. It is optional f
 
 ## Default Paths
 
-| Path                    | Purpose                                       |
-|-------------------------|-----------------------------------------------|
-| `~/.apvm/`              | APVM home directory                           |
-| `~/.apvm/config.json`   | Configuration file                            |
-| `~/.apvm/cache/`        | Default artifact cache store                  |
+| Path                        | Purpose                                       |
+|-----------------------------|-----------------------------------------------|
+| `~/.apvm/`                  | APVM home directory                           |
+| `~/.apvm/config.json`       | Configuration file                            |
+| `~/.apvm/update-check.json` | Background update-notifier state (throttle)   |
+| `~/.apvm/cache/`            | Default artifact cache store                  |
 
 These defaults are determined using the [`directories`](https://docs.rs/directories/6) crate for cross-platform home directory resolution.
 

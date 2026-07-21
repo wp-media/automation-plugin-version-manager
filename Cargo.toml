@@ -15,7 +15,9 @@ authors = ["Sandy Figueroa <sandy@wp-media.me>"]
 # https://docs.rs/tokio/1 — SemVer stable since 1.0
 # "sync" enables tokio::sync::OnceCell, used to cache one `git ls-remote`
 # snapshot per ref-resolution session.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "sync"] }
+# "time" enables tokio::time::timeout, used to bound the background
+# update-check so a slow/hung network can never stall the CLI.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "sync", "time"] }
 
 # GitHub API client
 # https://crates.io/crates/octocrab — pre-1.0, 0.54.x is compatible range

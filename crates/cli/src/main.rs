@@ -7,6 +7,7 @@ mod commands;
 mod defaults;
 mod paths;
 mod sanitize;
+mod update_check;
 
 use std::process::ExitCode;
 
@@ -87,34 +88,66 @@ async fn main() -> ExitCode {
     // Initialize tracing (only if RUST_LOG is set)
     init_tracing();
 
-    match run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            ExitCode::FAILURE
-        }
-    }
+    run().await
 }
 
-/// Run the CLI application.
+/// Run one CLI invocation end to end.
 ///
-/// Separated from main() to allow proper error handling with ExitCode.
-async fn run() -> Result<()> {
+/// Kicks off the non-blocking background update check up front (so it overlaps
+/// the command's own work), dispatches the requested command, reports its
+/// error if any, and — as the very last output — surfaces an available-update
+/// notice via [`update_check`]. Owns the final [`ExitCode`] so ordering between
+/// the command's error and the update notice is guaranteed.
+async fn run() -> ExitCode {
     // Parse CLI arguments
     let cli = Cli::parse();
 
-    // Load paths and default configuration
+    // Load paths (config + notifier state live under the APVM home)
     let paths = Paths::new(defaults::default_apvm_dir().clone());
+
+    // Start the background update check before running the command so the two
+    // overlap. `update` (does its own check) and `uninstall` (about to remove
+    // apvm) never trigger a notice.
+    let command_eligible = !matches!(cli.command, Commands::Update | Commands::Uninstall { .. });
+    let checker = update_check::maybe_start(&paths, command_eligible);
+
+    // Run the requested command.
+    let result = dispatch(cli, &paths).await;
+
+    // Report the command's own error first...
+    if let Err(e) = &result {
+        eprintln!("Error: {e}");
+    }
+
+    // ...then the update notice, as the last thing printed. Skipped entirely
+    // when no check was started (ineligible command, non-TTY, or opted out).
+    if let Some(checker) = checker {
+        checker.finish_and_report().await;
+    }
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+/// Dispatch to the appropriate command handler.
+///
+/// Separated from [`run`] so the update-notifier orchestration stays free of
+/// per-command branching. Each handler owns its user-facing success output;
+/// this returns the command's `Result` for [`run`] to map to an exit code.
+async fn dispatch(cli: Cli, paths: &Paths) -> Result<()> {
+    // Default configuration derived from the standard paths.
     let default_config = paths.to_config();
 
     // Config command doesn't need APVM instance — handle it early
     if let Commands::Config(args) = &cli.command {
-        return args.execute(&paths);
+        return args.execute(paths);
     }
 
     // Update command has its own GitHub client — handle it early
     if matches!(cli.command, Commands::Update) {
-        return commands::update::execute().await;
+        return commands::update::execute(paths).await;
     }
 
     // Skill command is self-contained (embedded files, no network) — handle

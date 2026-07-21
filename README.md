@@ -34,6 +34,7 @@ For extended CLI documentation, see the [CLI crate README](crates/cli/README.md)
 - **Version handling** — required or optional per plugin (BackWPup requires a version at build time; WP Rocket and Imagify auto-detect it from source, and when you pass `--ver` the requested version is rewritten into the plugin's source so the built artifact actually carries it)
 - **Claude Code skill** — `apvm skill install` installs the bundled [Claude Code skill](https://code.claude.com/docs/en/skills) (`apvm-cli`) into the current project (`./.claude/skills/`) or globally with `-g` (`~/.claude/skills/`), so Claude knows the full CLI surface. The skill is embedded in the binary — no network needed, always version-matched
 - **Self-update** — `apvm update` downloads and replaces the binary with the latest release, verifying SHA-256 checksums (and refreshes the installed global Claude Code skill, when present)
+- **Automatic update notice** — every other command runs a non-blocking, background version check (throttled to once per hour) and, when a newer release exists, prints a concise notice suggesting `apvm update`. It never self-updates, never affects the exit code, and can be disabled with `APVM_NO_UPDATE_CHECK`
 - **Self-uninstall** — `apvm uninstall` cleanly removes the binary and its directory (with `-y`/`--yes` to skip confirmation)
 - **GitHub token auto-resolution** — automatically finds tokens from config, `GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token`, or the gh CLI config file
 
@@ -291,6 +292,9 @@ apvm config path
 - **`GITHUB_TOKEN`** / **`GH_TOKEN`** — GitHub token used when none is set in
   config (part of token auto-resolution).
 - **`RUST_LOG`** — Enables logging output (`debug`, `trace`, …).
+- **`APVM_NO_UPDATE_CHECK`** — Set to any non-empty value to disable the
+  automatic background update check and its notice (see
+  [Automatic update notice](#automatic-update-notice)).
 
 `APVM_CACHE_DIR` is handy for pointing a run at a throwaway cache so it doesn't
 read from or warm your real `~/.apvm/cache` — for example in CI or when testing:
@@ -348,6 +352,17 @@ apvm update
 ```
 
 Downloads the latest release from GitHub, verifies the SHA-256 checksum, and atomically replaces the running binary. If the global Claude Code skill (`~/.claude/skills/apvm-cli/`) is installed, it is refreshed to match the new version (project-local copies: re-run `apvm skill install` per project). Supports macOS (arm64/x64), Linux (x64/arm64), and Windows (x64).
+
+### Automatic update notice
+
+Every command other than `update` and `uninstall` performs a **non-blocking, background** check for a newer release and — when one exists — prints a concise, colored notice to stderr as the last thing on screen, suggesting `apvm update`. Key properties:
+
+- **Throttled** — the network check runs at most **once per hour**, tracked in `~/.apvm/update-check.json`. Repeated invocations within the hour reuse the cached result, so nearly every run does no network work and stays instant.
+- **Report-only** — it never downloads or replaces anything; upgrading is always an explicit `apvm update`.
+- **Safe** — the check runs concurrently with your command and is bounded by a short timeout, so a slow or unreachable GitHub never stalls the CLI, and it **never changes the exit code** (only `apvm update` itself can fail).
+- **Quiet by default where it should be** — suppressed when stderr is not a TTY (pipes, CI), rendered without color when `NO_COLOR` is set, and disabled entirely by `APVM_NO_UPDATE_CHECK=1`.
+
+Running `apvm update` also refreshes this state, so the notice stays in sync and does not immediately re-report.
 
 ### Uninstall
 

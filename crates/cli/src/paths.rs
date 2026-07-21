@@ -8,6 +8,7 @@
 //! ```text
 //! ~/.apvm/                    (base APVM directory)
 //! ├── config.json             (config_file)
+//! ├── update-check.json       (update_state_file — background notifier state)
 //! └── cache/                  (cache_dir — the artifact cache store)
 //! ```
 //!
@@ -38,6 +39,8 @@ use apvm_config::Config;
 pub struct Paths {
     /// Configuration file path.
     config_file: PathBuf,
+    /// Background update-notifier state file path.
+    update_state_file: PathBuf,
     /// Artifact cache directory.
     cache_dir: PathBuf,
 }
@@ -47,6 +50,7 @@ impl Paths {
     ///
     /// Derives the child paths:
     /// - `config_file` = `{apvm_dir}/config.json`
+    /// - `update_state_file` = `{apvm_dir}/update-check.json`
     /// - `cache_dir` = `{apvm_dir}/cache`
     ///
     /// # Arguments
@@ -55,6 +59,7 @@ impl Paths {
     pub fn new(apvm_dir: PathBuf) -> Self {
         Self {
             config_file: apvm_dir.join("config.json"),
+            update_state_file: apvm_dir.join("update-check.json"),
             cache_dir: apvm_dir.join("cache"),
         }
     }
@@ -62,6 +67,15 @@ impl Paths {
     /// Get the configuration file path.
     pub fn config_file(&self) -> &PathBuf {
         &self.config_file
+    }
+
+    /// Get the background update-notifier state file path.
+    ///
+    /// This file lives alongside `config.json` (never inside the artifact
+    /// cache) so it is independent of `APVM_CACHE_DIR` and never mixes internal
+    /// bookkeeping into the user-facing configuration.
+    pub fn update_state_file(&self) -> &PathBuf {
+        &self.update_state_file
     }
 
     /// Convert to a Config for the core library.
@@ -85,8 +99,23 @@ mod tests {
             &PathBuf::from("/var/lib/apvm/config.json")
         );
         assert_eq!(
+            paths.update_state_file(),
+            &PathBuf::from("/var/lib/apvm/update-check.json")
+        );
+        assert_eq!(
             paths.to_config().cache_dir,
             PathBuf::from("/var/lib/apvm/cache")
+        );
+    }
+
+    #[test]
+    fn update_state_file_sits_beside_config() {
+        // The notifier state lives in the APVM home next to config.json, not
+        // in the cache directory — so it is unaffected by APVM_CACHE_DIR.
+        let paths = Paths::new(PathBuf::from("/base"));
+        assert_eq!(
+            paths.update_state_file().parent(),
+            paths.config_file().parent()
         );
     }
 

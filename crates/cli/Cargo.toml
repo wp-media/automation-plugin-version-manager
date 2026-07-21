@@ -30,7 +30,8 @@ clap = { workspace = true }
 # Async runtime (needed for #[tokio::main])
 tokio = { workspace = true }
 
-# Serialization (for config file I/O)
+# Serialization (config file I/O + the update-notifier state file)
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Logging and diagnostics (for CLI output)
@@ -61,3 +62,10 @@ tempfile = { workspace = true }
 # OpenSSL vendored build — only activated by the `vendored-openssl` feature.
 # Compiles OpenSSL from source; statically linked into the binary.
 openssl = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `test-util` enables tokio's virtual clock (`start_paused`), used to test the
+# background update-check timeout deterministically (no real 1.5s wait). Kept a
+# dev-dependency so it is never compiled into the shipped binary — with resolver
+# v3, dev-only features do not leak into normal or release builds.
+tokio = { workspace = true, features = ["test-util"] }

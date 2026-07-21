@@ -37,14 +37,25 @@ Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.1.1**
   the user, a system prompt, or a `CLAUDE.md` explicitly says to use an isolated
   cache (e.g. developing/testing *apvm itself*, where a throwaway dir avoids
   warming the developer's real cache: `APVM_CACHE_DIR="$(mktemp -d)" apvm ...`).
+- **Automatic update check** — every command except `update`/`uninstall`
+  performs a **non-blocking, background** check for a newer release, at most
+  **once per hour** (throttled via `~/.apvm/update-check.json`). It never
+  updates anything; when a newer version is known it prints a boxed notice to
+  **stderr** as the last output, suggesting `apvm update`. The check and notice
+  are skipped when stderr is not a TTY (pipes/CI) and never change the exit
+  code — only `apvm update` itself can fail.
+- **`APVM_NO_UPDATE_CHECK=<non-empty>`** — disable the automatic update check
+  and its notice entirely (e.g. `APVM_NO_UPDATE_CHECK=1`). `NO_COLOR` also
+  applies to the notice.
 
 ### Default paths
 
-| Path                  | Purpose                                |
-|-----------------------|----------------------------------------|
-| `~/.apvm/`            | APVM home                              |
-| `~/.apvm/config.json` | Configuration file                     |
-| `~/.apvm/cache/`      | Default artifact cache store (SQLite)  |
+| Path                       | Purpose                                     |
+|----------------------------|---------------------------------------------|
+| `~/.apvm/`                 | APVM home                                   |
+| `~/.apvm/config.json`      | Configuration file                          |
+| `~/.apvm/update-check.json`| Background update-notifier state (throttle) |
+| `~/.apvm/cache/`           | Default artifact cache store (SQLite)       |
 
 ---
 
@@ -309,6 +320,13 @@ installed, a successful update also refreshes it (via the new binary's
 `skill install --global`; non-fatal — a failure only warns). Project-local
 copies are not touched: re-run `apvm skill install` inside each project.
 
+A successful run also records the checked version and timestamp in
+`~/.apvm/update-check.json`, keeping the background update notice (see
+[Global conventions](#global-conventions)) in sync so it does not immediately
+re-report. Every **other** command performs that same version check
+automatically in the background (throttled to once per hour) and only reports —
+it never self-updates.
+
 ---
 
 ### `apvm uninstall [-y]`
@@ -373,7 +391,7 @@ Required for private repos and PR builds. Recommended for public repos
 ## Verification commands
 
 ```sh
-apvm --version              # 3.1.0 (or current)
+apvm --version              # 3.1.1 (or current)
 apvm list                   # registered plugins
 apvm info <plugin>          # version requirement, variants, tool deps
 apvm config path            # config file location
