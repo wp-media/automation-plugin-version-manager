@@ -477,6 +477,7 @@ pub async fn execute(paths: &Paths) -> Result<()> {
     // still runs the old code and embeds the old skill files. Non-fatal:
     // the binary update above already succeeded.
     if let Some(skill_dir) = super::skill::detect_global_installation() {
+        eprintln!();
         info("Refreshing the installed Claude Code skill...");
         let refreshed = exe_path
             .as_deref()
