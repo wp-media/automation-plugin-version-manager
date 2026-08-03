@@ -239,7 +239,10 @@ impl BuildArgs {
         if let Some(ref v) = version
             && !version_ignored
         {
-            println!("  Version: {}", v);
+            // Echoed before the core validates it, so escape: a newline or
+            // terminal escape in `--ver` must not forge output lines or drive the
+            // TTY. Identity for every accepted version.
+            println!("  Version: {}", v.escape_debug());
         }
         if !variants.is_empty() && !variants_ignored {
             println!("  Variants: {}", variants.join(", "));

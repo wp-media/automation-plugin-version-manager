@@ -517,19 +517,53 @@ fn is_release_keyword(value: &str) -> bool {
     )
 }
 
-/// Return `version` only if the artifact store would accept it as a version
-/// string (non-empty, ≤ 64 chars, `[A-Za-z0-9._+-]`).
+/// Whether `version` is safe to interpolate into a build command and to persist
+/// as an artifact-store version: non-empty, ≤ 64 chars, `[A-Za-z0-9._+-]`.
+///
+/// Build steps execute through a shell (`sh -c` / `cmd /C`) and builders splice
+/// the resolved version straight into those strings — e.g. BackWPup's
+/// `gulp free --packageVersion="{version}"`. Excluding shell-active characters
+/// stops a caller-supplied version (CLI `--ver`, or `version` via the napi
+/// bindings) from closing that quote and appending further commands.
+///
+/// Mirrors the charset `apvm_storage`'s `validate_version` enforces, so a
+/// cache-enabled build rejects nothing the store would have accepted later — it
+/// only refuses it *before* a shell runs. (A `--no-cache` build never reached the
+/// store, so there the check is genuinely new; that is the gap it closes.)
+/// Deliberately broader than the semver shape builders detect, so inputs such as
+/// `v5.1.0` keep working; being an allowlist, anything unforeseen is refused
+/// rather than passed through.
+fn is_safe_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// Reject `version` unless [`is_safe_version`] accepts it.
+///
+/// The rejected value is rendered with [`str::escape_debug`]: it is untrusted and
+/// may carry newlines or terminal escapes, which must not reach a log line or a
+/// TTY verbatim.
+fn ensure_safe_version(project: &str, version: &str) -> Result<()> {
+    if is_safe_version(version) {
+        return Ok(());
+    }
+    Err(Error::Build(format!(
+        "Version '{}' for project '{project}' contains unsupported characters. \
+         Use letters, digits, '.', '_', '+' or '-' (max 64 characters).",
+        version.escape_debug()
+    )))
+}
+
+/// Return `version` only if [`is_safe_version`] accepts it.
 ///
 /// Release rows carry the version as optional metadata; a version derived
 /// from an exotic tag (spaces, unicode, …) is dropped rather than allowed to
 /// fail the whole cache-warm for the release's assets.
 fn storable_version(version: &str) -> Option<String> {
-    let valid = !version.is_empty()
-        && version.len() <= 64
-        && version
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
-    valid.then(|| version.to_string())
+    is_safe_version(version).then(|| version.to_string())
 }
 
 /// Human-readable branch label derived from the resolved source, used for
@@ -702,6 +736,17 @@ impl<'a> BuildCommand<'a> {
         // Windows, whose packaging script needs a Unix toolchain) gets an
         // instant, actionable error instead of failing deep inside the build.
         project_info.builder.ensure_platform_supported()?;
+
+        // For most builders the caller's version is spliced into shell-executed
+        // build commands, so reject an unsafe one here — before any clone —
+        // rather than after checkout. `resolve_version` remains the authoritative
+        // check (it also covers detected and builder-default versions); this only
+        // saves the caller a pointless clone. Builders that discard the supplied
+        // version get the same check: stricter than needed, but nonsense input is
+        // better refused than silently ignored.
+        if let Some(version) = request.version.as_deref() {
+            ensure_safe_version(&request.project, version)?;
+        }
 
         // 2. Validate authentication for private repositories (fail-fast),
         // BEFORE any git operation, so users get a clear, actionable error
@@ -1909,7 +1954,7 @@ impl<'a> BuildCommand<'a> {
     ) -> Result<String> {
         let requirement = builder.version_requirement();
 
-        match (requirement, version) {
+        let resolved = match (requirement, version) {
             (VersionRequirement::Required, None) => {
                 // No explicit version provided — try the builder's default before erroring.
                 // This covers builders like BackWPup that define a development version
@@ -1956,7 +2001,14 @@ impl<'a> BuildCommand<'a> {
                 tracing::debug!("Auto-detecting version for '{}'", project);
                 self.detect_or_error(project, builder, working_dir)
             }
-        }
+        }?;
+
+        // Builders interpolate this value into shell-executed build commands, so
+        // refuse anything outside the store's charset before that point. Covers
+        // every source — caller-supplied, builder default, and detected.
+        ensure_safe_version(project, &resolved)?;
+
+        Ok(resolved)
     }
 
     /// Try to detect version from source files, or return an error.
@@ -2168,6 +2220,56 @@ mod tests {
         assert_eq!(output.result.artifacts[0].origin, ArtifactOrigin::Cache);
         assert_eq!(output.result.version, "1.0.0");
         assert!(out.path().join("plugin.zip").is_file());
+    }
+
+    /// Guard wiring, not just the predicate: `resolve_version` must refuse a
+    /// caller-supplied version before it can reach a build command. `TestBuilder`
+    /// is [`VersionRequirement::Required`], the path that has no
+    /// `apply_version_override` to validate it (as BackWPup does not).
+    // `#[tokio::test]` because `GitHubClient::anonymous()` spawns a tower buffer
+    // worker, which needs a runtime; `resolve_version` itself is synchronous.
+    #[tokio::test]
+    async fn resolve_version_rejects_shell_unsafe_caller_version() {
+        let cache = TempDir::new().unwrap();
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(cache.path().to_path_buf());
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
+        let work = TempDir::new().unwrap();
+
+        let err = cmd
+            .resolve_version(
+                "test",
+                Some(r#"1.0"; touch /tmp/pwned; #"#),
+                &TestBuilder,
+                work.path(),
+            )
+            .expect_err("a shell-unsafe version must not resolve")
+            .to_string();
+
+        assert!(
+            err.contains("unsupported characters"),
+            "unexpected error: {err}"
+        );
+        // Escaped, and the raw quote-closing sequence is not echoed verbatim.
+        assert!(!err.contains(r#"1.0"; touch"#), "value not escaped: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_version_accepts_safe_caller_version() {
+        let cache = TempDir::new().unwrap();
+        let mut registry = ProjectRegistry::new();
+        registry.register(single_output_project("test", Box::new(TestBuilder)));
+        let config = Config::new(cache.path().to_path_buf());
+        let github = GitHubClient::anonymous().unwrap();
+        let cmd = BuildCommand::new(&github, &registry, &config, None);
+        let work = TempDir::new().unwrap();
+
+        let resolved = cmd
+            .resolve_version("test", Some("5.1.0"), &TestBuilder, work.path())
+            .expect("a normal version must resolve");
+        assert_eq!(resolved, "5.1.0");
     }
 
     #[tokio::test]
@@ -2565,6 +2667,115 @@ mod tests {
         assert_eq!(storable_version("5.6.8 (beta)"), None); // spaces/parens
         assert_eq!(storable_version("feature/v2"), None); // slash
         assert_eq!(storable_version(&"9".repeat(65)), None); // too long
+    }
+
+    // =========================================================================
+    // is_safe_version tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_safe_version_accepts_real_world_versions() {
+        for v in [
+            "5.1.0",
+            "3.23.1",
+            "9.99.99",
+            "v5.1.0", // established input; stricter semver checks reject it
+            "4.0.0-beta1",
+            "1.0.0-beta.1+build", // full semver with build metadata
+            "nightly",
+            &"9".repeat(64), // exactly at the limit
+        ] {
+            assert!(is_safe_version(v), "'{v}' should be accepted");
+        }
+    }
+
+    /// Build steps run through `sh -c` / `cmd /C` and builders splice the
+    /// resolved version into those command strings (e.g. BackWPup's
+    /// `gulp free --packageVersion="{version}"`). A version able to close that
+    /// quote could append arbitrary commands, so every shell-active character
+    /// must be refused.
+    #[test]
+    fn test_is_safe_version_rejects_shell_metacharacters() {
+        for v in [
+            r#"1.0"; touch /tmp/pwned; #"#, // closes the quote, chains a command
+            "1.0; rm -rf /",
+            "1.0 && whoami",
+            "1.0 | tee /tmp/x",
+            "1.0$(whoami)",
+            "1.0`whoami`",
+            "1.0${HOME}",
+            "1.0\nwhoami", // newline as a command separator
+            "1.0 beta",    // bare space splits the shell argument
+            "1.0'",
+            "1.0>out",
+            "1.0<in",
+            "feature/v2",    // path separator
+            "",              // empty
+            &"9".repeat(65), // over the 64-char limit
+        ] {
+            assert!(
+                !is_safe_version(v),
+                "'{}' must be rejected",
+                v.escape_debug()
+            );
+        }
+    }
+
+    /// Pin the accepted charset against an explicit literal set, written out
+    /// independently of the implementation so editing either side fails here.
+    ///
+    /// Sweeps the whole 7-bit range, which also covers the control characters
+    /// (NUL, newline, ESC) that make log and terminal injection possible.
+    #[test]
+    fn test_is_safe_version_charset_boundary() {
+        const ALLOWED: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-";
+
+        for byte in 0u8..=127 {
+            let ch = byte as char;
+            // Prefixed with a digit so only `ch` decides the outcome.
+            assert_eq!(
+                is_safe_version(&format!("1{ch}")),
+                ALLOWED.contains(ch),
+                "ASCII {byte:#04x} ({:?}) classified wrongly",
+                ch.escape_debug().to_string()
+            );
+        }
+    }
+
+    /// Non-ASCII must be refused: the store's charset is ASCII-only, and a
+    /// multi-byte character would also make the byte-length limit misleading.
+    #[test]
+    fn test_is_safe_version_rejects_non_ascii() {
+        for v in ["1.0-café", "1.0-日本語", "1.0\u{202e}", "1.0\u{00a0}beta"] {
+            assert!(
+                !is_safe_version(v),
+                "'{}' must be rejected",
+                v.escape_debug()
+            );
+        }
+    }
+
+    /// The rejected value is untrusted, so the message must not carry raw
+    /// newlines or terminal escapes into a log line or a TTY.
+    #[test]
+    fn test_ensure_safe_version_escapes_the_rejected_value() {
+        let err = ensure_safe_version("backwpup", "1.0\n\u{1b}[31mRED")
+            .expect_err("control characters must be rejected")
+            .to_string();
+
+        assert!(
+            !err.contains('\n') && !err.contains('\u{1b}'),
+            "error must not embed raw control characters: {err:?}"
+        );
+        assert!(
+            err.contains("1.0\\n\\u{1b}[31mRED"),
+            "error should show the escaped value: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_safe_version_accepts_valid_version() {
+        assert!(ensure_safe_version("backwpup", "5.1.0").is_ok());
     }
 
     // =========================================================================

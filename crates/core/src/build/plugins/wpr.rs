@@ -24,7 +24,8 @@
 //! 2. Copy the repository into a temporary directory via `rsync`, excluding
 //!    development-only files (tests, node_modules, .git, etc.)
 //! 3. Install production Composer dependencies inside the copy
-//! 4. Create a zip archive from the copy, excluding dotfiles and JS tooling
+//! 4. Create a zip archive from the copy, excluding dotfiles and root-level
+//!    build tooling (see [`ZIP_EXCLUSIONS`])
 //! 5. Clean up the temporary directory
 //!
 //! # Variants
@@ -37,9 +38,8 @@ use crate::Result;
 use crate::error::Error;
 
 use super::super::BuildContext;
-#[cfg(any(windows, test))]
 use super::super::fs::ExclusionPattern;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use super::super::fs::{copy_dir_with_exclusions, create_zip_archive};
 use super::super::progress::{BuildEvent, BuildStep, ProgressReporter};
 use super::{
@@ -103,30 +103,67 @@ const RSYNC_EXCLUDES: &[&str] = &[
     ".tx",
 ];
 
-/// Patterns excluded from the zip archive.
+/// Patterns excluded from the zip archive, on every platform.
 ///
-/// These catch any remaining dev/tooling files that made it through
-/// the rsync step (e.g., dotfiles inside subdirectories).
+/// Single source of truth: the Unix build renders these into `zip -x` flags via
+/// [`zip_exclude_flags`], while the Windows build hands the same slice to
+/// [`create_zip_archive`]. Both platforms therefore produce identical archives
+/// by construction.
 ///
-/// Original shell patterns and their Rust equivalents:
-/// - `*/.*`          → `Prefix(".")`     — dotfiles in any subdirectory
-/// - `*/gulpfile.js` → `Exact("gulpfile.js")` — exact match
-/// - `*/package*`    → `Prefix("package")` — package.json, package-lock.json, etc.
-/// - `*/php*`        → `Prefix("php")`     — phpunit.xml, phpcs.xml, etc.
-#[cfg(unix)]
-const ZIP_EXCLUDES: &[&str] = &["*/.*", "*/gulpfile.js", "*/package*", "*/php*"];
-
-/// Filename exclusion patterns for the zip archive (Windows path, pure Rust).
+/// These catch dev/tooling files that survive the rsync step, which drops only
+/// the names listed in [`RSYNC_EXCLUDES`] (matched at any depth, whole subtree):
 ///
-/// Equivalent to the shell `zip -x` patterns in [`ZIP_EXCLUDES`].
-/// Used by [`create_zip_archive`] from the [`fs`](super::super::fs) module.
-#[cfg(any(windows, test))]
-const ZIP_EXCLUSION_PATTERNS: &[ExclusionPattern<'static>] = &[
+/// - `Prefix(".")` → `-x "*/.*"` — dotfiles at any depth
+/// - `Exact("gulpfile.js")` → `-x "*/gulpfile.js"` — the gulp entry point
+/// - `RootPrefix("package")` → `-x "wp-rocket/package*"` — root `package.json`,
+///   `package-lock.json`
+/// - `RootPrefix("php")` → `-x "wp-rocket/php*"` — root `phpcs.xml`,
+///   `phpstan.neon.dist`, `phpstan-baseline.neon`
+///
+/// # Why the `php`/`package` rules are root-anchored
+///
+/// A depth-independent `-x "*/php*"` also matches **nested** paths, because
+/// `zip`'s `*` spans `/`. That silently dropped the entire
+/// `vendor/wordpress/php-mcp-schema/` tree from the artifact, leaving
+/// `wordpress/mcp-adapter` with a declared but unloadable
+/// `WP\McpSchema\…` namespace and a fatal error at plugin load:
+///
+/// ```text
+/// PHP Fatal error: Could not check compatibility between
+/// WP\MCP\Domain\Tools\McpTool::get_protocol_dto(): WP\McpSchema\Server\Tools\DTO\Tool
+/// and WP\MCP\Domain\Contracts\McpComponentInterface::get_protocol_dto(): …,
+/// because class WP\McpSchema\Server\Tools\DTO\Tool is not available
+/// ```
+///
+/// `*/package*` had the same latent defect for any `vendor/*/package*/` package.
+/// Anchoring both to the plugin root keeps the intended tooling files out while
+/// leaving vendor subtrees intact.
+const ZIP_EXCLUSIONS: &[ExclusionPattern<'static>] = &[
     ExclusionPattern::Prefix("."),
     ExclusionPattern::Exact("gulpfile.js"),
-    ExclusionPattern::Prefix("package"),
-    ExclusionPattern::Prefix("php"),
+    ExclusionPattern::RootPrefix("package"),
+    ExclusionPattern::RootPrefix("php"),
 ];
+
+/// Render [`ZIP_EXCLUSIONS`] as `zip -x "<pattern>"` flags.
+///
+/// Root-anchored patterns are prefixed with [`PLUGIN_DIR_NAME`] so they match
+/// only the archive's top level; depth-independent patterns keep the leading
+/// `*/` wildcard.
+#[cfg(any(unix, test))]
+fn zip_exclude_flags() -> String {
+    ZIP_EXCLUSIONS
+        .iter()
+        .map(|pattern| match pattern {
+            ExclusionPattern::Prefix(prefix) => format!("-x \"*/{prefix}*\""),
+            ExclusionPattern::Exact(name) => format!("-x \"*/{name}\""),
+            ExclusionPattern::RootPrefix(prefix) => {
+                format!("-x \"{PLUGIN_DIR_NAME}/{prefix}*\"")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 impl Builder for WpRocketBuilder {
     // =========================================================================
@@ -405,12 +442,7 @@ impl WpRocketBuilder {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Build the zip exclude flags
-        let zip_excludes: String = ZIP_EXCLUDES
-            .iter()
-            .map(|e| format!("-x \"{e}\""))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let zip_excludes = zip_exclude_flags();
 
         let staging_dir = format!("{workspace_dir}/{STAGING_DIR}");
         let staging_plugin_dir = format!("{staging_dir}/{PLUGIN_DIR_NAME}");
@@ -480,7 +512,10 @@ impl WpRocketBuilder {
     /// Uses [`copy_dir_with_exclusions`] from the [`fs`](super::super::fs) module
     /// which relies on [`walkdir::WalkDir::filter_entry`] to skip excluded directories
     /// entirely (preventing descent into large dirs like `node_modules`).
-    #[cfg(windows)]
+    ///
+    /// Compiled under `cfg(test)` on every platform so the Windows staging step
+    /// is covered by the suite rather than only by Windows CI.
+    #[cfg(any(windows, test))]
     fn prepare_staging(
         &self,
         context: &BuildContext,
@@ -535,7 +570,10 @@ impl WpRocketBuilder {
     /// Uses [`create_zip_archive`] from the [`fs`](super::super::fs) module
     /// with Deflate compression, matching the default behavior of the `zip`
     /// command-line tool.
-    #[cfg(windows)]
+    ///
+    /// Compiled under `cfg(test)` on every platform so the Windows archive step
+    /// is covered by the suite rather than only by Windows CI.
+    #[cfg(any(windows, test))]
     fn create_archive(
         &self,
         context: &BuildContext,
@@ -559,7 +597,7 @@ impl WpRocketBuilder {
             &staging_plugin_dir,
             &archive_path,
             PLUGIN_DIR_NAME,
-            ZIP_EXCLUSION_PATTERNS,
+            ZIP_EXCLUSIONS,
         )?;
         tracing::info!(
             "Created archive '{}' with {} entries",
@@ -850,13 +888,10 @@ mod tests {
                 .contains(&context.workspace_dir().display().to_string()),
             "zip output should reference absolute workspace dir"
         );
-        for exclude in ZIP_EXCLUDES {
-            assert!(
-                commands[3].command.contains(exclude),
-                "zip command should exclude '{}'",
-                exclude
-            );
-        }
+        assert!(
+            commands[3].command.contains(&zip_exclude_flags()),
+            "zip command should carry the rendered exclude flags"
+        );
     }
 
     #[test]
@@ -1051,43 +1086,403 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_zip_exclusion_patterns_match_expected_files() {
-        use crate::build::fs::matches_any_exclusion;
+    fn test_zip_exclusions_match_expected_root_files() {
+        use crate::build::fs::matches_exclusion_at_depth;
 
-        // Dotfiles — matches original `*/.*`
-        assert!(matches_any_exclusion(".git", ZIP_EXCLUSION_PATTERNS));
-        assert!(matches_any_exclusion(".env", ZIP_EXCLUSION_PATTERNS));
-        assert!(matches_any_exclusion(".gitignore", ZIP_EXCLUSION_PATTERNS));
+        // Depth of entries at the top level of the archive.
+        const ROOT: usize = 1;
 
-        // gulpfile.js — matches original `*/gulpfile.js`
-        assert!(matches_any_exclusion("gulpfile.js", ZIP_EXCLUSION_PATTERNS));
+        // Dotfiles — `*/.*`
+        assert!(matches_exclusion_at_depth(".git", ROOT, ZIP_EXCLUSIONS));
+        assert!(matches_exclusion_at_depth(".env", ROOT, ZIP_EXCLUSIONS));
+        assert!(matches_exclusion_at_depth(
+            ".gitignore",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
 
-        // package* — matches original `*/package*`
-        assert!(matches_any_exclusion(
+        // gulpfile.js — `*/gulpfile.js`
+        assert!(matches_exclusion_at_depth(
+            "gulpfile.js",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
+
+        // package* — `wp-rocket/package*`
+        assert!(matches_exclusion_at_depth(
             "package.json",
-            ZIP_EXCLUSION_PATTERNS
+            ROOT,
+            ZIP_EXCLUSIONS
         ));
-        assert!(matches_any_exclusion(
+        assert!(matches_exclusion_at_depth(
             "package-lock.json",
-            ZIP_EXCLUSION_PATTERNS
+            ROOT,
+            ZIP_EXCLUSIONS
         ));
 
-        // php* — matches original `*/php*`
-        assert!(matches_any_exclusion("phpunit.xml", ZIP_EXCLUSION_PATTERNS));
-        assert!(matches_any_exclusion("phpcs.xml", ZIP_EXCLUSION_PATTERNS));
+        // php* — `wp-rocket/php*`. These are WP Rocket's real root tooling files.
+        assert!(matches_exclusion_at_depth(
+            "phpcs.xml",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
+        assert!(matches_exclusion_at_depth(
+            "phpstan.neon.dist",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
+        assert!(matches_exclusion_at_depth(
+            "phpstan-baseline.neon",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
+        assert!(matches_exclusion_at_depth(
+            "phpunit.xml",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
     }
 
     #[test]
-    fn test_zip_exclusion_patterns_do_not_match_production_files() {
-        use crate::build::fs::matches_any_exclusion;
+    fn test_zip_exclusions_do_not_match_production_files() {
+        use crate::build::fs::matches_exclusion_at_depth;
 
-        assert!(!matches_any_exclusion(
+        const ROOT: usize = 1;
+
+        assert!(!matches_exclusion_at_depth(
             "wp-rocket.php",
-            ZIP_EXCLUSION_PATTERNS
+            ROOT,
+            ZIP_EXCLUSIONS
         ));
-        assert!(!matches_any_exclusion("index.php", ZIP_EXCLUSION_PATTERNS));
-        assert!(!matches_any_exclusion("readme.txt", ZIP_EXCLUSION_PATTERNS));
-        assert!(!matches_any_exclusion("style.css", ZIP_EXCLUSION_PATTERNS));
-        assert!(!matches_any_exclusion("inc", ZIP_EXCLUSION_PATTERNS));
+        assert!(!matches_exclusion_at_depth(
+            "index.php",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
+        assert!(!matches_exclusion_at_depth(
+            "readme.txt",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
+        assert!(!matches_exclusion_at_depth(
+            "style.css",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
+        assert!(!matches_exclusion_at_depth("inc", ROOT, ZIP_EXCLUSIONS));
+        // Root-level production files that merely share the `php`/`package`
+        // prefix boundary must survive.
+        assert!(!matches_exclusion_at_depth(
+            "licence-data.php",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
+        assert!(!matches_exclusion_at_depth(
+            "uninstall.php",
+            ROOT,
+            ZIP_EXCLUSIONS
+        ));
+    }
+
+    /// Regression: `-x "*/php*"` also matched **nested** paths (zip's `*` spans
+    /// `/`), which dropped the whole `vendor/wordpress/php-mcp-schema/` tree and
+    /// made the shipped plugin fatal on load with
+    /// "class WP\McpSchema\Server\Tools\DTO\Tool is not available".
+    #[test]
+    fn test_zip_exclusions_keep_nested_vendor_packages_sharing_a_prefix() {
+        use crate::build::fs::matches_exclusion_at_depth;
+
+        // wp-rocket/vendor/wordpress/php-mcp-schema → depth 3
+        assert!(
+            !matches_exclusion_at_depth("php-mcp-schema", 3, ZIP_EXCLUSIONS),
+            "nested vendor dir starting with 'php' must not be excluded"
+        );
+        // wp-rocket/vendor/ocramius/package-versions → depth 3
+        assert!(
+            !matches_exclusion_at_depth("package-versions", 3, ZIP_EXCLUSIONS),
+            "nested vendor dir starting with 'package' must not be excluded"
+        );
+        // A nested tooling config is likewise kept — the rsync step already
+        // prunes the directories that would carry one.
+        assert!(!matches_exclusion_at_depth(
+            "phpunit.xml",
+            2,
+            ZIP_EXCLUSIONS
+        ));
+
+        // Dotfiles and gulpfile.js stay depth-independent.
+        assert!(matches_exclusion_at_depth(".gitignore", 4, ZIP_EXCLUSIONS));
+        assert!(matches_exclusion_at_depth("gulpfile.js", 4, ZIP_EXCLUSIONS));
+    }
+
+    #[test]
+    fn test_zip_exclude_flags_render_anchored_patterns() {
+        let flags = zip_exclude_flags();
+
+        assert_eq!(
+            flags,
+            r#"-x "*/.*" -x "*/gulpfile.js" -x "wp-rocket/package*" -x "wp-rocket/php*""#
+        );
+        // The unanchored form is what caused the vendor-tree regression.
+        assert!(
+            !flags.contains(r#""*/php*""#),
+            "php rule must stay anchored to the plugin root: {flags}"
+        );
+        assert!(
+            !flags.contains(r#""*/package*""#),
+            "package rule must stay anchored to the plugin root: {flags}"
+        );
+    }
+
+    // =========================================================================
+    // Windows Build Path (pure Rust staging + archiving)
+    // =========================================================================
+
+    /// Populate a repo dir mirroring the parts of WP Rocket that matter here.
+    ///
+    /// Deliberately has no `vendor/` — it is `.gitignore`d in the real repo and
+    /// listed in [`RSYNC_EXCLUDES`]. Production dependencies appear only later,
+    /// inside the staging copy (see [`seed_staging_vendor_like_composer`]).
+    fn seed_repo_like_wp_rocket(repo_dir: &Path) {
+        std::fs::create_dir_all(repo_dir.join("inc")).unwrap();
+        std::fs::write(repo_dir.join("inc/bootstrap.php"), "<?php // inc").unwrap();
+
+        // Root-level tooling that must not ship.
+        std::fs::write(repo_dir.join("phpcs.xml"), "<ruleset/>").unwrap();
+        std::fs::write(repo_dir.join("phpstan.neon.dist"), "params:").unwrap();
+        std::fs::write(repo_dir.join("phpstan-baseline.neon"), "params:").unwrap();
+        std::fs::write(repo_dir.join("package.json"), "{}").unwrap();
+        std::fs::write(repo_dir.join("gulpfile.js"), "// gulp").unwrap();
+        std::fs::write(repo_dir.join(".gitignore"), "vendor").unwrap();
+
+        // Root-level production files that must ship.
+        std::fs::write(repo_dir.join("wp-rocket.php"), "<?php // plugin").unwrap();
+        std::fs::write(repo_dir.join("licence-data.php"), "<?php // licence").unwrap();
+        std::fs::write(repo_dir.join("uninstall.php"), "<?php // uninstall").unwrap();
+
+        // rsync-excluded dev directories.
+        std::fs::create_dir_all(repo_dir.join("tests/Unit")).unwrap();
+        std::fs::write(repo_dir.join("tests/Unit/FooTest.php"), "<?php").unwrap();
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(repo_dir.join("src/dev.js"), "// dev").unwrap();
+    }
+
+    /// Stand in for `composer install --no-dev` inside the staging copy.
+    ///
+    /// Includes the two vendor package names that collide with the root tooling
+    /// prefixes — `php-mcp-schema` and `package-versions` — which is what the
+    /// unanchored `-x "*/php*"` / `-x "*/package*"` patterns used to delete.
+    fn seed_staging_vendor_like_composer(staging_plugin_dir: &Path) {
+        let vendor = staging_plugin_dir.join("vendor");
+
+        let schema_dto = vendor.join("wordpress/php-mcp-schema/src/Server/Tools/DTO");
+        std::fs::create_dir_all(&schema_dto).unwrap();
+        std::fs::write(schema_dto.join("Tool.php"), "<?php // Tool DTO").unwrap();
+
+        let schema_common = vendor.join("wordpress/php-mcp-schema/src/Common");
+        std::fs::create_dir_all(&schema_common).unwrap();
+        std::fs::write(
+            schema_common.join("AbstractDataTransferObject.php"),
+            "<?php // base DTO",
+        )
+        .unwrap();
+
+        let adapter = vendor.join("wordpress/mcp-adapter/includes/Domain/Tools");
+        std::fs::create_dir_all(&adapter).unwrap();
+        std::fs::write(adapter.join("McpTool.php"), "<?php // McpTool").unwrap();
+
+        let pkg_versions = vendor.join("ocramius/package-versions/src");
+        std::fs::create_dir_all(&pkg_versions).unwrap();
+        std::fs::write(pkg_versions.join("Versions.php"), "<?php // versions").unwrap();
+
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("autoload.php"), "<?php // autoload").unwrap();
+
+        // Vendor packages routinely ship their own tooling manifests; those are
+        // nested, so they must survive the root-anchored rules.
+        std::fs::write(vendor.join("wordpress/php-mcp-schema/composer.json"), "{}").unwrap();
+    }
+
+    /// Path of the staging plugin directory for a context.
+    fn staging_plugin_dir(context: &BuildContext) -> std::path::PathBuf {
+        context
+            .workspace_dir()
+            .join(STAGING_DIR)
+            .join(PLUGIN_DIR_NAME)
+    }
+
+    /// Read every entry name from a zip archive.
+    fn archive_entry_names(archive_path: &Path) -> Vec<String> {
+        let file = std::fs::File::open(archive_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    /// Read every file entry as `(name, bytes)`, sorted by name.
+    ///
+    /// Directory entries carry no payload and are covered by
+    /// [`archive_entry_names`], so they are skipped here.
+    fn archive_file_contents(archive_path: &Path) -> Vec<(String, Vec<u8>)> {
+        let file = std::fs::File::open(archive_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut entries = Vec::new();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            if name.ends_with('/') {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+            entries.push((name, bytes));
+        }
+        entries.sort();
+        entries
+    }
+
+    /// Drives the Windows pipeline (`prepare_staging` → `create_archive`) and
+    /// asserts the produced archive matches what the Unix `zip -x` flags yield.
+    ///
+    /// Regression: the vendor trees under `php-mcp-schema/` and
+    /// `package-versions/` were previously dropped, which made the shipped
+    /// plugin fatal on load with "class WP\McpSchema\Server\Tools\DTO\Tool is
+    /// not available".
+    #[test]
+    fn test_windows_pipeline_keeps_vendor_trees_and_drops_root_tooling() {
+        let (_ws, context) = test_context();
+        seed_repo_like_wp_rocket(context.repo_dir());
+
+        let version = "3.17.4";
+        builder()
+            .prepare_staging(&context, &NullReporter)
+            .expect("staging copy should succeed");
+        seed_staging_vendor_like_composer(&staging_plugin_dir(&context));
+        builder()
+            .create_archive(&context, version, &NullReporter)
+            .expect("archive creation should succeed");
+
+        let archive = context.workspace_dir().join(artifact_name(version));
+        let names = archive_entry_names(&archive);
+
+        // The classes whose absence produced the PHP fatal error.
+        for kept in [
+            "wp-rocket/vendor/wordpress/php-mcp-schema/src/Server/Tools/DTO/Tool.php",
+            "wp-rocket/vendor/wordpress/php-mcp-schema/src/Common/AbstractDataTransferObject.php",
+            "wp-rocket/vendor/wordpress/mcp-adapter/includes/Domain/Tools/McpTool.php",
+            "wp-rocket/vendor/ocramius/package-versions/src/Versions.php",
+            "wp-rocket/vendor/wordpress/php-mcp-schema/composer.json",
+            "wp-rocket/vendor/autoload.php",
+            "wp-rocket/inc/bootstrap.php",
+            "wp-rocket/wp-rocket.php",
+            "wp-rocket/licence-data.php",
+            "wp-rocket/uninstall.php",
+        ] {
+            assert!(
+                names.contains(&kept.to_string()),
+                "'{kept}' must ship; archive held {names:?}"
+            );
+        }
+
+        // Root tooling and dotfiles must not ship.
+        for dropped in [
+            "wp-rocket/phpcs.xml",
+            "wp-rocket/phpstan.neon.dist",
+            "wp-rocket/phpstan-baseline.neon",
+            "wp-rocket/package.json",
+            "wp-rocket/gulpfile.js",
+            "wp-rocket/.gitignore",
+        ] {
+            assert!(
+                !names.contains(&dropped.to_string()),
+                "'{dropped}' must not ship; archive held {names:?}"
+            );
+        }
+
+        // rsync drops dev directories before the archive step runs.
+        for pruned in ["wp-rocket/tests", "wp-rocket/src"] {
+            assert!(
+                !names.iter().any(|n| n.starts_with(pruned)),
+                "'{pruned}' must be pruned by staging: {names:?}"
+            );
+        }
+    }
+
+    /// The Unix and Windows paths must agree. Rendering the shared
+    /// [`ZIP_EXCLUSIONS`] through real `zip` and through [`create_zip_archive`]
+    /// must yield the same entry set for the same input tree.
+    #[test]
+    #[cfg(unix)]
+    fn test_unix_and_windows_archives_have_identical_entries() {
+        use std::process::Command;
+
+        // Skip when the `zip` binary is unavailable rather than failing the run.
+        let zip_available = Command::new("zip")
+            .arg("-v")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !zip_available {
+            eprintln!("skipping: `zip` binary not available");
+            return;
+        }
+
+        let (_ws, context) = test_context();
+        seed_repo_like_wp_rocket(context.repo_dir());
+
+        // Windows path: stage with pure Rust, archive with the zip crate.
+        let version = "3.17.4";
+        builder().prepare_staging(&context, &NullReporter).unwrap();
+        seed_staging_vendor_like_composer(&staging_plugin_dir(&context));
+        builder()
+            .create_archive(&context, version, &NullReporter)
+            .unwrap();
+        let rust_archive = context.workspace_dir().join(artifact_name(version));
+        let mut rust_names: Vec<String> = archive_entry_names(&rust_archive);
+        rust_names.sort();
+
+        // Unix path: archive the same staging tree with the real `zip` binary,
+        // using the flags the builder emits.
+        let staging_dir = context.workspace_dir().join(STAGING_DIR);
+        let shell_archive = context.workspace_dir().join("shell.zip");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "cd {} && zip -r {} {} {}",
+                staging_dir.display(),
+                shell_archive.display(),
+                PLUGIN_DIR_NAME,
+                zip_exclude_flags()
+            ))
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("zip should run");
+        assert!(status.success(), "shell zip failed");
+
+        let mut shell_names: Vec<String> = archive_entry_names(&shell_archive);
+        shell_names.sort();
+
+        // Complete entry sets — files *and* directory entries, including the
+        // archive root. No filtering, so any future divergence fails here.
+        assert_eq!(
+            rust_names, shell_names,
+            "Windows (pure Rust) and Unix (shell zip) archives must contain identical entries"
+        );
+        assert!(
+            rust_names.contains(&format!("{PLUGIN_DIR_NAME}/")),
+            "both archives must record the plugin root entry: {rust_names:?}"
+        );
+
+        // Matching names alone would not catch truncated or mis-written payloads.
+        // (The two paths may pick different per-entry compression methods; the
+        // decompressed bytes must still be identical.)
+        assert_eq!(
+            archive_file_contents(&rust_archive),
+            archive_file_contents(&shell_archive),
+            "file payloads must match byte-for-byte across both archive paths"
+        );
     }
 }
