@@ -117,9 +117,11 @@ pub(crate) fn distinct_versions(conn: &Connection, project: &str) -> rusqlite::R
     rows.collect()
 }
 
-/// Whether some build already occupies this relative directory.
+/// Whether some build already occupies this relative directory, compared
+/// ASCII-case-insensitively: on a case-insensitive filesystem (macOS,
+/// Windows) `1.0-RC1/…` and `1.0-rc1/…` are one directory.
 pub(crate) fn dir_taken(conn: &Connection, dir_rel: &str) -> rusqlite::Result<bool> {
-    conn.prepare_cached("SELECT 1 FROM builds WHERE dir_path = ?1 LIMIT 1")?
+    conn.prepare_cached("SELECT 1 FROM builds WHERE dir_path = ?1 COLLATE NOCASE LIMIT 1")?
         .query_row(params![dir_rel], |_| Ok(()))
         .optional()
         .map(|found| found.is_some())
@@ -214,6 +216,17 @@ pub(crate) fn artifacts_for(
     )?;
     let rows = stmt.query_map(params![build_id], row_to_artifact)?;
     rows.collect()
+}
+
+/// Delete one artifact record of a build by its exact filename.
+pub(crate) fn delete_artifact(
+    conn: &Connection,
+    build_id: i64,
+    filename: &str,
+) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM build_artifacts WHERE build_id = ?1 AND filename = ?2")?
+        .execute(params![build_id, filename])
+        .map(|_| ())
 }
 
 /// Source links of a build, most recently linked first.

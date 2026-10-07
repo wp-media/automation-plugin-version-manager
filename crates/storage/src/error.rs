@@ -122,9 +122,33 @@ pub enum Error {
         /// Build directories repair would re-index.
         adoptable_builds: u64,
     },
+
+    /// This handle's database file is no longer the store's: it was renamed
+    /// aside (a repair quarantining it), deleted or replaced after the handle
+    /// opened it. Mutations refuse, since they would update a database the
+    /// store no longer uses; open the store again.
+    #[error(
+        "the store database at {} was replaced, moved or deleted after this handle opened it; \
+         open the store again",
+        path.display()
+    )]
+    StaleHandle {
+        /// Path of the database file.
+        path: PathBuf,
+    },
 }
 
 impl Error {
+    /// The message, plus the I/O cause that [`Error::Io`]'s message leaves
+    /// out (e.g. "failed to open x: Permission denied (os error 13)"), for
+    /// reports and warnings that keep only text.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Io { context, source } => format!("{context}: {source}"),
+            other => other.to_string(),
+        }
+    }
+
     /// Shorthand constructor for [`Error::InvalidInput`].
     pub(crate) fn invalid(
         what: &'static str,

@@ -9,7 +9,9 @@
 //! - **Caching is built in** — when `Config::cache_enabled` is set (the
 //!   default), builds and release downloads are served from and stored to
 //!   the `apvm-storage` cache at `Config::cache_dir`. Cache failures always
-//!   degrade to a normal build, never an error.
+//!   degrade to a normal build, never an error; an unusable cache is
+//!   reported ([`Apvm::cache_status`], plus a build warning) and picked up
+//!   again once repaired.
 //! - **No default paths** — consumers supply the cache directory (the CLI
 //!   and Node bindings each provide their own default, `~/.apvm/cache`).
 //! - **One maintenance implementation** — [`maintenance::CacheMaintenance`]
@@ -52,6 +54,7 @@
 //! ```
 
 pub mod build;
+mod cache_status;
 pub mod commands;
 pub mod config_io;
 pub mod error;
@@ -70,50 +73,30 @@ pub use build::progress::{
     BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter,
 };
 pub use build::{ArtifactOrigin, ProducedArtifact, VersionOverride};
+pub use cache_status::CacheStatus;
 pub use commands::{BuildOutput, BuildRequest, WarmRequest};
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 pub use maintenance::{CacheMaintenance, CleanRequest};
 
 use std::path::Path;
-use std::sync::Arc;
 
-use apvm_storage::ArtifactStore;
+use cache_status::StoreSlot;
 use github::GitHubClient;
 use projects::ProjectRegistry;
 
-/// Open the artifact cache for a configuration, best-effort.
+/// Open the artifact cache for a new instance, best-effort.
 ///
-/// Returns `None` when caching is disabled **or** the store cannot be opened
-/// (e.g. an unwritable cache directory, a corrupt or lost database, or a
-/// directory holding someone else's data — the store never initializes
-/// there). A cache problem must never prevent APVM from building, so the
-/// failure is logged and caching is simply inactive for the session.
+/// Opening up front initializes the cache directory at construction, as
+/// consumers expect. A cache problem must never prevent APVM from building,
+/// so a failure only leaves the slot empty (and is logged): every build,
+/// warm and status call checks the cache again — see [`Apvm::cache_status`].
 ///
-/// The store is opened once and shared (via `Arc`) across every build on the
-/// instance, matching the concurrent-build model of the Node bindings.
-///
-/// I/O note: this performs a quick, one-time SQLite open + directory create.
-/// It is called from the async constructor too; the cost is negligible at
-/// startup and per-build cache operations (Phase 4) run on `spawn_blocking`.
-fn open_cache_store(config: &Config) -> Option<Arc<ArtifactStore>> {
-    if !config.cache_enabled {
-        tracing::debug!("artifact cache disabled by configuration");
-        return None;
-    }
-    match ArtifactStore::open(&config.cache_dir) {
-        Ok(store) => {
-            tracing::debug!(cache_dir = %config.cache_dir.display(), "artifact cache ready");
-            Some(Arc::new(store))
-        }
-        Err(e) => {
-            tracing::warn!(
-                cache_dir = %config.cache_dir.display(),
-                error = %e,
-                "failed to open artifact cache; caching disabled for this session"
-            );
-            None
-        }
-    }
+/// I/O note: a quick SQLite open + directory create, also run from the async
+/// constructor; per-build checks run on `spawn_blocking`.
+fn open_cache_store(config: &Config) -> StoreSlot {
+    let slot = StoreSlot::default();
+    slot.refresh(config);
+    slot
 }
 
 /// Selects which GitHub Release to download.
@@ -194,9 +177,9 @@ pub struct Apvm {
     pub registry: ProjectRegistry,
     /// Source of the resolved token (for diagnostics).
     pub token_source: Option<git::TokenSource>,
-    /// Shared artifact cache, or `None` when caching is disabled or the store
-    /// could not be opened. Opened once and reused across builds.
-    store: Option<Arc<ArtifactStore>>,
+    /// The shared artifact cache, re-checked before each build (see
+    /// [`Apvm::cache_status`]); empty while caching is off or unusable.
+    store: StoreSlot,
 }
 
 impl Apvm {
@@ -344,13 +327,25 @@ impl Apvm {
         self.token_source
     }
 
-    /// Whether the artifact cache is active for this instance.
+    /// Whether builds on this instance use the artifact cache right now, and
+    /// if not, why.
     ///
-    /// `true` only when caching is enabled *and* the store opened
-    /// successfully. `false` when disabled by config or when the store could
-    /// not be opened (builds still work — they just don't cache).
+    /// Checks the cache again, exactly as each build does: it opens the
+    /// cache when none is open — picking up a cache repaired meanwhile, by
+    /// any front end or process — and replaces an open one whose database
+    /// was renamed aside (a repair's quarantine), deleted or replaced.
+    /// Builds still work whatever the status; they only run uncached.
+    ///
+    /// Blocking (a stat, plus a SQLite open when nothing usable is open):
+    /// from async code, call it inside `tokio::task::spawn_blocking`.
+    pub fn cache_status(&self) -> CacheStatus {
+        self.store.refresh(&self.config).1
+    }
+
+    /// Whether the artifact cache is active for this instance: shorthand for
+    /// `self.cache_status().is_active()`, with the same check and cost.
     pub fn cache_active(&self) -> bool {
-        self.store.is_some()
+        self.cache_status().is_active()
     }
 
     /// The configured artifact cache directory (regardless of whether the
@@ -373,14 +368,8 @@ impl Apvm {
         request: BuildRequest,
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        let cmd = commands::BuildCommand::new(
-            &self.github,
-            &self.registry,
-            &self.config,
-            self.store.clone(),
-        );
         // `false` = deliver artifacts to the output directory (a normal build).
-        cmd.execute(request, reporter, false).await
+        self.command().await.execute(request, reporter, false).await
     }
 
     /// Warm the artifact cache for a project without producing any output.
@@ -406,33 +395,40 @@ impl Apvm {
     /// **built** ([`ArtifactOrigin::Built`]) or **downloaded**
     /// ([`ArtifactOrigin::Downloaded`]) — all of which are cached once this
     /// returns. When the cache is active, artifact paths point at their
-    /// canonical locations inside the cache (never an output directory).
+    /// canonical locations inside the cache (never an output directory) —
+    /// unless the cache refuses the write (e.g. a read-only database or a
+    /// full disk), which is reported as a [`BuildEvent::Warning`].
     ///
     /// # Note
     ///
-    /// If the cache is disabled (`Config::cache_enabled == false`) or the store
-    /// could not be opened, the pipeline still runs but caches nothing; a
-    /// [`BuildEvent::Warning`] is emitted to the reporter in that case, and
-    /// because there is no cache to point at, the returned artifact paths are
-    /// not durable (they reference a temporary workspace that is cleaned up).
-    /// Inspect [`Apvm::cache_active`] up front if you need warming to be
-    /// meaningful.
+    /// If the cache is disabled (`Config::cache_enabled == false`) or unusable
+    /// (see [`Apvm::cache_status`]), the pipeline still runs but caches
+    /// nothing; a [`BuildEvent::Warning`] saying why is emitted to the
+    /// reporter in that case, and because there is no cache to point at, the
+    /// returned artifact paths are not durable (they reference a temporary
+    /// workspace that is cleaned up). Inspect [`Apvm::cache_status`] up front
+    /// if you need warming to be meaningful.
     pub async fn warm_cache(
         &self,
         request: WarmRequest,
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
-        let cmd = commands::BuildCommand::new(
-            &self.github,
-            &self.registry,
-            &self.config,
-            self.store.clone(),
-        );
         // `true` = warm-only: run the whole pipeline but deliver nothing to an
         // output directory. `WarmRequest::into_build_request` supplies the
         // fixed `output_dir = ""`, `no_cache = false`.
-        cmd.execute(request.into_build_request(), reporter, true)
+        self.command()
             .await
+            .execute(request.into_build_request(), reporter, true)
+            .await
+    }
+
+    /// A build command over the cache as it is now: re-checked (see
+    /// [`Apvm::cache_status`]), with its status, so an unusable cache is
+    /// reported as a warning by the build.
+    async fn command(&self) -> commands::BuildCommand<'_> {
+        let (store, status) = self.store.refresh_async(&self.config).await;
+        commands::BuildCommand::new(&self.github, &self.registry, &self.config, store)
+            .with_cache_status(status)
     }
 
     /// Shared helper for the `build_from_*` conveniences: assemble a
@@ -675,6 +671,8 @@ mod tests {
         let config = Config::new(dir.path().join("cache")).set_cache_enabled(false);
         let apvm = Apvm::new(config).unwrap();
         assert!(!apvm.cache_active(), "disabled cache must not open a store");
+        assert_eq!(apvm.cache_status(), CacheStatus::Disabled);
+        assert!(!dir.path().join("cache").exists(), "nothing is created");
     }
 
     #[tokio::test]
@@ -685,12 +683,22 @@ mod tests {
         // shares the same `open_cache_store` helper.)
         let file = tempfile::NamedTempFile::new().unwrap();
         let bad_cache_dir = file.path().join("cache");
-        let config = Config::new(bad_cache_dir); // enabled by default
+        let config = Config::new(bad_cache_dir.clone()); // enabled by default
         let apvm = Apvm::new(config).expect("Apvm::new must not fail on a cache-open error");
         assert!(
             !apvm.cache_active(),
             "a broken cache dir must leave the store None"
         );
+        // The reason is reported: the path, then the I/O cause (on Unix
+        // "cannot access store directory <path>: Not a directory").
+        let CacheStatus::Unavailable { details } = apvm.cache_status() else {
+            panic!("expected Unavailable, got {:?}", apvm.cache_status());
+        };
+        let path = bad_cache_dir.display().to_string();
+        let cause = details
+            .split_once(&format!("{path}: "))
+            .map(|(_, cause)| cause);
+        assert!(cause.is_some_and(|c| !c.is_empty()), "{details}");
     }
 
     #[test]

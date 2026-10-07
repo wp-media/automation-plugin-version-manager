@@ -159,22 +159,27 @@ impl CacheMaintenance {
         self.with_store(ArtifactStore::clear_all)
     }
 
-    /// Reconcile the database with disk and sweep stale temp files
-    /// (`apvm cache gc`). Removes only what the store could have created,
-    /// and never follows symlinks.
+    /// Reconcile the database with disk (`apvm cache gc [--checksum]`):
+    /// remove what [`verify`](CacheMaintenance::verify) at the same `mode`
+    /// reports — records whose files are missing or damaged, with the bad
+    /// files — plus orphan directories and stale temp files. The next build
+    /// caches a removed entry again. Removes only what the store could have
+    /// created, never follows symlinks, and keeps files it cannot read
+    /// (listed in [`GcReport::failures`]).
     ///
     /// Returns `Ok(None)` when there is no cache.
     ///
     /// # Errors
     ///
     /// As for [`CacheMaintenance::usage`].
-    pub fn gc(&self) -> Result<Option<GcReport>> {
-        self.with_store(ArtifactStore::gc)
+    pub fn gc(&self, mode: VerifyMode) -> Result<Option<GcReport>> {
+        self.with_store(|store| store.gc_with(mode))
     }
 
     /// Check stored files at the depth `mode` selects (`apvm cache verify`).
     /// An empty list means healthy. Reports only: nothing is fixed or
-    /// deleted.
+    /// deleted — [`gc`](CacheMaintenance::gc) at the same `mode` removes
+    /// what it reports.
     ///
     /// Returns `Ok(None)` when there is no cache.
     ///
@@ -187,8 +192,10 @@ impl CacheMaintenance {
 
     /// Recover the cache (`apvm cache repair`): quarantine a corrupt
     /// database, clear an unreadable one in place (keeping a copy), or
-    /// rebuild a lost one, then re-index the builds found on disk. A no-op on a healthy database (the report records
-    /// nothing done).
+    /// rebuild a lost one, then re-index the builds found on disk. A no-op
+    /// on a healthy database (the report records nothing done). Running
+    /// [`Apvm`](crate::Apvm) instances pick the repaired cache up on their
+    /// next build.
     ///
     /// Returns `Ok(None)` when there is no cache — and then creates nothing.
     ///
@@ -490,7 +497,11 @@ mod tests {
                 cache.clean(&CleanRequest::default()).map(|r| r.is_some()),
             ),
             ("clear", cache.clear().map(|r| r.is_some())),
-            ("gc", cache.gc().map(|r| r.is_some())),
+            ("gc", cache.gc(VerifyMode::Size).map(|r| r.is_some())),
+            (
+                "gc --checksum",
+                cache.gc(VerifyMode::Checksum).map(|r| r.is_some()),
+            ),
             (
                 "verify",
                 cache.verify(VerifyMode::Size).map(|r| r.is_some()),
@@ -839,8 +850,37 @@ mod tests {
         std::fs::remove_dir_all(artifact.parent().unwrap()).unwrap();
         let cache = CacheMaintenance::new(&dir);
 
-        let report = cache.gc().unwrap().unwrap();
+        let report = cache.gc(VerifyMode::Size).unwrap().unwrap();
         assert_eq!(report.stale_build_rows, 1);
+        assert_eq!(counts(&cache), (0, 0));
+    }
+
+    #[test]
+    fn gc_removes_what_verify_reports_at_the_same_depth() {
+        let (_root, dir) = temp_cache();
+        let artifact = seed_build(&dir, "wp-rocket", COMMIT_A, chrono::Duration::zero());
+        let mut bytes = std::fs::read(&artifact).unwrap();
+        bytes[0] ^= 0xFF; // same size: only a checksum pass sees it
+        std::fs::write(&artifact, &bytes).unwrap();
+        let cache = CacheMaintenance::new(&dir);
+
+        let report = cache.gc(VerifyMode::Size).unwrap().unwrap();
+        assert_eq!(report.damaged_artifacts, 0);
+        assert_eq!(
+            cache.verify(VerifyMode::Checksum).unwrap().unwrap().len(),
+            1
+        );
+
+        let report = cache.gc(VerifyMode::Checksum).unwrap().unwrap();
+        assert_eq!(report.damaged_artifacts, 1);
+        assert!(!artifact.exists());
+        assert!(
+            cache
+                .verify(VerifyMode::Checksum)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(counts(&cache), (0, 0));
     }
 
@@ -876,7 +916,7 @@ mod tests {
             &cache.clean(&CleanRequest::default()).unwrap_err()
         ));
         assert!(is_corrupt(&cache.clear().unwrap_err()));
-        assert!(is_corrupt(&cache.gc().unwrap_err()));
+        assert!(is_corrupt(&cache.gc(VerifyMode::Size).unwrap_err()));
         assert!(is_corrupt(&cache.verify(VerifyMode::Size).unwrap_err()));
         assert_eq!(
             std::fs::read(dir.join("apvm.db")).unwrap(),

@@ -1,6 +1,6 @@
 # NAPI cache maintenance — parity with `apvm cache`
 
-Status: **Phase 1 implemented and audited** (Phases 2–4 planned) · Target version: **3.3.0** (from 3.2.0 — also claimed by the site-deployment plan; whichever lands second takes the next minor) · Author: Sandy Figueroa
+Status: **Phases 1–2 implemented** (Phase 1 audited; Phases 3–4 planned) · Target version: **3.3.0** (from 3.2.0 — also claimed by the site-deployment plan; whichever lands second takes the next minor) · Author: Sandy Figueroa
 
 ---
 
@@ -127,7 +127,7 @@ pub use apvm_storage::{CleanReport, CleanTarget, GcReport, RepairReport, StoreSt
 
 - **A slot, not a fixed `Option`:** `Apvm` keeps its store in a private `Mutex` slot (poison-tolerant, like `ArtifactStore::conn`). While caching is enabled but the store is not open, each `build`, `warm_cache` and `cache_status` call retries the open once — one SQLite open, the cost the constructors already pay. A `repair()` from anywhere (NAPI, the CLI, another process) therefore re-enables caching on live instances; nothing has to be re-created. An **open** store survives repair of unreadable rows (cleared in place, F19). A file-level corrupt database is renamed aside, though, and a store still open on it stays on the old file, so the slot must also drop its store after a corruption error.
 - **Status:** `pub fn cache_status(&self) -> CacheStatus` = `Active | Disabled | Corrupted { details } | Unavailable { details }`, classified from the open error. `cache_active()` (used only by tests today) is derived from it.
-- **Warning:** when caching is enabled but unavailable, `build` and `warm_cache` emit exactly one `BuildEvent::Warning` with the reason and the remedy (for `Corrupted`, naming both `apvm cache repair` and `ApvmCache.repair()`). `Apvm` hands the status to `BuildCommand` through a new non-breaking setter, so the 13 existing `BuildCommand::new` call sites are untouched and the generic warm warning fires only for the disabled case, with its text unchanged (pinned by `cache_e2e.rs:584`). The CLI already prints warnings as `⚠ …`; NAPI delivers them to `onProgress`.
+- **Warning:** when caching is enabled but unavailable, `build` and `warm_cache` emit exactly one `BuildEvent::Warning` with the reason and the remedy (for `Corrupted`, `apvm cache repair`; Phase 3 adds `ApvmCache.repair()` once it exists). `Apvm` hands the status to `BuildCommand` through a new non-breaking setter, so the 13 existing `BuildCommand::new` call sites are untouched and the generic warm warning fires only for the disabled case, with its text unchanged (pinned by `cache_e2e.rs:584`). The CLI already prints warnings as `⚠ …`; NAPI delivers them to `onProgress`.
 
 ### 3.4 F12 — `gc` removes what `verify` reports
 
@@ -241,7 +241,58 @@ Every phase ends green on the full CLAUDE.md validation suite, run with `APVM_CA
   - `clear` on a broken cache errors before prompting.
 - **Docs:** SKILL.md (cache section and error rows), CLI/core/storage/root READMEs.
 
-### Phase 2 — F11 and F12 (core, storage, CLI; no JS change)
+### Phase 2 — F11 and F12 (core, storage, CLI; no JS change) — **implemented**
+
+As built (the plan below was followed except where noted):
+
+- **Storage (F12):** `gc_with(VerifyMode)`, with `gc()` ≡ `gc_with(Size)`. It judges each file the way `verify` does (shared `check_file`), deletes damaged files and then drops their records. A record goes only once its file is gone, so a failed delete stays visible. Builds or releases left without files lose their rows (counted in `stale_*_rows`), and their dirs go to the orphan sweep. Files are deleted only inside store-shaped dirs reached without symlinks (`layout::owned_dir`, valid filename). A file another kept record names up to case is never deleted. Otherwise the record is dropped, the file is untouched, and the case is listed. `Checksum` mode hashes without the lock and re-hashes only the suspects under it. `GcReport` gains `damaged_artifacts`, `damaged_bytes_removed` and `failures`.
+- **Storage, also changed:**
+  - A file that cannot be *inspected* (e.g. a non-searchable dir) is now `Unreadable` in `verify` and kept by `gc`, instead of `Missing` (which would have made gc drop a record whose file exists).
+  - Orphan dirs that gc fails to remove are listed in `failures` (before, they were only logged).
+  - `Unreadable` details keep the I/O cause ("…: Permission denied").
+- **F11, deviation — `is_current()` instead of error-based detection:** an open handle does not notice a database file damaged in place. SQLite serves the cached pages, so its `quick_check` and reads still pass; only a fresh open reports it (verified with a probe). So the slot does not run a per-build integrity check, which would cost time and catch nothing. It drops its store when `ArtifactStore::is_current()` (a stat against the file identity recorded at open) says the file was renamed aside by a repair, deleted or replaced, then reopens. A store is held only after a successful open, and every refresh reopens when nothing is held, so a corrupt cache is always reported (status + warning) and re-attached once repaired.
+- **Core:** `CacheStatus` (`#[non_exhaustive]`): `MissingDatabase` maps to `Corrupted` (its remedy is `repair`), and an I/O error's details include the cause. `BuildCommand::with_cache_status` exists; `Apvm::build` / `warm_cache` re-check the slot on `spawn_blocking`. The facade's `gc` takes a `VerifyMode` (`gc(mode)`, mirroring `verify(mode)`); Phase 1's `gc()` was never released.
+- **CLI:** `apvm cache gc [--checksum]` gets the new line `Dropped N damaged file record(s) (X deleted)`. What gc left in place goes to stderr (`Left N item(s) in place:`), exit 0, like `clean`. The `verify` hint names `gc` or `gc --checksum`, plus a permissions line when some files are unreadable.
+- **Audit (adversarial).** Round 1 had 4 independent auditors; two ran out of budget. Round 2 re-ran those two and added a third to attack the fixes, all on the fixed tree. The concurrency stress (6 handles; store, gc, gc --checksum, clean, repair and damage at once; about 31k ops) gave 0 errors, a clean final checksum verify and an idempotent second gc. Every finding was reproduced by a regression test before being fixed. Round 2 added:
+  - The build warning no longer names the Phase 3 `ApvmCache.repair()`.
+  - The `verify` hint omits `gc` when only unreadable files remain.
+  - `clean`/`clear` failure remedies no longer promise that `gc` removes symlinked dirs.
+  - SKILL.md documents the "could not be stored" warning, and its corrupt-database row quotes the real text.
+  - Store paths are made absolute when a store opens (`std::path::absolute`), so a cwd change cannot break `is_current` or the lock.
+
+  Round 1:
+  - **N1 (new in Phase 2):** gc deleted through symlinked dirs. Destructive paths in gc, clean, `delete_build` and `delete_release` now resolve through `layout::owned_dir` (store-shaped, no symlinks). `resolve_within_base` was removed.
+  - **N2 (new):** on case-insensitive filesystems, records spelled differently share a dir, and gc emptying one wiped the other. Root fix: build and release dir allocation is case-insensitive (release collision → `{first100}-{hash8}`), and a re-store in another case replaces the old file record. Defense: the gc sweep matches live dirs case-insensitively, recomputed after commit; gc and clean never delete a file or dir another record names up to case.
+  - **N3:** a damaged record outside the store layout had its file deleted.
+  - **N4 (pre-existing):** mutations through a stale handle. They now fail with the new `Error::StaleHandle` (`store`, `store_release`, `clean`, `gc_with`, `delete_*`).
+  - **N5 (pre-existing):** a dir that could not be inspected counted as vanished. Its records are now kept and the failure listed.
+  - **N6:** a failed delete left an invisible file. Files now go first.
+  - **A1:** a failed cache write during a build or warm was silent. It now emits a warning (`commands/cache.rs`).
+  - **A2:** an open landing mid-repair reported "needs repair". `create()` re-checks `Orphaned` under the store lock.
+  - **A3/A4:** the slot kept a store for an old `cache_dir`, or after caching was disabled.
+  - **A5 (pre-existing):** a negative `user_version` was unrepairable. It is now `DatabaseCorrupted`.
+  - **H1/H2:** slot compare-and-swap; stores are closed on the blocking pool.
+  - **Nits:** symlink byte counts; the docs now cover artifact-less rows.
+  - **Residual, documented:**
+    - On Windows, a repair cannot quarantine a database an instance still holds.
+    - Someone who can write the cache dir and swaps in a symlink or FIFO between a check and a deletion or hash (TOCTOU) is not defended. A FIFO could block a checksum pass.
+    - On case-sensitive filesystems, an outside-made dir that differs only in case from a recorded one is kept by gc (a bounded leak; the store never creates such pairs).
+    - The case tests run only on case-insensitive filesystems.
+- **Tests:** 752 pass (695 before): storage +34, core +19, CLI +4. The permission tests skip as root, where permissions are not enforced.
+- **Mutation testing:** 24 mutants over the new logic, all caught, each by the test written for it. Under each mutant, the test that caught it:
+  - gc verdicts, the empty-row drop, the suspects re-check, the layout guard, byte counting and failure listing — the storage gc tests;
+  - `probe_file` — its unit test;
+  - `is_current` — the handle tests;
+  - the slot's keep / reopen / hold — the `cache_status` tests;
+  - error classification and warning text — `cache_status`;
+  - the warning wiring — the `BuildCommand` unit tests and the e2e;
+  - the CLI hint, flag and stderr list — the CLI tests.
+
+  Only the stderr list survived at first; a test was added. Hashing every file under the lock instead of only the suspects is an equivalent mutant (performance only) and was not counted.
+- **Verified on the real binary:**
+  - A seeded cache through `verify`, then the hinted `gc` / `gc --checksum`, ends with `verify --checksum` clean.
+  - An unreadable file is kept and reported on stderr, exit 0.
+  - Against a corrupt cache, `apvm build imagify tag:v2.3.4` prints exactly one `⚠ … needs repair …` line and builds. After `apvm cache repair`, the next build is built and cached with no warning, and the one after is served from the cache.
 
 - **New:** §3.3 and §3.4, including `apvm cache gc --checksum`. SKILL.md (per CLAUDE.md): the gc row, flag and output, the verify → gc remedy, and a troubleshooting row for the build warning. CLI README: gc and verify sections.
 - **Tests:**

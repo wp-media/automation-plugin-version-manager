@@ -33,8 +33,8 @@ use apvm_core::build::{
 };
 use apvm_core::projects::Project;
 use apvm_core::{
-    Apvm, ArtifactOrigin, BuildEvent, BuildOutput, BuildRequest, ClosureReporter, Config,
-    NullReporter, VersionOverride, WarmRequest,
+    Apvm, ArtifactOrigin, BuildEvent, BuildOutput, BuildRequest, CacheMaintenance, CacheStatus,
+    ClosureReporter, Config, NullReporter, VersionOverride, WarmRequest,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -583,6 +583,108 @@ async fn warm_cache_with_caching_disabled_warns_and_builds() {
             .iter()
             .any(|m| m.contains("disabled or unavailable")),
         "expected a cache-disabled warning, got: {warnings:?}"
+    );
+}
+
+/// A cache that is corrupt when the instance is created is reported, not
+/// skipped in silence (F11): its status says so and each build warns, once,
+/// while still building. After a repair — here through the maintenance
+/// facade, as another front end or process would — the **same instance**
+/// caches again, with no re-creation.
+#[tokio::test]
+async fn a_corrupt_cache_warns_then_resumes_after_repair() {
+    use std::sync::{Arc, Mutex};
+
+    let repo = init_repo();
+    let cache = tempfile::tempdir().unwrap();
+    let store_dir = cache.path().join("store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(store_dir.join("apvm.db"), b"not a sqlite database").unwrap();
+
+    let mut apvm = Apvm::new_empty(Config::new(store_dir.clone())).expect("Apvm::new_empty");
+    apvm.register_project(Project {
+        name: "single".to_string(),
+        repo_url: repo.path().to_string_lossy().to_string(),
+        owner: "test".to_string(),
+        repo: "fixture".to_string(),
+        default_branch: "main".to_string(),
+        is_private: false,
+        has_releases: false,
+        builder: Box::new(SingleBuilder),
+    });
+    assert_eq!(
+        apvm.cache_status(),
+        CacheStatus::Corrupted {
+            details: "file is not a database".to_string()
+        }
+    );
+
+    let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let reporter = ClosureReporter::new({
+        let warnings = Arc::clone(&warnings);
+        move |event| {
+            if let BuildEvent::Warning(message) = event {
+                warnings.lock().unwrap().push(message.clone());
+            }
+        }
+    });
+    let request = |out: &Path| {
+        BuildRequest::new("single", "branch:main", out).version(Some("1.0.0".to_string()))
+    };
+
+    // Corrupt: the build succeeds uncached, with exactly one warning.
+    let out = tempfile::tempdir().unwrap();
+    let build = apvm
+        .build(request(out.path()), &reporter)
+        .await
+        .expect("a broken cache must not fail the build");
+    assert_eq!(origin_of(&build, None), ArtifactOrigin::Built);
+    {
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("needs repair: file is not a database")
+                && warnings[0].contains("`apvm cache repair`"),
+            "{}",
+            warnings[0]
+        );
+    }
+    assert_eq!(
+        std::fs::read(store_dir.join("apvm.db")).unwrap(),
+        b"not a sqlite database",
+        "a build never repairs (or touches) the database itself"
+    );
+
+    // Repair from the outside; the instance re-attaches on its own.
+    CacheMaintenance::new(&store_dir)
+        .repair()
+        .expect("repair")
+        .expect("there is a cache to repair");
+    assert_eq!(apvm.cache_status(), CacheStatus::Active);
+    warnings.lock().unwrap().clear();
+
+    let out = tempfile::tempdir().unwrap();
+    let rebuilt = apvm
+        .build(request(out.path()), &reporter)
+        .await
+        .expect("build");
+    assert_eq!(
+        origin_of(&rebuilt, None),
+        ArtifactOrigin::Built,
+        "the uncached build left nothing behind"
+    );
+    let out = tempfile::tempdir().unwrap();
+    let hit = apvm
+        .build(request(out.path()), &reporter)
+        .await
+        .expect("build");
+    assert!(
+        hit.from_cache(),
+        "the same instance caches again after repair"
+    );
+    assert!(
+        warnings.lock().unwrap().is_empty(),
+        "a healthy cache does not warn"
     );
 }
 

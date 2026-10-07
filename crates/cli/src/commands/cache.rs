@@ -43,8 +43,15 @@ pub enum CacheAction {
     Info,
     /// Remove cached entries (by age, project, or kind)
     Clean(CleanArgs),
-    /// Reconcile the database with disk and sweep leftover temp files
-    Gc,
+    /// Remove missing or damaged entries and orphan files (add --checksum to
+    /// re-hash them)
+    Gc {
+        /// Also re-hash every file and remove those whose content no longer
+        /// matches its recorded checksum (slowest, most thorough). Without
+        /// this, only presence and size are checked.
+        #[arg(long)]
+        checksum: bool,
+    },
     /// Check that cached files are intact (add --checksum to re-hash them)
     Verify {
         /// Re-hash every file and compare to its recorded checksum (slowest,
@@ -127,7 +134,7 @@ impl CacheArgs {
         match &self.action {
             CacheAction::Info => info(cache, console),
             CacheAction::Clean(args) => clean(cache, args, console),
-            CacheAction::Gc => gc(cache, console),
+            CacheAction::Gc { checksum } => gc(cache, *checksum, console),
             CacheAction::Verify { checksum } => verify(cache, *checksum, console),
             CacheAction::Repair => repair(cache, console),
             CacheAction::Clear { yes } => clear(cache, *yes, console),
@@ -172,17 +179,24 @@ fn clean(
     (console.out)(&clean_text(&report));
     (console.err)(&failures_text(
         &report.failures,
-        "orphaned until `apvm cache gc`",
+        "`apvm cache gc` retries removal failures",
     ));
     Ok(())
 }
 
-/// `apvm cache gc` — reconcile the database with disk.
-fn gc(cache: &CacheMaintenance, console: &mut Console<'_>) -> apvm_core::Result<()> {
-    let Some(report) = cache.gc().map_err(hint_with_repair)? else {
+/// `apvm cache gc` — reconcile the database with disk, removing what
+/// `verify` at the same depth reports. What it had to leave in place goes to
+/// stderr; like `clean`, that does not fail the command.
+fn gc(
+    cache: &CacheMaintenance,
+    checksum: bool,
+    console: &mut Console<'_>,
+) -> apvm_core::Result<()> {
+    let Some(report) = cache.gc(verify_mode(checksum)).map_err(hint_with_repair)? else {
         return report_empty(cache, console);
     };
     (console.out)(&gc_text(&report));
+    (console.err)(&left_in_place_text(&report.failures));
     Ok(())
 }
 
@@ -244,7 +258,10 @@ fn clear(cache: &CacheMaintenance, yes: bool, console: &mut Console<'_>) -> apvm
         return report_empty(cache, console);
     };
     (console.out)(&cleared_text(&report));
-    (console.err)(&failures_text(&report.failures, "run `apvm cache gc`"));
+    (console.err)(&failures_text(
+        &report.failures,
+        "`apvm cache gc` retries removal failures",
+    ));
     Ok(())
 }
 
@@ -377,6 +394,11 @@ fn gc_text(report: &GcReport) -> String {
             report.stale_build_rows, report.stale_release_rows
         ),
         format!(
+            "  Dropped {} damaged file record(s) ({} deleted)",
+            report.damaged_artifacts,
+            human_bytes(report.damaged_bytes_removed)
+        ),
+        format!(
             "  Removed {} orphan director(ies) ({})",
             report.orphan_dirs_removed,
             human_bytes(report.orphan_bytes_removed)
@@ -388,7 +410,18 @@ fn gc_text(report: &GcReport) -> String {
     ])
 }
 
-/// One line per verification issue, then the remedy hint.
+/// What gc left in place (unreadable files, failed deletions), one line
+/// each; empty when there is nothing.
+fn left_in_place_text(failures: &[String]) -> String {
+    if failures.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![format!("  Left {} item(s) in place:", failures.len())];
+    lines.extend(failures.iter().map(|failure| format!("    - {failure}")));
+    lines_text(&lines)
+}
+
+/// One line per verification issue, then the remedy hints.
 fn issues_text(issues: &[VerifyIssue]) -> String {
     let mut lines = vec![format!("Found {} cache issue(s):", issues.len())];
     lines.extend(issues.iter().map(|issue| {
@@ -400,11 +433,33 @@ fn issues_text(issues: &[VerifyIssue]) -> String {
         )
     }));
     lines.push(String::new());
-    lines.push(
-        "Run `apvm cache gc` to drop records for missing files, or rebuild to heal them."
-            .to_string(),
-    );
+    lines.extend(remedy_lines(issues));
     lines_text(&lines)
+}
+
+/// What to do about `issues`: the `gc` that removes them — `--checksum` when
+/// only a checksum pass sees some of them; none when every issue is an
+/// unreadable file, which gc keeps — and, for those, a permissions hint.
+fn remedy_lines(issues: &[VerifyIssue]) -> Vec<String> {
+    let has = |wanted: fn(&VerifyProblem) -> bool| issues.iter().any(|i| wanted(&i.problem));
+    let mut lines = Vec::new();
+    if has(|p| !matches!(p, VerifyProblem::Unreadable { .. })) {
+        let gc = if has(|p| matches!(p, VerifyProblem::ChecksumMismatch { .. })) {
+            "apvm cache gc --checksum"
+        } else {
+            "apvm cache gc"
+        };
+        lines.push(format!(
+            "Run `{gc}` to remove the damaged entries; the next build caches them again."
+        ));
+    }
+    if has(|p| matches!(p, VerifyProblem::Unreadable { .. })) {
+        lines.push(
+            "Files that cannot be read are kept by gc: fix their permissions, then verify again."
+                .to_string(),
+        );
+    }
+    lines
 }
 
 /// A verification problem in words.
@@ -609,7 +664,8 @@ mod tests {
         for action in [
             CacheAction::Info,
             CacheAction::Verify { checksum: true },
-            CacheAction::Gc,
+            CacheAction::Gc { checksum: false },
+            CacheAction::Gc { checksum: true },
             CacheAction::Repair,
         ] {
             assert!(
@@ -790,7 +846,8 @@ mod tests {
         vec![
             CacheAction::Info,
             CacheAction::Clean(clean_args()),
-            CacheAction::Gc,
+            CacheAction::Gc { checksum: false },
+            CacheAction::Gc { checksum: true },
             CacheAction::Verify { checksum: false },
             CacheAction::Verify { checksum: true },
             CacheAction::Repair,
@@ -1243,11 +1300,19 @@ mod tests {
             orphan_dirs_removed: 3,
             orphan_bytes_removed: 2048,
             stale_temp_files_removed: 4,
+            damaged_artifacts: 5,
+            damaged_bytes_removed: 1536,
+            failures: vec!["/c/a.zip: denied".to_string()],
         };
         assert_eq!(
             gc_text(&gc),
-            "Cache garbage collection complete:\n  Dropped stale records: 1 build(s), 2 release(s)\n  Removed 3 orphan director(ies) (2.0 KiB)\n  Swept 4 stale temp file(s)\n"
+            "Cache garbage collection complete:\n  Dropped stale records: 1 build(s), 2 release(s)\n  Dropped 5 damaged file record(s) (1.5 KiB deleted)\n  Removed 3 orphan director(ies) (2.0 KiB)\n  Swept 4 stale temp file(s)\n"
         );
+        assert_eq!(
+            left_in_place_text(&gc.failures),
+            "  Left 1 item(s) in place:\n    - /c/a.zip: denied\n"
+        );
+        assert_eq!(left_in_place_text(&[]), "");
 
         let healthy = RepairReport::default();
         assert_eq!(
@@ -1305,7 +1370,167 @@ mod tests {
         ];
         assert_eq!(
             issues_text(&issues),
-            "Found 4 cache issue(s):\n  - [p] f.zip: missing\n  - [p] f.zip: size mismatch (recorded 3, on disk 4)\n  - [p] f.zip: checksum mismatch\n  - [p] f.zip: unreadable: denied\n\nRun `apvm cache gc` to drop records for missing files, or rebuild to heal them.\n"
+            "Found 4 cache issue(s):\n  - [p] f.zip: missing\n  - [p] f.zip: size mismatch (recorded 3, on disk 4)\n  - [p] f.zip: checksum mismatch\n  - [p] f.zip: unreadable: denied\n\nRun `apvm cache gc --checksum` to remove the damaged entries; the next build caches them again.\nFiles that cannot be read are kept by gc: fix their permissions, then verify again.\n"
         );
+    }
+
+    #[test]
+    fn the_verify_hint_names_the_gc_that_removes_the_issues() {
+        let issue = |problem| VerifyIssue {
+            project: "p".to_string(),
+            context: apvm_core::maintenance::IssueContext::Build {
+                version: "1.0".to_string(),
+                commit: "aaaaaaa".to_string(),
+            },
+            filename: "f.zip".to_string(),
+            path: "/c/f.zip".into(),
+            problem,
+        };
+        let gc =
+            "Run `apvm cache gc` to remove the damaged entries; the next build caches them again.";
+        let gc_checksum = "Run `apvm cache gc --checksum` to remove the damaged entries; the next build caches them again.";
+        let unreadable =
+            "Files that cannot be read are kept by gc: fix their permissions, then verify again.";
+        let missing = || issue(VerifyProblem::Missing);
+        let resized = || {
+            issue(VerifyProblem::SizeMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        };
+        let tampered = || {
+            issue(VerifyProblem::ChecksumMismatch {
+                expected: "a".to_string(),
+                actual: "b".to_string(),
+            })
+        };
+        let locked = || {
+            issue(VerifyProblem::Unreadable {
+                details: "denied".to_string(),
+            })
+        };
+
+        assert_eq!(remedy_lines(&[missing()]), [gc]);
+        assert_eq!(remedy_lines(&[resized()]), [gc]);
+        assert_eq!(remedy_lines(&[missing(), tampered()]), [gc_checksum]);
+        assert_eq!(remedy_lines(&[tampered()]), [gc_checksum]);
+        assert_eq!(
+            remedy_lines(&[locked()]),
+            [unreadable],
+            "gc would change nothing"
+        );
+        assert_eq!(
+            remedy_lines(&[locked(), resized(), tampered()]),
+            [gc_checksum, unreadable]
+        );
+    }
+
+    #[test]
+    fn gc_parses_its_checksum_flag() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct Harness {
+            #[command(flatten)]
+            args: CacheArgs,
+        }
+        let parse = |argv: &[&str]| Harness::try_parse_from(argv).map(|h| h.args.action);
+        assert!(matches!(
+            parse(&["cache", "gc"]),
+            Ok(CacheAction::Gc { checksum: false })
+        ));
+        assert!(matches!(
+            parse(&["cache", "gc", "--checksum"]),
+            Ok(CacheAction::Gc { checksum: true })
+        ));
+        assert!(parse(&["cache", "gc", "--bogus"]).is_err());
+    }
+
+    // Unix only: permission bits; skipped where they are not enforced (root).
+    #[cfg(unix)]
+    #[test]
+    fn gc_lists_what_it_left_in_place_on_stderr_and_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let chmod = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        seed(&cache);
+        let path = ArtifactStore::open(&cache)
+            .unwrap()
+            .find_by_commit("wp-rocket", "3.17.4", "aaaaaaa")
+            .unwrap()
+            .expect("seeded build")
+            .artifacts[0]
+            .path
+            .clone();
+        chmod(&path, 0o000);
+        if std::fs::File::open(&path).is_ok() {
+            chmod(&path, 0o644);
+            eprintln!("skipped: permissions are not enforced for this user");
+            return;
+        }
+        let got = run(CacheAction::Gc { checksum: true }, &cache, &[]);
+        chmod(&path, 0o644);
+
+        assert!(got.result.is_ok(), "{:?}", got.result);
+        assert!(
+            got.out
+                .contains("Dropped 0 damaged file record(s) (0 B deleted)"),
+            "{}",
+            got.out
+        );
+        assert!(
+            got.err.starts_with("  Left 1 item(s) in place:\n    - "),
+            "{}",
+            got.err
+        );
+        assert!(got.err.contains("Permission denied"), "{}", got.err);
+        assert!(path.exists(), "an unreadable file is kept");
+    }
+
+    #[test]
+    fn gc_removes_what_verify_found_and_the_hint_was_right() {
+        // The F12 loop through the CLI: verify finds damage, the command
+        // its hint names removes it, and verify is clean afterwards.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        seed(&cache);
+        let path = ArtifactStore::open(&cache)
+            .unwrap()
+            .find_by_commit("wp-rocket", "3.17.4", "aaaaaaa")
+            .unwrap()
+            .expect("seeded build")
+            .artifacts[0]
+            .path
+            .clone();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let found = run(CacheAction::Verify { checksum: true }, &cache, &[]);
+        assert!(
+            found.err.contains("Run `apvm cache gc --checksum`"),
+            "{}",
+            found.err
+        );
+
+        let plain = run(CacheAction::Gc { checksum: false }, &cache, &[]);
+        assert!(plain.result.is_ok(), "{:?}", plain.result);
+        assert!(
+            plain.out.contains("Dropped 0 damaged file record(s)"),
+            "{}",
+            plain.out
+        );
+
+        let deep = run(CacheAction::Gc { checksum: true }, &cache, &[]);
+        assert!(deep.result.is_ok(), "{:?}", deep.result);
+        assert_eq!(
+            deep.out,
+            "Cache garbage collection complete:\n  Dropped stale records: 1 build(s), 0 release(s)\n  Dropped 1 damaged file record(s) (14 B deleted)\n  Removed 1 orphan director(ies) (0 B)\n  Swept 0 stale temp file(s)\n"
+        );
+        assert_eq!(deep.err, "");
+        let clean = run(CacheAction::Verify { checksum: true }, &cache, &[]);
+        assert!(clean.result.is_ok(), "{}", clean.err);
     }
 }

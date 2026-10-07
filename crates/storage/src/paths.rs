@@ -368,44 +368,15 @@ pub(crate) fn release_dir_rel(project: &str, tag_dir: &str) -> String {
 /// Legitimate stored paths never contain `.` or `..` as a component
 /// (project, version, commit and sanitized tags all forbid them), so this
 /// filtering cannot change a valid path — it only ensures the result stays
-/// inside `base_dir` even if the database were tampered with.
+/// inside `base_dir` even if the database were tampered with. For reads
+/// only: destructive operations resolve through `layout::owned_dir`, which
+/// also refuses non-store paths and symlinks.
 pub(crate) fn rel_to_abs(base_dir: &Path, rel: &str) -> PathBuf {
     rel.split(['/', '\\'])
         .filter(|component| !component.is_empty() && *component != "." && *component != "..")
         .fold(base_dir.to_path_buf(), |path, component| {
             path.join(component)
         })
-}
-
-/// Resolve a stored relative path to an absolute path **only when it is a
-/// clean, strict descendant of `base_dir`**.
-///
-/// Every well-formed stored directory (`{project}/commits/{version}/{dir}`
-/// or `{project}/releases/{tag_dir}`) qualifies. The path is rejected
-/// (`None`) when it is empty, or contains any empty / `.` / `..` component —
-/// conditions only reachable from a corrupt or tampered database. Unlike
-/// [`rel_to_abs`], which *neutralizes* such components (fine for read paths,
-/// where a wrong path is just a cache miss), this refuses them so
-/// destructive operations (`delete_build`, `delete_release`, `clean`) never
-/// remove the store root or follow a tampered path into the filesystem — the
-/// bogus record is dropped from the index and its files are left untouched
-/// (reclaimed later by [`crate::ArtifactStore::gc`]).
-pub(crate) fn resolve_within_base(base_dir: &Path, rel: &str) -> Option<PathBuf> {
-    if rel.is_empty() {
-        return None;
-    }
-    let mut path = base_dir.to_path_buf();
-    let mut components = 0usize;
-    for component in rel.split(['/', '\\']) {
-        if component.is_empty() || component == "." || component == ".." {
-            return None;
-        }
-        path.push(component);
-        components += 1;
-    }
-    // At least one component, and (belt and braces) the result must remain
-    // strictly inside the base directory.
-    (components > 0 && path != base_dir && path.starts_with(base_dir)).then_some(path)
 }
 
 // ============================================================================
@@ -571,37 +542,6 @@ mod tests {
                 abs.starts_with(base),
                 "{rel:?} escaped base: {}",
                 abs.display()
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_within_base_accepts_clean_descendants_rejects_tampered() {
-        let base = Path::new("/base");
-        // A well-formed build directory resolves.
-        let rel = build_dir_rel("backwpup", "5.6.0", "a1b2c3d");
-        assert_eq!(
-            resolve_within_base(base, &rel),
-            Some(Path::new("/base/backwpup/commits/5.6.0/a1b2c3d").to_path_buf())
-        );
-        // Any traversal / empty / dot component (only reachable via a
-        // tampered database) is refused outright, so destructive callers
-        // never follow it or remove the store root.
-        for tampered in [
-            "",
-            ".",
-            "..",
-            "../escape",
-            "../../etc/passwd",
-            "a/../../b",
-            "..\\..\\x",
-            "backwpup//commits",
-            "backwpup/./commits",
-        ] {
-            assert_eq!(
-                resolve_within_base(base, tampered),
-                None,
-                "tampered path {tampered:?} must be refused"
             );
         }
     }

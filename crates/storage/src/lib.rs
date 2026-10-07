@@ -26,7 +26,9 @@
 //! - **Hits are verified.** Every find/lookup checks presence + size of the
 //!   files before reporting a hit; damaged entries degrade to a miss and
 //!   are healed by the next store. [`ArtifactStore::verify`] goes deeper on
-//!   demand (up to full SHA-256 re-hashing).
+//!   demand (up to full SHA-256 re-hashing), and [`ArtifactStore::gc_with`]
+//!   at the same depth removes what it reports — including same-size
+//!   corruption, which a lookup cannot see.
 //! - **Corruption is detected and recoverable.** The database runs in WAL
 //!   mode (crash-safe by design) and is integrity-checked on every open; a
 //!   damaged database fails with [`Error::DatabaseCorrupted`] and

@@ -126,6 +126,26 @@ pub(crate) fn upsert_asset(
     .map(|_| ())
 }
 
+/// Whether some release already occupies this relative directory, compared
+/// ASCII-case-insensitively (see [`super::builds::dir_taken`]).
+pub(crate) fn dir_taken(conn: &Connection, dir_rel: &str) -> rusqlite::Result<bool> {
+    conn.prepare_cached("SELECT 1 FROM releases WHERE dir_path = ?1 COLLATE NOCASE LIMIT 1")?
+        .query_row(params![dir_rel], |_| Ok(()))
+        .optional()
+        .map(|found| found.is_some())
+}
+
+/// Delete one asset record of a release by its exact filename.
+pub(crate) fn delete_asset(
+    conn: &Connection,
+    release_id: i64,
+    filename: &str,
+) -> rusqlite::Result<()> {
+    conn.prepare_cached("DELETE FROM release_assets WHERE release_id = ?1 AND filename = ?2")?
+        .execute(params![release_id, filename])
+        .map(|_| ())
+}
+
 /// Asset records of a release, ordered by filename.
 pub(crate) fn assets_for(conn: &Connection, release_id: i64) -> rusqlite::Result<Vec<ArtifactRow>> {
     let mut stmt = conn.prepare_cached(

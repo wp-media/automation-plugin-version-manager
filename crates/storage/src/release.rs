@@ -18,7 +18,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::fsx;
 use crate::lock::StoreLock;
 use crate::paths;
-use crate::store::{ArtifactStore, validate_artifact_inputs};
+use crate::store::{ArtifactStore, case_variants, validate_artifact_inputs};
 use crate::types::{
     ReleaseMetadata, SourceArtifact, StoreReleaseResult, StoredArtifact, StoredRelease,
 };
@@ -38,8 +38,9 @@ impl ArtifactStore {
     /// # Errors
     ///
     /// [`Error::InvalidInput`], [`Error::SourceFileMissing`],
-    /// [`Error::Io`] and [`Error::Database`], with the same semantics as
-    /// [`ArtifactStore::store`].
+    /// [`Error::StaleHandle`], [`Error::Io`] and [`Error::Database`], with
+    /// the same semantics as [`ArtifactStore::store`]. Tags that differ only
+    /// in case get distinct directories.
     pub fn store_release(
         &self,
         metadata: &ReleaseMetadata,
@@ -53,6 +54,7 @@ impl ArtifactStore {
         validate_artifact_inputs(assets)?;
 
         let _lock = StoreLock::acquire(&self.base_dir)?;
+        self.ensure_current()?;
         let now = Utc::now();
 
         // Reuse the existing directory when the release is already cached;
@@ -61,13 +63,10 @@ impl ArtifactStore {
             let conn = self.conn();
             match db::releases::by_tag(&conn, &metadata.project, &metadata.tag)? {
                 Some(row) => (db::releases::assets_for(&conn, row.id)?, row.dir_rel),
-                None => {
-                    let tag_dir = paths::sanitize_tag_dir(&metadata.tag);
-                    (
-                        Vec::new(),
-                        paths::release_dir_rel(&metadata.project, &tag_dir),
-                    )
-                }
+                None => (
+                    Vec::new(),
+                    pick_release_dir(&conn, &metadata.project, &metadata.tag)?,
+                ),
             }
         };
         let dir_abs = paths::rel_to_abs(&self.base_dir, &dir_rel);
@@ -118,6 +117,10 @@ impl ArtifactStore {
             &dir_rel,
             db::to_ms(now),
         )?;
+        let names: Vec<&str> = records.iter().map(|(name, _)| name.as_str()).collect();
+        for filename in case_variants(&known_assets, &names) {
+            db::releases::delete_asset(&tx, release_id, &filename)?;
+        }
         for (filename, digest) in &records {
             db::releases::upsert_asset(
                 &tx,
@@ -198,36 +201,29 @@ impl ArtifactStore {
     ///
     /// # Errors
     ///
+    /// [`Error::StaleHandle`] if this handle's database was replaced.
     /// [`Error::Io`] if the asset directory could not be removed — the
     /// metadata is already gone, so the files are orphans and the next
-    /// [`ArtifactStore::gc`](crate::ArtifactStore::gc) reclaims them.
+    /// [`ArtifactStore::gc`](crate::ArtifactStore::gc) reclaims them. Like
+    /// [`ArtifactStore::delete_build`], it never removes a directory outside
+    /// the store layout, behind a symlink, or still named by another record.
     pub fn delete_release(&self, project: &str, tag: &str) -> Result<bool> {
         paths::validate_project(project)?;
         paths::validate_tag(tag)?;
 
         let _lock = StoreLock::acquire(&self.base_dir)?;
-        let dir_rel = {
+        self.ensure_current()?;
+        let (dir_rel, shared) = {
             let conn = self.conn();
             let Some(row) = db::releases::by_tag(&conn, project, tag)? else {
                 return Ok(false);
             };
             db::releases::delete(&conn, row.id)?;
-            row.dir_rel
+            let shared = db::maintenance::dir_in_use(&conn, &row.dir_rel)?;
+            (row.dir_rel, shared)
         };
-        // Only remove a directory genuinely inside the store; a tampered
-        // `dir_path` is dropped from the index but never followed into a
-        // destructive removal (see `paths::resolve_within_base`).
-        match paths::resolve_within_base(&self.base_dir, &dir_rel) {
-            Some(dir_abs) => {
-                fsx::remove_dir_all_if_exists(&dir_abs)?;
-                if let Some(parent) = dir_abs.parent() {
-                    fsx::remove_empty_parents(parent, &self.base_dir);
-                }
-            }
-            None => tracing::warn!(
-                dir_rel = %dir_rel,
-                "release record had an out-of-store directory; dropped record without removing files"
-            ),
+        if !shared {
+            self.remove_record_dir(&dir_rel)?;
         }
         Ok(true)
     }
@@ -286,4 +282,30 @@ fn assets_healthy(release: &StoredRelease) -> bool {
             .assets
             .iter()
             .all(|asset| fsx::file_size(&asset.path) == Some(asset.size_bytes))
+}
+
+/// Choose the directory of a newly cached release: the sanitized tag, or —
+/// when another release already has that name up to letter case (`v1.0` vs
+/// `V1.0`, one directory on a case-insensitive filesystem) — its first 100
+/// chars plus a hash of the tag, still a valid release directory name.
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] in the astronomically unlikely case that both
+/// names are taken; [`Error::Database`] for SQLite failures.
+fn pick_release_dir(conn: &Connection, project: &str, tag: &str) -> Result<String> {
+    let name = paths::sanitize_tag_dir(tag);
+    let short: String = name.chars().take(100).collect();
+    let alternate = format!("{short}-{}", paths::hash8(&format!("{tag}\ncase")));
+    for candidate in [name, alternate] {
+        let rel = paths::release_dir_rel(project, &candidate);
+        if !db::releases::dir_taken(conn, &rel)? {
+            return Ok(rel);
+        }
+    }
+    Err(Error::invalid(
+        "tag",
+        tag,
+        "its cache directory collides with another release's",
+    ))
 }

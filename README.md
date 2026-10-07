@@ -317,9 +317,9 @@ apvm cache info
 apvm cache clean --dry-run
 apvm cache clean --older-than 30d --project backwpup
 
-# Reconcile with disk, verify integrity, or recover a corrupt database
-apvm cache gc
+# Verify integrity, remove what verify found, or recover a corrupt database
 apvm cache verify --checksum
+apvm cache gc --checksum
 apvm cache repair
 
 # Remove everything

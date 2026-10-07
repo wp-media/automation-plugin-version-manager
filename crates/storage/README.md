@@ -36,8 +36,22 @@ All tables are `STRICT`; deletes cascade; timestamps are epoch milliseconds
   Crashes leave only invisible or orphan files — never a record pointing at
   nothing. `gc()` reclaims orphans in both directions.
 - **Hits are verified.** Finds/lookups check presence + size before
-  reporting a hit; damaged entries degrade to a miss and re-storing heals
-  them. `verify(VerifyMode::Checksum)` re-hashes everything on demand.
+  reporting a hit; such damaged entries degrade to a miss and re-storing
+  heals them. Same-size corruption passes that check: only
+  `verify(VerifyMode::Checksum)` sees it, and `gc_with(VerifyMode::Checksum)`
+  removes it. In general `gc_with(mode)` removes what `verify(mode)` reports —
+  damaged file records, their bad files, and builds/releases left without
+  files — so the next store caches them again; files it cannot read are kept
+  and listed in `GcReport::failures` (`gc()` = `gc_with(VerifyMode::Size)`).
+- **Swapped databases are detectable.** `is_current()` tells a long-lived
+  handle that its database file was renamed aside (a repair's quarantine),
+  deleted or replaced; mutations through such a handle fail with
+  `Error::StaleHandle` instead of updating a database the store no longer
+  uses — open the store again.
+- **Deletes stay inside the store.** `clean`, `gc` and `delete_*` remove only
+  store-shaped directories reached without symlinks, and never a file or
+  directory another record still names up to letter case (case-insensitive
+  filesystems). Entries differing only in case get distinct directories.
 - **Corruption story.** WAL journal + integrity check on every open; a
   damaged database fails with `Error::DatabaseCorrupted` (unreadable rows:
   `Error::Data`), and `ArtifactStore::repair()` quarantines it (an
@@ -119,6 +133,7 @@ fn main() -> apvm_storage::Result<()> {
     // Maintenance.
     store.gc()?;                            // reconcile db ↔ disk, sweep temp files
     store.verify(VerifyMode::Checksum)?;    // deep integrity audit
+    store.gc_with(VerifyMode::Checksum)?;   // …and remove what it reports
     store.integrity_check()?;               // SQLite-level check
     Ok(())
 }

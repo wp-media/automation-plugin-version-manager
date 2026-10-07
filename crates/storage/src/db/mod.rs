@@ -179,9 +179,15 @@ pub(crate) enum OpenMode {
     ExistingOnly,
 }
 
+/// Identity of a database file (device and inode on Unix), recorded when a
+/// connection opens it so a store can later tell whether the file at its
+/// path is still the one it uses.
+pub(crate) type FileId = (u64, u64);
+
 /// Open the store database (creating it only under
 /// [`OpenMode::CreateIfMissing`]): configure pragmas, verify integrity, and
-/// run pending migrations.
+/// run pending migrations. Returns the connection and the identity of the
+/// file it is bound to.
 ///
 /// # Errors
 ///
@@ -197,11 +203,11 @@ pub(crate) fn open(
     busy_timeout_ms: u64,
     full_durability: bool,
     mode: OpenMode,
-) -> Result<Connection> {
-    let mut conn = connect(db_path, mode, busy_timeout_ms, full_durability, &mut || {})?;
+) -> Result<(Connection, FileId)> {
+    let (mut conn, file) = connect(db_path, mode, busy_timeout_ms, full_durability, &mut || {})?;
     quick_check(&conn, db_path)?;
-    migrate(&mut conn)?;
-    Ok(conn)
+    migrate(&mut conn, db_path)?;
+    Ok((conn, file))
 }
 
 /// Orders, within this process, renaming a database file away (repair's
@@ -242,14 +248,14 @@ const CONNECT_ATTEMPTS: usize = 3;
 /// file's identity is taken before opening and again after the first read
 /// (the pragmas), and a connection whose file changed in between is discarded
 /// and opened again. `before_first_read` runs between the two; tests use it
-/// to replace the file.
+/// to replace the file. Returns the connection and that confirmed identity.
 fn connect(
     db_path: &Path,
     mode: OpenMode,
     busy_timeout_ms: u64,
     full_durability: bool,
     before_first_read: &mut dyn FnMut(),
-) -> Result<Connection> {
+) -> Result<(Connection, FileId)> {
     let flags = match mode {
         OpenMode::CreateIfMissing => OpenFlags::default(),
         OpenMode::ExistingOnly => OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE),
@@ -261,9 +267,11 @@ fn connect(
             .map_err(|err| map_corruption(err, db_path))?;
         before_first_read();
         let configured = configure(&conn, busy_timeout_ms, full_durability);
-        if before.is_some() && file_id(db_path) == before {
+        if let Some(file) = before
+            && file_id(db_path) == before
+        {
             return configured
-                .map(|()| conn)
+                .map(|()| (conn, file))
                 .map_err(|err| map_corruption(err, db_path));
         }
     }
@@ -279,7 +287,7 @@ fn connect(
 /// Identity of the file at `path` (device and inode), `None` when there is
 /// none.
 #[cfg(unix)]
-fn file_id(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn file_id(path: &Path) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path)
         .ok()
@@ -290,7 +298,7 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
 /// `FILE_SHARE_DELETE` on Windows, so an open file cannot be renamed and
 /// cannot be replaced mid-open.
 #[cfg(not(unix))]
-fn file_id(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn file_id(path: &Path) -> Option<FileId> {
     path.exists().then_some((0, 0))
 }
 
@@ -389,12 +397,12 @@ pub(crate) fn quick_check(conn: &Connection, db_path: &Path) -> Result<()> {
 /// front: exactly one opener applies the migrations and the rest find them
 /// done. A deferred transaction here would let two openers both run the DDL
 /// ("table already exists") or fail upgrading their read lock.
-fn migrate(conn: &mut Connection) -> Result<()> {
-    if supported_version(conn)? == SCHEMA_VERSION {
+fn migrate(conn: &mut Connection, db_path: &Path) -> Result<()> {
+    if supported_version(conn, db_path)? == SCHEMA_VERSION {
         return Ok(());
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current = supported_version(&tx)?;
+    let current = supported_version(&tx, db_path)?;
     for version in current..SCHEMA_VERSION {
         let ddl = usize::try_from(version)
             .ok()
@@ -411,10 +419,17 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// The database's `user_version`, or [`Error::UnsupportedSchema`] when it
-/// is newer than this build understands.
-fn supported_version(conn: &Connection) -> Result<i64> {
+/// The database's `user_version`; [`Error::UnsupportedSchema`] when it is
+/// newer than this build understands, [`Error::DatabaseCorrupted`] when it
+/// is negative — no apvm writes that, so repair should replace the file.
+fn supported_version(conn: &Connection, db_path: &Path) -> Result<i64> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current < 0 {
+        return Err(Error::DatabaseCorrupted {
+            path: db_path.to_path_buf(),
+            details: format!("invalid schema version {current}"),
+        });
+    }
     if current > SCHEMA_VERSION {
         return Err(Error::UnsupportedSchema {
             found: current,
@@ -479,7 +494,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("apvm.db");
 
-        let conn = open(&path, 100, false, OpenMode::CreateIfMissing).unwrap();
+        let (conn, _) = open(&path, 100, false, OpenMode::CreateIfMissing).unwrap();
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
@@ -495,7 +510,7 @@ mod tests {
         drop(conn);
 
         // Reopening an initialized database is a no-op.
-        let conn = open(&path, 100, false, OpenMode::CreateIfMissing).unwrap();
+        let (conn, _) = open(&path, 100, false, OpenMode::CreateIfMissing).unwrap();
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
@@ -536,7 +551,7 @@ mod tests {
                 let outcome = handle.join().expect("opener thread panicked");
                 assert!(outcome.is_ok(), "round {round}: {outcome:?}");
             }
-            let conn = open(&path, 5_000, false, OpenMode::ExistingOnly).unwrap();
+            let (conn, _) = open(&path, 5_000, false, OpenMode::ExistingOnly).unwrap();
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
@@ -565,7 +580,7 @@ mod tests {
             rival.execute_batch("COMMIT").unwrap();
         });
 
-        let conn = open(&path, 5_000, false, OpenMode::CreateIfMissing).unwrap();
+        let (conn, _) = open(&path, 5_000, false, OpenMode::CreateIfMissing).unwrap();
         release.join().expect("releasing thread panicked");
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -616,7 +631,7 @@ mod tests {
             .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE old (x);")
             .unwrap();
         let mut calls = 0;
-        let conn = connect(&path, OpenMode::ExistingOnly, 1_000, false, &mut || {
+        let (conn, file) = connect(&path, OpenMode::ExistingOnly, 1_000, false, &mut || {
             calls += 1;
             if calls == 1 {
                 replace_database(&path, "new");
@@ -624,6 +639,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(calls, 2);
+        assert_eq!(Some(file), file_id(&path), "the identity is the new file's");
         let tables: String = conn
             .query_row(
                 "SELECT group_concat(name) FROM sqlite_master WHERE type = 'table'",
@@ -660,7 +676,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("apvm.db");
         let mut calls = 0;
-        let conn = connect(&path, OpenMode::CreateIfMissing, 1_000, false, &mut || {
+        let (conn, _) = connect(&path, OpenMode::CreateIfMissing, 1_000, false, &mut || {
             calls += 1;
             if calls == 1 {
                 std::fs::rename(&path, dir.path().join("moved.db")).unwrap();
@@ -716,6 +732,22 @@ mod tests {
         }
         let err = open(&path, 100, false, OpenMode::CreateIfMissing).unwrap_err();
         assert!(matches!(err, Error::UnsupportedSchema { found: 999, .. }));
+    }
+
+    #[test]
+    fn a_negative_schema_version_is_corruption_not_a_dead_end() {
+        // Audit: it failed open and repair alike with `Data`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apvm.db");
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", -1)
+            .unwrap();
+        let err = open(&path, 100, false, OpenMode::CreateIfMissing).unwrap_err();
+        assert!(
+            matches!(&err, Error::DatabaseCorrupted { details, .. } if details == "invalid schema version -1"),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ The core library for the **Automation Plugin Version Manager**. This crate conta
 Design principles:
 
 - **Core builds artifacts** — handles git, builds, version detection
-- **Caching is built in** — with `Config::cache_enabled` (the default), builds and release downloads are served from and stored to the [`apvm-storage`](../storage/) cache at `Config::cache_dir`; cache failures always degrade to a normal build, never an error
+- **Caching is built in** — with `Config::cache_enabled` (the default), builds and release downloads are served from and stored to the [`apvm-storage`](../storage/) cache at `Config::cache_dir`; cache failures always degrade to a normal build, never an error — and an unusable cache is reported (see [Cache status](#cache-status))
 - **No default paths** — consumers supply the cache directory (the CLI and Node bindings default to `~/.apvm/cache`)
 
 ## Quick Start
@@ -374,6 +374,11 @@ client) and ignores `cache_enabled`.
   rows: `Data`) comes back inside `Error::Storage` for each front end to
   annotate. `repair()` is the remedy — it also rebuilds a lost database — and
   a no-op on a healthy one.
+- **`gc(mode)` removes what `verify(mode)` reports:** records whose files are
+  missing or the wrong size (`VerifyMode::Checksum`: also the wrong content),
+  with the bad files; builds left without files go too, and the next build
+  caches them again. Files it cannot read are kept and listed in
+  `GcReport::failures`.
 
 The storage types it takes and returns (`CleanTarget`, `VerifyMode`, the
 report types, `StoreState`, …) are re-exported from `maintenance`, so
@@ -392,9 +397,32 @@ match cache.clean(&request)? {
     None => println!("nothing has been cached yet"),
 }
 let issues = cache.verify(VerifyMode::Checksum)?;       // Option<Vec<VerifyIssue>>
+let report = cache.gc(VerifyMode::Checksum)?;           // …removes what verify found
 ```
 
 All I/O is blocking; from async code, call it inside `spawn_blocking`.
+
+## Cache Status
+
+Builds never fail because of the cache, but they no longer skip it silently.
+`Apvm::cache_status()` returns a `CacheStatus`:
+
+| Status | Meaning |
+|---|---|
+| `Active` | Caching is on and the cache is open |
+| `Disabled` | `Config::cache_enabled` is `false` |
+| `Corrupted { details }` | The database is corrupt, or lost while cached builds remain — `repair()` fixes it |
+| `Unavailable { details }` | Anything else: the directory can't be created, holds someone else's data, or has a newer apvm's database |
+
+Every `build` / `warm_cache` (and `cache_status` call) checks the cache
+again. If nothing is open, it opens the cache, which picks up a cache that
+another front end or process has since repaired. If a cache is open but its
+database was renamed aside by a repair, deleted or replaced, it opens it
+again. While caching is on but the cache is `Corrupted` or `Unavailable`,
+each build emits exactly one `BuildEvent::Warning` with the reason (and, for
+`Corrupted`, the remedy) and runs uncached. `cache_active()` is
+`cache_status().is_active()`. `cache_status()` is blocking; from async code,
+call it inside `spawn_blocking`.
 
 ## Configuration I/O
 

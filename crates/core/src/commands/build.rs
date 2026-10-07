@@ -6,6 +6,7 @@
 use crate::build::plugins::{VersionOverride, VersionRequirement};
 use crate::build::progress::{BuildEvent, BuildPhase, BuildStep, ProgressReporter};
 use crate::build::{ArtifactOrigin, BuildResult, BuildRunner, ProducedArtifact};
+use crate::cache_status::CacheStatus;
 use crate::commands::cache;
 use crate::error::{Error, Result};
 use crate::git::{BuildWorkspace, RefResolver, RefSource, RemoteGit, ResolvedRef};
@@ -667,6 +668,9 @@ pub struct BuildCommand<'a> {
     /// (store unavailable or caching disabled by config). Held as an `Arc`
     /// so it can be cloned into `spawn_blocking` closures for cache I/O.
     store: Option<Arc<ArtifactStore>>,
+    /// Why `store` is what it is, when the caller knows (see
+    /// [`BuildCommand::with_cache_status`]).
+    cache_status: Option<CacheStatus>,
 }
 
 impl<'a> BuildCommand<'a> {
@@ -685,13 +689,47 @@ impl<'a> BuildCommand<'a> {
             registry,
             config,
             store,
+            cache_status: None,
         }
+    }
+
+    /// Record why the cache is (un)available, so [`BuildCommand::execute`]
+    /// can say so: when caching is on but the cache is unusable
+    /// ([`CacheStatus::Corrupted`] / [`CacheStatus::Unavailable`]), it emits
+    /// one [`BuildEvent::Warning`] with the reason and the remedy instead of
+    /// building uncached in silence. [`crate::Apvm`] always sets it.
+    #[must_use]
+    pub fn with_cache_status(mut self, status: CacheStatus) -> Self {
+        self.cache_status = Some(status);
+        self
     }
 
     /// Whether the cache should be consulted for this request: a store is
     /// available and the caller did not pass `--no-cache`.
     fn caching_enabled(&self, request: &BuildRequest) -> bool {
         self.store.is_some() && !request.no_cache
+    }
+
+    /// Report, once, that this run will not use the cache when the caller
+    /// should know: caching is on but the cache is unusable (any run), or
+    /// warming was requested without a cache. The pipeline still runs to
+    /// completion either way.
+    fn warn_if_uncached(&self, reporter: &dyn ProgressReporter, warm_cache: bool) {
+        let unusable = self
+            .cache_status
+            .as_ref()
+            .and_then(|status| status.warning(&self.config.cache_dir));
+        if let Some(warning) = unusable {
+            reporter.report(&BuildEvent::Warning(warning));
+        } else if warm_cache && self.store.is_none() {
+            // Warming needs a cache to warm: without one it populates
+            // nothing, so the caller must not think the cache is now primed.
+            reporter.report(&BuildEvent::Warning(
+                "cache warming was requested, but the artifact cache is disabled or unavailable; \
+                 nothing will be cached"
+                    .to_string(),
+            ));
+        }
     }
 
     /// Execute the build described by `request`, with automatic ref detection.
@@ -757,17 +795,7 @@ impl<'a> BuildCommand<'a> {
             });
         }
 
-        // Warming needs a cache to warm. If the store is unavailable (disabled
-        // by config, or it could not be opened) the pipeline still runs to
-        // completion but populates nothing — warn so the caller isn't misled
-        // into thinking the cache is now primed.
-        if warm_cache && self.store.is_none() {
-            reporter.report(&BuildEvent::Warning(
-                "cache warming was requested, but the artifact cache is disabled or unavailable; \
-                 nothing will be cached"
-                    .to_string(),
-            ));
-        }
+        self.warn_if_uncached(reporter, warm_cache);
 
         // 3. Early-resolve GitHub refs that don't need a local repo (PRs,
         // releases, version-as-release). See `try_early_resolve_github_ref`.
@@ -1281,6 +1309,7 @@ impl<'a> BuildCommand<'a> {
                 store,
                 output.to_build_metadata(&request.project),
                 output.to_source_artifacts(),
+                reporter,
             )
             .await;
             if warm_cache && let Some(stored) = stored {
@@ -1935,7 +1964,7 @@ impl<'a> BuildCommand<'a> {
                     target_name: a.filename.clone(),
                 })
                 .collect();
-            let stored = cache::store_release(store, metadata, assets).await;
+            let stored = cache::store_release(store, metadata, assets, reporter).await;
             if warm_cache && let Some(stored) = stored {
                 repoint_to_cache(&mut output.result.artifacts, &stored.assets);
             }
@@ -2220,6 +2249,80 @@ mod tests {
         assert_eq!(output.result.artifacts[0].origin, ArtifactOrigin::Cache);
         assert_eq!(output.result.version, "1.0.0");
         assert!(out.path().join("plugin.zip").is_file());
+    }
+
+    /// The warnings `warn_if_uncached` emits for a command over `store`
+    /// with `status`, in a build (`warm == false`) or a warm.
+    async fn uncached_warnings(
+        store: Option<Arc<ArtifactStore>>,
+        status: Option<CacheStatus>,
+        warm: bool,
+    ) -> Vec<String> {
+        let cache = TempDir::new().unwrap();
+        let registry = ProjectRegistry::new();
+        let config = Config::new(cache.path().join("cache"));
+        let github = GitHubClient::anonymous().unwrap();
+        let mut cmd = BuildCommand::new(&github, &registry, &config, store);
+        if let Some(status) = status {
+            cmd = cmd.with_cache_status(status);
+        }
+        let warnings = std::sync::Mutex::new(Vec::new());
+        let reporter = crate::ClosureReporter::new(|event| {
+            if let BuildEvent::Warning(message) = event {
+                warnings.lock().unwrap().push(message.clone());
+            }
+        });
+        cmd.warn_if_uncached(&reporter, warm);
+        warnings.into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unusable_cache_warns_once_with_its_reason_in_builds_and_warms() {
+        let corrupted = || CacheStatus::Corrupted {
+            details: "file is not a database".to_string(),
+        };
+        for warm in [false, true] {
+            let warnings = uncached_warnings(None, Some(corrupted()), warm).await;
+            assert_eq!(warnings.len(), 1, "warm={warm}: {warnings:?}");
+            assert!(warnings[0].contains("needs repair: file is not a database"));
+            assert!(warnings[0].contains("`apvm cache repair`"));
+
+            let unavailable = CacheStatus::Unavailable {
+                details: "denied".to_string(),
+            };
+            let warnings = uncached_warnings(None, Some(unavailable), warm).await;
+            assert_eq!(warnings.len(), 1, "warm={warm}: {warnings:?}");
+            assert!(warnings[0].contains("is unavailable: denied"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_or_unknown_cache_keeps_the_generic_warm_warning_only() {
+        let generic = "cache warming was requested, but the artifact cache is disabled or \
+                       unavailable; nothing will be cached";
+        for status in [Some(CacheStatus::Disabled), None] {
+            assert_eq!(
+                uncached_warnings(None, status.clone(), true).await,
+                [generic],
+                "{status:?}"
+            );
+            assert!(
+                uncached_warnings(None, status.clone(), false)
+                    .await
+                    .is_empty(),
+                "a build with caching off is not news: {status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_active_cache_does_not_warn() {
+        let (_cache, store) = seed_single_output("test", "1.0.0");
+        for warm in [false, true] {
+            let warnings =
+                uncached_warnings(Some(Arc::clone(&store)), Some(CacheStatus::Active), warm).await;
+            assert!(warnings.is_empty(), "warm={warm}: {warnings:?}");
+        }
     }
 
     /// Guard wiring, not just the predicate: `resolve_version` must refuse a

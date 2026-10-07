@@ -125,6 +125,20 @@ pub(crate) fn file_size(path: &Path) -> Option<u64> {
         .map(|meta| meta.len())
 }
 
+/// Like [`file_size`], but tells "nothing usable there" from "cannot look":
+/// `Ok(Some(size))` for a regular file, `Ok(None)` when nothing exists at
+/// `path` or it is not a regular file, and the error when it cannot be
+/// inspected (e.g. permission denied) — so a check never reports a file it
+/// could not see as missing.
+pub(crate) fn probe_file(path: &Path) -> std::io::Result<Option<u64>> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(Some(meta.len())),
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// Remove a directory tree; a missing directory is success.
 pub(crate) fn remove_dir_all_if_exists(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
@@ -269,6 +283,23 @@ mod tests {
             0
         );
         assert!(fresh.exists());
+    }
+
+    #[test]
+    fn probe_file_tells_missing_from_uninspectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.zip");
+        std::fs::write(&file, b"abc").unwrap();
+        assert_eq!(probe_file(&file).unwrap(), Some(3));
+        assert_eq!(probe_file(&dir.path().join("none")).unwrap(), None);
+        assert_eq!(
+            probe_file(dir.path()).unwrap(),
+            None,
+            "a directory is no file"
+        );
+        // Below a regular file: ENOTDIR on Unix — an error, not "missing".
+        #[cfg(unix)]
+        assert!(probe_file(&file.join("x")).is_err());
     }
 
     #[test]

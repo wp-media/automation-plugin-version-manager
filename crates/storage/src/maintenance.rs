@@ -163,19 +163,33 @@ pub struct CleanReport {
     pub failures: Vec<String>,
 }
 
-/// Outcome of [`ArtifactStore::gc`].
+/// Outcome of [`ArtifactStore::gc_with`] (and [`ArtifactStore::gc`]).
 #[derive(Debug, Clone, Default)]
 pub struct GcReport {
-    /// Build records dropped because their directory no longer exists.
+    /// Build records dropped because their directory no longer exists, or
+    /// because none of their files survived (see `damaged_artifacts`).
     pub stale_build_rows: u64,
-    /// Release records dropped because their directory no longer exists.
+    /// Release records dropped for the same reasons.
     pub stale_release_rows: u64,
-    /// Orphan directories (files with no record) removed.
+    /// Orphan directories (files with no record) removed — including those
+    /// of builds and releases dropped by this run.
     pub orphan_dirs_removed: u64,
     /// Bytes reclaimed from orphan directories.
     pub orphan_bytes_removed: u64,
     /// Stale temporary files swept.
     pub stale_temp_files_removed: u64,
+    /// File records (artifacts and release assets) dropped as damaged: the
+    /// file was missing, had the wrong size or — in
+    /// [`VerifyMode::Checksum`] — the wrong content, or the record's size
+    /// could not be read back.
+    pub damaged_artifacts: u64,
+    /// Bytes of damaged files deleted from disk.
+    pub damaged_bytes_removed: u64,
+    /// What gc left in place, one line each: files and directories it could
+    /// not read or inspect (their records kept), files or directories it
+    /// failed to delete, and damaged records outside the store layout or
+    /// behind a symlink (dropped, their files untouched).
+    pub failures: Vec<String>,
 }
 
 /// How deeply [`ArtifactStore::verify`] inspects stored files.
@@ -332,9 +346,13 @@ impl ArtifactStore {
     /// # Errors
     ///
     /// [`crate::Error::InvalidInput`] for a malformed project filter,
-    /// [`crate::Error::Database`] for SQLite failures. Directory-removal
-    /// failures are collected in [`CleanReport::failures`], not returned as
-    /// errors, so one stubborn directory cannot abort the rest.
+    /// [`crate::Error::StaleHandle`] when this handle's database was replaced
+    /// (not for a dry run), [`crate::Error::Database`] for SQLite failures.
+    /// Directory-removal failures — and directories outside the store
+    /// layout or behind a symlink, which are never removed — are collected in
+    /// [`CleanReport::failures`], not returned as errors, so one stubborn
+    /// directory cannot abort the rest. A directory another record still
+    /// names up to letter case is kept silently: its files are still in use.
     pub fn clean(&self, options: &CleanOptions) -> Result<CleanReport> {
         options.validate()?;
         let older_ms = options.older_than.map(db::to_ms);
@@ -347,7 +365,9 @@ impl ArtifactStore {
         let lock = if options.dry_run {
             None
         } else {
-            Some(StoreLock::acquire(&self.base_dir)?)
+            let lock = StoreLock::acquire(&self.base_dir)?;
+            self.ensure_current()?;
+            Some(lock)
         };
 
         let (build_victims, release_victims) = {
@@ -377,7 +397,7 @@ impl ArtifactStore {
             return Ok(report);
         }
 
-        {
+        let shared = {
             let mut conn = self.conn();
             let tx = conn.transaction()?;
             for victim in &build_victims {
@@ -386,23 +406,36 @@ impl ArtifactStore {
             for victim in &release_victims {
                 db::releases::delete(&tx, victim.id)?;
             }
+            // A directory another record still uses (same path up to case:
+            // one directory on a case-insensitive filesystem) must stay.
+            let mut shared = HashSet::new();
+            for victim in build_victims.iter().chain(&release_victims) {
+                if db::maintenance::dir_in_use(&tx, &victim.dir_rel)? {
+                    shared.insert(victim.dir_rel.clone());
+                }
+            }
             tx.commit()?;
-        }
+            shared
+        };
 
         for victim in build_victims.iter().chain(release_victims.iter()) {
-            // A tampered `dir_path` that escapes the store is dropped from
-            // the index (already done above) but never removed from disk.
-            let Some(dir) = paths::resolve_within_base(&self.base_dir, &victim.dir_rel) else {
+            let bytes = u64::try_from(victim.bytes).unwrap_or(0);
+            if shared.contains(&victim.dir_rel) {
+                report.bytes_freed = report.bytes_freed.saturating_sub(bytes);
+                continue;
+            }
+            // A tampered or symlinked `dir_path` is dropped from the index
+            // (already done above) but never removed from disk.
+            let Some(dir) = layout::owned_dir(&self.base_dir, &victim.dir_rel) else {
                 tracing::warn!(
                     dir_rel = %victim.dir_rel,
-                    "record had an out-of-store directory; dropped record without removing files"
+                    "record directory is outside the store layout or behind a symlink; left on disk"
                 );
-                report
-                    .failures
-                    .push(format!("{}: out-of-store directory", victim.dir_rel));
-                report.bytes_freed = report
-                    .bytes_freed
-                    .saturating_sub(u64::try_from(victim.bytes).unwrap_or(0));
+                report.failures.push(format!(
+                    "{}: outside the store layout or behind a symlink; left on disk (remove it by hand)",
+                    victim.dir_rel
+                ));
+                report.bytes_freed = report.bytes_freed.saturating_sub(bytes);
                 continue;
             };
             match fsx::remove_dir_all_if_exists(&dir) {
@@ -413,12 +446,10 @@ impl ArtifactStore {
                 }
                 Err(err) => {
                     tracing::warn!(dir = %dir.display(), error = %err, "failed to remove directory");
-                    report.failures.push(format!("{}: {err}", dir.display()));
+                    report.failures.push(err.detail());
                     // The record is gone but the bytes are still on disk
                     // (orphans until the next gc) — keep the report honest.
-                    report.bytes_freed = report
-                        .bytes_freed
-                        .saturating_sub(u64::try_from(victim.bytes).unwrap_or(0));
+                    report.bytes_freed = report.bytes_freed.saturating_sub(bytes);
                 }
             }
         }
@@ -438,43 +469,71 @@ impl ArtifactStore {
         self.clean(&CleanOptions::default().older_than(cutoff))
     }
 
-    /// Reconcile the database with the disk, in both directions:
+    /// Reconcile the database with the disk at the default depth:
+    /// equivalent to [`gc_with(VerifyMode::Size)`](ArtifactStore::gc_with).
     ///
-    /// 1. records whose directory vanished are dropped;
-    /// 2. directories in managed locations with no record are removed
-    ///    (reclaiming their bytes);
-    /// 3. stale `.apvm-tmp-*` crash leftovers are swept.
+    /// # Errors
     ///
-    /// Unrecognized entries outside the managed layout are deliberately
-    /// left untouched.
+    /// As for [`ArtifactStore::gc_with`].
     pub fn gc(&self) -> Result<GcReport> {
+        self.gc_with(VerifyMode::Size)
+    }
+
+    /// Reconcile the database with the disk, in both directions, removing
+    /// what [`verify`](ArtifactStore::verify) at the same `mode` reports:
+    ///
+    /// 1. records whose directory is gone are dropped;
+    /// 2. damaged files are deleted, then their records dropped: the file is
+    ///    missing, has the wrong size or — with [`VerifyMode::Checksum`] —
+    ///    the wrong content, or the record's size cannot be read back. A
+    ///    build or release left without files (or that never had any) loses
+    ///    its record too;
+    /// 3. directories in managed locations with no record are removed
+    ///    (reclaiming their bytes), including those of step 2;
+    /// 4. stale `.apvm-tmp-*` crash leftovers are swept.
+    ///
+    /// The next store of a dropped entry caches it again. A damaged file's
+    /// record goes only once the file is gone, so one gc fails to delete
+    /// stays visible to the next verify and gc. Nothing is deleted outside
+    /// the store layout, through a symlink, or that another record still
+    /// names up to letter case (one file or directory on a case-insensitive
+    /// filesystem). What gc leaves in place — unreadable files and
+    /// directories, failed deletions — is listed in [`GcReport::failures`].
+    /// `Checksum` mode hashes every file first without the store lock (like
+    /// `verify`), then re-checks only the suspects under it, so stores are
+    /// not blocked for the whole pass.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Io`] when the store lock cannot be taken,
+    /// [`crate::Error::StaleHandle`] when this handle's database was
+    /// replaced, [`crate::Error::Database`] for SQLite failures.
+    pub fn gc_with(&self, mode: VerifyMode) -> Result<GcReport> {
+        let suspects = match mode {
+            VerifyMode::Checksum => self.checksum_suspects()?,
+            VerifyMode::Presence | VerifyMode::Size => HashSet::new(),
+        };
         let _lock = StoreLock::acquire(&self.base_dir)?;
+        self.ensure_current()?;
         let mut report = GcReport::default();
-        let live = self.gc_reconcile_rows(&mut report)?;
+        let live = self.gc_reconcile_rows(mode, &suspects, &mut report)?;
         self.gc_sweep_disk(&live, &mut report);
         Ok(report)
     }
 
     /// Check every stored file at the requested depth and report problems.
-    /// Read-only: issues are reported, never auto-deleted. `Checksum` mode
-    /// re-hashes every file — thorough but I/O-proportional.
+    /// Read-only: issues are reported, never deleted —
+    /// [`gc_with`](ArtifactStore::gc_with) at the same depth removes them.
+    /// `Checksum` mode re-hashes every file — thorough but I/O-proportional.
     pub fn verify(&self, mode: VerifyMode) -> Result<Vec<VerifyIssue>> {
-        let (build_files, release_files) = {
-            let conn = self.conn();
-            (
-                db::maintenance::build_files(&conn)?,
-                db::maintenance::release_files(&conn)?,
-            )
-        };
-
         let mut issues = Vec::new();
-        for record in build_files.iter().chain(release_files.iter()) {
-            let path = paths::rel_to_abs(&self.base_dir, &record.dir_rel).join(&record.filename);
+        for record in self.file_records()? {
+            let path = self.record_path(&record);
             if let Some(problem) = check_file(mode, &path, record.size_bytes, &record.sha256) {
                 issues.push(VerifyIssue {
                     project: record.project.clone(),
-                    context: record_context(record),
-                    filename: record.filename.clone(),
+                    context: record_context(&record),
+                    filename: record.filename,
                     path,
                     problem,
                 });
@@ -523,7 +582,7 @@ impl ArtifactStore {
     /// fails. [`crate::Error::UnsupportedSchema`] is passed through
     /// untouched — a newer schema is not corruption.
     pub fn repair(base_dir: impl Into<PathBuf>) -> Result<(Self, RepairReport)> {
-        let base_dir: PathBuf = base_dir.into();
+        let base_dir = crate::store::absolute(base_dir.into())?;
         // Refuse before creating anything, then classify again under the
         // lock, where the answer is authoritative.
         refuse_foreign(&base_dir, layout::inspect(&base_dir)?)?;
@@ -623,13 +682,13 @@ impl ArtifactStore {
     fn open_locked(base_dir: &Path) -> Result<Self> {
         let db_path = base_dir.join(paths::DB_FILE_NAME);
         let options = StoreOptions::default();
-        let conn = db::open(
+        let (conn, file) = db::open(
             &db_path,
             options.busy_timeout_ms(),
             options.full_durability,
             db::OpenMode::CreateIfMissing,
         )?;
-        Ok(Self::from_parts(base_dir, db_path, conn))
+        Ok(Self::from_parts(base_dir, db_path, conn, file))
     }
 
     /// Read every stored record back the way lookups and reports do, so
@@ -661,42 +720,207 @@ impl ArtifactStore {
             .sum()
     }
 
-    /// Drop records whose directory vanished; return the surviving
-    /// (relative) directory set for the disk sweep.
-    fn gc_reconcile_rows(&self, report: &mut GcReport) -> Result<HashSet<String>> {
+    /// Every stored file record: build artifacts, then release assets.
+    fn file_records(&self) -> Result<Vec<db::maintenance::FileRecord>> {
+        let conn = self.conn();
+        let mut records = db::maintenance::build_files(&conn)?;
+        records.extend(db::maintenance::release_files(&conn)?);
+        Ok(records)
+    }
+
+    /// Where a record's file is read from (verify and gc agree on it).
+    fn record_path(&self, record: &db::maintenance::FileRecord) -> PathBuf {
+        paths::rel_to_abs(&self.base_dir, &record.dir_rel).join(&record.filename)
+    }
+
+    /// The records a checksum pass flags, found without the store lock:
+    /// the only files [`Self::gc_with`] re-hashes while holding it.
+    fn checksum_suspects(&self) -> Result<HashSet<FileKey>> {
+        Ok(self
+            .file_records()?
+            .iter()
+            .filter(|record| {
+                let path = self.record_path(record);
+                check_file(
+                    VerifyMode::Checksum,
+                    &path,
+                    record.size_bytes,
+                    &record.sha256,
+                )
+                .is_some()
+            })
+            .map(|record| (record.kind, record.id))
+            .collect())
+    }
+
+    /// Steps 1–2 of [`Self::gc_with`]: delete the damaged files, then drop
+    /// stale and damaged records in one transaction. Returns the directories
+    /// still recorded, ASCII-lowercased, for the disk sweep. The caller holds
+    /// the store lock.
+    fn gc_reconcile_rows(
+        &self,
+        mode: VerifyMode,
+        suspects: &HashSet<FileKey>,
+        report: &mut GcReport,
+    ) -> Result<HashSet<String>> {
+        let rows = self.gc_stale_rows(report)?;
+        let damaged = self.gc_damaged_files(mode, suspects, &rows, report)?;
+        // Files go first here: their records already point at bad data, and
+        // a record is dropped only once its file is gone, so a file that
+        // cannot be deleted stays visible to the next verify and gc.
+        let dropped: Vec<FileKey> = damaged
+            .iter()
+            .filter(|file| gc_delete_damaged(file, report))
+            .map(|file| file.key)
+            .collect();
+        let (emptied_builds, emptied_releases) = self.gc_commit(&rows, &dropped)?;
+
+        report.stale_build_rows = (rows.builds.len() + emptied_builds.len()) as u64;
+        report.stale_release_rows = (rows.releases.len() + emptied_releases.len()) as u64;
+        report.damaged_artifacts = dropped.len() as u64;
+        let conn = self.conn();
+        Ok(db::maintenance::all_dirs(&conn)?
+            .iter()
+            .map(|dir| dir.to_ascii_lowercase())
+            .collect())
+    }
+
+    /// Records whose directory is gone, and those still present. A
+    /// directory that cannot be inspected is not gone: its records stay,
+    /// its files are not judged, and the reason is listed in
+    /// `report.failures`.
+    fn gc_stale_rows(&self, report: &mut GcReport) -> Result<StaleRows> {
+        let conn = self.conn();
+        let mut rows = StaleRows::default();
+        let builds = db::builds::all_dirs(&conn)?
+            .into_iter()
+            .map(|row| (true, row));
+        let releases = db::releases::all_dirs(&conn)?
+            .into_iter()
+            .map(|row| (false, row));
+        for (is_build, (id, dir_rel)) in builds.chain(releases) {
+            let path = paths::rel_to_abs(&self.base_dir, &dir_rel);
+            match fs::metadata(&path) {
+                Ok(meta) if meta.is_dir() => {
+                    rows.live.insert(dir_rel);
+                }
+                Err(err)
+                    if !matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    report
+                        .failures
+                        .push(format!("cannot inspect {}: {err}", path.display()));
+                    rows.blocked.insert(dir_rel);
+                }
+                _ if is_build => rows.builds.push(id),
+                _ => rows.releases.push(id),
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Check the files of present directories as `verify` at `mode` would —
+    /// hashing only `suspects` — and return the damaged ones. Files that
+    /// cannot be read are kept and listed in `report.failures`.
+    fn gc_damaged_files(
+        &self,
+        mode: VerifyMode,
+        suspects: &HashSet<FileKey>,
+        rows: &StaleRows,
+        report: &mut GcReport,
+    ) -> Result<Vec<DamagedFile>> {
+        let mut damaged = Vec::new();
+        let mut kept: HashSet<String> = HashSet::new();
+        for record in self.file_records()? {
+            if !rows.live.contains(&record.dir_rel) {
+                continue; // dropped with its whole record, or not judged
+            }
+            let depth = match mode {
+                VerifyMode::Checksum if !suspects.contains(&(record.kind, record.id)) => {
+                    VerifyMode::Size
+                }
+                other => other,
+            };
+            let path = self.record_path(&record);
+            match gc_verdict(depth, &path, &record) {
+                GcVerdict::Keep => {
+                    kept.insert(file_identity(&record));
+                }
+                // The details name the file ("failed to open <path>: …").
+                GcVerdict::Unreadable(details) => {
+                    kept.insert(file_identity(&record));
+                    report.failures.push(details);
+                }
+                GcVerdict::Drop { delete_file } => {
+                    damaged.push(self.damaged_file(&record, delete_file, report));
+                }
+            }
+        }
+        // A file a kept record also names (same path up to case: one file on
+        // a case-insensitive filesystem) belongs to that record and stays.
+        for file in &mut damaged {
+            if kept.contains(&file.identity) {
+                file.delete = None;
+            }
+        }
+        Ok(damaged)
+    }
+
+    /// A record to drop; its file is deleted only when `delete_file` and the
+    /// record names a file in a store-produced directory reached without
+    /// symlinks ([`layout::owned_dir`]).
+    fn damaged_file(
+        &self,
+        record: &db::maintenance::FileRecord,
+        delete_file: bool,
+        report: &mut GcReport,
+    ) -> DamagedFile {
+        let mut delete = None;
+        if delete_file {
+            delete = layout::owned_dir(&self.base_dir, &record.dir_rel)
+                .filter(|_| paths::validate_filename(&record.filename).is_ok())
+                .map(|dir| dir.join(&record.filename));
+            if delete.is_none() {
+                report.failures.push(format!(
+                    "{}/{}: outside the store layout or behind a symlink; dropped the record, \
+                     left the file",
+                    record.dir_rel, record.filename
+                ));
+            }
+        }
+        DamagedFile {
+            key: (record.kind, record.id),
+            identity: file_identity(record),
+            delete,
+        }
+    }
+
+    /// Drop stale rows and the `dropped` file records, then every build or
+    /// release left without files, in one transaction. Returns the
+    /// directories of the emptied builds and releases.
+    fn gc_commit(
+        &self,
+        rows: &StaleRows,
+        dropped: &[FileKey],
+    ) -> Result<(Vec<String>, Vec<String>)> {
         let mut conn = self.conn();
-        let mut live: HashSet<String> = HashSet::new();
-        let mut stale_builds: Vec<i64> = Vec::new();
-        let mut stale_releases: Vec<i64> = Vec::new();
-
-        for (id, dir_rel) in db::builds::all_dirs(&conn)? {
-            if paths::rel_to_abs(&self.base_dir, &dir_rel).is_dir() {
-                live.insert(dir_rel);
-            } else {
-                stale_builds.push(id);
-            }
+        let tx = conn.transaction()?;
+        for id in &rows.builds {
+            db::builds::delete(&tx, *id)?;
         }
-        for (id, dir_rel) in db::releases::all_dirs(&conn)? {
-            if paths::rel_to_abs(&self.base_dir, &dir_rel).is_dir() {
-                live.insert(dir_rel);
-            } else {
-                stale_releases.push(id);
-            }
+        for id in &rows.releases {
+            db::releases::delete(&tx, *id)?;
         }
-
-        if !stale_builds.is_empty() || !stale_releases.is_empty() {
-            let tx = conn.transaction()?;
-            for id in &stale_builds {
-                db::builds::delete(&tx, *id)?;
-            }
-            for id in &stale_releases {
-                db::releases::delete(&tx, *id)?;
-            }
-            tx.commit()?;
+        for (kind, id) in dropped {
+            db::maintenance::delete_file(&tx, *kind, *id)?;
         }
-        report.stale_build_rows = stale_builds.len() as u64;
-        report.stale_release_rows = stale_releases.len() as u64;
-        Ok(live)
+        let builds = db::maintenance::drop_empty_builds(&tx)?;
+        let releases = db::maintenance::drop_empty_releases(&tx)?;
+        tx.commit()?;
+        Ok((builds, releases))
     }
 
     /// Remove unrecorded directories at managed depths and sweep stale temp
@@ -785,7 +1009,7 @@ impl ArtifactStore {
     /// Handle one leaf directory: sweep temps when recorded, remove it when
     /// orphaned.
     fn gc_visit_leaf(&self, path: &Path, rel: &str, live: &HashSet<String>, report: &mut GcReport) {
-        if live.contains(rel) {
+        if live.contains(&rel.to_ascii_lowercase()) {
             report.stale_temp_files_removed += fsx::remove_stale_temp_files(path, TEMP_MAX_AGE);
             return;
         }
@@ -797,6 +1021,7 @@ impl ArtifactStore {
             }
             Err(err) => {
                 tracing::warn!(dir = %path.display(), error = %err, "failed to remove orphan directory");
+                report.failures.push(err.detail());
             }
         }
     }
@@ -875,6 +1100,90 @@ impl ArtifactStore {
 // ============================================================================
 // Free helpers
 // ============================================================================
+
+/// Identity of a file record: its table and row id.
+type FileKey = (db::maintenance::FileKind, i64);
+
+/// Records whose directory is gone, those still present (`live`), and
+/// those whose directory cannot be inspected (`blocked`: kept, not judged).
+#[derive(Default)]
+struct StaleRows {
+    builds: Vec<i64>,
+    releases: Vec<i64>,
+    live: HashSet<String>,
+    blocked: HashSet<String>,
+}
+
+/// A damaged file record gc drops, and the file to delete with it (`None`
+/// when nothing is to be deleted).
+struct DamagedFile {
+    key: FileKey,
+    /// [`file_identity`] of the record.
+    identity: String,
+    delete: Option<PathBuf>,
+}
+
+/// The file a record names, lowercased: records whose paths differ only in
+/// case name one file on a case-insensitive filesystem.
+fn file_identity(record: &db::maintenance::FileRecord) -> String {
+    format!("{}/{}", record.dir_rel, record.filename).to_lowercase()
+}
+
+/// What gc does with one file record.
+#[derive(Debug, PartialEq, Eq)]
+enum GcVerdict {
+    /// Healthy at the checked depth.
+    Keep,
+    /// Damaged: drop the record, and delete the file when one is there.
+    Drop { delete_file: bool },
+    /// The file cannot be read: keep it and report why.
+    Unreadable(String),
+}
+
+/// Judge one record at `depth` the way `verify` does. A record whose size
+/// cannot be read back is dropped, its file with it; a file that cannot be
+/// read is kept.
+fn gc_verdict(depth: VerifyMode, path: &Path, record: &db::maintenance::FileRecord) -> GcVerdict {
+    if db::size_from_db(record.size_bytes).is_err() {
+        return GcVerdict::Drop { delete_file: true };
+    }
+    match check_file(depth, path, record.size_bytes, &record.sha256) {
+        None => GcVerdict::Keep,
+        Some(VerifyProblem::Missing) => GcVerdict::Drop { delete_file: false },
+        Some(VerifyProblem::SizeMismatch { .. } | VerifyProblem::ChecksumMismatch { .. }) => {
+            GcVerdict::Drop { delete_file: true }
+        }
+        Some(VerifyProblem::Unreadable { details }) => GcVerdict::Unreadable(details),
+    }
+}
+
+/// Delete a damaged file, counting the bytes freed. Returns whether its
+/// record may be dropped: the file is gone (or was never to be deleted).
+/// A failed deletion is listed in `report.failures` and keeps the record.
+fn gc_delete_damaged(file: &DamagedFile, report: &mut GcReport) -> bool {
+    let Some(path) = &file.delete else {
+        return true;
+    };
+    // The link's own size for a symlink: only the link is removed.
+    let bytes = fs::symlink_metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .map_or(0, |meta| meta.len());
+    match fs::remove_file(path) {
+        Ok(()) => {
+            report.damaged_bytes_removed += bytes;
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            tracing::warn!(file = %path.display(), error = %err, "failed to delete damaged file");
+            report
+                .failures
+                .push(format!("{}: failed to delete: {err}", path.display()));
+            false
+        }
+    }
+}
 
 /// Refuse a directory that holds someone else's data — see
 /// [`StoreState::Foreign`].
@@ -956,8 +1265,14 @@ fn check_file(
             });
         }
     };
-    let Some(actual) = fsx::file_size(path) else {
-        return Some(VerifyProblem::Missing);
+    let actual = match fsx::probe_file(path) {
+        Ok(Some(size)) => size,
+        Ok(None) => return Some(VerifyProblem::Missing),
+        Err(err) => {
+            return Some(VerifyProblem::Unreadable {
+                details: format!("cannot inspect {}: {err}", path.display()),
+            });
+        }
     };
     if matches!(mode, VerifyMode::Size | VerifyMode::Checksum) && actual != expected {
         return Some(VerifyProblem::SizeMismatch { expected, actual });
@@ -970,7 +1285,7 @@ fn check_file(
                 actual: digest.sha256,
             }),
             Err(err) => Some(VerifyProblem::Unreadable {
-                details: err.to_string(),
+                details: err.detail(),
             }),
         };
     }

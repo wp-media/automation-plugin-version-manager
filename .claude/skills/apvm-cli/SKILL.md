@@ -199,8 +199,8 @@ no cache exists yet.
 |------------|----------------------------------------------------------------------------------------|
 | `info`     | Usage totals + per-project breakdown                                                   |
 | `clean`    | Remove entries by age / project / kind (supports `--dry-run`)                          |
-| `gc`       | Reconcile the SQLite DB with disk, sweep stale temp files. Removes only what apvm created; never follows symlinks |
-| `verify`   | Check integrity (presence + size; `--checksum` re-hashes). **Exits non-zero on issues** so CI can gate on cache health |
+| `gc`       | Remove what `verify` reports at the same depth: records whose files are missing or the wrong size (the bad files deleted; `--checksum` also catches same-size corruption), plus orphan dirs and stale temp files. The next build re-caches what was removed. Files it cannot read are kept and listed on stderr (exit 0). Removes only what apvm created; never follows symlinks |
+| `verify`   | Check integrity (presence + size; `--checksum` re-hashes). **Exits non-zero on issues** so CI can gate on cache health; the hint names the `gc` that removes them (`gc --checksum` for checksum mismatches) |
 | `repair`   | Quarantine a corrupt DB, clear an unreadable one (copy kept), or rebuild a missing one; then re-index builds from disk |
 | `clear`    | Remove everything (prompts unless `-y`; a broken cache errors before prompting)        |
 
@@ -213,6 +213,12 @@ no cache exists yet.
 | `--dry-run`                | Report what would be removed, do not delete                            |
 | `--builds` / `--releases`  | Scope to builds only / release downloads only (**mutually exclusive**) |
 
+#### `apvm cache gc` / `verify` flag
+
+| Flag         | Notes                                                                   |
+|--------------|-------------------------------------------------------------------------|
+| `--checksum` | Re-hash every file (slowest, most thorough). Without it, only presence and size are checked — same-size corruption is still served as a cache hit until `gc --checksum` removes it |
+
 ```sh
 apvm cache info
 apvm cache clean --dry-run
@@ -221,9 +227,24 @@ apvm cache clean --project backwpup --builds
 apvm cache verify
 apvm cache verify --checksum
 apvm cache gc
+apvm cache gc --checksum
 apvm cache repair
 apvm cache clear -y
 ```
+
+`gc` output (failures, if any, go to stderr as `  Left N item(s) in place:`):
+
+```text
+Cache garbage collection complete:
+  Dropped stale records: 1 build(s), 0 release(s)
+  Dropped 2 damaged file record(s) (1 B deleted)
+  Removed 1 orphan director(ies) (0 B)
+  Swept 0 stale temp file(s)
+```
+
+A build whose every file was dropped loses its record, and its directory is
+then removed as an orphan — hence `0 B` there when the damaged files were
+already deleted.
 
 ---
 
@@ -385,8 +406,11 @@ Required for private repos and PR builds. Recommended for public repos
 
 | Symptom                                                          | Likely cause / fix                                                                |
 |------------------------------------------------------------------|-----------------------------------------------------------------------------------|
-| `Error: The cache database is corrupt — run 'apvm cache repair'` | Follow the hint: `apvm cache repair` quarantines the DB (unreadable rows, `corrupt stored metadata`: copies it aside and clears it in place) and rebuilds the index. |
+| `The cache database is corrupt — run \`apvm cache repair\` to recover it.` | Follow the hint: `apvm cache repair` quarantines the DB (unreadable rows, `corrupt stored metadata`: copies it aside and clears it in place) and rebuilds the index. |
 | `… the store database at <dir> is missing but store content remains …` | The DB was deleted while cached files remain. `apvm cache repair` rebuilds it from the builds on disk. |
+| `⚠ the artifact cache at <dir> needs repair: … This run neither reads nor writes the cache …` (during `build`) | The cache DB is corrupt (or lost while builds remain); the build still succeeds, uncached. Run `apvm cache repair`; builds cache again from then on. |
+| `⚠ this build could not be stored in the artifact cache (…); it is not cached` (also `this release download …`) | Writing to the cache failed (disk full, permissions, a replaced database). The output is still delivered; only caching was skipped. Check the reason, then `apvm cache verify` / `apvm cache gc`. |
+| `⚠ the artifact cache at <dir> is unavailable: …` (during `build`) | The cache dir cannot be used (permissions, a file in the path, someone else's data, a newer apvm's DB). The build still succeeds, uncached. Fix or re-point the cache dir (see the next rows). |
 | `… refusing to use <dir> as an artifact store …`                | The cache dir holds other data. Point the cache at a new or empty directory (source: `APVM_CACHE_DIR` if set, else config `cache-dir`, else `~/.apvm/cache`). |
 | `Error: IO error: cannot access cache directory '<path>': …`    | `<path>` is the effective cache dir (as above). One of its components is a regular file, or a parent can't be traversed. Fix or re-point it — note `apvm config get cache-dir` shows the config/default only, not `APVM_CACHE_DIR`. On Windows such a path may just print "Cache is empty". |
 | `Error: failed to determine home directory`                      | `HOME` unset on Unix / `USERPROFILE` unset on Windows. Rare; set the env var.     |

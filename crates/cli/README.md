@@ -179,14 +179,18 @@ apvm cache clean --project backwpup        # one project
 apvm cache clean --builds                  # builds only (keep release downloads)
 apvm cache clean --releases                # release downloads only
 
-# Reconcile the database with disk and sweep leftover temp files
-# (removes only what apvm created; never follows symlinks)
-apvm cache gc
-
 # Verify cached files are intact (add --checksum to re-hash them).
-# Exits non-zero when issues are found, so CI can gate on cache health.
+# Exits non-zero when issues are found, so CI can gate on cache health,
+# and names the gc that removes them.
 apvm cache verify
 apvm cache verify --checksum
+
+# Remove what verify reports at the same depth — missing or resized files
+# (--checksum: also same-size corruption) — plus orphan directories and
+# leftover temp files. The next build caches removed entries again.
+# (Removes only what apvm created; never follows symlinks.)
+apvm cache gc
+apvm cache gc --checksum
 
 # Recover the cache database: quarantine a corrupt one, clear an unreadable
 # one (a copy is kept), or rebuild a deleted one, then re-index the builds
@@ -207,6 +211,16 @@ A directory is a cache only if it holds the cache database: a missing or empty
 one is reported as empty and never written to, and a directory holding other
 data is refused — apvm never initializes a cache there, since `gc` could later
 delete that data.
+
+Lookups check only presence and size, so a file corrupted without changing size
+is still served from the cache until `apvm cache gc --checksum` removes it. `gc`
+keeps files it cannot read and lists them, with any deletion that failed, on
+stderr; that does not change its exit code.
+
+When the cache is unusable during a build — a corrupt database, or a directory
+that cannot be used — the build still succeeds without the cache and prints a
+`⚠` warning with the reason. After `apvm cache repair` (for a corrupt cache),
+builds use the cache again.
 
 ## Config Command
 

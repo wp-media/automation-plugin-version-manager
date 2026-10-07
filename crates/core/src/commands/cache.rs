@@ -31,6 +31,7 @@ use apvm_storage::{
 };
 
 use crate::build::plugins::Builder;
+use crate::build::progress::{BuildEvent, ProgressReporter};
 use crate::build::{ArtifactOrigin, ProducedArtifact};
 
 /// The concrete variant keys a build request will deliver.
@@ -266,7 +267,9 @@ pub(crate) async fn reuse_and_copy(
 /// Idempotent and self-healing — already-cached files are recognized and not
 /// recopied, so passing the full requested set (reused + built) simply keeps
 /// the row complete and refreshes its last-used timestamp. Never fails the
-/// build; storage errors are logged and swallowed.
+/// build: a storage error becomes one [`BuildEvent::Warning`] on `reporter`
+/// (an open cache can still refuse writes — read-only, full disk, a database
+/// replaced meanwhile), so the run never claims a cache it did not fill.
 ///
 /// Returns the resulting [`StoredBuild`] on success (its artifacts carry their
 /// canonical in-cache paths), or `None` when there was nothing to store or the
@@ -276,6 +279,7 @@ pub(crate) async fn store_build(
     store: Arc<ArtifactStore>,
     metadata: BuildMetadata,
     artifacts: Vec<SourceArtifact>,
+    reporter: &dyn ProgressReporter,
 ) -> Option<StoredBuild> {
     if artifacts.is_empty() {
         return None;
@@ -291,11 +295,11 @@ pub(crate) async fn store_build(
             Some(outcome.build)
         }
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "failed to warm artifact cache");
+            report_not_cached(reporter, "build", &e.detail());
             None
         }
         Err(e) => {
-            tracing::warn!(error = %e, "cache store task failed");
+            report_not_cached(reporter, "build", &e.to_string());
             None
         }
     }
@@ -426,7 +430,8 @@ pub(crate) async fn reuse_release_assets(
 /// Best-effort warm: cache a release's delivered assets under its tag.
 ///
 /// Idempotent and self-healing, mirroring [`store_build`]; already-cached
-/// assets are recognized and not recopied. Never fails the download.
+/// assets are recognized and not recopied. Never fails the download; a
+/// storage error becomes one warning, as in [`store_build`].
 ///
 /// Returns the resulting [`StoredRelease`] on success (its assets carry their
 /// canonical in-cache paths), or `None` when there was nothing to store or the
@@ -436,6 +441,7 @@ pub(crate) async fn store_release(
     store: Arc<ArtifactStore>,
     metadata: ReleaseMetadata,
     assets: Vec<SourceArtifact>,
+    reporter: &dyn ProgressReporter,
 ) -> Option<StoredRelease> {
     if assets.is_empty() {
         return None;
@@ -451,14 +457,22 @@ pub(crate) async fn store_release(
             Some(outcome.release)
         }
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "failed to warm release cache");
+            report_not_cached(reporter, "release download", &e.detail());
             None
         }
         Err(e) => {
-            tracing::warn!(error = %e, "release store task failed");
+            report_not_cached(reporter, "release download", &e.to_string());
             None
         }
     }
+}
+
+/// Log and report that a `what` (build, release download) was not cached.
+fn report_not_cached(reporter: &dyn ProgressReporter, what: &str, reason: &str) {
+    tracing::warn!(reason, "failed to store {what} in the artifact cache");
+    reporter.report(&BuildEvent::Warning(format!(
+        "this {what} could not be stored in the artifact cache ({reason}); it is not cached"
+    )));
 }
 
 /// Materialize every `key` from a stored build into cache-origin
@@ -878,7 +892,13 @@ mod tests {
             target_name: "free.zip".to_string(),
         }];
 
-        store_build(Arc::clone(&store), metadata, artifacts).await;
+        store_build(
+            Arc::clone(&store),
+            metadata,
+            artifacts,
+            &crate::NullReporter,
+        )
+        .await;
 
         // The build is now findable.
         let found = store
@@ -1029,7 +1049,7 @@ mod tests {
             target_name: "free.zip".to_string(),
         }];
 
-        store_release(Arc::clone(&store), metadata, assets).await;
+        store_release(Arc::clone(&store), metadata, assets, &crate::NullReporter).await;
 
         assert!(store.has_release("backwpup", "v5.6.8").unwrap());
     }
@@ -1037,6 +1057,49 @@ mod tests {
     // ---- warm mode (`deliver = false`): reference the cache, write nothing ----
 
     /// The output directory must be empty (contain no entries).
+    #[tokio::test]
+    async fn a_failed_cache_write_warns_once_instead_of_passing_silently() {
+        // Audit A1: an open cache that refused the write reported nothing,
+        // so a warm "succeeded" with nothing cached.
+        let cache = tempfile::tempdir().unwrap();
+        let store = Arc::new(ArtifactStore::open(cache.path()).unwrap());
+        let gone = SourceArtifact {
+            variant_id: None,
+            path: cache.path().join("no-such-file.zip"),
+            target_name: "plugin.zip".to_string(),
+        };
+        let warnings = std::sync::Mutex::new(Vec::new());
+        let reporter = crate::ClosureReporter::new(|event| {
+            if let BuildEvent::Warning(message) = event {
+                warnings.lock().unwrap().push(message.clone());
+            }
+        });
+        let metadata = BuildMetadata::new(
+            "test",
+            "1.0.0",
+            apvm_storage::BuildSource::PullRequest(1),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "main".to_string(),
+        );
+        let stored = store_build(Arc::clone(&store), metadata, vec![gone.clone()], &reporter).await;
+        assert!(stored.is_none());
+        let release = store_release(
+            Arc::clone(&store),
+            ReleaseMetadata::new("test", "v1.0.0"),
+            vec![gone],
+            &reporter,
+        )
+        .await;
+        assert!(release.is_none());
+        let warnings = warnings.into_inner().unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with(
+            "this build could not be stored in the artifact cache (artifact source file not found"
+        ));
+        assert!(warnings[0].ends_with("; it is not cached"));
+        assert!(warnings[1].starts_with("this release download could not be stored"));
+    }
+
     fn assert_output_empty(dir: &std::path::Path) {
         assert!(
             std::fs::read_dir(dir).unwrap().next().is_none(),

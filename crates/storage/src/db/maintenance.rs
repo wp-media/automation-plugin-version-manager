@@ -21,9 +21,22 @@ pub(crate) struct Victim {
     pub bytes: i64,
 }
 
+/// Which table a stored file's record lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FileKind {
+    /// `build_artifacts`.
+    Artifact,
+    /// `release_assets`.
+    Asset,
+}
+
 /// A stored file joined with enough context to verify and report it.
 #[derive(Debug, Clone)]
 pub(crate) struct FileRecord {
+    /// Table of the file's record; with `id`, the record's identity.
+    pub kind: FileKind,
+    /// Row id within that table.
+    pub id: i64,
     pub project: String,
     /// `(version, commit)` for builds, `tag` for releases.
     pub build_context: Option<(String, String)>,
@@ -149,16 +162,43 @@ pub(crate) fn release_victims(
 /// Every stored build artifact with verification context.
 pub(crate) fn build_files(conn: &Connection) -> rusqlite::Result<Vec<FileRecord>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT b.project, b.version, b.commit_hash, b.dir_path, a.filename, a.size_bytes, a.sha256
+        "SELECT a.id, b.project, b.version, b.commit_hash, b.dir_path, a.filename, a.size_bytes,
+                a.sha256
          FROM build_artifacts AS a
          JOIN builds AS b ON b.id = a.build_id
          ORDER BY b.project, b.version, b.commit_hash, a.filename",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(FileRecord {
-            project: row.get(0)?,
-            build_context: Some((row.get(1)?, row.get(2)?)),
+            kind: FileKind::Artifact,
+            id: row.get(0)?,
+            project: row.get(1)?,
+            build_context: Some((row.get(2)?, row.get(3)?)),
             tag_context: None,
+            dir_rel: row.get(4)?,
+            filename: row.get(5)?,
+            size_bytes: row.get(6)?,
+            sha256: row.get(7)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Every stored release asset with verification context.
+pub(crate) fn release_files(conn: &Connection) -> rusqlite::Result<Vec<FileRecord>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT s.id, r.project, r.tag, r.dir_path, s.filename, s.size_bytes, s.sha256
+         FROM release_assets AS s
+         JOIN releases AS r ON r.id = s.release_id
+         ORDER BY r.project, r.tag, s.filename",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(FileRecord {
+            kind: FileKind::Asset,
+            id: row.get(0)?,
+            project: row.get(1)?,
+            build_context: None,
+            tag_context: Some(row.get(2)?),
             dir_rel: row.get(3)?,
             filename: row.get(4)?,
             size_bytes: row.get(5)?,
@@ -168,24 +208,56 @@ pub(crate) fn build_files(conn: &Connection) -> rusqlite::Result<Vec<FileRecord>
     rows.collect()
 }
 
-/// Every stored release asset with verification context.
-pub(crate) fn release_files(conn: &Connection) -> rusqlite::Result<Vec<FileRecord>> {
+/// Delete one file record (an artifact or a release asset). Its build or
+/// release stays, possibly with no files left (see [`drop_empty_builds`]).
+pub(crate) fn delete_file(conn: &Connection, kind: FileKind, id: i64) -> rusqlite::Result<()> {
+    let sql = match kind {
+        FileKind::Artifact => "DELETE FROM build_artifacts WHERE id = ?1",
+        FileKind::Asset => "DELETE FROM release_assets WHERE id = ?1",
+    };
+    conn.prepare_cached(sql)?.execute(params![id]).map(|_| ())
+}
+
+/// Whether any build or release record still uses `dir_rel`, compared
+/// ASCII-case-insensitively: on a case-insensitive filesystem two records
+/// spelled differently can share one directory, which must then stay.
+pub(crate) fn dir_in_use(conn: &Connection, dir_rel: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM builds WHERE dir_path = ?1 COLLATE NOCASE)
+             OR EXISTS (SELECT 1 FROM releases WHERE dir_path = ?1 COLLATE NOCASE)",
+        params![dir_rel],
+        |row| row.get(0),
+    )
+}
+
+/// Every recorded build and release directory — the set the gc sweep keeps.
+pub(crate) fn all_dirs(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT dir_path FROM builds UNION ALL SELECT dir_path FROM releases")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect()
+}
+
+/// Delete every build that has no artifact left (it could never be served)
+/// and return their directories. Sources cascade.
+pub(crate) fn drop_empty_builds(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT r.project, r.tag, r.dir_path, s.filename, s.size_bytes, s.sha256
-         FROM release_assets AS s
-         JOIN releases AS r ON r.id = s.release_id
-         ORDER BY r.project, r.tag, s.filename",
+        "DELETE FROM builds
+         WHERE NOT EXISTS (SELECT 1 FROM build_artifacts AS a WHERE a.build_id = builds.id)
+         RETURNING dir_path",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(FileRecord {
-            project: row.get(0)?,
-            build_context: None,
-            tag_context: Some(row.get(1)?),
-            dir_rel: row.get(2)?,
-            filename: row.get(3)?,
-            size_bytes: row.get(4)?,
-            sha256: row.get(5)?,
-        })
-    })?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect()
+}
+
+/// Delete every release that has no asset left and return their
+/// directories.
+pub(crate) fn drop_empty_releases(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "DELETE FROM releases
+         WHERE NOT EXISTS (SELECT 1 FROM release_assets AS s WHERE s.release_id = releases.id)
+         RETURNING dir_path",
+    )?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
     rows.collect()
 }

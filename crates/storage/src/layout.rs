@@ -198,6 +198,46 @@ pub(crate) fn managed_dir(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// `base_dir/rel` when `rel` is a directory path the store produces —
+/// `{project}/commits/{version}/{build}` or `{project}/releases/{release}` —
+/// and none of its existing components is a symlink or a non-directory.
+///
+/// Destructive operations resolve record paths through this, so neither a
+/// tampered record nor a symlinked directory can lead them outside the store
+/// (`base_dir` itself may be a symlink: the user chose it). Components that
+/// do not exist yet are fine: there is nothing to follow there. `None` also
+/// when a component cannot be inspected.
+pub(crate) fn owned_dir(base_dir: &Path, rel: &str) -> Option<PathBuf> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let shaped = match parts.as_slice() {
+        [project, kind, version, build] if *kind == paths::COMMITS_DIR => {
+            paths::validate_project(project).is_ok()
+                && paths::validate_version(version).is_ok()
+                && is_build_dir_name(build)
+        }
+        [project, kind, release] if *kind == paths::RELEASES_DIR => {
+            paths::validate_project(project).is_ok() && is_release_dir_name(release)
+        }
+        _ => false,
+    };
+    if !shaped {
+        return None;
+    }
+    let path = parts
+        .iter()
+        .fold(base_dir.to_path_buf(), |path, part| path.join(part));
+    let mut walked = base_dir.to_path_buf();
+    for part in parts {
+        walked.push(part);
+        match fs::symlink_metadata(&walked) {
+            Ok(meta) if meta.is_dir() => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+            _ => return None,
+        }
+    }
+    Some(path)
+}
+
 /// Whether `name` is a build directory name the store produces: 7–64
 /// lowercase hex chars, or 7 of them plus `-` and an 8-char hex
 /// disambiguator (see `pick_build_dir`).
@@ -273,6 +313,52 @@ mod tests {
             assert!(!is_build_dir_name(bad), "{bad:?}");
         }
         assert!(!is_build_dir_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn owned_dirs_are_store_shaped_and_free_of_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("store");
+        let build = "wp-rocket/commits/3.17.4/a1b2c3d";
+        let release = "backwpup/releases/v5.3.0";
+        std::fs::create_dir_all(base.join(build)).unwrap();
+
+        assert_eq!(owned_dir(&base, build), Some(base.join(build)));
+        // Not created yet: nothing to follow, still ours.
+        assert_eq!(owned_dir(&base, release), Some(base.join(release)));
+        for bad in [
+            "",
+            "wp-rocket",
+            "My-Notes",
+            "wp-rocket/commits/3.17.4",
+            "wp-rocket/commits/3.17.4/a1b2c3d/extra",
+            "wp-rocket/commits/../a1b2c3d",
+            "wp-rocket/other/3.17.4/a1b2c3d",
+            "wp-rocket/commits/3.17.4/notahash",
+            "Bad Project/releases/v1",
+            "backwpup/releases/.hidden",
+            "/abs/commits/1.0/a1b2c3d",
+            "wp-rocket\\commits\\3.17.4\\a1b2c3d",
+        ] {
+            assert_eq!(owned_dir(&base, bad), None, "{bad:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_dirs_never_go_through_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("store");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(outside.join("3.17.4/a1b2c3d")).unwrap();
+        std::fs::create_dir_all(base.join("wp-rocket")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("wp-rocket/commits")).unwrap();
+        assert_eq!(owned_dir(&base, "wp-rocket/commits/3.17.4/a1b2c3d"), None);
+
+        // A file where a directory belongs is refused too.
+        std::fs::create_dir_all(base.join("backwpup")).unwrap();
+        std::fs::write(base.join("backwpup/releases"), b"x").unwrap();
+        assert_eq!(owned_dir(&base, "backwpup/releases/v1"), None);
     }
 
     #[test]

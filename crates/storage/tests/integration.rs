@@ -1824,3 +1824,847 @@ fn repair_racing_concurrent_opens_indexes_every_build() {
         assert_eq!(usage.build_count, 3, "round {round}");
     }
 }
+
+// ============================================================================
+// gc removes what verify reports (F12): per-file damage, at the same depth
+// ============================================================================
+
+/// The recorded `(builds, releases)`.
+fn recorded(store: &ArtifactStore) -> (u64, u64) {
+    let usage = store.usage().unwrap();
+    (usage.build_count, usage.release_count)
+}
+
+/// Store `files` (name, content) as one build of `wp-rocket` 3.17.4.
+fn store_files(
+    store: &ArtifactStore,
+    scratch: &Path,
+    files: &[(&str, &[u8])],
+) -> apvm_storage::StoredBuild {
+    let artifacts: Vec<_> = files
+        .iter()
+        .map(|(name, content)| artifact(scratch, name, content, None))
+        .collect();
+    store
+        .store(&metadata("wp-rocket", "3.17.4", COMMIT_A), &artifacts)
+        .unwrap()
+        .build
+}
+
+/// After gc: a checksum audit is clean, and storing the build again copies
+/// `name` back in (re-cached, not reused) and serves it.
+fn assert_healed_by_restore(store: &ArtifactStore, scratch: &Path, name: &str) {
+    assert!(
+        store.verify(VerifyMode::Checksum).unwrap().is_empty(),
+        "verify still reports issues after gc"
+    );
+    let result = store
+        .store(
+            &metadata("wp-rocket", "3.17.4", COMMIT_A),
+            &[artifact(scratch, name, b"fresh-bytes", None)],
+        )
+        .unwrap();
+    assert_eq!(result.newly_stored, [name.to_string()]);
+    assert!(
+        store
+            .find_by_commit("wp-rocket", "3.17.4", "a1b2c3d")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn gc_drops_a_missing_file_and_its_emptied_build() {
+    let (_root, store, scratch) = make_store();
+    let build = store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    std::fs::remove_file(&build.artifacts[0].path).unwrap();
+
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert_eq!(report.damaged_bytes_removed, 0, "nothing was on disk");
+    assert_eq!(
+        report.stale_build_rows, 1,
+        "no file left: the build goes too"
+    );
+    assert_eq!(report.orphan_dirs_removed, 1, "its directory is swept");
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(!build.dir.exists());
+    assert_eq!(recorded(&store), (0, 0));
+    assert_healed_by_restore(&store, &scratch, "a.zip");
+}
+
+#[test]
+fn gc_drops_a_resized_file_but_keeps_the_rest_of_its_build() {
+    let (_root, store, scratch) = make_store();
+    let build = store_files(
+        &store,
+        &scratch,
+        &[("ok.zip", b"pristine"), ("bad.zip", b"original")],
+    );
+    let bad = build.dir.join("bad.zip");
+    std::fs::write(&bad, b"resized!!").unwrap();
+
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert_eq!(report.damaged_bytes_removed, 9);
+    assert_eq!(
+        (report.stale_build_rows, report.orphan_dirs_removed),
+        (0, 0)
+    );
+    assert!(!bad.exists(), "the damaged file is deleted");
+    assert!(build.dir.join("ok.zip").exists(), "intact files stay");
+    let kept = store.list_builds(None, None).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].artifacts.len(), 1);
+    assert_eq!(kept[0].artifacts[0].filename, "ok.zip");
+    assert_healed_by_restore(&store, &scratch, "bad.zip");
+}
+
+#[test]
+fn only_a_checksum_gc_removes_same_size_corruption() {
+    let (_root, store, scratch) = make_store();
+    let build = store_files(&store, &scratch, &[("a.zip", b"12345678")]);
+    let path = &build.artifacts[0].path;
+    std::fs::write(path, b"87654321").unwrap(); // same size, other content
+
+    // A size-depth gc cannot see it: the entry is still served (F12).
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 0);
+    assert!(path.exists());
+    assert!(
+        store
+            .find_by_commit("wp-rocket", "3.17.4", "a1b2c3d")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(store.verify(VerifyMode::Checksum).unwrap().len(), 1);
+
+    let report = store.gc_with(VerifyMode::Checksum).unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert_eq!(report.damaged_bytes_removed, 8);
+    assert_eq!(report.stale_build_rows, 1);
+    assert!(!path.exists());
+    assert_healed_by_restore(&store, &scratch, "a.zip");
+}
+
+#[test]
+fn gc_is_gc_with_size() {
+    // The same damaged cache, collected both ways, ends up the same.
+    let collect = |with_mode: bool| {
+        let (_root, store, scratch) = make_store();
+        let build = store_files(
+            &store,
+            &scratch,
+            &[
+                ("gone.zip", b"gone"),
+                ("resized.zip", b"resized"),
+                ("tampered.zip", b"12345678"),
+            ],
+        );
+        std::fs::remove_file(build.dir.join("gone.zip")).unwrap();
+        std::fs::write(build.dir.join("resized.zip"), b"x").unwrap();
+        std::fs::write(build.dir.join("tampered.zip"), b"87654321").unwrap();
+        let report = if with_mode {
+            store.gc_with(VerifyMode::Size).unwrap()
+        } else {
+            store.gc().unwrap()
+        };
+        let left: Vec<String> = store.list_builds(None, None).unwrap()[0]
+            .artifacts
+            .iter()
+            .map(|a| a.filename.clone())
+            .collect();
+        (format!("{report:?}"), left)
+    };
+    let (default, left) = collect(false);
+    assert_eq!(default, collect(true).0);
+    assert_eq!(left, ["tampered.zip"], "size depth keeps the tampered file");
+}
+
+#[test]
+fn gc_with_presence_drops_only_missing_files() {
+    let (_root, store, scratch) = make_store();
+    let build = store_files(
+        &store,
+        &scratch,
+        &[("gone.zip", b"gone"), ("resized.zip", b"resized")],
+    );
+    std::fs::remove_file(build.dir.join("gone.zip")).unwrap();
+    std::fs::write(build.dir.join("resized.zip"), b"x").unwrap();
+
+    let report = store.gc_with(VerifyMode::Presence).unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert!(build.dir.join("resized.zip").exists());
+    assert!(store.verify(VerifyMode::Presence).unwrap().is_empty());
+    assert_eq!(store.verify(VerifyMode::Size).unwrap().len(), 1);
+}
+
+#[test]
+fn gc_drops_damaged_release_assets_and_emptied_releases() {
+    let (_root, store, scratch) = make_store();
+    let release = store
+        .store_release(
+            &ReleaseMetadata::new("backwpup", "v5.3.0"),
+            &[artifact(&scratch, "backwpup.zip", b"release-bytes", None)],
+        )
+        .unwrap()
+        .release;
+    std::fs::write(&release.assets[0].path, b"x").unwrap();
+
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert_eq!(report.damaged_bytes_removed, 1);
+    assert_eq!(report.stale_release_rows, 1);
+    assert!(!release.dir.exists());
+    assert_eq!(recorded(&store), (0, 0));
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+}
+
+#[test]
+fn gc_drops_a_record_whose_size_cannot_be_read_back() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    {
+        let conn = rusqlite::Connection::open(base.join("apvm.db")).unwrap();
+        conn.execute("UPDATE build_artifacts SET size_bytes = -1", [])
+            .unwrap();
+    }
+    let store = ArtifactStore::open(&base).unwrap();
+    assert!(matches!(
+        store.verify(VerifyMode::Size).unwrap()[0].problem,
+        VerifyProblem::Unreadable { .. }
+    ));
+
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert_eq!(report.damaged_bytes_removed, 8, "its file is deleted too");
+    assert_eq!(report.stale_build_rows, 1);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(recorded(&store), (0, 0));
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+}
+
+#[test]
+fn gc_never_deletes_through_a_record_pointing_outside_the_layout() {
+    let (root, store, scratch) = make_store();
+    let build = store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    // A tampered filename that climbs out of the build directory, naming a
+    // file of another size: damaged, yet never to be deleted.
+    let outside = root.path().join("outside.zip");
+    std::fs::write(&outside, b"precious user data").unwrap();
+    let climb = format!(
+        "{}outside.zip",
+        "../".repeat(build.dir.strip_prefix(root.path()).unwrap().iter().count())
+    );
+    {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute("UPDATE build_artifacts SET filename = ?1", [&climb])
+            .unwrap();
+    }
+
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1, "the record is dropped");
+    assert_eq!(report.damaged_bytes_removed, 0);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(report.failures[0].contains("outside the store layout"));
+    assert_eq!(std::fs::read(&outside).unwrap(), b"precious user data");
+}
+
+/// Set the Unix permission bits of `path`.
+#[cfg(unix)]
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Whether permission bits bind this user — not when running as root, so
+/// the permission tests skip there.
+#[cfg(unix)]
+fn permissions_enforced() -> bool {
+    let probe = tempfile::NamedTempFile::new().unwrap();
+    chmod(probe.path(), 0o000);
+    let enforced = std::fs::File::open(probe.path()).is_err();
+    if !enforced {
+        eprintln!("skipped: permissions are not enforced for this user");
+    }
+    enforced
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_keeps_and_reports_files_it_cannot_read() {
+    if !permissions_enforced() {
+        return;
+    }
+    let (_root, store, scratch) = make_store();
+    let build = store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    let file = &build.artifacts[0].path;
+    chmod(file, 0o000);
+    let report = store.gc_with(VerifyMode::Checksum);
+    let issues = store.verify(VerifyMode::Checksum);
+    chmod(file, 0o644);
+
+    let report = report.unwrap();
+    assert_eq!(report.damaged_artifacts, 0);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(
+        report.failures[0].contains("Permission denied"),
+        "the cause is kept: {:?}",
+        report.failures
+    );
+    let named = report.failures[0]
+        .matches(&file.display().to_string())
+        .count();
+    assert_eq!(named, 1, "names the file once: {:?}", report.failures);
+    assert!(file.exists());
+    assert_eq!(recorded(&store), (1, 0), "the record is kept");
+    assert!(matches!(
+        issues.unwrap()[0].problem,
+        VerifyProblem::Unreadable { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_that_cannot_be_inspected_is_unreadable_not_missing() {
+    // Regression: a permission error used to read as "missing", so gc would
+    // have dropped a record whose file was still there.
+    if !permissions_enforced() {
+        return;
+    }
+    let (_root, store, scratch) = make_store();
+    let build = store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    chmod(&build.dir, 0o000);
+    let issues = store.verify(VerifyMode::Size);
+    let report = store.gc();
+    chmod(&build.dir, 0o755);
+
+    let issues = issues.unwrap();
+    assert!(
+        matches!(&issues[0].problem, VerifyProblem::Unreadable { details } if details.contains("cannot inspect")),
+        "{issues:?}"
+    );
+    let report = report.unwrap();
+    assert_eq!(report.damaged_artifacts, 0);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(recorded(&store), (1, 0));
+    assert!(build.artifacts[0].path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_reports_an_orphan_directory_it_cannot_remove() {
+    if !permissions_enforced() {
+        return;
+    }
+    let (_root, store, _scratch) = make_store();
+    let version = store.base_dir().join("backwpup/commits/9.9.9");
+    put(&version, "deadbee/stray.zip", "stray");
+    chmod(&version, 0o555); // listable, but its entries cannot be removed
+    let report = store.gc();
+    chmod(&version, 0o755);
+
+    let report = report.unwrap();
+    assert_eq!(report.orphan_dirs_removed, 0);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(
+        report.failures[0].contains("deadbee"),
+        "{:?}",
+        report.failures
+    );
+}
+
+// ============================================================================
+// is_current: a long-lived handle can tell its database was swapped out
+// ============================================================================
+
+#[test]
+fn a_handle_is_current_until_its_database_file_goes_away() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    let holder = ArtifactStore::open(&base).unwrap();
+    assert!(holder.is_current());
+
+    // A repair of a healthy database replaces nothing.
+    ArtifactStore::repair(&base).unwrap();
+    assert!(holder.is_current());
+
+    // Unix only: Windows cannot delete or rename an open database.
+    #[cfg(unix)]
+    {
+        delete_database(&base);
+        assert!(!holder.is_current(), "deleted under the handle");
+        let fresh = ArtifactStore::open(&base);
+        // The build directory is still there: the lost database is refused.
+        assert!(matches!(fresh, Err(Error::MissingDatabase { .. })));
+        let (fresh, _) = ArtifactStore::repair(&base).unwrap();
+        assert!(fresh.is_current());
+        assert!(!holder.is_current(), "a new file is not the old one");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_handle_on_a_quarantined_database_is_not_current() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    let holder = ArtifactStore::open(&base).unwrap();
+
+    // Rows that cannot be read are repaired in place: the handle stays.
+    {
+        let conn = rusqlite::Connection::open(base.join("apvm.db")).unwrap();
+        conn.execute("UPDATE builds SET built_at_ms = 9000000000000000000", [])
+            .unwrap();
+    }
+    ArtifactStore::repair(&base).unwrap();
+    assert!(holder.is_current());
+
+    // A corrupt file is renamed aside with its sidecars, the way repair
+    // quarantines it: the handle is left on the old file.
+    for suffix in ["", "-wal", "-shm"] {
+        let from = base.join(format!("apvm.db{suffix}"));
+        if from.exists() {
+            std::fs::rename(&from, base.join(format!("apvm.db.corrupt-1{suffix}"))).unwrap();
+        }
+    }
+    assert!(!holder.is_current());
+}
+
+// ============================================================================
+// Phase 2 audit: deletion safety, case-insensitive filesystems, stale handles
+// ============================================================================
+
+/// Whether `dir`'s filesystem ignores letter case (macOS, Windows defaults).
+fn case_insensitive_fs(dir: &Path) -> bool {
+    let probe = dir.join("CaseProbe");
+    std::fs::write(&probe, b"x").unwrap();
+    let insensitive = dir.join("caseprobe").exists();
+    std::fs::remove_file(probe).unwrap();
+    insensitive
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_never_deletes_through_a_symlinked_build_directory() {
+    // Audit N1: a damaged file was deleted through a symlinked leaf.
+    let (root, store, scratch) = make_store();
+    let build = store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("a.zip"), b"PRECIOUS, another size").unwrap();
+    std::fs::remove_dir_all(&build.dir).unwrap();
+    std::os::unix::fs::symlink(&outside, &build.dir).unwrap();
+
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1, "the record is dropped");
+    assert_eq!(report.damaged_bytes_removed, 0);
+    assert!(
+        report.failures[0].contains("behind a symlink"),
+        "{:?}",
+        report.failures
+    );
+    assert_eq!(
+        std::fs::read(outside.join("a.zip")).unwrap(),
+        b"PRECIOUS, another size"
+    );
+}
+
+/// A store with one build whose project directory was moved outside and
+/// symlinked back; returns the artifact's real path (outside the store).
+#[cfg(unix)]
+fn store_behind_a_symlinked_project() -> (tempfile::TempDir, ArtifactStore, PathBuf) {
+    let (root, store, scratch) = make_store();
+    store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    let project = store.base_dir().join("wp-rocket");
+    let moved = root.path().join("elsewhere");
+    std::fs::rename(&project, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &project).unwrap();
+    let file = moved.join("commits/3.17.4/a1b2c3d/a.zip");
+    (root, store, file)
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_never_deletes_through_a_symlinked_project() {
+    let (_root, store, file) = store_behind_a_symlinked_project();
+    std::fs::write(&file, b"resized user data").unwrap();
+    store.gc().unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"resized user data");
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_never_deletes_through_a_symlinked_project() {
+    // Same class as audit N1, in clean (and delete_build/delete_release,
+    // which share `remove_record_dir`).
+    let (_root, store, file) = store_behind_a_symlinked_project();
+    let report = store.clear_all().unwrap();
+    assert_eq!(report.builds_deleted, 1, "the record goes");
+    assert_eq!(report.bytes_freed, 0, "nothing was freed");
+    assert!(
+        report.failures[0].contains("behind a symlink"),
+        "{:?}",
+        report.failures
+    );
+    assert!(file.exists(), "clean deleted through the symlink");
+}
+
+#[test]
+fn gc_deletes_only_inside_store_shaped_directories() {
+    // Audit N3: a tampered record under base_dir but outside the layout.
+    let (_root, store, scratch) = make_store();
+    store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    let notes = store.base_dir().join("My-Notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("todo.txt"), b"keep me").unwrap();
+    {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute_batch(
+            "UPDATE builds SET dir_path = 'My-Notes'; UPDATE build_artifacts SET filename = 'todo.txt';",
+        )
+        .unwrap();
+    }
+
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert!(
+        report.failures[0].contains("outside the store layout"),
+        "{:?}",
+        report.failures
+    );
+    assert_eq!(std::fs::read(notes.join("todo.txt")).unwrap(), b"keep me");
+}
+
+#[test]
+fn versions_differing_only_in_case_get_their_own_build_directories() {
+    // Audit N2: `1.0-RC1` and `1.0-rc1` shared one directory on a
+    // case-insensitive filesystem; gc emptying one wiped the other.
+    let (_root, store, scratch) = make_store();
+    let a = store
+        .store(
+            &metadata("wp-rocket", "1.0-RC1", COMMIT_A),
+            &[artifact(&scratch, "a.zip", b"build-a", None)],
+        )
+        .unwrap()
+        .build;
+    let b = store
+        .store(
+            &metadata("wp-rocket", "1.0-rc1", COMMIT_A),
+            &[artifact(&scratch, "b.zip", b"build-b-bytes", None)],
+        )
+        .unwrap()
+        .build;
+    let leaf = |dir: &Path| dir.file_name().unwrap().to_string_lossy().into_owned();
+    assert_ne!(
+        leaf(&a.dir),
+        leaf(&b.dir),
+        "distinct leaves, whatever the case"
+    );
+
+    std::fs::remove_file(a.dir.join("a.zip")).unwrap();
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert!(b.dir.join("b.zip").exists(), "the healthy build was wiped");
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+    assert!(
+        store
+            .find_by_commit("wp-rocket", "1.0-rc1", COMMIT_A)
+            .unwrap()
+            .is_some()
+    );
+    let again = store.gc().unwrap();
+    assert_eq!(again.orphan_dirs_removed + again.damaged_artifacts, 0);
+}
+
+#[test]
+fn tags_differing_only_in_case_get_their_own_release_directories() {
+    let (_root, store, scratch) = make_store();
+    let cache = |tag: &str, body: &[u8]| {
+        store
+            .store_release(
+                &ReleaseMetadata::new("backwpup", tag),
+                &[artifact(&scratch, "backwpup.zip", body, None)],
+            )
+            .unwrap()
+            .release
+    };
+    let lower = cache("v1.0", b"lower-bytes");
+    let upper = cache("V1.0", b"UPPER-BYTES-longer");
+    assert_ne!(
+        lower.dir.to_string_lossy().to_lowercase(),
+        upper.dir.to_string_lossy().to_lowercase()
+    );
+
+    std::fs::remove_file(&lower.assets[0].path).unwrap();
+    store.gc().unwrap();
+    assert!(upper.assets[0].path.exists(), "the other release was wiped");
+    assert!(store.find_release("backwpup", "V1.0").unwrap().is_some());
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+}
+
+#[test]
+fn restoring_a_filename_in_another_case_replaces_its_record() {
+    // Audit P6: two records ended up naming one file.
+    let (_root, store, scratch) = make_store();
+    let meta = metadata("wp-rocket", "3.17.4", COMMIT_A);
+    store
+        .store(&meta, &[artifact(&scratch, "plugin.zip", b"first", None)])
+        .unwrap();
+    let second = store
+        .store(
+            &meta,
+            &[artifact(&scratch, "Plugin.zip", b"second-longer", None)],
+        )
+        .unwrap();
+    let names: Vec<&str> = second
+        .build
+        .artifacts
+        .iter()
+        .map(|a| a.filename.as_str())
+        .collect();
+    assert_eq!(names, ["Plugin.zip"]);
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+    assert_eq!(store.gc().unwrap().damaged_artifacts, 0);
+}
+
+/// Legacy state from before case-insensitive allocation: build `3.17.5`'s
+/// record names `3.17.4`'s directory in another case, and its file lives
+/// there. `3.17.4` was last used 10 days ago. Returns that directory, or
+/// `None` on a case-sensitive filesystem, where two spellings are two
+/// directories and nothing can be shared.
+fn shared_directory_store(store: &ArtifactStore, scratch: &Path) -> Option<PathBuf> {
+    if !case_insensitive_fs(store.base_dir()) {
+        return None;
+    }
+    let old =
+        metadata("wp-rocket", "3.17.4", COMMIT_A).with_built_at(Utc::now() - Duration::days(10));
+    let a = store
+        .store(&old, &[artifact(scratch, "a.zip", b"artifact-a", None)])
+        .unwrap()
+        .build;
+    store
+        .store(
+            &metadata("wp-rocket", "3.17.5", COMMIT_A),
+            &[artifact(scratch, "b.zip", b"artifact-b", None)],
+        )
+        .unwrap();
+    std::fs::write(a.dir.join("b.zip"), b"artifact-b").unwrap();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE builds SET dir_path = 'WP-ROCKET/commits/3.17.4/a1b2c3d' WHERE version = '3.17.5'",
+        [],
+    )
+    .unwrap();
+    Some(a.dir)
+}
+
+#[test]
+fn gc_keeps_a_directory_another_record_still_uses() {
+    let (_root, store, scratch) = make_store();
+    let Some(shared) = shared_directory_store(&store, &scratch) else {
+        return;
+    };
+    std::fs::remove_file(shared.join("a.zip")).unwrap();
+    store.gc().unwrap();
+    assert!(
+        shared.join("b.zip").exists(),
+        "gc wiped the shared directory"
+    );
+    assert!(store.verify(VerifyMode::Size).unwrap().is_empty());
+}
+
+#[test]
+fn clean_and_delete_keep_a_directory_another_record_still_uses() {
+    let (_root, store, scratch) = make_store();
+    let Some(shared) = shared_directory_store(&store, &scratch) else {
+        return;
+    };
+    let report = store
+        .clean(&CleanOptions::default().older_than(Utc::now() - Duration::days(1)))
+        .unwrap();
+    assert_eq!(report.builds_deleted, 1, "only the old build");
+    assert_eq!(
+        report.bytes_freed, 0,
+        "its files stay with the other record"
+    );
+    assert!(
+        shared.join("b.zip").exists(),
+        "clean wiped the shared directory"
+    );
+    assert!(store.verify(VerifyMode::Size).unwrap().is_empty());
+
+    // Re-share, then delete the other way round.
+    let (_root2, store2, scratch2) = make_store();
+    let shared2 = shared_directory_store(&store2, &scratch2).unwrap();
+    assert!(
+        store2
+            .delete_build("wp-rocket", "3.17.4", COMMIT_A)
+            .unwrap()
+    );
+    assert!(shared2.join("b.zip").exists(), "delete_build wiped it");
+}
+
+#[test]
+fn gc_never_deletes_a_file_a_healthy_record_also_names() {
+    // Legacy state: two records name one file up to case; one is damaged.
+    let (_root, store, scratch) = make_store();
+    if !case_insensitive_fs(store.base_dir()) {
+        return;
+    }
+    let build = store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "INSERT INTO build_artifacts (build_id, variant, filename, size_bytes, sha256)
+             SELECT build_id, NULL, 'A.zip', 999, sha256 FROM build_artifacts",
+            [],
+        )
+        .unwrap();
+    }
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1, "the wrong record is dropped");
+    assert_eq!(report.damaged_bytes_removed, 0);
+    assert!(
+        build.dir.join("a.zip").exists(),
+        "the healthy record's file stays"
+    );
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stale_handle_refuses_to_mutate() {
+    // Audit N4: gc through a handle left on a replaced database swept the
+    // live store's builds as orphans.
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    let holder = ArtifactStore::open(&base).unwrap();
+    delete_database(&base);
+    let (fresh, _) = ArtifactStore::repair(&base).unwrap();
+    let scratch = root.path().join("scratch");
+    let newer = fresh
+        .store(
+            &metadata("backwpup", "7.0.0", COMMIT_A),
+            &[artifact(&scratch, "n.zip", b"new", None)],
+        )
+        .unwrap()
+        .build;
+
+    let stale = |result: Result<(), Error>| matches!(result, Err(Error::StaleHandle { .. }));
+    assert!(stale(holder.gc().map(|_| ())));
+    assert!(stale(holder.clear_all().map(|_| ())));
+    assert!(stale(
+        holder
+            .store(
+                &metadata("backwpup", "8.0.0", COMMIT_A),
+                &[artifact(&scratch, "x.zip", b"x", None)],
+            )
+            .map(|_| ())
+    ));
+    assert!(stale(
+        holder
+            .store_release(
+                &ReleaseMetadata::new("backwpup", "v1"),
+                &[artifact(&scratch, "r.zip", b"r", None)],
+            )
+            .map(|_| ())
+    ));
+    assert!(stale(
+        holder
+            .delete_build("backwpup", "7.0.0", COMMIT_A)
+            .map(|_| ())
+    ));
+    assert!(newer.artifacts[0].path.exists());
+    assert_eq!(fresh.usage().unwrap().build_count, 2);
+    // Reads keep working; a dry run is a read.
+    assert!(holder.clean(&CleanOptions::default().dry_run(true)).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_keeps_records_whose_directory_it_cannot_inspect() {
+    // Audit N5: a permission error read as "directory vanished".
+    if !permissions_enforced() {
+        return;
+    }
+    let (_root, store, scratch) = make_store();
+    let build = store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    let version = build.dir.parent().unwrap().to_path_buf();
+    chmod(&version, 0o000);
+    let report = store.gc();
+    chmod(&version, 0o755);
+
+    let report = report.unwrap();
+    assert_eq!((report.stale_build_rows, report.damaged_artifacts), (0, 0));
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(report.failures[0].starts_with("cannot inspect"));
+    assert_eq!(recorded(&store), (1, 0));
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_damaged_file_gc_cannot_delete_keeps_its_record() {
+    // Audit N6: the record went first, so the undeleted file became
+    // invisible to every later verify and gc.
+    if !permissions_enforced() {
+        return;
+    }
+    let (_root, store, scratch) = make_store();
+    let build = store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    std::fs::write(build.dir.join("a.zip"), b"resized!!").unwrap();
+    chmod(&build.dir, 0o555);
+    let first = store.gc();
+    chmod(&build.dir, 0o755);
+
+    let first = first.unwrap();
+    assert_eq!(first.damaged_artifacts, 0);
+    assert!(
+        first.failures[0].contains("failed to delete"),
+        "{:?}",
+        first.failures
+    );
+    assert_eq!(
+        store.verify(VerifyMode::Size).unwrap().len(),
+        1,
+        "still visible"
+    );
+    let second = store.gc().unwrap();
+    assert_eq!(second.damaged_artifacts, 1);
+    assert!(!build.dir.join("a.zip").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_damaged_symlink_counts_no_target_bytes() {
+    let (root, store, scratch) = make_store();
+    let build = store_files(&store, &scratch, &[("a.zip", b"artifact")]);
+    let big = root.path().join("big.bin");
+    std::fs::write(&big, vec![0u8; 100_000]).unwrap();
+    let link = build.dir.join("a.zip");
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&big, &link).unwrap();
+
+    let report = store.gc().unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert_eq!(report.damaged_bytes_removed, 0);
+    assert!(big.exists(), "only the link goes");
+}
+
+#[test]
+fn repair_recovers_a_database_with_a_negative_schema_version() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    rusqlite::Connection::open(base.join("apvm.db"))
+        .unwrap()
+        .pragma_update(None, "user_version", -1)
+        .unwrap();
+    assert!(matches!(
+        ArtifactStore::open(&base),
+        Err(Error::DatabaseCorrupted { .. })
+    ));
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert!(report.quarantined_database.is_some());
+    assert_eq!(report.builds_adopted, 1);
+    assert_eq!(store.usage().unwrap().build_count, 1);
+}
