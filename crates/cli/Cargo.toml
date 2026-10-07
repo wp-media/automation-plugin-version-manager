@@ -44,7 +44,7 @@ indicatif = { workspace = true }
 # Platform directories (home, config, etc.)
 directories = { workspace = true }
 
-# Date/time (for `apvm cache clean --older-than` cutoffs)
+# Date/time (update-notifier timestamps in `update_check.rs`)
 chrono = { workspace = true }
 
 # Semantic versioning (for update version comparison)

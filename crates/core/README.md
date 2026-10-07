@@ -43,6 +43,7 @@ apvm-core/src/
 ├── lib.rs          Main Apvm struct (entry point)
 ├── error.rs        Error types (thiserror-based)
 ├── config_io.rs    Configuration file load/save helpers
+├── maintenance.rs  CacheMaintenance — the `apvm cache` actions, shared by every front end
 ├── build/          Build system
 │   ├── context.rs      BuildContext (shared build state)
 │   ├── runner.rs       BuildRunner (command execution)
@@ -354,6 +355,47 @@ Helper methods: `description()` renders a human-readable summary (e.g.
 `PR #123 @ a1b2c3d`), and `from_cache()` is `true` when every delivered
 artifact came from the cache (a partial build is `false`).
 
+## Cache Maintenance
+
+`maintenance::CacheMaintenance` is the single implementation of the
+`apvm cache` actions — `usage`, `clean`, `clear`, `gc`, `verify`, `repair`.
+The CLI is a thin adapter over it; other front ends are meant to wrap it the
+same way. It works on a cache directory directly (no `Apvm`, no GitHub
+client) and ignores `cache_enabled`.
+
+- **Validates first:** a bad `CleanRequest` (`older_than` spec, `project`)
+  fails whether or not the cache exists.
+- **Only real caches:** a directory is a cache only if it holds the cache
+  database. Missing or empty → every action returns `Ok(None)` and nothing is
+  created. Someone else's data (`ForeignDirectory`), a lost database
+  (`MissingDatabase`), a regular file, an empty path, or a path that can't be
+  inspected are errors — never "empty".
+- **Surfaces errors:** a corrupt database (`DatabaseCorrupted`, or unreadable
+  rows: `Data`) comes back inside `Error::Storage` for each front end to
+  annotate. `repair()` is the remedy — it also rebuilds a lost database — and
+  a no-op on a healthy one.
+
+The storage types it takes and returns (`CleanTarget`, `VerifyMode`, the
+report types, `StoreState`, …) are re-exported from `maintenance`, so
+callers need no `apvm-storage` dependency.
+
+```rust,ignore
+use apvm_core::maintenance::{CacheMaintenance, CleanRequest, CleanTarget, VerifyMode};
+
+let cache = CacheMaintenance::new("/home/me/.apvm/cache");
+let request = CleanRequest::default()
+    .older_than(Some("30d".to_string()))    // `m`, `h`, `d`, `w` — parse_duration()
+    .project(Some("backwpup".to_string()))
+    .target(CleanTarget::Builds);
+match cache.clean(&request)? {
+    Some(report) => println!("removed {} build(s)", report.builds_deleted),
+    None => println!("nothing has been cached yet"),
+}
+let issues = cache.verify(VerifyMode::Checksum)?;       // Option<Vec<VerifyIssue>>
+```
+
+All I/O is blocking; from async code, call it inside `spawn_blocking`.
+
 ## Configuration I/O
 
 `config_io` provides load/save helpers for `apvm_config::Config`:
@@ -397,6 +439,7 @@ All library code returns `Result<T>` (alias for `Result<T, Error>`). **No panics
 | [reqwest](https://docs.rs/reqwest/0.13)         | 0.13    | HTTP downloads (native-tls)       |
 | [serde](https://docs.rs/serde/1)                | 1       | Serialization                     |
 | [serde_json](https://docs.rs/serde_json/1)      | 1       | JSON parsing                      |
+| [chrono](https://docs.rs/chrono/0.4)            | 0.4     | Cache-maintenance age cutoffs     |
 | [thiserror](https://docs.rs/thiserror/2)        | 2       | Error type derivation             |
 | [tracing](https://docs.rs/tracing/0.1)          | 0.1     | Structured logging                |
 | [which](https://docs.rs/which/8)                | 8       | Tool dependency checking          |

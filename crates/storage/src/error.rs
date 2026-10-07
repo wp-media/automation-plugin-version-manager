@@ -83,11 +83,44 @@ pub enum Error {
 
     /// Stored metadata is internally inconsistent (e.g. a negative file size
     /// or an out-of-range timestamp). Indicates external tampering with the
-    /// database; [`crate::ArtifactStore::repair`] rebuilds a clean index.
+    /// database; [`crate::ArtifactStore::repair`] quarantines it and rebuilds
+    /// a clean index.
     #[error("corrupt stored metadata: {details}")]
     Data {
         /// Description of the inconsistency.
         details: String,
+    },
+
+    /// The directory has no store database and no sign of ever having held
+    /// a store, yet contains `entry`, a subdirectory named like a store
+    /// project. The store refuses to initialize there: its garbage
+    /// collection could later delete that data.
+    #[error(
+        "refusing to use {} as an artifact store: it has no apvm database but already \
+         contains '{entry}' (use a new or empty directory)",
+        path.display()
+    )]
+    ForeignDirectory {
+        /// The directory that was refused.
+        path: PathBuf,
+        /// The first project-named subdirectory found in it.
+        entry: String,
+    },
+
+    /// The store database is missing while store content remains on disk
+    /// (a store whose database was deleted). Opening would silently orphan
+    /// that content, so it is refused; [`crate::ArtifactStore::repair`]
+    /// rebuilds the index.
+    #[error(
+        "the store database at {} is missing but store content remains \
+         ({adoptable_builds} re-indexable build(s)); run ArtifactStore::repair to rebuild the index",
+        path.display()
+    )]
+    MissingDatabase {
+        /// The store directory.
+        path: PathBuf,
+        /// Build directories repair would re-index.
+        adoptable_builds: u64,
     },
 }
 

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use apvm_storage::{
     ArtifactStore, BuildMetadata, BuildSource, CleanOptions, CleanTarget, Error, LookupKey,
-    LookupRequest, LookupResult, MissReason, ReleaseMetadata, SourceArtifact, VerifyMode,
-    VerifyProblem,
+    LookupRequest, LookupResult, MissReason, ReleaseMetadata, SourceArtifact, StoreState,
+    VerifyMode, VerifyProblem,
 };
 use chrono::{Duration, Utc};
 
@@ -528,6 +528,49 @@ fn clean_scopes_by_project_and_target() {
         !store.base_dir().join("backwpup").exists(),
         "empty project dirs are pruned"
     );
+}
+
+#[test]
+fn clean_options_validate_checks_filters_without_a_store() {
+    // No store is opened anywhere in this test: validation is pure.
+    assert!(CleanOptions::default().validate().is_ok());
+    assert!(
+        CleanOptions::default()
+            .project("wp-rocket")
+            .validate()
+            .is_ok()
+    );
+    for bad in ["Bad/Name", "", "../escape", "UPPER"] {
+        let err = CleanOptions::default()
+            .project(bad)
+            .validate()
+            .expect_err("an invalid project filter must be rejected");
+        assert!(
+            matches!(
+                err,
+                Error::InvalidInput {
+                    what: "project",
+                    ..
+                }
+            ),
+            "unexpected error for {bad:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn clean_rejects_an_invalid_project_through_validate() {
+    let (_root, store, _scratch) = make_store();
+    let err = store
+        .clean(&CleanOptions::default().project("Bad/Name").dry_run(true))
+        .expect_err("clean must validate its filters");
+    assert!(matches!(
+        err,
+        Error::InvalidInput {
+            what: "project",
+            ..
+        }
+    ));
 }
 
 // ============================================================================
@@ -1446,5 +1489,338 @@ fn rebuild_of_another_version_coexists_with_the_original() {
             assert_eq!(available, vec!["5.7.0".to_string(), "5.6.0".to_string()]);
         }
         other => panic!("expected VersionMismatch listing both versions, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// Ownership: what a directory holds, and never touching what the store did
+// not create (audit findings: gc on foreign/symlinked data, races, repair)
+// ============================================================================
+
+/// Every entry under `dir`, relative and sorted — to prove an operation left
+/// a directory exactly as it found it.
+fn tree(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current).unwrap().flatten() {
+            let path = entry.path();
+            out.push(
+                path.strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Write `body` at `rel` below `dir`, creating parents.
+fn put(dir: &Path, rel: &str, body: &str) {
+    let path = dir.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+/// A user's directory with data at store-shaped paths and no database.
+fn user_dir(root: &Path) -> PathBuf {
+    let dir = root.join("user");
+    put(&dir, "my-plugin/releases/1.0/important.txt", "important");
+    put(&dir, "tools/commits/2024/q1/report.md", "report");
+    put(&dir, "Docs/readme.md", "docs");
+    std::fs::create_dir_all(dir.join("notes")).unwrap();
+    dir
+}
+
+/// Store one build and close the store, returning its base directory.
+fn closed_store_with_a_build(root: &Path) -> PathBuf {
+    let base = root.join("store");
+    let scratch = root.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let store = ArtifactStore::open(&base).unwrap();
+    store
+        .store(
+            &metadata("backwpup", "5.6.0", COMMIT_A),
+            &[artifact(&scratch, "a.zip", b"artifact", None)],
+        )
+        .unwrap();
+    base
+}
+
+/// Delete the database file (and any sidecars), as a user might by hand.
+fn delete_database(base: &Path) {
+    for name in ["apvm.db", "apvm.db-wal", "apvm.db-shm"] {
+        let _ = std::fs::remove_file(base.join(name));
+    }
+}
+
+#[test]
+fn inspect_classifies_each_directory_state() {
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(
+        ArtifactStore::inspect(root.path().join("missing")).unwrap(),
+        StoreState::Missing
+    );
+
+    // Root files and non-project directories never make a store.
+    let empty = root.path().join("empty");
+    put(&empty, ".DS_Store", "x");
+    put(&empty, "Docs/readme.md", "docs");
+    assert_eq!(ArtifactStore::inspect(&empty).unwrap(), StoreState::Empty);
+
+    let base = closed_store_with_a_build(root.path());
+    assert_eq!(ArtifactStore::inspect(&base).unwrap(), StoreState::Present);
+    delete_database(&base);
+    assert_eq!(
+        ArtifactStore::inspect(&base).unwrap(),
+        StoreState::Orphaned {
+            adoptable_builds: 1
+        }
+    );
+
+    // Only a cached release left (not adoptable), plus the store's lock file.
+    let releases_only = root.path().join("releases-only");
+    put(&releases_only, "backwpup/releases/5.7.6/a.zip", "zip");
+    put(&releases_only, ".apvm.lock", "");
+    assert_eq!(
+        ArtifactStore::inspect(&releases_only).unwrap(),
+        StoreState::Orphaned {
+            adoptable_builds: 0
+        }
+    );
+
+    assert_eq!(
+        ArtifactStore::inspect(user_dir(root.path())).unwrap(),
+        StoreState::Foreign {
+            entry: "my-plugin".to_string()
+        }
+    );
+
+    let file = root.path().join("a-file");
+    std::fs::write(&file, b"x").unwrap();
+    assert!(matches!(
+        ArtifactStore::inspect(&file),
+        Err(Error::Io { .. })
+    ));
+}
+
+#[test]
+fn a_foreign_directory_is_refused_and_left_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    let user = user_dir(root.path());
+    let before = tree(&user);
+
+    let err = ArtifactStore::open(&user).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&err, Error::ForeignDirectory { entry, .. } if entry == "my-plugin"),
+        "{err}"
+    );
+    assert!(matches!(
+        ArtifactStore::repair(&user).map(|_| ()),
+        Err(Error::ForeignDirectory { .. })
+    ));
+    assert!(ArtifactStore::open_existing(&user).unwrap().is_none());
+    assert_eq!(tree(&user), before, "no database or lock file may appear");
+}
+
+#[test]
+fn a_store_with_a_lost_database_is_refused_until_repaired() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    delete_database(&base);
+
+    assert!(matches!(
+        ArtifactStore::open(&base).map(|_| ()),
+        Err(Error::MissingDatabase {
+            adoptable_builds: 1,
+            ..
+        })
+    ));
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert!(report.rebuilt_missing_database);
+    assert!(report.quarantined_database.is_none());
+    assert_eq!((report.builds_adopted, report.artifacts_adopted), (1, 1));
+    assert_eq!(store.usage().unwrap().build_count, 1);
+    assert_eq!(ArtifactStore::inspect(&base).unwrap(), StoreState::Present);
+}
+
+#[test]
+fn open_existing_never_creates_anything() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    assert!(ArtifactStore::open_existing(&missing).unwrap().is_none());
+    assert!(!missing.exists());
+
+    let empty = root.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert!(ArtifactStore::open_existing(&empty).unwrap().is_none());
+    assert!(
+        tree(&empty).is_empty(),
+        "no database or lock file may appear"
+    );
+
+    let base = closed_store_with_a_build(root.path());
+    let store = ArtifactStore::open_existing(&base).unwrap().unwrap();
+    assert_eq!(store.usage().unwrap().build_count, 1);
+}
+
+#[test]
+fn gc_removes_only_what_the_store_could_have_created() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    let user_shaped = [
+        "tools/commits/2024/q1/report.md",
+        "my-plugin/releases/has space/x.txt",
+        "backwpup/commits/5.6.0/not-hex/x.txt",
+    ];
+    for rel in user_shaped {
+        put(&base, rel, "keep");
+    }
+    std::fs::create_dir_all(base.join("notes")).unwrap();
+    // A genuine orphan the store could have produced: still reclaimed.
+    put(&base, "backwpup/commits/5.6.0/bbbbbbb/b.zip", "orphan");
+
+    let report = ArtifactStore::open(&base).unwrap().gc().unwrap();
+    assert_eq!(report.orphan_dirs_removed, 1);
+    assert!(!base.join("backwpup/commits/5.6.0/bbbbbbb").exists());
+    for rel in user_shaped.iter().copied().chain(["notes"]) {
+        assert!(base.join(rel).exists(), "gc removed {rel}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_never_follows_symlinks_out_of_the_store() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    let outside = root.path().join("outside");
+    // Store-shaped names, so only the symlink rule protects them.
+    put(&outside, "v1.0/keep.txt", "keep");
+    put(&outside, "3.17.4/aaaaaaa/keep.txt", "keep");
+    put(&outside, "leaf/keep.txt", "keep");
+    let before = tree(&outside);
+
+    std::fs::create_dir_all(base.join("imagify/commits")).unwrap();
+    symlink(&outside, base.join("imagify/releases")).unwrap();
+    symlink(&outside, base.join("wp-rocket")).unwrap();
+    std::fs::create_dir_all(base.join("backwpup/releases")).unwrap();
+    symlink(&outside, base.join("backwpup/commits/5.6.0/ccccccc")).unwrap();
+    symlink(&outside, base.join("backwpup/releases/v9.9.9")).unwrap();
+
+    ArtifactStore::open(&base).unwrap().gc().unwrap();
+    assert_eq!(tree(&outside), before, "gc reached outside the store");
+}
+
+#[test]
+fn repair_recovers_a_database_whose_rows_cannot_be_read() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    {
+        let conn = rusqlite::Connection::open(base.join("apvm.db")).unwrap();
+        conn.execute("UPDATE builds SET built_at_ms = 9000000000000000000", [])
+            .unwrap();
+    }
+    // A long-lived handle (an `Apvm`, a running build) stays open throughout.
+    let holder = ArtifactStore::open(&base).unwrap();
+    assert!(matches!(holder.usage(), Err(Error::Data { .. })));
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert!(!report.rebuilt_missing_database);
+    assert_eq!(report.builds_adopted, 1);
+    assert_eq!(store.usage().unwrap().build_count, 1);
+    // The unreadable index is kept, as it was, for inspection.
+    let copy = rusqlite::Connection::open(report.quarantined_database.unwrap()).unwrap();
+    let kept: i64 = copy
+        .query_row("SELECT built_at_ms FROM builds", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(kept, 9_000_000_000_000_000_000);
+
+    // Regression: repair renamed the file, leaving the holder on the copy,
+    // where its reads stayed broken and its writes were lost.
+    assert_eq!(holder.usage().unwrap().build_count, 1);
+    let scratch = root.path().join("scratch");
+    holder
+        .store(
+            &metadata("backwpup", "5.6.1", COMMIT_A),
+            &[artifact(&scratch, "b.zip", b"later", None)],
+        )
+        .unwrap();
+    drop((holder, store));
+    let reopened = ArtifactStore::open(&base).unwrap();
+    assert_eq!(reopened.usage().unwrap().build_count, 2);
+}
+
+#[test]
+fn repair_recovers_unreadable_release_rows_too() {
+    let (_root, store, scratch) = make_store();
+    let base = store.base_dir().to_path_buf();
+    let meta = ReleaseMetadata::new("backwpup", "v5.3.0");
+    let assets = [artifact(&scratch, "backwpup-5.3.0.zip", b"release", None)];
+    store.store_release(&meta, &assets).unwrap();
+    drop(store);
+    {
+        let conn = rusqlite::Connection::open(base.join("apvm.db")).unwrap();
+        conn.execute("UPDATE releases SET cached_at_ms = 9000000000000000000", [])
+            .unwrap();
+    }
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert!(report.quarantined_database.is_some());
+    assert_eq!(report.orphan_release_dirs, 1);
+    // The unreadable record is gone, so lookups work again.
+    assert!(store.find_release("backwpup", "v5.3.0").unwrap().is_none());
+    drop(store);
+    let (_, again) = ArtifactStore::repair(&base).unwrap();
+    assert!(again.quarantined_database.is_none(), "still unreadable");
+}
+
+#[test]
+fn repair_racing_concurrent_opens_indexes_every_build() {
+    // Regression: a concurrent open could create a database between repair's
+    // quarantine and its rebuild, failing the repair and leaving the builds
+    // unindexed.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    for round in 0..50 {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("store");
+        for commit in ["aaaaaaa", "bbbbbbb", "ccccccc"] {
+            put(
+                &base,
+                &format!("wp-rocket/commits/3.17.4/{commit}/a.zip"),
+                "zip",
+            );
+        }
+        std::fs::write(base.join("apvm.db"), b"not a sqlite database").unwrap();
+
+        let barrier = Arc::new(Barrier::new(4));
+        let done = Arc::new(AtomicBool::new(false));
+        let openers: Vec<_> = (0..3)
+            .map(|_| {
+                let (base, barrier, done) = (base.clone(), barrier.clone(), done.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    while !done.load(Ordering::SeqCst) {
+                        let _ = ArtifactStore::open(&base).and_then(|s| s.usage());
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        let repaired = ArtifactStore::repair(&base).map(|(_, report)| report);
+        done.store(true, Ordering::SeqCst);
+        for opener in openers {
+            opener.join().unwrap();
+        }
+        let report = repaired.unwrap_or_else(|err| panic!("round {round}: {err}"));
+        assert_eq!(report.builds_adopted, 3, "round {round}");
+        let usage = ArtifactStore::open(&base).unwrap().usage().unwrap();
+        assert_eq!(usage.build_count, 3, "round {round}");
     }
 }

@@ -39,13 +39,27 @@ All tables are `STRICT`; deletes cascade; timestamps are epoch milliseconds
   reporting a hit; damaged entries degrade to a miss and re-storing heals
   them. `verify(VerifyMode::Checksum)` re-hashes everything on demand.
 - **Corruption story.** WAL journal + integrity check on every open; a
-  damaged database fails with `Error::DatabaseCorrupted`, and
-  `ArtifactStore::repair()` quarantines it, rebuilds a fresh index, and
-  re-adopts artifact files found on disk (hashes recomputed).
+  damaged database fails with `Error::DatabaseCorrupted` (unreadable rows:
+  `Error::Data`), and `ArtifactStore::repair()` quarantines it (an
+  unreadable one is copied aside and cleared in place, so open handles keep
+  working), rebuilds the index, and re-adopts artifact files found on disk
+  (hashes recomputed). A *deleted* database with files left is `StoreState::Orphaned`:
+  `open` refuses (`Error::MissingDatabase`) and `repair()` rebuilds it.
+- **Only its own files.** `ArtifactStore::inspect()` classifies a directory
+  (`StoreState`: missing, empty, present, orphaned, foreign) without touching
+  it. A store is only created in a missing or empty directory; one holding
+  someone else's data is refused (`Error::ForeignDirectory`).
+  `open_existing()` never creates anything. `gc` and `repair` walk only
+  store-produced names and never follow symlinks.
 - **Concurrency.** `ArtifactStore` is `Send + Sync`. Cross-process:
-  SQLite/WAL guards the database; an advisory lock (`.apvm.lock`)
-  serializes mutating operations so a clean can't race a store. Keep the
-  store on a local disk (advisory locks over NFS/SMB are unreliable).
+  SQLite/WAL guards the database (concurrent first opens are safe:
+  migrations run in an `IMMEDIATE` transaction, and the WAL switch retries
+  within the busy timeout; an open racing repair's replacement of the file
+  reopens on the new one); an advisory lock
+  (`.apvm.lock`) serializes mutating operations — database creation
+  included — so a clean can't race a store and a create can't race a
+  repair. Keep the store on a local disk (advisory locks over NFS/SMB are
+  unreliable).
 - **Async.** Everything is intentionally blocking; call through
   `tokio::task::spawn_blocking` from async code.
 
@@ -97,6 +111,10 @@ fn main() -> apvm_storage::Result<()> {
         .project("backwpup")
         .target(CleanTarget::Releases))?;
     store.clear_all()?;                                    // everything
+
+    // Filters can be checked without any store — e.g. to reject bad input
+    // before knowing whether a cache exists (`clean` also runs this).
+    CleanOptions::default().project("backwpup").validate()?;
 
     // Maintenance.
     store.gc()?;                            // reconcile db ↔ disk, sweep temp files

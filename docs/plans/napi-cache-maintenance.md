@@ -1,6 +1,6 @@
 # NAPI cache maintenance — parity with `apvm cache`
 
-Status: **planned** · Target version: **3.3.0** (from 3.2.0 — also claimed by the site-deployment plan; whichever lands second takes the next minor) · Author: Sandy Figueroa
+Status: **Phase 1 implemented and audited** (Phases 2–4 planned) · Target version: **3.3.0** (from 3.2.0 — also claimed by the site-deployment plan; whichever lands second takes the next minor) · Author: Sandy Figueroa
 
 ---
 
@@ -13,12 +13,13 @@ Status: **planned** · Target version: **3.3.0** (from 3.2.0 — also claimed by
 | **Approach** | A core facade, `apvm_core::maintenance::CacheMaintenance`, owns every maintenance decision. The CLI and NAPI become thin adapters over it, so parity comes from shared code, not discipline. |
 | **JS API** | `ApvmCache` with `info()`, `clean()`, `gc()`, `verify()`, `repair()`, `clear()` — 1:1 with the subcommands — from `apvm.cache()` (the dir that instance builds into) or `ApvmCache.open(config?)` (standalone, no GitHub client). Plus `apvm.cacheStatus()`. |
 | **Errors** | Every `ApvmCache` rejection carries a stable `err.code`: `CacheCorrupted` (→ `repair()`), `InvalidArg`, `GenericFailure`. Delivered through a JS-thread callback, spike-verified on napi 3.13. |
-| **Fixes** | **F4** input is validated before the missing-dir guard. **F11** an unusable cache is reported (status + build warning) and re-attached automatically once repaired. **F12** `gc` removes damaged entries (`--checksum` catches same-size corruption), which makes verify's hint true. |
+| **Fixes** | **F4** input is validated before the missing-dir guard, and an uninspectable path is an error, not "empty". **F11** an unusable cache is reported (status + build warning) and re-attached automatically once repaired. **F12** `gc` removes damaged entries (`--checksum` catches same-size corruption), which makes verify's hint true. |
 | **Invariants** | Never creates a missing cache dir. Validates before touching disk. All I/O runs off the event loop. |
 | **Deliberate differences** | `clear()` has no prompt. `verify()` resolves with the issue list instead of rejecting. |
 | **CLI impact** | Output unchanged except the fixes: the F4 error, the F11 warning, `gc --checksum` + one gc line + a corrected hint (F12). SKILL.md is updated for exactly those. |
 | **Deps** | `chrono` added to `apvm-core` (already a workspace dependency). Nothing new in the root `Cargo.toml`. |
-| **Phases** | 1 facade + F4 → 2 F11 + F12 → 3 NAPI surface → 4 release 3.3.0. |
+| **Audit (Phase 1)** | Adversarial audits, a mutation campaign and load stress found seven storage hazards, all fixed in Phase 1 (F13–F19): gc deleting foreign or symlinked data, races on concurrent opens and repair (including an in-process SIGBUS), unrepairable rows, open handles stranded on a quarantined copy, and a busy timeout that silently became 0. The first F15 fix was incomplete; load stress exposed the remaining WAL-switch race. |
+| **Phases** | 1 facade + F4 + audit fixes (F13–F19) → 2 F11 + F12 → 3 NAPI surface → 4 release 3.3.0. |
 
 ---
 
@@ -47,7 +48,7 @@ Confirmed at runtime on the shipped binary: `Apvm.prototype` has only `build*`, 
 | F1 | `apvm cache` calls `apvm_storage::ArtifactStore` directly; core has no maintenance API. NAPI would have to copy the CLI glue: missing-dir guard, `--older-than` grammar (`parse_duration`), target mapping, corruption hint. | read |
 | F2 | On a missing dir, all six actions print "Cache is empty", exit 0 and never create the dir. `ArtifactStore::open`/`repair` both `create_dir_all`, so the guard must precede any open. | ran all six |
 | F3 | `Apvm.create()` with caching on creates `apvm.db` (+WAL); with `cacheEnabled: false` it creates nothing; on a corrupt DB it **resolves** with caching off, and the store is never reopened for that instance. | ran from Node + read |
-| F4 | **Bug:** the guard runs before validation — `clean --older-than 30y --project Bad/Name` exits 0 on a missing dir, 1 once the dir exists. For a library that is a CI-only failure (fresh runners have no cache). | ran |
+| F4 | **Bug:** the guard runs before validation — `clean --older-than 30y --project Bad/Name` exits 0 on a missing dir, 1 once the dir exists. For a library that is a CI-only failure (fresh runners have no cache). Same class: the guard's `Path::exists` hides errors, so a path that cannot be inspected (below a regular file, permission denied) is reported as "Cache is empty", exit 0. | ran |
 | F5 | NAPI resolves `cacheDir` → `~/.apvm/cache`, then `APVM_CACHE_DIR` wins (set from JS, it beat an explicit `cacheDir`). NAPI never reads `~/.apvm/config.json`. | ran from Node + read |
 | F6 | Existing rejections carry `err.code` = the napi `Status` (`"InvalidArg"` for an unknown project). | ran from Node |
 | F7 | Spike on the locked versions (napi 3.13.0, derive 3.6.9, cli 3.10.5): a method can return another class ✅; a sync factory taking an optional object config ✅; `spawn_blocking` keeps the event loop live ✅; a bad string-enum value → `InvalidArg` ✅. A custom code through an `async fn` return type (`napi::Result<T, CustomStatus>`) does **not** compile — but `Env::spawn_future_with_callback` + `create_error` + a `code` property **does**: the promise rejects with `code: "CacheCorrupted"`, still `instanceof Error` with message and stack, 8 concurrent calls behave, and `ts_return_type` yields `Promise<T>`. | spike |
@@ -56,6 +57,14 @@ Confirmed at runtime on the shipped binary: `Apvm.prototype` has only `build*`, 
 | F10 | Unfiltered `clean` deletes everything without a prompt, so `clear`'s prompt is UI, not a safety boundary. | ran |
 | F11 | **Bug (both front ends):** with a corrupt or unopenable cache every build is silently uncached. Only `warmCache` warns, and only "disabled or unavailable"; the one signal carrying the reason is a `tracing` log, hidden unless `RUST_LOG` is set. | ran CLI + read |
 | F12 | **Bug:** damaged artifacts, via the storage API. *Missing file:* lookup misses, re-store heals, `gc` drops 0. *Size mismatch:* lookup misses, re-store heals, `gc` ignores it. *Same-size corruption:* **served as a cache hit, re-store reuses it, `gc` ignores it** — only `verify --checksum` sees it, and nothing short of `clean`/`clear` removes it. So verify's hint ("run `apvm cache gc` … or rebuild to heal them") has `gc` advice that fixes none of the three, and "rebuild" fails for the third. | probe crate |
+
+| F13 | **Bug (audit):** `gc` on a directory that is not a cache deleted user data at store-shaped paths (`my-plugin/releases/1.0/…`, `tools/commits/2024/q1/…`, empty `notes/`) and created `apvm.db` there. On a real cache whose database was deleted, `gc` removed every build. Read-only actions also created `apvm.db` in any existing directory. | ran |
+| F14 | **Bug (audit):** `gc` followed a symlinked `commits`/`releases` directory and deleted outside the cache. | ran |
+| F15 | **Bug (audit):** concurrent first opens of a new database failed (`table builds already exists` / `database is locked`; 43–84 of 320 in-process opens). The WAL switch alone still failed 16 of 120,000 racing opens: SQLite fails that lock upgrade at once, without the busy handler. `repair` racing concurrent opens failed after quarantining, leaving builds unindexed (~0.5% of rounds). A load stress run exposed the WAL case after the first fix. `repair` racing concurrent opens failed after quarantining, leaving builds unindexed (~0.5% of rounds). | probe |
+| F16 | **Bug (audit):** a database with unreadable rows (e.g. an out-of-range timestamp) failed every read forever: `repair` reported "healthy", although the docs said it rebuilt the index. An empty cache path meant "missing" to maintenance but the current directory to the store. | ran |
+| F17 | **Bug (audit):** a connection that opened `apvm.db` just before repair renamed it, and first read it just after, paired the quarantined file with the new database's WAL. Distinct layouts gave `database disk image is malformed`; lookalike layouts (the F16 case) let its writes reach the new database. SQLite checks for a moved file only on rollback-journal writes and on close. **In the same process**, POSIX locks are shared, so the ghost took the new `-shm` for its own and truncated it under live connections: SIGBUS in `walIndexReadHdr` in 3 of 4 race-probe runs. Windows is immune: an open database cannot be renamed there (no `FILE_SHARE_DELETE`). | probe + crash report + source |
+| F18 | **Bug (audit, pre-existing):** `StoreOptions::busy_timeout` above `i32::MAX` ms saturated to `u64::MAX`, which SQLite silently reads as 0, so the store never waited. | ran |
+| F19 | **Bug (audit):** F16's repair renamed a database with unreadable rows. Such a database opens fine, so a long-lived handle (`Apvm` keeps its store for its lifetime; a running build) stayed on the renamed copy: its reads stayed broken, its writes were lost, and `gc` later collected its builds as orphans. | ran |
 
 Baseline at `1f22e28`: fmt, clippy and doc are clean; 631 tests pass.
 
@@ -81,36 +90,42 @@ The facade owns every *decision* (guard, validation, grammar, mapping); the adap
 ```rust
 pub struct CacheMaintenance { dir: PathBuf }             // Send + Sync; never holds an open store
 
-impl CacheMaintenance {
+impl CacheMaintenance {                                  // Ok(None) = no cache here (missing or empty dir)
     pub fn new(dir: impl Into<PathBuf>) -> Self;
     pub fn dir(&self) -> &Path;
-    pub fn exists(&self) -> bool;                         // the F2 guard; never creates
-    pub fn usage(&self) -> Result<UsageReport>;
-    pub fn clean(&self, request: &CleanRequest) -> Result<CleanReport>;
-    pub fn clear(&self) -> Result<CleanReport>;
-    pub fn gc(&self, mode: VerifyMode) -> Result<GcReport>;          // mode: Phase 2 (F12)
-    pub fn verify(&self, mode: VerifyMode) -> Result<Vec<VerifyIssue>>;
-    pub fn repair(&self) -> Result<RepairReport>;
+    pub fn exists(&self) -> Result<bool>;                // true only if the cache DB is present; never creates
+    pub fn usage(&self) -> Result<Option<UsageReport>>;
+    pub fn clean(&self, request: &CleanRequest) -> Result<Option<CleanReport>>;
+    pub fn clear(&self) -> Result<Option<CleanReport>>;
+    pub fn gc(&self) -> Result<Option<GcReport>>;        // gains a VerifyMode in Phase 2 (F12)
+    pub fn verify(&self, mode: VerifyMode) -> Result<Option<Vec<VerifyIssue>>>;
+    pub fn repair(&self) -> Result<Option<RepairReport>>;
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct CleanRequest {                                // CLI flags ≡ JS options, 1:1
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanRequest {                                // CLI flags ≡ JS options, 1:1; chainable setters
     pub older_than: Option<String>,                      // "30d" — parse_duration grammar
     pub project: Option<String>,
     pub target: CleanTarget,                             // apvm_storage::CleanTarget (default All)
     pub dry_run: bool,
 }
+impl CleanRequest {
+    pub fn to_options(&self, now: DateTime<Utc>) -> Result<CleanOptions>; // pure: resolves + validates
+}
 
 pub fn parse_duration(spec: &str) -> std::result::Result<chrono::Duration, String>; // moved verbatim from the CLI
+
+pub use apvm_storage::{CleanReport, CleanTarget, GcReport, RepairReport, StoreState, UsageReport, VerifyMode, …};
 ```
 
 - **Order:** validate → guard → open → operate. Validation checks the duration first, then the project (today's order); the project rule is a new public `apvm_storage::CleanOptions::validate()`, which `clean()` itself also calls — one rule, one place.
-- **Missing dir:** the report type's `Default` (`clean` keeps `dry_run`). **Corrupt DB:** `Error::Storage(DatabaseCorrupted)` untouched; each adapter adds its own hint or code.
+- **No cache:** a missing or empty directory is `Ok(None)` rather than a zeroed report, so "nothing cached" stays distinguishable from "empty": the CLI prints its "Cache is empty" note, NAPI renders an empty report. Classification comes from storage `ArtifactStore::inspect` (`StoreState`); only a present database is opened, via the non-creating `open_existing`, so no action but `repair` ever creates a file (F13).
+- **Errors, never "empty":** someone else's data (`ForeignDirectory`), a lost database (`MissingDatabase` — `repair` rebuilds it), a regular file, an empty path (`Error::Config`, F16), or a path `try_exists` cannot inspect (`Error::Io` with its kind, F4). **Corrupt DB** (`DatabaseCorrupted`, or unreadable rows: `Data`): returned untouched inside `Error::Storage`; each adapter adds its own hint or code.
 - **Blocking by design,** like storage: the CLI calls it directly, NAPI wraps it. The age cutoff (`now − duration`) is a private pure fn taking `now`, so age tests are deterministic.
 
 ### 3.3 F11 — an unusable cache is visible and heals itself
 
-- **A slot, not a fixed `Option`:** `Apvm` keeps its store in a private `Mutex` slot (poison-tolerant, like `ArtifactStore::conn`). While caching is enabled but the store is not open, each `build`, `warm_cache` and `cache_status` call retries the open once — one SQLite open, the cost the constructors already pay. A `repair()` from anywhere (NAPI, the CLI, another process) therefore re-enables caching on live instances; nothing has to be re-created.
+- **A slot, not a fixed `Option`:** `Apvm` keeps its store in a private `Mutex` slot (poison-tolerant, like `ArtifactStore::conn`). While caching is enabled but the store is not open, each `build`, `warm_cache` and `cache_status` call retries the open once — one SQLite open, the cost the constructors already pay. A `repair()` from anywhere (NAPI, the CLI, another process) therefore re-enables caching on live instances; nothing has to be re-created. An **open** store survives repair of unreadable rows (cleared in place, F19). A file-level corrupt database is renamed aside, though, and a store still open on it stays on the old file, so the slot must also drop its store after a corruption error.
 - **Status:** `pub fn cache_status(&self) -> CacheStatus` = `Active | Disabled | Corrupted { details } | Unavailable { details }`, classified from the open error. `cache_active()` (used only by tests today) is derived from it.
 - **Warning:** when caching is enabled but unavailable, `build` and `warm_cache` emit exactly one `BuildEvent::Warning` with the reason and the remedy (for `Corrupted`, naming both `apvm cache repair` and `ApvmCache.repair()`). `Apvm` hands the status to `BuildCommand` through a new non-breaking setter, so the 13 existing `BuildCommand::new` call sites are untouched and the generic warm warning fires only for the disabled case, with its text unchanged (pinned by `cache_e2e.rs:584`). The CLI already prints warnings as `⚠ …`; NAPI delivers them to `onProgress`.
 
@@ -200,16 +215,31 @@ const usage  = await ApvmCache.open({ cacheDir }).info();   // maintenance-only 
 
 Every phase ends green on the full CLAUDE.md validation suite, run with `APVM_CACHE_DIR="$(mktemp -d)"`. From Phase 3 on, also run `npm run build:debug && npm run typecheck && npm test`. The locally generated `index.js`, `index.d.ts` and `*.node` are never committed; CI owns them.
 
-### Phase 1 — Core facade; CLI on top (pure refactor + F4)
+### Phase 1 — Core facade; CLI on top (+ F4 and the audit fixes) — **implemented**
 
-- **New:** `crates/core/src/maintenance.rs` (§3.2; `gc` takes no mode yet) and `pub mod maintenance`; `chrono = { workspace = true }` in `crates/core/Cargo.toml`; public `CleanOptions::validate()` in storage.
-- **Changed:** `crates/cli/src/commands/cache.rs` keeps only printing, `human_bytes`, the `clear` prompt, the corruption hint and verify's exit 1. `parse_duration` and its 2 tests move to core (the CLI keeps `chrono` for `update_check.rs`).
-- **Tests (core, temp dirs, offline):**
-  - The six ops on a missing dir → default report, dir still absent.
-  - F4 inputs rejected on a missing dir; with both invalid, the duration error wins (today's order).
-  - Seeded store (`ArtifactStore::store`, as the CLI tests do) → `usage`; `clean` by project / target / age (injected `now`) / dry-run; `clear`; `gc`; `verify` in both modes.
-  - Corrupt DB → `DatabaseCorrupted` from every op except `repair`, which quarantines and adopts.
-- **Exit:** the 7 remaining CLI tests pass unmodified, plus 1 for F4. On copies of one cache seeded offline (F9), every action's output diffs identical between the pre- and post-change binaries.
+- **Core:** `crates/core/src/maintenance.rs` (§3.2; `gc` takes no mode yet), `pub mod maintenance` + root re-exports; `chrono = { workspace = true }`.
+- **Storage (audit fixes):**
+  - **F13:** new `layout.rs` — `inspect()` → `StoreState` (Missing / Empty / Present / Orphaned / Foreign), read-only and symlink-safe. `open` creates a store only in a missing or empty directory; it refuses foreign data (`ForeignDirectory`) and a lost database (`MissingDatabase`). New non-creating `open_existing()`.
+  - **F13/F14 — gc:** removes only store-produced names (hex build leaves, sanitized-tag release leaves), never traverses symlinks, and prunes only store-shaped project dirs.
+  - **F15:** migrations re-check `user_version` inside `BEGIN IMMEDIATE`; the WAL switch retries on `SQLITE_BUSY` until the busy timeout elapses; a database is only ever created under the store lock, re-checked there.
+  - **F16/F19:** `repair` rebuilds a lost database from disk and refuses foreign directories. For unreadable rows (`Error::Data`) it copies the index aside (`VACUUM INTO apvm.db.corrupt-<ms>`), then empties and re-fills it in place, so open handles keep working. Only a non-UTF-8 base path, which SQL cannot name, falls back to renaming. `CleanOptions::validate()` is public.
+  - **F17:** `db::open` records the file's identity (device, inode) before opening and again after the first read. If it changed, it reopens, at most 3 times. Within the process, a lock keeps the quarantine rename and a connection's start apart.
+  - **F18:** the busy timeout saturates at `i32::MAX` ms.
+- **CLI:** `crates/cli/src/commands/cache.rs` is presentation only. All I/O goes through an injectable `Console` (stdout, stderr, confirmation), and every report is a pure renderer. Hints are per error (corrupt/unreadable → repair; missing → repair; foreign → where the cache location comes from). `clear` checks the cache before prompting. `parse_duration` and its 2 tests moved to core verbatim.
+- **Tests (all offline):** 695 pass (631 before): storage +25, core +24 (2 moved from the CLI), CLI +14 net, 1 doctest.
+  - core: 24 facade tests — every action in every directory state, exact messages, Unix-gated error kinds;
+  - CLI: 23 cache tests — exact renderer output, streams, scripted prompts, flag mapping, hints;
+  - storage: every `StoreState`, refusals leaving directories byte-identical, gc name and symlink rules, lost-DB rebuild, unreadable-row repair, concurrent first opens and repair-vs-open races, a WAL switch waiting for (and timing out on) a rival writer, a file replaced / moved / kept replaced mid-open, the in-process swap lock (both sides), in-place repair keeping an open handle working, unreadable release rows, busy-timeout saturation, creation waiting for the lock.
+- **Verified:**
+  - **Clap definitions and the 7 original CLI tests:** byte-identical to `HEAD`.
+  - **Mutation testing:** 50 of 51 mutants caught under full-suite load, each by the test written for it. Runs use `--no-fail-fast`, since one "catch" turned out to be the F15 flake; a timing-based guard test that let a mutant through under load was made deterministic. The 51st ("repair offers itself as remedy") is equivalent in practice: repair can only surface a corruption error if its own fresh database fails the integrity check.
+  - **Race probes:** 0 failures in 1,600 first opens, 1,000 repair rounds and 120,000 racing WAL switches; before the fixes, 43–84 of 320, ~0.5% and 16 of 120,000 failed. 0 of 360 storage-suite runs under 6× parallel load failed; 1 of 240 failed before the WAL fix. 10 of 10 race-probe processes exit cleanly (16,000 first opens, 10,000 repair rounds); without the in-process lock, 4 of 4 die of SIGBUS.
+  - **Old vs new CLI:** 57 scenarios, with a clean control run. 38 of the original 42 are byte-identical. The 4 intended deltas are the three F4 cases and the neutral out-of-range message (`'100000000w' is out of range`, no CLI flag name in core). All 15 new foreign / empty / deleted-DB / symlink scenarios changed as intended: nothing written or deleted, errors with next-step hints, `repair` re-indexing.
+- **Other intended deltas:**
+  - Invalid `clean` input now beats a corrupt database (validation first).
+  - An existing empty directory is reported as empty, with no `apvm.db` created.
+  - `clear` on a broken cache errors before prompting.
+- **Docs:** SKILL.md (cache section and error rows), CLI/core/storage/root READMEs.
 
 ### Phase 2 — F11 and F12 (core, storage, CLI; no JS change)
 

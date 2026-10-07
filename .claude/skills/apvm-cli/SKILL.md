@@ -189,14 +189,20 @@ Tool dependencies:
 Inspect and maintain the artifact cache. Works **even when caching is turned
 off** (`apvm config set cache false`) — operates directly on the cache dir.
 
+A directory is a cache only if it holds the cache database. A missing or empty
+directory prints `Cache is empty — nothing has been cached yet.` and is never
+written to. A directory holding other data is refused (apvm never initializes
+a cache there, and `gc` could otherwise delete it). Invalid flags fail even when
+no cache exists yet.
+
 | Subcommand | Purpose                                                                                |
 |------------|----------------------------------------------------------------------------------------|
 | `info`     | Usage totals + per-project breakdown                                                   |
 | `clean`    | Remove entries by age / project / kind (supports `--dry-run`)                          |
-| `gc`       | Reconcile the SQLite DB with disk, sweep stale temp files                              |
+| `gc`       | Reconcile the SQLite DB with disk, sweep stale temp files. Removes only what apvm created; never follows symlinks |
 | `verify`   | Check integrity (presence + size; `--checksum` re-hashes). **Exits non-zero on issues** so CI can gate on cache health |
-| `repair`   | Recover a corrupt cache DB (quarantine it, rebuild the index from disk)                |
-| `clear`    | Remove everything (prompts unless `-y`)                                                |
+| `repair`   | Quarantine a corrupt DB, clear an unreadable one (copy kept), or rebuild a missing one; then re-index builds from disk |
+| `clear`    | Remove everything (prompts unless `-y`; a broken cache errors before prompting)        |
 
 #### `apvm cache clean` flags
 
@@ -379,7 +385,10 @@ Required for private repos and PR builds. Recommended for public repos
 
 | Symptom                                                          | Likely cause / fix                                                                |
 |------------------------------------------------------------------|-----------------------------------------------------------------------------------|
-| `Error: The cache database is corrupt — run 'apvm cache repair'` | Follow the hint: `apvm cache repair` quarantines the DB and rebuilds the index.   |
+| `Error: The cache database is corrupt — run 'apvm cache repair'` | Follow the hint: `apvm cache repair` quarantines the DB (unreadable rows, `corrupt stored metadata`: copies it aside and clears it in place) and rebuilds the index. |
+| `… the store database at <dir> is missing but store content remains …` | The DB was deleted while cached files remain. `apvm cache repair` rebuilds it from the builds on disk. |
+| `… refusing to use <dir> as an artifact store …`                | The cache dir holds other data. Point the cache at a new or empty directory (source: `APVM_CACHE_DIR` if set, else config `cache-dir`, else `~/.apvm/cache`). |
+| `Error: IO error: cannot access cache directory '<path>': …`    | `<path>` is the effective cache dir (as above). One of its components is a regular file, or a parent can't be traversed. Fix or re-point it — note `apvm config get cache-dir` shows the config/default only, not `APVM_CACHE_DIR`. On Windows such a path may just print "Cache is empty". |
 | `Error: failed to determine home directory`                      | `HOME` unset on Unix / `USERPROFILE` unset on Windows. Rare; set the env var.     |
 | `Error: --ver required` (BackWPup)                               | Pass `-v 5.1.0` (or whatever version). See `apvm info backwpup` for the default. |
 | `Warning: --ver ignored for '<plugin>'`                          | Plugin has `Embedded`/`Optional` version handling but you passed `--ver`. Harmless for `Optional` (it rewrites source); for `Embedded` it's rejected. |

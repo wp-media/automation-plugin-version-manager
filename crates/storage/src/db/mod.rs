@@ -17,6 +17,8 @@
 //! - `foreign_keys = ON` — deleting a build/release cascades to its
 //!   artifact and source rows.
 //! - `busy_timeout` — concurrent processes wait instead of failing fast.
+//!   It also bounds the retries of the WAL switch on a new database, which
+//!   SQLite fails without waiting when two openers race.
 //!
 //! `PRAGMA quick_check` runs on every open (the database is small), so a
 //! damaged file is detected up front and reported as
@@ -28,9 +30,11 @@ pub(crate) mod maintenance;
 pub(crate) mod releases;
 
 use std::path::Path;
+use std::sync::{PoisonError, RwLock, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
 
 use crate::error::{Error, Result};
 
@@ -166,8 +170,18 @@ pub(crate) struct ReleaseRow {
 // Connection lifecycle
 // ============================================================================
 
-/// Open (creating if needed) the store database: configure pragmas, verify
-/// integrity, and run pending migrations.
+/// Whether [`open`] may create a missing database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenMode {
+    /// Create the file when it does not exist.
+    CreateIfMissing,
+    /// Fail instead of creating — for callers that must leave no trace.
+    ExistingOnly,
+}
+
+/// Open the store database (creating it only under
+/// [`OpenMode::CreateIfMissing`]): configure pragmas, verify integrity, and
+/// run pending migrations.
 ///
 /// # Errors
 ///
@@ -175,18 +189,109 @@ pub(crate) struct ReleaseRow {
 ///   fails `quick_check`.
 /// - [`Error::UnsupportedSchema`] — the database was written by a newer
 ///   version of this crate.
-/// - [`Error::Database`] — any other SQLite failure.
+/// - [`Error::Database`] — any other SQLite failure, including a missing
+///   file under [`OpenMode::ExistingOnly`], or a file that kept being
+///   replaced while it was opened.
 pub(crate) fn open(
     db_path: &Path,
     busy_timeout_ms: u64,
     full_durability: bool,
+    mode: OpenMode,
 ) -> Result<Connection> {
-    let mut conn = Connection::open(db_path).map_err(|err| map_corruption(err, db_path))?;
-    configure(&conn, busy_timeout_ms, full_durability)
-        .map_err(|err| map_corruption(err, db_path))?;
+    let mut conn = connect(db_path, mode, busy_timeout_ms, full_durability, &mut || {})?;
     quick_check(&conn, db_path)?;
     migrate(&mut conn)?;
     Ok(conn)
+}
+
+/// Orders, within this process, renaming a database file away (repair's
+/// quarantine) against the start of every connection.
+///
+/// SQLite's POSIX locks are per process, so a connection here that opened
+/// the old file and first read it after the rename would take the new
+/// database's shared-memory file for its own, truncate it under the live
+/// connections (SIGBUS) and drop their locks. Other processes see those locks,
+/// so for them [`connect`]'s identity check is enough.
+static FILE_SWAP: RwLock<()> = RwLock::new(());
+
+/// Hold while renaming a database file away; waits for connections that are
+/// starting and keeps new ones from starting.
+pub(crate) fn swapping_files() -> RwLockWriteGuard<'static, ()> {
+    FILE_SWAP.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What [`connect`] holds while a connection starts; lets tests stand in
+/// for one.
+#[cfg(test)]
+pub(crate) fn connection_starting() -> std::sync::RwLockReadGuard<'static, ()> {
+    FILE_SWAP.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How many times [`connect`] opens a file that is replaced meanwhile. Creating
+/// a database takes two (the file appears); the rest cover a racing repair.
+const CONNECT_ATTEMPTS: usize = 3;
+
+/// Open and configure a connection bound to the file that is at `db_path`.
+///
+/// Repair renames a damaged database aside and creates a new one. A
+/// connection that opens the old file just before the rename but first reads
+/// it just after pairs the old file with the new database's WAL. SQLite
+/// reports that mixed view as corruption or, when the two look alike, lets
+/// writes based on it reach the new database. Within this process
+/// [`FILE_SWAP`] keeps the rename out of that window; for other processes the
+/// file's identity is taken before opening and again after the first read
+/// (the pragmas), and a connection whose file changed in between is discarded
+/// and opened again. `before_first_read` runs between the two; tests use it
+/// to replace the file.
+fn connect(
+    db_path: &Path,
+    mode: OpenMode,
+    busy_timeout_ms: u64,
+    full_durability: bool,
+    before_first_read: &mut dyn FnMut(),
+) -> Result<Connection> {
+    let flags = match mode {
+        OpenMode::CreateIfMissing => OpenFlags::default(),
+        OpenMode::ExistingOnly => OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE),
+    };
+    for _ in 0..CONNECT_ATTEMPTS {
+        let _starting = FILE_SWAP.read().unwrap_or_else(PoisonError::into_inner);
+        let before = file_id(db_path);
+        let conn = Connection::open_with_flags(db_path, flags)
+            .map_err(|err| map_corruption(err, db_path))?;
+        before_first_read();
+        let configured = configure(&conn, busy_timeout_ms, full_durability);
+        if before.is_some() && file_id(db_path) == before {
+            return configured
+                .map(|()| conn)
+                .map_err(|err| map_corruption(err, db_path));
+        }
+    }
+    Err(Error::Database(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some(format!(
+            "{} kept being replaced while it was being opened",
+            db_path.display()
+        )),
+    )))
+}
+
+/// Identity of the file at `path` (device and inode), `None` when there is
+/// none.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Elsewhere only existence counts: SQLite opens a database without
+/// `FILE_SHARE_DELETE` on Windows, so an open file cannot be renamed and
+/// cannot be replaced mid-open.
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    path.exists().then_some((0, 0))
 }
 
 /// Apply the per-connection pragmas described in the module docs.
@@ -195,20 +300,21 @@ fn configure(
     busy_timeout_ms: u64,
     full_durability: bool,
 ) -> rusqlite::Result<()> {
-    // These two pragmas return a result row, so they must be read as
-    // queries rather than executed as statements.
-    let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    // This pragma returns a result row, so it must be read as a query
+    // rather than executed as a statement. It goes first so that the WAL
+    // switch below waits for locks rather than failing.
+    let _applied: i64 = conn.query_row(
+        &format!("PRAGMA busy_timeout = {busy_timeout_ms}"),
+        [],
+        |row| row.get(0),
+    )?;
+    let mode = enable_wal(conn, Duration::from_millis(busy_timeout_ms))?;
     if !mode.eq_ignore_ascii_case("wal") {
         tracing::warn!(
             journal_mode = %mode,
             "SQLite WAL mode unavailable on this filesystem; falling back"
         );
     }
-    let _applied: i64 = conn.query_row(
-        &format!("PRAGMA busy_timeout = {busy_timeout_ms}"),
-        [],
-        |row| row.get(0),
-    )?;
 
     conn.pragma_update(
         None,
@@ -217,6 +323,34 @@ fn configure(
     )?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
+}
+
+/// Pause between attempts of [`enable_wal`]; a rival switch takes well
+/// under a millisecond.
+const WAL_RETRY_DELAY: Duration = Duration::from_millis(2);
+
+/// Switch the connection to WAL and return the journal mode now in effect.
+///
+/// Switching a database that is not yet in WAL mode upgrades a read lock to
+/// a write lock. When another connection is switching at the same moment,
+/// SQLite fails that upgrade with `SQLITE_BUSY` at once, bypassing the busy
+/// handler, because waiting could deadlock. The failed statement has
+/// already released its lock, so this retries until `timeout` elapses. The
+/// retry finds the file in WAL mode and needs no write lock.
+fn enable_wal(conn: &Connection, timeout: Duration) -> rusqlite::Result<String> {
+    // No deadline when the timeout is too large to represent.
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0)) {
+            Err(err)
+                if err.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
+                    && deadline.is_none_or(|end| Instant::now() < end) =>
+            {
+                std::thread::sleep(WAL_RETRY_DELAY);
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 /// Run `PRAGMA quick_check` and fail with [`Error::DatabaseCorrupted`] if
@@ -248,14 +382,19 @@ pub(crate) fn quick_check(conn: &Connection, db_path: &Path) -> Result<()> {
 
 /// Bring `PRAGMA user_version` up to [`SCHEMA_VERSION`], refusing databases
 /// from the future.
+///
+/// Safe when several connections open a new database at once. An
+/// up-to-date database costs one read and no lock. Otherwise the version is
+/// re-read inside an `IMMEDIATE` transaction, which takes the write lock up
+/// front: exactly one opener applies the migrations and the rest find them
+/// done. A deferred transaction here would let two openers both run the DDL
+/// ("table already exists") or fail upgrading their read lock.
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if current > SCHEMA_VERSION {
-        return Err(Error::UnsupportedSchema {
-            found: current,
-            supported: SCHEMA_VERSION,
-        });
+    if supported_version(conn)? == SCHEMA_VERSION {
+        return Ok(());
     }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = supported_version(&tx)?;
     for version in current..SCHEMA_VERSION {
         let ddl = usize::try_from(version)
             .ok()
@@ -263,12 +402,26 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             .ok_or_else(|| Error::Data {
                 details: format!("no migration registered for schema version {version}"),
             })?;
-        let tx = conn.transaction()?;
         tx.execute_batch(ddl)?;
-        tx.pragma_update(None, "user_version", version + 1)?;
-        tx.commit()?;
     }
+    if current < SCHEMA_VERSION {
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    tx.commit()?;
     Ok(())
+}
+
+/// The database's `user_version`, or [`Error::UnsupportedSchema`] when it
+/// is newer than this build understands.
+fn supported_version(conn: &Connection) -> Result<i64> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > SCHEMA_VERSION {
+        return Err(Error::UnsupportedSchema {
+            found: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    Ok(current)
 }
 
 /// Translate "this is not a usable database file" SQLite errors into
@@ -326,7 +479,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("apvm.db");
 
-        let conn = open(&path, 100, false).unwrap();
+        let conn = open(&path, 100, false, OpenMode::CreateIfMissing).unwrap();
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
@@ -342,11 +495,215 @@ mod tests {
         drop(conn);
 
         // Reopening an initialized database is a no-op.
-        let conn = open(&path, 100, false).unwrap();
+        let conn = open(&path, 100, false, OpenMode::CreateIfMissing).unwrap();
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn existing_only_never_creates_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apvm.db");
+        assert!(matches!(
+            open(&path, 100, false, OpenMode::ExistingOnly),
+            Err(Error::Database(_))
+        ));
+        assert!(!path.exists(), "ExistingOnly must not create the database");
+    }
+
+    #[test]
+    fn concurrent_first_opens_all_succeed() {
+        // Regression: migrations used to run in a deferred transaction after
+        // an unlocked version read, so concurrent first opens of a new
+        // database failed ("table builds already exists" / "locked").
+        const THREADS: usize = 8;
+        for round in 0..25 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("apvm.db");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let (path, barrier) = (path.clone(), std::sync::Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        open(&path, 5_000, false, OpenMode::CreateIfMissing).map(|_| ())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let outcome = handle.join().expect("opener thread panicked");
+                assert!(outcome.is_ok(), "round {round}: {outcome:?}");
+            }
+            let conn = open(&path, 5_000, false, OpenMode::ExistingOnly).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+        }
+    }
+
+    /// A new, not-yet-WAL database whose write lock a rival connection
+    /// holds, as while another opener switches it to WAL.
+    fn locked_new_database(dir: &Path) -> (std::path::PathBuf, Connection) {
+        let path = dir.join("apvm.db");
+        let rival = Connection::open(&path).unwrap();
+        rival.execute_batch("BEGIN IMMEDIATE").unwrap();
+        (path, rival)
+    }
+
+    #[test]
+    fn wal_switch_waits_for_a_rival_writer_instead_of_failing() {
+        // Regression: SQLite fails this lock upgrade at once, without the
+        // busy handler, so racing first opens used to fail "database is
+        // locked" (16 of 120,000 in a probe).
+        let dir = tempfile::tempdir().unwrap();
+        let (path, rival) = locked_new_database(dir.path());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            rival.execute_batch("COMMIT").unwrap();
+        });
+
+        let conn = open(&path, 5_000, false, OpenMode::CreateIfMissing).unwrap();
+        release.join().expect("releasing thread panicked");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn wal_switch_gives_up_when_the_busy_timeout_elapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _rival) = locked_new_database(dir.path());
+        let start = Instant::now();
+        let err = open(&path, 50, false, OpenMode::CreateIfMissing).unwrap_err();
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        let Error::Database(err) = err else {
+            panic!("expected a SQLite error, got {err:?}");
+        };
+        assert_eq!(err.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+    }
+
+    /// Move `path` and its sidecars aside the way repair's quarantine does,
+    /// then create a different database, with one table `marker`, there.
+    #[cfg(unix)]
+    fn replace_database(path: &Path, marker: &str) {
+        for suffix in ["", "-wal", "-shm"] {
+            let from = format!("{}{suffix}", path.display());
+            if Path::new(&from).exists() {
+                std::fs::rename(&from, format!("{}.{marker}-old{suffix}", path.display())).unwrap();
+            }
+        }
+        Connection::open(path)
+            .unwrap()
+            .execute_batch(&format!(
+                "PRAGMA journal_mode = WAL; CREATE TABLE {marker} (x);"
+            ))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_database_replaced_mid_open_is_opened_again() {
+        // Regression: the connection stayed on the renamed file and read it
+        // through the new database's WAL (a "ghost" after repair).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apvm.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE old (x);")
+            .unwrap();
+        let mut calls = 0;
+        let conn = connect(&path, OpenMode::ExistingOnly, 1_000, false, &mut || {
+            calls += 1;
+            if calls == 1 {
+                replace_database(&path, "new");
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        let tables: String = conn
+            .query_row(
+                "SELECT group_concat(name) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_database_that_keeps_being_replaced_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apvm.db");
+        replace_database(&path, "first");
+        let mut calls = 0;
+        let err = connect(&path, OpenMode::ExistingOnly, 1_000, false, &mut || {
+            calls += 1;
+            replace_database(&path, &format!("again{calls}"));
+        })
+        .unwrap_err();
+        assert_eq!(calls, CONNECT_ATTEMPTS);
+        let Error::Database(err) = err else {
+            panic!("expected a SQLite error, got {err:?}");
+        };
+        assert_eq!(err.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+        assert!(err.to_string().contains("kept being replaced"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_database_moved_away_mid_open_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apvm.db");
+        let mut calls = 0;
+        let conn = connect(&path, OpenMode::CreateIfMissing, 1_000, false, &mut || {
+            calls += 1;
+            if calls == 1 {
+                std::fs::rename(&path, dir.path().join("moved.db")).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 3); // moved away, then created again, then confirmed
+        conn.execute_batch("CREATE TABLE kept (x);").unwrap();
+        let at_path = Connection::open(&path).unwrap();
+        let found: i64 = at_path
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'kept'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1);
+    }
+
+    #[test]
+    fn a_starting_connection_holds_off_file_swaps_until_its_first_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apvm.db");
+        let mut swap_could_start = None;
+        connect(&path, OpenMode::CreateIfMissing, 1_000, false, &mut || {
+            swap_could_start.get_or_insert(FILE_SWAP.try_write().is_ok());
+        })
+        .unwrap();
+        assert_eq!(swap_could_start, Some(false));
+    }
+
+    #[test]
+    fn creating_a_database_rechecks_it_once_whatever_the_timeout() {
+        // The file appears during the first attempt, so a second one binds
+        // to it; that must not depend on the busy timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apvm.db");
+        let mut calls = 0;
+        connect(&path, OpenMode::CreateIfMissing, 0, false, &mut || {
+            calls += 1
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
     }
 
     #[test]
@@ -357,7 +714,7 @@ mod tests {
             let conn = Connection::open(&path).unwrap();
             conn.pragma_update(None, "user_version", 999).unwrap();
         }
-        let err = open(&path, 100, false).unwrap_err();
+        let err = open(&path, 100, false, OpenMode::CreateIfMissing).unwrap_err();
         assert!(matches!(err, Error::UnsupportedSchema { found: 999, .. }));
     }
 
@@ -366,11 +723,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("apvm.db");
         std::fs::write(&path, b"this is definitely not a sqlite database").unwrap();
-        let err = open(&path, 100, false).unwrap_err();
+        let start = Instant::now();
+        let err = open(&path, 60_000, false, OpenMode::CreateIfMissing).unwrap_err();
         assert!(
             matches!(err, Error::DatabaseCorrupted { .. }),
             "got: {err:?}"
         );
+        // Only lock contention is retried; corruption is reported at once.
+        assert!(start.elapsed() < Duration::from_secs(30));
     }
 
     #[test]

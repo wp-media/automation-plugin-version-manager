@@ -52,6 +52,19 @@ fn row_to_victim(row: &rusqlite::Row<'_>) -> rusqlite::Result<Victim> {
     })
 }
 
+/// Write a consistent copy of the whole database to the new file `target`
+/// (`VACUUM INTO`), readable while other connections keep working. Fails if
+/// `target` exists.
+pub(crate) fn snapshot_into(conn: &Connection, target: &str) -> rusqlite::Result<()> {
+    conn.execute("VACUUM INTO ?1", [target]).map(|_| ())
+}
+
+/// Delete every build and release record; artifact, source and asset rows
+/// follow through `ON DELETE CASCADE`.
+pub(crate) fn clear_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("DELETE FROM builds; DELETE FROM releases;")
+}
+
 /// Every project that has at least one build or cached release, sorted.
 pub(crate) fn projects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare_cached(

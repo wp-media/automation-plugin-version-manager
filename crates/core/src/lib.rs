@@ -12,6 +12,9 @@
 //!   degrade to a normal build, never an error.
 //! - **No default paths** — consumers supply the cache directory (the CLI
 //!   and Node bindings each provide their own default, `~/.apvm/cache`).
+//! - **One maintenance implementation** — [`maintenance::CacheMaintenance`]
+//!   performs the `apvm cache` actions (usage, clean, clear, gc, verify,
+//!   repair) for every front end.
 //!
 //! See [`build::plugins::VersionRequirement`] for how different projects handle versions.
 //!
@@ -54,6 +57,7 @@ pub mod config_io;
 pub mod error;
 pub mod git;
 pub mod github;
+pub mod maintenance;
 pub mod projects;
 
 // Re-export Config from apvm-config
@@ -68,6 +72,7 @@ pub use build::progress::{
 pub use build::{ArtifactOrigin, ProducedArtifact, VersionOverride};
 pub use commands::{BuildOutput, BuildRequest, WarmRequest};
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
+pub use maintenance::{CacheMaintenance, CleanRequest};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -79,9 +84,10 @@ use projects::ProjectRegistry;
 /// Open the artifact cache for a configuration, best-effort.
 ///
 /// Returns `None` when caching is disabled **or** the store cannot be opened
-/// (e.g. an unwritable cache directory or a corrupt database). A cache problem
-/// must never prevent APVM from building, so the failure is logged and
-/// caching is simply inactive for the session.
+/// (e.g. an unwritable cache directory, a corrupt or lost database, or a
+/// directory holding someone else's data — the store never initializes
+/// there). A cache problem must never prevent APVM from building, so the
+/// failure is logged and caching is simply inactive for the session.
 ///
 /// The store is opened once and shared (via `Arc`) across every build on the
 /// instance, matching the concurrent-build model of the Node bindings.

@@ -32,11 +32,17 @@
 //!   damaged database fails with [`Error::DatabaseCorrupted`] and
 //!   [`ArtifactStore::repair`] quarantines it, rebuilds a fresh index, and
 //!   re-adopts the artifact files found on disk.
+//! - **Only its own files.** A store is only created in a missing or empty
+//!   directory ([`ArtifactStore::inspect`] / [`StoreState`]); a directory
+//!   holding someone else's data is refused. `gc` and `repair` walk only
+//!   store-produced names and never follow symlinks, so they cannot delete
+//!   or adopt anything the store did not create.
 //! - **Concurrency.** The store is `Send + Sync`; in-process access is
 //!   serialized internally. Across processes, SQLite's WAL handles the
-//!   database and an advisory file lock serializes mutations so a clean
-//!   cannot race a store. (Keep the store on a local disk — advisory locks
-//!   on network filesystems are unreliable.)
+//!   database (concurrent first opens, and opens racing a repair that
+//!   replaces it, included) and an advisory file lock
+//!   serializes mutations so a clean cannot race a store. (Keep the store on
+//!   a local disk — advisory locks on network filesystems are unreliable.)
 //!
 //! # Async usage
 //!
@@ -87,6 +93,7 @@
 mod db;
 mod error;
 mod fsx;
+mod layout;
 mod lock;
 mod lookup;
 mod maintenance;
@@ -96,6 +103,7 @@ mod store;
 mod types;
 
 pub use error::{Error, Result};
+pub use layout::StoreState;
 pub use lookup::{LookupHit, LookupKey, LookupRequest, LookupResult, MissReason};
 pub use maintenance::{
     CleanOptions, CleanReport, CleanTarget, GcReport, IssueContext, ProjectUsage, RepairReport,

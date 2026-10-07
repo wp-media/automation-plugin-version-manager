@@ -22,6 +22,9 @@ octocrab = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Date/time (cache-maintenance age cutoffs, e.g. `apvm cache clean --older-than`)
+chrono = { workspace = true }
+
 # Error handling
 thiserror = { workspace = true }
 

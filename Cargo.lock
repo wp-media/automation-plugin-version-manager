@@ -107,6 +107,7 @@ version = "3.2.0"
 dependencies = [
  "apvm-config",
  "apvm-storage",
+ "chrono",
  "directories",
  "glob",
  "octocrab",

@@ -180,6 +180,7 @@ apvm cache clean --builds                  # builds only (keep release downloads
 apvm cache clean --releases                # release downloads only
 
 # Reconcile the database with disk and sweep leftover temp files
+# (removes only what apvm created; never follows symlinks)
 apvm cache gc
 
 # Verify cached files are intact (add --checksum to re-hash them).
@@ -187,7 +188,8 @@ apvm cache gc
 apvm cache verify
 apvm cache verify --checksum
 
-# Recover a corrupt cache database (quarantine + rebuild the index)
+# Recover the cache database: quarantine a corrupt one, clear an unreadable
+# one (a copy is kept), or rebuild a deleted one, then re-index the builds
 apvm cache repair
 
 # Remove everything (prompts unless -y)
@@ -198,7 +200,13 @@ apvm cache clear -y
 **`--older-than`** accepts `m` (minutes), `h` (hours), `d` (days), `w` (weeks),
 e.g. `12h`, `30d`, `2w`. An entry's "last used" time is refreshed on every cache
 hit, so entries you keep building never age out. `--builds` and `--releases`
-are mutually exclusive (omit both to clean everything).
+are mutually exclusive (omit both to clean everything). Invalid flags fail even
+when nothing has been cached yet.
+
+A directory is a cache only if it holds the cache database: a missing or empty
+one is reported as empty and never written to, and a directory holding other
+data is refused — apvm never initializes a cache there, since `gc` could later
+delete that data.
 
 ## Config Command
 

@@ -23,9 +23,10 @@ use std::time::Duration;
 use chrono::Utc;
 use rusqlite::Connection;
 
-use crate::db;
+use crate::db::{self, OpenMode};
 use crate::error::{Error, IoContext, Result};
 use crate::fsx::{self, FileDigest};
+use crate::layout::{self, StoreState};
 use crate::lock::StoreLock;
 use crate::paths;
 use crate::types::{
@@ -38,7 +39,8 @@ use crate::types::{
 #[non_exhaustive]
 pub struct StoreOptions {
     /// How long concurrent processes wait on a busy database before failing
-    /// (SQLite `busy_timeout`). Default: 5 seconds.
+    /// (SQLite `busy_timeout`). Default: 5 seconds. Capped at `i32::MAX`
+    /// milliseconds (about 24.8 days), the most SQLite accepts.
     pub busy_timeout: Duration,
     /// `true` fsyncs the database on every commit (`synchronous = FULL`);
     /// the default `false` uses `NORMAL`, which in WAL mode still guarantees
@@ -57,9 +59,11 @@ impl Default for StoreOptions {
 }
 
 impl StoreOptions {
-    /// SQLite `busy_timeout` in milliseconds, saturating on overflow.
+    /// SQLite `busy_timeout` in milliseconds, saturating at `i32::MAX`:
+    /// SQLite silently treats any larger value as 0, which disables waiting.
     pub(crate) fn busy_timeout_ms(&self) -> u64 {
-        u64::try_from(self.busy_timeout.as_millis()).unwrap_or(u64::MAX)
+        let max = u64::from(i32::MAX.unsigned_abs());
+        u64::try_from(self.busy_timeout.as_millis()).map_or(max, |ms| ms.min(max))
     }
 }
 
@@ -84,12 +88,17 @@ impl ArtifactStore {
     /// Open (creating if needed) the store at `base_dir` with default
     /// [`StoreOptions`].
     ///
+    /// A store is only ever created in a missing or [`StoreState::Empty`]
+    /// directory — never over content it does not own.
+    ///
     /// # Errors
     ///
-    /// [`Error::Io`] if the directory cannot be created,
-    /// [`Error::DatabaseCorrupted`] if the database file is damaged (see
-    /// [`ArtifactStore::repair`]), [`Error::UnsupportedSchema`] if it was
-    /// written by a newer apvm.
+    /// [`Error::Io`] if the directory cannot be inspected or created,
+    /// [`Error::ForeignDirectory`] if it holds someone else's data,
+    /// [`Error::MissingDatabase`] if its database was lost (see
+    /// [`ArtifactStore::repair`]), [`Error::DatabaseCorrupted`] if the
+    /// database file is damaged (see [`ArtifactStore::repair`]),
+    /// [`Error::UnsupportedSchema`] if it was written by a newer apvm.
     pub fn open(base_dir: impl Into<PathBuf>) -> Result<Self> {
         Self::open_with(base_dir, StoreOptions::default())
     }
@@ -98,15 +107,87 @@ impl ArtifactStore {
     /// options. See [`ArtifactStore::open`] for the error contract.
     pub fn open_with(base_dir: impl Into<PathBuf>, options: StoreOptions) -> Result<Self> {
         let base_dir = base_dir.into();
+        if let Some(store) = Self::open_present(&base_dir, &options)? {
+            return Ok(store);
+        }
+        Self::create(base_dir, &options)
+    }
+
+    /// Open the store at `base_dir` only if one exists — never creating a
+    /// directory or a database file. `Ok(None)` unless
+    /// [`ArtifactStore::inspect`] reports [`StoreState::Present`], or when
+    /// the database disappears between that check and the open.
+    ///
+    /// # Errors
+    ///
+    /// As for [`ArtifactStore::open`], except that it never refuses: a
+    /// directory that is not a present store is simply `Ok(None)`.
+    pub fn open_existing(base_dir: impl Into<PathBuf>) -> Result<Option<Self>> {
+        Self::open_present(&base_dir.into(), &StoreOptions::default())
+    }
+
+    /// Open the database if one is present, never creating it. `Ok(None)`
+    /// when there is none — including one removed (e.g. quarantined by a
+    /// repair) between the check and the open.
+    fn open_present(base_dir: &Path, options: &StoreOptions) -> Result<Option<Self>> {
+        if layout::inspect(base_dir)? != StoreState::Present {
+            return Ok(None);
+        }
+        let db_path = base_dir.join(paths::DB_FILE_NAME);
+        let opened = db::open(
+            &db_path,
+            options.busy_timeout_ms(),
+            options.full_durability,
+            OpenMode::ExistingOnly,
+        );
+        match opened {
+            Ok(conn) => Ok(Some(Self::from_parts(base_dir, db_path, conn))),
+            Err(_) if matches!(db_path.try_exists(), Ok(false)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Initialize the store in a missing or empty directory. The database
+    /// is only ever created under the store lock, after re-checking there,
+    /// so creation races neither another creator nor a repair (which holds
+    /// the lock while it quarantines and rebuilds).
+    fn create(base_dir: PathBuf, options: &StoreOptions) -> Result<Self> {
+        // Before touching anything: even the lock file would make someone
+        // else's directory look like a store.
+        refuse_unowned(&base_dir, layout::inspect(&base_dir)?)?;
         std::fs::create_dir_all(&base_dir)
             .io_ctx(|| format!("failed to create store directory {}", base_dir.display()))?;
+        let _lock = StoreLock::acquire(&base_dir)?;
+        refuse_unowned(&base_dir, layout::inspect(&base_dir)?)?;
         let db_path = base_dir.join(paths::DB_FILE_NAME);
-        let conn = db::open(&db_path, options.busy_timeout_ms(), options.full_durability)?;
-        Ok(Self {
-            base_dir,
+        let conn = db::open(
+            &db_path,
+            options.busy_timeout_ms(),
+            options.full_durability,
+            OpenMode::CreateIfMissing,
+        )?;
+        Ok(Self::from_parts(&base_dir, db_path, conn))
+    }
+
+    /// Assemble a store around an opened connection.
+    pub(crate) fn from_parts(base_dir: &Path, db_path: PathBuf, conn: Connection) -> Self {
+        Self {
+            base_dir: base_dir.to_path_buf(),
             db_path,
             conn: Mutex::new(conn),
-        })
+        }
+    }
+
+    /// Classify `base_dir` without touching it: missing, empty, a store, a
+    /// store whose database was lost, or someone else's directory. See
+    /// [`StoreState`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when `base_dir` cannot be inspected or is not a
+    /// directory.
+    pub fn inspect(base_dir: impl AsRef<Path>) -> Result<StoreState> {
+        layout::inspect(base_dir.as_ref())
     }
 
     /// The store's base directory.
@@ -542,6 +623,23 @@ pub(crate) fn touch_build_quiet(conn: &Connection, id: i64, now_ms: i64) {
     }
 }
 
+/// Refuse to initialize a store over content it does not own: another
+/// party's data ([`StoreState::Foreign`]) or a store whose database was
+/// lost ([`StoreState::Orphaned`] — opening would orphan its files).
+pub(crate) fn refuse_unowned(base_dir: &Path, state: StoreState) -> Result<()> {
+    match state {
+        StoreState::Foreign { entry } => Err(Error::ForeignDirectory {
+            path: base_dir.to_path_buf(),
+            entry,
+        }),
+        StoreState::Orphaned { adoptable_builds } => Err(Error::MissingDatabase {
+            path: base_dir.to_path_buf(),
+            adoptable_builds,
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Find the row this (project, version, commit) belongs to, treating two
 /// commits as the same build when one is a prefix of the other (short vs
 /// full SHA of the same commit).
@@ -674,4 +772,62 @@ fn copy_artifacts(
         }
     }
     Ok((records, newly_stored, reused))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_timeout_saturates_where_sqlite_would_stop_waiting() {
+        // Regression: a huge timeout became u64::MAX ms, which SQLite reads
+        // as 0, so a store opened with Duration::MAX never waited.
+        let ms = |busy_timeout| {
+            StoreOptions {
+                busy_timeout,
+                ..StoreOptions::default()
+            }
+            .busy_timeout_ms()
+        };
+        assert_eq!(ms(Duration::from_secs(5)), 5_000);
+        assert_eq!(ms(Duration::from_millis(2_147_483_648)), 2_147_483_647);
+        assert_eq!(ms(Duration::MAX), 2_147_483_647);
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = StoreOptions {
+            busy_timeout: Duration::MAX,
+            ..StoreOptions::default()
+        };
+        let store = ArtifactStore::open_with(dir.path().join("store"), options).unwrap();
+        let applied: i64 = store
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(applied, 2_147_483_647);
+    }
+
+    #[test]
+    fn creating_a_store_waits_for_the_store_lock() {
+        // Creation must not race a repair, which holds this lock while it
+        // quarantines and rebuilds the database.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        std::fs::create_dir_all(&base).unwrap();
+        let held = StoreLock::acquire(&base).unwrap();
+
+        let opener = {
+            let base = base.clone();
+            std::thread::spawn(move || ArtifactStore::open(&base).map(|_| ()))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !base.join(paths::DB_FILE_NAME).exists(),
+            "a database was created while another holder had the store lock"
+        );
+
+        drop(held);
+        let opened = opener.join().expect("opener thread panicked");
+        assert!(opened.is_ok(), "{opened:?}");
+        assert!(base.join(paths::DB_FILE_NAME).exists());
+    }
 }
