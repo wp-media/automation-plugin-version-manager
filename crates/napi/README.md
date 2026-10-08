@@ -177,6 +177,72 @@ console.log(output.fromCache); // true
 
 The returned `JsBuildOutput` describes what was cached. Each artifact's `origin` distinguishes what was already cached (`"cache"`) from what had to be `"built"` or `"downloaded"` to warm it; artifact `path`s point at their canonical locations inside the cache, not an output directory.
 
+### Cache Maintenance
+
+`ApvmCache` maintains the artifact cache from Node, at parity with `apvm cache` (one shared implementation in `apvm-core`, so both behave the same).
+
+```ts
+import { Apvm, ApvmCache, type JsCleanTarget } from 'apvm-napi';
+
+const apvm = await Apvm.create({});
+const cache = apvm.cache();                                // the cache this instance builds into
+const other = ApvmCache.open({ cacheDir: '/var/cache/apvm' }); // standalone: no GitHub client needed
+
+await cache.clean({ olderThan: '30d', project: 'backwpup', target: 'Builds' as JsCleanTarget });
+const issues = await cache.verify({ checksum: true });     // [] = healthy
+if (issues.length > 0) await cache.gc({ checksum: true }); // removes what it can (see gc below)
+```
+
+| Method | CLI | Resolves with |
+|---|---|---|
+| `ApvmCache.open(config?)` | — | a handle (synchronous) for `cacheDir` — default `~/.apvm/cache`, `APVM_CACHE_DIR` wins — made absolute |
+| `apvm.cache()` | — | a handle (synchronous) for the directory the instance builds into, fixed at `create()` |
+| `cache.dir()` | — | the directory (synchronous) |
+| `cache.info()` | `cache info` | `JsCacheUsage` |
+| `cache.clean(options?)` | `cache clean` | `JsCleanReport` — no options removes everything |
+| `cache.clear()` | `cache clear` | `JsCleanReport` — no prompt: the call is the consent |
+| `cache.gc(options?)` | `cache gc [--checksum]` | `JsGcReport` — removes missing/damaged entries; keeps files it cannot read (listed in `failures`) |
+| `cache.verify(options?)` | `cache verify [--checksum]` | `JsVerifyIssue[]` — resolves with the issues, never rejects for them |
+| `cache.repair()` | `cache repair` | `JsRepairReport` — a no-op on a healthy cache |
+| `apvm.cacheStatus()` | — | `JsCacheStatus` |
+
+**Behavior**
+
+- **Independent of `cacheEnabled`:** a disabled cache can still be inspected and cleaned. Creating a handle touches nothing on disk.
+- **No cache yet:** a missing or empty directory resolves every method with an empty report and creates nothing. `info().exists` is `false` then — often a sign of the wrong `cacheDir`.
+- **Strict options**, because `clean()`'s default removes everything: a non-object, an unknown key (`dryrun`), a wrong type, or — for `clean()` — a key set to `undefined` / `null` rejects with `InvalidArg` instead of falling back to a default. Omit a key to leave it unset. `ApvmCache.open()` reads its config the same way (it throws), so `{ cacheDir: process.env.UNSET }` cannot silently open the default cache.
+- **Validation first:** bad options reject with `InvalidArg` whatever the disk state, even on a corrupt cache.
+- **Relative `cacheDir`:** made absolute when the handle (or the `Apvm`) is created, so a later `process.chdir()` changes nothing. `~` is not expanded.
+- **Threading:** each call runs on the blocking pool with its own store, closed before the promise settles. At most one call per CPU runs at a time (the rest wait), so maintenance cannot starve builds. Calls are safe alongside builds on the same cache.
+- **Snapshots:** `verify()` may report as `missing` an entry that a concurrent `clean()` or `clear()` removed meanwhile; `gc()` re-checks before deleting.
+- **Interrupted repair** (the process exited mid-way): the cache is left needing repair — `CacheCorrupted`, and `gc()` refuses — never half-indexed. Run `repair()` again.
+- **Repair never swaps the database file:** it keeps a copy and resets the file in place, so other processes using the cache cannot be crashed by it. A corrupt database that another process (or a running build) holds open is refused with a `GenericFailure` ("in use…"), nothing changed; idle `Apvm` instances of this process let go of it on their own.
+- **One copy of the addon per process:** two copies (a duplicated dependency, a bundler copying the `.node` file) link two SQLite libraries whose file locks cannot see each other, which corrupts or crashes on a shared cache. The second copy's `Apvm.create()`, `Apvm.createWithTokenResolution()` and `ApvmCache.open()` throw `GenericFailure`; deduplicate the dependency. (A copy loaded only inside a worker thread is not detected.)
+- **Self-healing instances:** after a `repair()` from anywhere (this process, the CLI, another process), `Apvm` instances using that cache resume caching on their next build. Nothing needs re-creating. `cacheStatus()` reflects whether the database *opens*: a database that opens but has unreadable rows reports `active` while the maintenance methods reject with `CacheCorrupted`.
+
+**Error codes.** Every method reports errors by rejecting with an `Error` that has a `message` and a `code` (its `stack` has no JavaScript frames: it is created on the event loop when the work finishes). Only `ApvmCache.open()` is synchronous; it throws `InvalidArg`.
+
+| `err.code` | When | Remedy |
+|---|---|---|
+| `CacheCorrupted` | The database is corrupt, has unreadable rows, or is missing / blank while cached builds remain (every method but `repair()`) | `await cache.repair()`, then retry |
+| `InvalidArg` | Bad options (see *Strict options*), a bad `olderThan` (e.g. `30y`) or `project` (e.g. `Bad/Name`), or an empty cache path | Fix the input |
+| `GenericFailure` | Anything else: I/O, someone else's data in the directory, a newer apvm's database. `repair()` never rejects with `CacheCorrupted`, so the recipe below cannot loop | Report it |
+
+```ts
+let usage;
+try {
+  usage = await cache.info();
+} catch (e) {
+  if ((e as { code?: string }).code !== 'CacheCorrupted') throw e;
+  await cache.repair(); // quarantines the bad database, re-indexes builds on disk
+  usage = await cache.info();
+}
+
+const status = await apvm.cacheStatus(); // { state: 'active' | 'disabled' | 'corrupted' | 'unavailable', reason? }
+```
+
+While caching is on but the cache is `corrupted` or `unavailable`, every build still succeeds, uncached, and emits one `warning` progress event with the reason.
+
 ### Release Download Methods
 
 These methods download pre-built assets directly from GitHub Releases, bypassing the clone → build pipeline entirely. The version is always derived from the release tag — there is no `version` parameter.
@@ -273,7 +339,10 @@ interface ApvmConfig {
 ```
 
 > The `APVM_CACHE_DIR` environment variable, when set, overrides `cacheDir`
-> (and the default) for every `Apvm` instance in the process. Handy in tests to
+> (and the default) for every `Apvm` instance in the process. It is read
+> when `create()` / `ApvmCache.open()` is called, and a relative directory
+> is made absolute then, so neither a later env change nor `process.chdir()`
+> moves an existing instance's cache. Handy in tests to
 > isolate the cache from the real `~/.apvm/cache` — this package's own test
 > suite uses it (see `__tests__/setup.ts`).
 
@@ -363,6 +432,28 @@ export const enum JsReleaseSelector {
 | `Latest`           | [`GET /releases`](https://docs.github.com/en/rest/releases/releases#list-releases) — first non-draft |
 | `PreviousLatest`   | [`GET /releases`](https://docs.github.com/en/rest/releases/releases#list-releases) — second non-draft |
 
+#### Cache maintenance types
+
+```ts
+interface CleanOptions  { olderThan?: string; project?: string; dryRun?: boolean; target?: JsCleanTarget }
+interface GcOptions     { checksum?: boolean } // also re-hash files (slowest)
+interface VerifyOptions { checksum?: boolean }
+const enum JsCleanTarget { All = 'All', Builds = 'Builds', Releases = 'Releases' }
+```
+
+`olderThan` is an amount plus a unit: `m` minutes, `h` hours, `d` days, `w` weeks (`30d`, `12h`) — the CLI's `--older-than` grammar. `JsCleanTarget` is an ambient `const enum`; under TypeScript's `isolatedModules` (TS2748) pass its string value instead, e.g. `'Builds' as JsCleanTarget`.
+
+Byte sizes and counts are `number`s; timestamps are ISO-8601 strings; fields that do not apply are absent.
+
+| Type | Fields |
+|---|---|
+| `JsCacheUsage` | `cacheDir`, `exists`, `totalBytes`, `buildsBytes`, `releasesBytes`, `buildCount`, `releaseCount`, `fileCount`, `databaseBytes`, `oldestBuild?` / `newestBuild?` (when the oldest / newest build was *built* — `olderThan` goes by last use), `projects[]` (`project`, `buildCount`, `releaseCount`, `buildsBytes`, `releasesBytes`) |
+| `JsCleanReport` | `buildsDeleted`, `releasesDeleted`, `bytesFreed`, `dryRun`, `failures: string[]` (directories that could not be removed; each line says whether `gc()` retries it or it must be removed by hand) |
+| `JsGcReport` | `staleBuildRows`, `staleReleaseRows`, `orphanDirsRemoved`, `orphanBytesRemoved`, `staleTempFilesRemoved`, `damagedArtifacts`, `damagedBytesRemoved`, `failures: string[]` |
+| `JsVerifyIssue` | `project`, `kind` (`'build'` → `version`, `commit`; `'release'` → `tag`), `filename`, `path`, `problem` (`'missing'`; `'size_mismatch'` → `expectedSize`, `actualSize`; `'checksum_mismatch'` → `expectedSha256`, `actualSha256`; `'unreadable'` → `details`, kept by `gc()`; `'invalid_record'` → `details`, removed by `gc()`) |
+| `JsRepairReport` | `quarantinedDatabase?` (where the damaged database was kept), `rebuiltMissingDatabase` (it was missing or blank), `buildsAdopted`, `artifactsAdopted`, `entriesSkipped`, `orphanReleaseDirs` |
+| `JsCacheStatus` | `state` (`'active'` \| `'disabled'` \| `'corrupted'` \| `'unavailable'`), `reason?` |
+
 #### `JsBuildEvent` (Progress)
 
 Events use a [discriminated union](https://www.typescriptlang.org/docs/handbook/2/narrowing.html#discriminated-unions) pattern:
@@ -417,7 +508,7 @@ All errors from the Rust core are converted to JavaScript `Error` objects via N-
 | `Config`                          | `InvalidArg`      | Invalid configuration             |
 | `GitHub`, `Git`, `Build`, `Io`   | `GenericFailure`  | API, git, build, or I/O errors    |
 
-Errors are always thrown as Promise rejections — they never crash the Node.js process.
+Errors are thrown as Promise rejections — they never crash the Node.js process. For the build methods, napi's own argument conversion is the exception: an argument of the wrong type, or an unknown enum value, throws synchronously. The cache maintenance methods read their arguments themselves and always reject, with their own codes (see [Cache Maintenance](#cache-maintenance)).
 
 ```ts
 try {

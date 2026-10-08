@@ -239,9 +239,17 @@ pub enum VerifyProblem {
         /// Hash of the on-disk content.
         actual: String,
     },
-    /// The file or its record could not be read.
+    /// The file could not be read or inspected (e.g. permissions). `gc`
+    /// keeps it, and its record.
     Unreadable {
         /// Description of the failure.
+        details: String,
+    },
+    /// The file's record cannot be read back (e.g. a negative size): the
+    /// database was tampered with. `gc` drops the record and deletes the
+    /// file; the next build caches it again.
+    InvalidRecord {
+        /// Description of the inconsistency.
         details: String,
     },
 }
@@ -264,12 +272,13 @@ pub struct VerifyIssue {
 /// Outcome of [`ArtifactStore::repair`].
 #[derive(Debug, Clone, Default)]
 pub struct RepairReport {
-    /// Where the damaged database is kept: moved there when corrupt, copied
-    /// there when only its rows were unreadable. `None` when it was healthy
-    /// (nothing done) or missing (see `rebuilt_missing_database`).
+    /// Where a copy of the damaged database was kept, for inspection only —
+    /// the database itself is reset (corrupt) or cleared (unreadable rows)
+    /// in place. `None` when it was healthy (nothing done), or missing /
+    /// blank / half-repaired (see `rebuilt_missing_database`).
     pub quarantined_database: Option<PathBuf>,
-    /// `true` when the database was missing while store content remained,
-    /// and a fresh one was built from the files on disk.
+    /// `true` when the database was missing, blank or left half-repaired by
+    /// an interrupted repair, and the index was built again from disk.
     pub rebuilt_missing_database: bool,
     /// Builds re-indexed from the files found on disk.
     pub builds_adopted: u64,
@@ -389,7 +398,7 @@ impl ArtifactStore {
         let mut report = CleanReport {
             builds_deleted: build_victims.len() as u64,
             releases_deleted: release_victims.len() as u64,
-            bytes_freed: sum_bytes(&build_victims) + sum_bytes(&release_victims),
+            bytes_freed: sum_bytes(&build_victims).saturating_add(sum_bytes(&release_victims)),
             dry_run: options.dry_run,
             failures: Vec::new(),
         };
@@ -556,18 +565,30 @@ impl ArtifactStore {
     ///
     /// - **Healthy database:** equivalent to [`ArtifactStore::open`]; the
     ///   report says nothing was done.
-    /// - **Corrupt database:** the damaged file is **quarantined** (renamed
-    ///   to `apvm.db.corrupt-<timestamp>`, WAL sidecars included), a fresh
-    ///   database is created, and builds found on disk are **adopted** —
-    ///   their files re-hashed and re-indexed. Handles opened before the
-    ///   rename keep using the quarantined file; open them again.
-    /// - **Metadata that cannot be read back** ([`crate::Error::Data`]): the
-    ///   database is copied to `apvm.db.corrupt-<timestamp>`, emptied in
-    ///   place and re-filled the same way, so other open handles keep working
-    ///   on the repaired index.
-    /// - **Missing database with store content left**
-    ///   ([`StoreState::Orphaned`]): a fresh database is created and builds
-    ///   adopted the same way (`rebuilt_missing_database`).
+    /// - **Corrupt database:** a copy is kept as `apvm.db.corrupt-<timestamp>`
+    ///   (its WAL too), the database is **reset in place**, and the builds
+    ///   found on disk are **adopted** — their files re-hashed and
+    ///   re-indexed.
+    /// - **Metadata that cannot be read back** ([`crate::Error::Data`]): a
+    ///   snapshot is kept the same way, then the index is cleared and
+    ///   re-filled.
+    /// - **Missing or blank database, or an interrupted repair**
+    ///   ([`StoreState::Orphaned`]): the index is built (again) from disk
+    ///   (`rebuilt_missing_database`).
+    ///
+    /// **Safe beside other users.** The database file is never renamed or
+    ///   replaced, so open connections — in this process or another — stay
+    ///   bound to it and see the repaired index. A corrupt database that
+    ///   another connection holds open cannot be reset:
+    ///   [`crate::Error::DatabaseInUse`], with nothing changed.
+    ///
+    /// **Crash-safe.** Files are hashed before anything changes; a marker
+    /// (`apvm.db.repairing`) is written before the database is touched and
+    /// removed once the re-filled index commits (one transaction). An
+    /// interrupted repair therefore leaves the store
+    /// [`StoreState::Orphaned`] — opening and `gc` refuse — never a
+    /// half-filled index whose unlisted builds `gc` would delete; running
+    /// repair again completes it.
     ///
     /// Variant labels and source links are not reconstructible; adopted
     /// builds re-learn them on the next store. Release directories are
@@ -577,8 +598,10 @@ impl ArtifactStore {
     /// # Errors
     ///
     /// [`crate::Error::ForeignDirectory`] for a directory holding someone
-    /// else's data (nothing is created). [`crate::Error::Io`] /
-    /// [`crate::Error::Database`] when quarantine or the fresh database
+    /// else's data, [`crate::Error::ForeignDatabase`] for someone else's
+    /// SQLite file (nothing is created or changed).
+    /// [`crate::Error::DatabaseInUse`] as above. [`crate::Error::Io`] /
+    /// [`crate::Error::Database`] when copying, resetting or re-filling
     /// fails. [`crate::Error::UnsupportedSchema`] is passed through
     /// untouched — a newer schema is not corruption.
     pub fn repair(base_dir: impl Into<PathBuf>) -> Result<(Self, RepairReport)> {
@@ -590,7 +613,7 @@ impl ArtifactStore {
             .io_ctx(|| format!("failed to create store directory {}", base_dir.display()))?;
         let _lock = StoreLock::acquire(&base_dir)?;
         match layout::inspect(&base_dir)? {
-            StoreState::Orphaned { .. } => Self::rebuild(base_dir, None),
+            StoreState::Orphaned { .. } => Self::rebuild(base_dir, Damage::Lost),
             state => {
                 refuse_foreign(&base_dir, state)?;
                 Self::repair_database(base_dir)
@@ -603,77 +626,90 @@ impl ArtifactStore {
     // ========================================================================
 
     /// Repair path for a directory with (or without, if empty) a database:
-    /// open it, and quarantine + rebuild when it is corrupt or its metadata
-    /// cannot be read back. The caller holds the store lock.
+    /// open it, and rebuild when it is corrupt or its metadata cannot be
+    /// read back. The caller holds the store lock.
     fn repair_database(base_dir: PathBuf) -> Result<(Self, RepairReport)> {
         let store = match Self::open_locked(&base_dir) {
             Ok(store) => store,
-            Err(Error::DatabaseCorrupted { .. }) => return Self::quarantine_and_rebuild(base_dir),
+            Err(err) if err.is_corruption() => return Self::rebuild(base_dir, Damage::Corrupt),
             Err(other) => return Err(other),
         };
         match store.check_metadata() {
             Ok(()) => Ok((store, RepairReport::default())),
-            Err(Error::Data { details }) => {
-                tracing::warn!(%details, "unreadable store metadata; rebuilding the index");
-                store.rebuild_in_place()
+            Err(err) if err.is_corruption() => {
+                tracing::warn!(error = %err, "unreadable store metadata; rebuilding the index");
+                drop(store);
+                Self::rebuild(base_dir, Damage::Unreadable)
             }
             Err(other) => Err(other),
         }
     }
 
-    /// Rebuild an index whose rows cannot be read, keeping the database
-    /// file: copy it aside, empty it, and re-index from disk.
-    ///
-    /// Other handles (a long-lived `Apvm`, a running build) keep one
-    /// connection for their lifetime; renaming the file would leave them on
-    /// the quarantined copy, where their writes are lost and their builds
-    /// later collected as orphans. Clearing through SQL keeps them on the
-    /// live database. A base path that is not UTF-8 cannot be named to
-    /// SQLite; that database is renamed aside instead, like a corrupt one.
-    fn rebuild_in_place(self) -> Result<(Self, RepairReport)> {
-        let target = quarantine_target(&self.base_dir);
-        let Some(target_sql) = target.to_str() else {
-            let base_dir = self.base_dir.clone();
-            drop(self); // an open file cannot be renamed on Windows
-            return Self::quarantine_and_rebuild(base_dir);
-        };
-        {
-            let mut conn = self.conn();
-            db::maintenance::snapshot_into(&conn, target_sql)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            db::maintenance::clear_index(&tx)?;
-            tx.commit()?;
-        }
-        tracing::warn!(copy = %target.display(), "unreadable store index copied aside and cleared");
-        Ok(self.reindex(Some(target), false))
-    }
-
-    /// Move the damaged database aside, then rebuild the index from disk.
-    fn quarantine_and_rebuild(base_dir: PathBuf) -> Result<(Self, RepairReport)> {
-        let db_path = base_dir.join(paths::DB_FILE_NAME);
-        let quarantined = quarantine_database(&base_dir, &db_path)?;
-        Self::rebuild(base_dir, Some(quarantined))
-    }
-
-    /// Create a fresh database and re-index the builds found on disk.
-    /// `quarantined` is where the old database went — `None` when it was
-    /// missing.
-    fn rebuild(base_dir: PathBuf, quarantined: Option<PathBuf>) -> Result<(Self, RepairReport)> {
-        let missing = quarantined.is_none();
-        Ok(Self::open_locked(&base_dir)?.reindex(quarantined, missing))
-    }
-
-    /// Re-index the builds found on disk into this empty index and report
-    /// it.
-    fn reindex(self, quarantined: Option<PathBuf>, missing: bool) -> (Self, RepairReport) {
+    /// Rebuild the index from the builds on disk, in place (see
+    /// [`ArtifactStore::repair`] for the guarantees). The caller holds the
+    /// store lock.
+    fn rebuild(base_dir: PathBuf, damage: Damage) -> Result<(Self, RepairReport)> {
         let mut report = RepairReport {
-            quarantined_database: quarantined,
-            rebuilt_missing_database: missing,
+            rebuilt_missing_database: damage == Damage::Lost,
             ..RepairReport::default()
         };
-        self.adopt_builds_from_disk(&mut report);
-        self.count_orphan_release_dirs(&mut report);
-        (self, report)
+        // The slow part, before anything changes.
+        let scanned = scan_builds(&base_dir, &mut report);
+        let marker = RepairMarker::create(&base_dir)?;
+        let store = match Self::open_locked(&base_dir) {
+            Ok(store) => {
+                if damage == Damage::Unreadable {
+                    report.quarantined_database = Some(store.snapshot()?);
+                }
+                store
+            }
+            Err(err) if err.is_corruption() => {
+                let db_path = base_dir.join(paths::DB_FILE_NAME);
+                let copy = copy_damaged(&base_dir, &db_path)?;
+                if let Err(err) =
+                    db::reset_in_place(&db_path, StoreOptions::default().busy_timeout_ms())
+                {
+                    // Nothing changed: the store is as damaged as before, and
+                    // the database itself is the evidence — keep no copy.
+                    remove_copy(&copy);
+                    marker.abandon();
+                    return Err(err);
+                }
+                report.quarantined_database = Some(copy);
+                tracing::warn!(db = %db_path.display(), "corrupt store database reset in place");
+                Self::open_locked(&base_dir)?
+            }
+            Err(other) => {
+                marker.abandon();
+                return Err(other);
+            }
+        };
+        store.refill(&scanned, &mut report)?;
+        marker.finish()?;
+        count_orphan_release_dirs(&base_dir, &mut report);
+        Ok((store, report))
+    }
+
+    /// Replace the whole index with `scanned`, in one transaction.
+    fn refill(&self, scanned: &[ScannedBuild], report: &mut RepairReport) -> Result<()> {
+        let mut conn = self.conn();
+        let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        db::maintenance::clear_index(&tx)?;
+        insert_scanned(&mut tx, scanned, report)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Keep a consistent copy of this (readable) database beside it, as
+    /// `apvm.db.corrupt-<timestamp>`; returns where. A base path that is not
+    /// UTF-8 cannot be named to SQLite: its files are copied instead.
+    fn snapshot(&self) -> Result<PathBuf> {
+        let target = quarantine_target(&self.base_dir);
+        let Some(target_sql) = target.to_str() else {
+            return copy_damaged(&self.base_dir, &self.db_path);
+        };
+        db::maintenance::snapshot_into(&self.conn(), target_sql)?;
+        Ok(target)
     }
 
     /// Open (creating if needed) the database of a store whose lock the
@@ -1025,81 +1061,124 @@ impl ArtifactStore {
             }
         }
     }
-
-    /// Re-index builds found on disk into a fresh database (repair path).
-    /// Best-effort by design: anything unadoptable is skipped and counted,
-    /// never fatal — repair must always leave a working store.
-    fn adopt_builds_from_disk(&self, report: &mut RepairReport) {
-        for build in layout::build_dirs(&self.base_dir, &mut report.entries_skipped) {
-            match self.adopt_one_build(&build) {
-                Ok(0) => report.entries_skipped += 1,
-                Ok(files) => {
-                    report.builds_adopted += 1;
-                    report.artifacts_adopted += files;
-                }
-                Err(err) => {
-                    tracing::warn!(dir = %build.path.display(), error = %err, "failed to adopt build");
-                    report.entries_skipped += 1;
-                }
-            }
-        }
-    }
-
-    /// Hash and index the files of one on-disk build directory. Returns the
-    /// number of adopted files (0 = nothing adoptable, no record created).
-    fn adopt_one_build(&self, build: &layout::BuildDir) -> Result<u64> {
-        let mut files: Vec<(String, fsx::FileDigest)> = Vec::new();
-        for (name, path) in layout::adoptable_files(&build.path) {
-            files.push((name, fsx::hash_file(&path)?));
-        }
-        if files.is_empty() {
-            return Ok(0);
-        }
-
-        let built_at = fs::metadata(&build.path)
-            .and_then(|meta| meta.modified())
-            .map(DateTime::<Utc>::from)
-            .unwrap_or_else(|_| Utc::now());
-        let dir_rel = paths::build_dir_rel(&build.project, &build.version, &build.name);
-
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let build_id = db::builds::insert(
-            &tx,
-            &build.project,
-            &build.version,
-            &build.commit,
-            &dir_rel,
-            db::to_ms(built_at),
-        )?;
-        for (filename, digest) in &files {
-            db::builds::upsert_artifact(
-                &tx,
-                build_id,
-                None,
-                filename,
-                db::size_to_db(digest.size_bytes)?,
-                &digest.sha256,
-            )?;
-        }
-        tx.commit()?;
-        Ok(files.len() as u64)
-    }
-
-    /// Count release directories that now have no record (repair path).
-    fn count_orphan_release_dirs(&self, report: &mut RepairReport) {
-        for project in layout::project_dirs(&self.base_dir) {
-            let releases = self.base_dir.join(&project).join(paths::RELEASES_DIR);
-            if let Some(releases) = layout::managed_dir(&releases) {
-                report.orphan_release_dirs += layout::subdirectories(&releases).len() as u64;
-            }
-        }
-    }
 }
 
 // ============================================================================
 // Free helpers
 // ============================================================================
+
+/// An on-disk build directory hashed for adoption by repair.
+struct ScannedBuild {
+    build: layout::BuildDir,
+    /// The directory's modification time (now, if unreadable).
+    built_at: DateTime<Utc>,
+    /// Each adoptable file with its digest.
+    files: Vec<(String, fsx::FileDigest)>,
+}
+
+/// Hash every adoptable build under `base_dir` — the slow part of a repair,
+/// done before any index is created or changed. Best-effort by design: a
+/// directory with nothing adoptable, or a file that cannot be read, is
+/// skipped and counted, never fatal.
+fn scan_builds(base_dir: &Path, report: &mut RepairReport) -> Vec<ScannedBuild> {
+    let mut scanned = Vec::new();
+    for build in layout::build_dirs(base_dir, &mut report.entries_skipped) {
+        let mut files = Vec::new();
+        let mut unreadable = None;
+        for (name, path) in layout::adoptable_files(&build.path) {
+            match fsx::hash_file(&path) {
+                Ok(digest) => files.push((name, digest)),
+                Err(err) => {
+                    unreadable = Some(err);
+                    break;
+                }
+            }
+        }
+        if let Some(err) = unreadable {
+            tracing::warn!(dir = %build.path.display(), error = %err, "failed to adopt build");
+            report.entries_skipped += 1;
+            continue;
+        }
+        if files.is_empty() {
+            report.entries_skipped += 1;
+            continue;
+        }
+        let built_at = fs::metadata(&build.path)
+            .and_then(|meta| meta.modified())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(|_| Utc::now());
+        scanned.push(ScannedBuild {
+            build,
+            built_at,
+            files,
+        });
+    }
+    scanned
+}
+
+/// Index `scanned` inside `tx`, each build under its own savepoint: one
+/// that cannot be recorded is skipped and counted, the others are kept.
+///
+/// # Errors
+///
+/// [`Error::Database`] when a savepoint cannot be created or released —
+/// the whole transaction is then abandoned.
+fn insert_scanned(
+    tx: &mut rusqlite::Transaction<'_>,
+    scanned: &[ScannedBuild],
+    report: &mut RepairReport,
+) -> Result<()> {
+    for entry in scanned {
+        let savepoint = tx.savepoint()?;
+        match insert_build(&savepoint, entry) {
+            Ok(()) => {
+                savepoint.commit()?;
+                report.builds_adopted += 1;
+                report.artifacts_adopted += entry.files.len() as u64;
+            }
+            // Dropping the savepoint rolls this build back.
+            Err(err) => {
+                tracing::warn!(dir = %entry.build.path.display(), error = %err, "failed to adopt build");
+                report.entries_skipped += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Record one scanned build and its files.
+fn insert_build(conn: &rusqlite::Connection, entry: &ScannedBuild) -> Result<()> {
+    let build = &entry.build;
+    let build_id = db::builds::insert(
+        conn,
+        &build.project,
+        &build.version,
+        &build.commit,
+        &paths::build_dir_rel(&build.project, &build.version, &build.name),
+        db::to_ms(entry.built_at),
+    )?;
+    for (filename, digest) in &entry.files {
+        db::builds::upsert_artifact(
+            conn,
+            build_id,
+            None,
+            filename,
+            db::size_to_db(digest.size_bytes)?,
+            &digest.sha256,
+        )?;
+    }
+    Ok(())
+}
+
+/// Count release directories left without a record (repair path).
+fn count_orphan_release_dirs(base_dir: &Path, report: &mut RepairReport) {
+    for project in layout::project_dirs(base_dir) {
+        let releases = base_dir.join(&project).join(paths::RELEASES_DIR);
+        if let Some(releases) = layout::managed_dir(&releases) {
+            report.orphan_release_dirs += layout::subdirectories(&releases).len() as u64;
+        }
+    }
+}
 
 /// Identity of a file record: its table and row id.
 type FileKey = (db::maintenance::FileKind, i64);
@@ -1144,15 +1223,14 @@ enum GcVerdict {
 /// cannot be read back is dropped, its file with it; a file that cannot be
 /// read is kept.
 fn gc_verdict(depth: VerifyMode, path: &Path, record: &db::maintenance::FileRecord) -> GcVerdict {
-    if db::size_from_db(record.size_bytes).is_err() {
-        return GcVerdict::Drop { delete_file: true };
-    }
     match check_file(depth, path, record.size_bytes, &record.sha256) {
         None => GcVerdict::Keep,
         Some(VerifyProblem::Missing) => GcVerdict::Drop { delete_file: false },
-        Some(VerifyProblem::SizeMismatch { .. } | VerifyProblem::ChecksumMismatch { .. }) => {
-            GcVerdict::Drop { delete_file: true }
-        }
+        Some(
+            VerifyProblem::SizeMismatch { .. }
+            | VerifyProblem::ChecksumMismatch { .. }
+            | VerifyProblem::InvalidRecord { .. },
+        ) => GcVerdict::Drop { delete_file: true },
         Some(VerifyProblem::Unreadable { details }) => GcVerdict::Unreadable(details),
     }
 }
@@ -1257,10 +1335,11 @@ fn check_file(
     recorded_size: i64,
     recorded_sha256: &str,
 ) -> Option<VerifyProblem> {
+    // Checked first, at every depth: gc relies on it to drop such records.
     let expected = match db::size_from_db(recorded_size) {
         Ok(size) => size,
         Err(err) => {
-            return Some(VerifyProblem::Unreadable {
+            return Some(VerifyProblem::InvalidRecord {
                 details: err.to_string(),
             });
         }
@@ -1298,63 +1377,164 @@ fn quarantine_target(base_dir: &Path) -> PathBuf {
     base_dir.join(format!("{}.corrupt-{stamp}", paths::DB_FILE_NAME))
 }
 
-/// Move the corrupt database (and WAL sidecars) aside; returns where the
-/// main file went. Connections in this process cannot start meanwhile (see
-/// `db::swapping_files`).
-fn quarantine_database(base_dir: &Path, db_path: &Path) -> Result<PathBuf> {
+/// Copy the damaged database at `db_path` (and its WAL, if any) to
+/// `apvm.db.corrupt-<timestamp>` — kept for inspection, never read again;
+/// returns the copy's path.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the database file cannot be copied. A WAL that cannot
+/// be copied is only logged: the copy is for forensics.
+fn copy_damaged(base_dir: &Path, db_path: &Path) -> Result<PathBuf> {
     let target = quarantine_target(base_dir);
-    let _swapping = db::swapping_files();
-    fs::rename(db_path, &target).io_ctx(|| {
+    fs::copy(db_path, &target).io_ctx(|| {
         format!(
-            "failed to quarantine corrupt database {} -> {}",
+            "failed to keep a copy of the damaged database {} as {}",
             db_path.display(),
             target.display()
         )
     })?;
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = base_dir.join(format!("{}{suffix}", paths::DB_FILE_NAME));
-        if !sidecar.exists() {
-            continue;
-        }
-        let mut sidecar_target = target.clone().into_os_string();
-        sidecar_target.push(suffix);
-        if let Err(err) = fs::rename(&sidecar, &sidecar_target) {
-            tracing::warn!(file = %sidecar.display(), error = %err, "failed to quarantine WAL sidecar; removing");
-            let _ = fs::remove_file(&sidecar);
+    let mut wal = db_path.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    if wal.exists() {
+        let mut wal_copy = target.clone().into_os_string();
+        wal_copy.push("-wal");
+        if let Err(err) = fs::copy(&wal, &wal_copy) {
+            tracing::warn!(file = %wal.display(), error = %err, "failed to copy the damaged database's WAL");
         }
     }
-    tracing::warn!(
-        quarantined = %target.display(),
-        "corrupt storage database quarantined; rebuilding index"
-    );
     Ok(target)
+}
+
+/// Remove a copy [`copy_damaged`] made (and its WAL copy), best-effort.
+fn remove_copy(copy: &Path) {
+    let mut wal = copy.as_os_str().to_owned();
+    wal.push("-wal");
+    for file in [copy, Path::new(&wal)] {
+        let _ = fs::remove_file(file);
+    }
+}
+
+/// Why repair rebuilds the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Damage {
+    /// The database is missing or blank, or a repair was interrupted.
+    Lost,
+    /// The database does not open, or SQLite reports it corrupt.
+    Corrupt,
+    /// It opens, but its records cannot be read back.
+    Unreadable,
+}
+
+/// The marker of a repair in progress ([`paths::REPAIR_MARKER_NAME`]): while
+/// it exists, the store is [`StoreState::Orphaned`].
+struct RepairMarker {
+    path: PathBuf,
+    /// Left by an earlier, interrupted repair: never remove it unless this
+    /// one completes.
+    inherited: bool,
+}
+
+impl RepairMarker {
+    /// Write the marker durably (unless an interrupted repair left one).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when it cannot be written: repair must not change the
+    /// database without it.
+    fn create(base_dir: &Path) -> Result<Self> {
+        let path = base_dir.join(paths::REPAIR_MARKER_NAME);
+        let inherited = path.exists();
+        if !inherited {
+            let file = fs::File::create(&path)
+                .and_then(|file| file.sync_all().map(|()| file))
+                .io_ctx(|| format!("failed to write the repair marker {}", path.display()))?;
+            drop(file);
+            sync_dir(base_dir);
+        }
+        Ok(Self { path, inherited })
+    }
+
+    /// The repaired index is committed: remove the marker.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when it cannot be removed (the store then still needs
+    /// a repair, which completes at once).
+    fn finish(self) -> Result<()> {
+        match fs::remove_file(&self.path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(Error::Io {
+                context: format!("failed to remove the repair marker {}", self.path.display()),
+                source: err,
+            }),
+            _ => {
+                sync_dir(self.path.parent().unwrap_or(Path::new(".")));
+                Ok(())
+            }
+        }
+    }
+
+    /// Repair stopped before changing the database: remove a marker this
+    /// repair created (best-effort), keep an inherited one.
+    fn abandon(self) {
+        if !self.inherited {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Flush a directory's entries to disk (best-effort; a no-op off Unix), so
+/// a marker created or removed survives a power loss in that state.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn quarantine_waits_for_connections_that_are_starting() {
-        // A connection that opened the old file must finish its first read
-        // before the rename, or it would share the new database's memory.
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join(paths::DB_FILE_NAME);
-        fs::write(&db_path, b"damaged").unwrap();
+    fn marker_path(dir: &Path) -> PathBuf {
+        dir.join(paths::REPAIR_MARKER_NAME)
+    }
 
-        let starting = db::connection_starting();
-        let quarantine = {
-            let (base, db_path) = (dir.path().to_path_buf(), db_path.clone());
-            std::thread::spawn(move || quarantine_database(&base, &db_path))
-        };
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(db_path.exists(), "renamed while a connection was starting");
-        drop(starting);
-        let target = quarantine
-            .join()
-            .expect("quarantine thread panicked")
-            .unwrap();
-        assert!(!db_path.exists());
-        assert_eq!(fs::read(target).unwrap(), b"damaged");
+    #[test]
+    fn a_finished_repair_removes_its_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = RepairMarker::create(dir.path()).unwrap();
+        assert!(marker_path(dir.path()).exists());
+        marker.finish().unwrap();
+        assert!(!marker_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn an_abandoned_repair_removes_only_its_own_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        RepairMarker::create(dir.path()).unwrap().abandon();
+        assert!(!marker_path(dir.path()).exists());
+
+        // An interrupted repair's marker stays until a repair completes.
+        fs::write(marker_path(dir.path()), b"").unwrap();
+        let inherited = RepairMarker::create(dir.path()).unwrap();
+        assert!(inherited.inherited);
+        inherited.abandon();
+        assert!(marker_path(dir.path()).exists());
+        RepairMarker::create(dir.path()).unwrap().finish().unwrap();
+        assert!(!marker_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_stops_the_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        assert!(matches!(
+            RepairMarker::create(&missing),
+            Err(Error::Io { .. })
+        ));
     }
 }

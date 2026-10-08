@@ -12,6 +12,10 @@
 //! - **Type-safe**: Full TypeScript type definitions are generated automatically.
 //! - **Error-safe**: All Rust errors are converted to JavaScript exceptions
 //!   without crashing the Node.js process.
+//! - **Cache maintenance**: `ApvmCache` (from `apvm.cache()` or
+//!   `ApvmCache.open()`) inspects, cleans, verifies, garbage-collects and
+//!   repairs the artifact cache, at parity with `apvm cache`; its rejections
+//!   carry an `err.code` (`CacheCorrupted`, `InvalidArg`, `GenericFailure`).
 //!
 //! # Supported Projects
 //!
@@ -22,7 +26,7 @@
 //! # Quick Start (JavaScript/TypeScript)
 //!
 //! ```typescript
-//! import { Apvm } from 'apvm-napi';
+//! import { Apvm, type JsCleanTarget } from 'apvm-napi';
 //!
 //! // All config fields are optional — cacheDir defaults to ~/.apvm/cache
 //! const apvm = await Apvm.create({});
@@ -39,10 +43,19 @@
 //! // Prime the cache without producing output — same pipeline, no outputDir.
 //! // A later build of the same ref is then served from the cache.
 //! await apvm.warmCache({ project: 'wp-rocket', gitRef: 'branch:develop' });
+//!
+//! // Maintain the same cache: drop builds unused for 30 days, then check it.
+//! const cache = apvm.cache();
+//! await cache.clean({ olderThan: '30d', target: 'Builds' as JsCleanTarget });
+//! const issues = await cache.verify(); // [] = healthy
 //! ```
 
 mod apvm;
+mod cache;
+mod cache_input;
+mod cache_types;
 mod config;
 mod error;
 mod progress;
+mod single_copy;
 mod types;

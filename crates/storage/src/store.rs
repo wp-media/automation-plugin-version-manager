@@ -932,11 +932,33 @@ mod tests {
         let build = base.join("wp-rocket/commits/3.17.4/a1b2c3d");
         std::fs::create_dir_all(&build).unwrap();
         std::fs::write(build.join("a.zip"), b"zip").unwrap();
+        std::fs::write(base.join(paths::LOCK_FILE_NAME), b"").unwrap();
         assert!(matches!(
             ArtifactStore::open(&base),
             Err(Error::MissingDatabase { .. })
         ));
         assert!(!base.join(paths::DB_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn store_shaped_data_without_the_lock_file_is_foreign() {
+        // Audit: one store-shaped build in someone else's directory made it
+        // a "lost" store, which repair adopted and gc then trimmed.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let build = base.join("wp-rocket/commits/3.17.4/a1b2c3d");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("a.zip"), b"zip").unwrap();
+        assert!(matches!(
+            ArtifactStore::open(&base),
+            Err(Error::ForeignDirectory { .. })
+        ));
+        assert!(matches!(
+            ArtifactStore::repair(&base),
+            Err(Error::ForeignDirectory { .. })
+        ));
+        assert!(!base.join(paths::DB_FILE_NAME).exists());
+        assert!(!base.join(paths::LOCK_FILE_NAME).exists());
     }
 
     #[test]

@@ -187,10 +187,25 @@ pub fn apply_env_overrides(config: Config) -> Config {
     override_cache_dir(config, cache_dir_env_override())
 }
 
+/// `config` with [`Config::cache_dir`] made absolute against the current
+/// directory (lexically: symlinks and `..` are kept, nothing is read from
+/// disk), so a later change of directory cannot move the cache.
+///
+/// An empty path is kept as is — it cannot be made absolute, and keeping it
+/// lets the cache report it as an error instead of using the current
+/// directory. Likewise when the current directory cannot be determined.
+pub fn pin_cache_dir(mut config: Config) -> Config {
+    if let Ok(dir) = std::path::absolute(&config.cache_dir) {
+        config.cache_dir = dir;
+    }
+    config
+}
+
 /// Pure core of [`apply_env_overrides`]: replace the cache directory when an
 /// override is provided. Separated from the environment read so the precedence
-/// logic is testable without mutating process-global state.
-fn override_cache_dir(mut config: Config, cache_dir: Option<PathBuf>) -> Config {
+/// logic is testable without mutating process-global state — here and by
+/// front ends that resolve their own config the same way.
+pub fn override_cache_dir(mut config: Config, cache_dir: Option<PathBuf>) -> Config {
     if let Some(dir) = cache_dir {
         config.cache_dir = dir;
     }
@@ -468,6 +483,40 @@ mod tests {
     use super::*;
     use apvm_config::ConfigKey;
     use tempfile::TempDir;
+
+    #[test]
+    fn pin_cache_dir_makes_a_relative_dir_absolute() {
+        let config = pin_cache_dir(Config::new(PathBuf::from("rel/cache")));
+        assert!(config.cache_dir.is_absolute());
+        assert_eq!(
+            config.cache_dir,
+            std::env::current_dir().unwrap().join("rel").join("cache")
+        );
+    }
+
+    #[test]
+    fn pin_cache_dir_keeps_absolute_and_empty_dirs() {
+        let absolute = std::env::temp_dir().join("apvm-cache");
+        assert_eq!(
+            pin_cache_dir(Config::new(absolute.clone())).cache_dir,
+            absolute
+        );
+        assert_eq!(
+            pin_cache_dir(Config::new(PathBuf::new())).cache_dir,
+            PathBuf::new()
+        );
+    }
+
+    #[test]
+    fn pin_cache_dir_touches_only_the_dir() {
+        let config = pin_cache_dir(
+            Config::new(PathBuf::from("rel"))
+                .set_token("ghp_x".to_string())
+                .set_cache_enabled(false),
+        );
+        assert_eq!(config.github_token.as_deref(), Some("ghp_x"));
+        assert!(!config.cache_enabled);
+    }
 
     fn test_config(cache: PathBuf) -> Config {
         Config::new(cache)

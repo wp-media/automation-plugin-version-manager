@@ -30,10 +30,10 @@ pub(crate) mod maintenance;
 pub(crate) mod releases;
 
 use std::path::Path;
-use std::sync::{PoisonError, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
 
 use crate::error::{Error, Result};
@@ -210,27 +210,54 @@ pub(crate) fn open(
     Ok((conn, file))
 }
 
-/// Orders, within this process, renaming a database file away (repair's
-/// quarantine) against the start of every connection.
+/// Reset the database at `db_path` to an empty one (no schema, no rows), in
+/// place: the file keeps its identity, so every connection — in this
+/// process or another — stays bound to it, and SQLite's own locking
+/// coordinates the change. Works on a badly corrupted file, including one
+/// that is not a database at all (SQLite's `SQLITE_DBCONFIG_RESET_DATABASE`
+/// procedure).
 ///
-/// SQLite's POSIX locks are per process, so a connection here that opened
-/// the old file and first read it after the rename would take the new
-/// database's shared-memory file for its own, truncate it under the live
-/// connections (SIGBUS) and drop their locks. Other processes see those locks,
-/// so for them [`connect`]'s identity check is enough.
-static FILE_SWAP: RwLock<()> = RwLock::new(());
-
-/// Hold while renaming a database file away; waits for connections that are
-/// starting and keeps new ones from starting.
-pub(crate) fn swapping_files() -> RwLockWriteGuard<'static, ()> {
-    FILE_SWAP.write().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// What [`connect`] holds while a connection starts; lets tests stand in
-/// for one.
-#[cfg(test)]
-pub(crate) fn connection_starting() -> std::sync::RwLockReadGuard<'static, ()> {
-    FILE_SWAP.read().unwrap_or_else(PoisonError::into_inner)
+/// Never renaming the database is deliberate: a connection that opened the
+/// old file but first read it after a rename would take the new file's WAL
+/// index for its own and truncate it under other connections of its
+/// process (SIGBUS), or pair the new file with a stale WAL.
+///
+/// # Errors
+///
+/// [`Error::DatabaseInUse`] when another connection keeps the file open
+/// past `busy_timeout_ms` (WAL connections hold a shared lock for as long as
+/// they are open); [`Error::Database`] for other SQLite failures.
+pub(crate) fn reset_in_place(db_path: &Path, busy_timeout_ms: u64) -> Result<()> {
+    let flags = OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE);
+    let conn = Connection::open_with_flags(db_path, flags)?;
+    let _applied: i64 = conn.query_row(
+        &format!("PRAGMA busy_timeout = {busy_timeout_ms}"),
+        [],
+        |row| row.get(0),
+    )?;
+    // The documented procedure reads the schema first; on a damaged file
+    // that read fails, which is expected.
+    let _ = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    });
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_RESET_DATABASE, true)?;
+    let vacuum = conn.execute_batch("VACUUM");
+    // Best-effort: the connection is dropped right after.
+    let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_RESET_DATABASE, false);
+    match vacuum {
+        Ok(()) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            Err(Error::DatabaseInUse {
+                path: db_path.to_path_buf(),
+            })
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// How many times [`connect`] opens a file that is replaced meanwhile. Creating
@@ -239,15 +266,13 @@ const CONNECT_ATTEMPTS: usize = 3;
 
 /// Open and configure a connection bound to the file that is at `db_path`.
 ///
-/// Repair renames a damaged database aside and creates a new one. A
-/// connection that opens the old file just before the rename but first reads
-/// it just after pairs the old file with the new database's WAL. SQLite
-/// reports that mixed view as corruption or, when the two look alike, lets
-/// writes based on it reach the new database. Within this process
-/// [`FILE_SWAP`] keeps the rename out of that window; for other processes the
-/// file's identity is taken before opening and again after the first read
-/// (the pragmas), and a connection whose file changed in between is discarded
-/// and opened again. `before_first_read` runs between the two; tests use it
+/// The store never replaces its database file (repair resets it in place),
+/// but older apvm versions renamed a damaged one aside, and anyone can
+/// replace the file. A connection that opens the old file just before such
+/// a rename but first reads it just after pairs the old file with the new
+/// database's WAL. So the file's identity is taken before opening and again
+/// after the first read (the pragmas), and a connection whose file changed
+/// in between is discarded and opened again. `before_first_read` runs between the two; tests use it
 /// to replace the file. Returns the connection and that confirmed identity.
 fn connect(
     db_path: &Path,
@@ -261,18 +286,15 @@ fn connect(
         OpenMode::ExistingOnly => OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE),
     };
     for _ in 0..CONNECT_ATTEMPTS {
-        let _starting = FILE_SWAP.read().unwrap_or_else(PoisonError::into_inner);
         let before = file_id(db_path);
         let conn = Connection::open_with_flags(db_path, flags)
             .map_err(|err| map_corruption(err, db_path))?;
         before_first_read();
-        let configured = configure(&conn, busy_timeout_ms, full_durability);
+        let configured = configure(&conn, db_path, busy_timeout_ms, full_durability);
         if let Some(file) = before
             && file_id(db_path) == before
         {
-            return configured
-                .map(|()| (conn, file))
-                .map_err(|err| map_corruption(err, db_path));
+            return configured.map(|()| (conn, file));
         }
     }
     Err(Error::Database(rusqlite::Error::SqliteFailure(
@@ -302,21 +324,32 @@ pub(crate) fn file_id(path: &Path) -> Option<FileId> {
     path.exists().then_some((0, 0))
 }
 
-/// Apply the per-connection pragmas described in the module docs.
+/// Apply the per-connection pragmas described in the module docs — after
+/// refusing someone else's database, before anything writes to the file.
+///
+/// # Errors
+///
+/// [`Error::ForeignDatabase`]; [`Error::DatabaseCorrupted`] when the file
+/// is not a usable database; [`Error::Database`] otherwise.
 fn configure(
     conn: &Connection,
+    db_path: &Path,
     busy_timeout_ms: u64,
     full_durability: bool,
-) -> rusqlite::Result<()> {
+) -> Result<()> {
+    let sqlite = |err| map_corruption(err, db_path);
     // This pragma returns a result row, so it must be read as a query
     // rather than executed as a statement. It goes first so that the WAL
     // switch below waits for locks rather than failing.
-    let _applied: i64 = conn.query_row(
-        &format!("PRAGMA busy_timeout = {busy_timeout_ms}"),
-        [],
-        |row| row.get(0),
-    )?;
-    let mode = enable_wal(conn, Duration::from_millis(busy_timeout_ms))?;
+    let _applied: i64 = conn
+        .query_row(
+            &format!("PRAGMA busy_timeout = {busy_timeout_ms}"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite)?;
+    refuse_foreign_database(conn, db_path)?;
+    let mode = enable_wal(conn, Duration::from_millis(busy_timeout_ms)).map_err(sqlite)?;
     if !mode.eq_ignore_ascii_case("wal") {
         tracing::warn!(
             journal_mode = %mode,
@@ -328,8 +361,10 @@ fn configure(
         None,
         "synchronous",
         if full_durability { "FULL" } else { "NORMAL" },
-    )?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
+    )
+    .map_err(sqlite)?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(sqlite)?;
     Ok(())
 }
 
@@ -416,6 +451,34 @@ fn migrate(conn: &mut Connection, db_path: &Path) -> Result<()> {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// A database at schema version 0 is new — or someone else's: apvm's
+/// migrations set the version in the transaction that creates the tables,
+/// so a version-0 database holding any schema object was never apvm's.
+/// Runs before anything writes to the file (the WAL switch does), as one
+/// statement so the version and the tables come from the same snapshot even
+/// while a concurrent opener migrates a new database.
+///
+/// # Errors
+///
+/// [`Error::ForeignDatabase`] for such a database; [`Error::Database`] when
+/// it cannot be read.
+fn refuse_foreign_database(conn: &Connection, db_path: &Path) -> Result<()> {
+    let (version, objects): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT user_version FROM pragma_user_version), \
+                    (SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|err| map_corruption(err, db_path))?;
+    if version == 0 && objects > 0 {
+        return Err(Error::ForeignDatabase {
+            path: db_path.to_path_buf(),
+        });
+    }
     Ok(())
 }
 
@@ -614,7 +677,8 @@ mod tests {
         Connection::open(path)
             .unwrap()
             .execute_batch(&format!(
-                "PRAGMA journal_mode = WAL; CREATE TABLE {marker} (x);"
+                "PRAGMA journal_mode = WAL; CREATE TABLE {marker} (x); \
+                 PRAGMA user_version = {SCHEMA_VERSION};"
             ))
             .unwrap();
     }
@@ -628,7 +692,10 @@ mod tests {
         let path = dir.path().join("apvm.db");
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE old (x);")
+            .execute_batch(&format!(
+                "PRAGMA journal_mode = WAL; CREATE TABLE old (x); \
+                 PRAGMA user_version = {SCHEMA_VERSION};"
+            ))
             .unwrap();
         let mut calls = 0;
         let (conn, file) = connect(&path, OpenMode::ExistingOnly, 1_000, false, &mut || {
@@ -694,18 +761,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(found, 1);
-    }
-
-    #[test]
-    fn a_starting_connection_holds_off_file_swaps_until_its_first_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("apvm.db");
-        let mut swap_could_start = None;
-        connect(&path, OpenMode::CreateIfMissing, 1_000, false, &mut || {
-            swap_could_start.get_or_insert(FILE_SWAP.try_write().is_ok());
-        })
-        .unwrap();
-        assert_eq!(swap_could_start, Some(false));
     }
 
     #[test]

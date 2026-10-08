@@ -54,15 +54,29 @@ All tables are `STRICT`; deletes cascade; timestamps are epoch milliseconds
   filesystems). Entries differing only in case get distinct directories.
 - **Corruption story.** WAL journal + integrity check on every open; a
   damaged database fails with `Error::DatabaseCorrupted` (unreadable rows:
-  `Error::Data`), and `ArtifactStore::repair()` quarantines it (an
-  unreadable one is copied aside and cleared in place, so open handles keep
-  working), rebuilds the index, and re-adopts artifact files found on disk
-  (hashes recomputed). A *deleted* database with files left is `StoreState::Orphaned`:
-  `open` refuses (`Error::MissingDatabase`) and `repair()` rebuilds it.
+  `Error::Data`; corruption met later: `Error::is_corruption()`), and
+  `ArtifactStore::repair()` keeps a copy (`apvm.db.corrupt-<ms>`), **resets
+  the database in place** (SQLite's reset procedure; unreadable rows are
+  cleared), and re-adopts the artifact files found on disk (hashes
+  recomputed). The file is never renamed or replaced, so connections in
+  any process stay bound to it — a rename could make another process's
+  connection take the new file's shared memory for its own (SIGBUS). A
+  corrupt database another connection holds open is refused
+  (`Error::DatabaseInUse`, nothing changed). A *deleted* or blank (0-byte)
+  database with builds left is `StoreState::Orphaned`: `open` refuses
+  (`Error::MissingDatabase`) and `repair()` rebuilds it. Repair is
+  crash-safe: it hashes first, writes a marker (`apvm.db.repairing`) before
+  touching the database and removes it once the re-filled index commits in
+  one transaction; while the marker exists the store is `Orphaned`, so an
+  interrupted repair never leaves a half-filled index that `gc` would
+  trust.
 - **Only its own files.** `ArtifactStore::inspect()` classifies a directory
   (`StoreState`: missing, empty, present, orphaned, foreign) without touching
   it. A store is only created in a missing or empty directory; one holding
-  someone else's data is refused (`Error::ForeignDirectory`).
+  someone else's data is refused (`Error::ForeignDirectory`) — so is
+  store-shaped data without the store's `.apvm.lock` file, someone else's
+  SQLite file at `apvm.db` (`Error::ForeignDatabase`, never migrated) and a
+  symlinked `apvm.db` (never followed).
   `open_existing()` never creates anything. `gc` and `repair` walk only
   store-produced names and never follow symlinks.
 - **Concurrency.** `ArtifactStore` is `Send + Sync`. Cross-process:

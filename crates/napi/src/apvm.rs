@@ -19,12 +19,17 @@
 
 use std::sync::Arc;
 
+use napi::Env;
+use napi::bindgen_prelude::PromiseRaw;
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 
-use crate::config::ApvmConfig;
+use crate::cache::ApvmCache;
+use crate::cache_types::JsCacheStatus;
+use crate::config::{ApvmConfig, resolve_config};
 use crate::error::core_error_to_napi;
 use crate::progress::JsProgressReporter;
+use crate::single_copy::ensure_single_copy;
 use crate::types::{BuildOptions, JsBuildEvent, JsBuildOutput, JsReleaseSelector, WarmOptions};
 
 /// Main APVM instance for building WordPress plugins.
@@ -105,18 +110,26 @@ impl Apvm {
     ///   githubToken: 'ghp_xxxxxxxxxxxx',
     /// });
     /// ```
-    #[napi(factory)]
-    pub async fn create(config: Option<ApvmConfig>) -> napi::Result<Self> {
-        let config = config.unwrap_or_default();
-        let rust_config: apvm_config::Config = config.into();
-        // APVM_CACHE_DIR (if set) overrides the resolved cache directory, so a
-        // single env var can isolate a run (e.g. tests) from ~/.apvm/cache.
-        let rust_config = apvm_core::config_io::apply_env_overrides(rust_config);
+    #[napi(
+        ts_args_type = "config?: ApvmConfig | undefined | null",
+        ts_return_type = "Promise<Apvm>"
+    )]
+    pub fn create<'env>(
+        env: &'env Env,
+        config: Option<ApvmConfig>,
+    ) -> napi::Result<PromiseRaw<'env, Apvm>> {
+        ensure_single_copy(env)?;
+        // Resolved now, on the calling thread: `APVM_CACHE_DIR` counts as it
+        // is when `create()` is called (not when the promise runs), and the
+        // environment is never read off the JS thread while JS may write it.
+        let rust_config = resolve_config(config);
         // Octocrab (HTTP client) requires a Tokio runtime during
-        // initialization, which is why this factory is async.
-        let inner = apvm_core::Apvm::new(rust_config).map_err(core_error_to_napi)?;
-        Ok(Self {
-            inner: Arc::new(inner),
+        // initialization, which is why creation is async.
+        env.spawn_future(async move {
+            let inner = apvm_core::Apvm::new(rust_config).map_err(core_error_to_napi)?;
+            Ok(Self {
+                inner: Arc::new(inner),
+            })
         })
     }
 
@@ -157,17 +170,25 @@ impl Apvm {
     ///
     /// console.log('Has token:', apvm.hasToken());
     /// ```
-    #[napi(factory)]
-    pub async fn create_with_token_resolution(config: Option<ApvmConfig>) -> napi::Result<Self> {
-        let config = config.unwrap_or_default();
-        let rust_config: apvm_config::Config = config.into();
-        // APVM_CACHE_DIR (if set) overrides the resolved cache directory.
-        let rust_config = apvm_core::config_io::apply_env_overrides(rust_config);
-        let inner = apvm_core::Apvm::new_with_token_resolution(rust_config)
-            .await
-            .map_err(core_error_to_napi)?;
-        Ok(Self {
-            inner: Arc::new(inner),
+    #[napi(
+        ts_args_type = "config?: ApvmConfig | undefined | null",
+        ts_return_type = "Promise<Apvm>"
+    )]
+    pub fn create_with_token_resolution<'env>(
+        env: &'env Env,
+        config: Option<ApvmConfig>,
+    ) -> napi::Result<PromiseRaw<'env, Apvm>> {
+        ensure_single_copy(env)?;
+        // `APVM_CACHE_DIR` is read now, as in `create()`. (Token resolution
+        // still reads `GITHUB_TOKEN` / `GH_TOKEN` when the promise runs.)
+        let rust_config = resolve_config(config);
+        env.spawn_future(async move {
+            let inner = apvm_core::Apvm::new_with_token_resolution(rust_config)
+                .await
+                .map_err(core_error_to_napi)?;
+            Ok(Self {
+                inner: Arc::new(inner),
+            })
         })
     }
 
@@ -207,6 +228,53 @@ impl Apvm {
     #[napi]
     pub fn token_source(&self) -> Option<String> {
         self.inner.token_source().map(|s| s.to_string())
+    }
+
+    /// A maintenance handle for the cache this instance builds into (its
+    /// `cacheDir` after `APVM_CACHE_DIR`, fixed at `create()`). Works whether
+    /// caching is enabled or not; touches nothing on disk.
+    ///
+    /// # TypeScript
+    ///
+    /// ```typescript
+    /// const usage = await apvm.cache().info();
+    /// console.log(`${usage.buildCount} builds, ${usage.totalBytes} bytes`);
+    /// ```
+    #[napi]
+    pub fn cache(&self) -> ApvmCache {
+        ApvmCache::new(apvm_core::CacheMaintenance::new(self.inner.cache_dir()))
+    }
+
+    /// Whether builds on this instance use the artifact cache right now:
+    /// `active`, `disabled` (`cacheEnabled: false`), `corrupted` (call
+    /// `cache().repair()`) or `unavailable`, with a `reason` for the last two.
+    ///
+    /// Re-checks the cache exactly as each build does, so after a
+    /// `repair()` — from this process, the CLI or anywhere else — it reports
+    /// `active` again and builds resume caching, with no new instance.
+    /// Builds work whatever the status; they only run uncached.
+    ///
+    /// # TypeScript
+    ///
+    /// ```typescript
+    /// const status = await apvm.cacheStatus();
+    /// if (status.state === 'corrupted') {
+    ///   await apvm.cache().repair();
+    /// }
+    /// ```
+    #[napi]
+    pub async fn cache_status(&self) -> napi::Result<JsCacheStatus> {
+        let apvm = Arc::clone(&self.inner);
+        // A stat, plus a SQLite open when nothing usable is open: blocking.
+        let status = tokio::task::spawn_blocking(move || apvm.cache_status())
+            .await
+            .map_err(|join| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("the cache check did not complete: {join}"),
+                )
+            })?;
+        Ok(JsCacheStatus::from(&status))
     }
 
     /// List all registered project names.

@@ -190,25 +190,34 @@ impl CacheMaintenance {
         self.with_store(|store| store.verify(mode))
     }
 
-    /// Recover the cache (`apvm cache repair`): quarantine a corrupt
-    /// database, clear an unreadable one in place (keeping a copy), or
-    /// rebuild a lost one, then re-index the builds found on disk. A no-op
-    /// on a healthy database (the report records nothing done). Running
-    /// [`Apvm`](crate::Apvm) instances pick the repaired cache up on their
-    /// next build.
+    /// Recover the cache (`apvm cache repair`): reset a corrupt database in
+    /// place, or clear an unreadable one (keeping a copy of either), or
+    /// rebuild a missing, blank or half-repaired one; then re-index the
+    /// builds found on disk. A no-op on a healthy database (the report
+    /// records nothing done). Crash-safe and never renames the database —
+    /// see [`ArtifactStore::repair`]. [`Apvm`](crate::Apvm) instances of
+    /// this process first let go of the cache (they reopen it on their next
+    /// build), since a corrupt database is only reset once nobody has it
+    /// open.
     ///
     /// Returns `Ok(None)` when there is no cache — and then creates nothing.
     ///
     /// # Errors
     ///
     /// Those of [`CacheMaintenance::exists`], except that a lost database is
-    /// what repair fixes; [`Error::Storage`] when the quarantine or the
-    /// fresh database fails, or the schema is newer than this build.
+    /// what repair fixes; [`Error::Storage`] wrapping
+    /// [`apvm_storage::Error::DatabaseInUse`] when another process (or a
+    /// build running in this one) holds a corrupt database open — nothing is
+    /// changed; retry once it is done — and otherwise when copying,
+    /// resetting or re-filling fails, or the schema is newer than this build.
     pub fn repair(&self) -> Result<Option<RepairReport>> {
         match self.state()? {
             StoreState::Missing | StoreState::Empty => Ok(None),
             // Present or Orphaned; storage itself refuses a foreign directory.
             _ => {
+                // Idle instances in this process would keep a corrupt
+                // database open, and repair refuses to reset one in use.
+                crate::cache_status::release_stores(&self.dir);
                 let (_store, report) = ArtifactStore::repair(&self.dir)?;
                 Ok(Some(report))
             }

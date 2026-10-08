@@ -112,6 +112,7 @@ dependencies = [
  "glob",
  "octocrab",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -130,11 +131,13 @@ dependencies = [
  "apvm-config",
  "apvm-core",
  "apvm-storage",
+ "chrono",
  "directories",
  "napi",
  "napi-build",
  "napi-derive",
  "openssl",
+ "rusqlite",
  "tokio",
 ]
 

@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::error::{Error, IoContext, Result};
+use crate::error::{Error, Result};
 use crate::paths;
 
 /// What a directory holds, as far as the store is concerned.
@@ -22,20 +22,23 @@ pub enum StoreState {
     /// The directory exists with no database and nothing a store would own
     /// (files at its root are fine): safe to initialize.
     Empty,
-    /// The directory holds a store database.
+    /// The directory holds a store database (one with content, or a blank
+    /// one beside nothing repair could adopt).
     Present,
-    /// No database, but store content — re-indexable build directories, or
-    /// the leftovers every used store has (its lock file, database
-    /// sidecars): a store whose database was lost.
-    /// [`ArtifactStore::repair`](crate::ArtifactStore::repair) rebuilds it.
+    /// A store — it has the store's lock file, created with the database and
+    /// never removed — holding project content but no usable database: the
+    /// database is missing or blank (0 bytes), or a repair was interrupted
+    /// (its marker remains). [`ArtifactStore::repair`](crate::ArtifactStore::repair)
+    /// rebuilds it.
     Orphaned {
         /// How many build directories repair would adopt (may be 0 when
         /// only cached releases remain).
         adoptable_builds: u64,
     },
-    /// No database and no sign of a store, yet a subdirectory named like a
-    /// store project. Creating a store here could later let `gc` delete
-    /// that data, so the store refuses.
+    /// No usable database and no lock file, yet a subdirectory named like a
+    /// store project — even one shaped like a store build. Creating a store
+    /// here could later let repair adopt that data and `gc` delete it, so
+    /// the store refuses.
     Foreign {
         /// The first such subdirectory.
         entry: String,
@@ -65,42 +68,104 @@ pub(crate) fn inspect(base_dir: &Path) -> Result<StoreState> {
             source: io::Error::from(io::ErrorKind::NotADirectory),
         });
     }
-    let db_path = base_dir.join(paths::DB_FILE_NAME);
-    if db_path
-        .try_exists()
-        .io_ctx(|| format!("cannot access store database {}", db_path.display()))?
-    {
+    let owned = has_lock_file(base_dir);
+    // An interrupted repair: whatever the database holds is incomplete.
+    if owned && base_dir.join(paths::REPAIR_MARKER_NAME).exists() {
+        return Ok(StoreState::Orphaned {
+            adoptable_builds: count_adoptable_builds(base_dir),
+        });
+    }
+    let database = database(base_dir)?;
+    if database == Database::Present {
         return Ok(StoreState::Present);
     }
-    // Without a database, only project-named subdirectories matter: they are
-    // the only thing a store would ever walk into (and gc delete from).
+    // Without a usable database, only project-named subdirectories matter:
+    // they are the only thing a store would ever walk into (and gc delete
+    // from).
     let Some(entry) = project_dirs(base_dir).into_iter().next() else {
-        return Ok(StoreState::Empty);
+        return Ok(match database {
+            // Nothing to orphan: opening simply initializes the file.
+            Database::Blank => StoreState::Present,
+            _ => StoreState::Empty,
+        });
     };
-    let adoptable_builds = build_dirs(base_dir, &mut 0)
-        .iter()
-        .filter(|build| !adoptable_files(&build.path).is_empty())
-        .count() as u64;
-    if adoptable_builds > 0 || has_store_leftovers(base_dir) {
+    let adoptable_builds = count_adoptable_builds(base_dir);
+    // Only a directory that has been a store — its lock file is created with
+    // the database and never removed — can have lost its database. Without
+    // it, store-shaped names prove nothing: the data is someone else's, and
+    // treating it as a store would let repair adopt it and gc delete it.
+    if owned {
         return Ok(StoreState::Orphaned { adoptable_builds });
+    }
+    if database == Database::Blank && adoptable_builds == 0 {
+        return Ok(StoreState::Present);
     }
     Ok(StoreState::Foreign { entry })
 }
 
-/// Whether `base_dir` holds files only a store leaves behind: its lock file
-/// (created by the first write, never removed) or `apvm.db-*` / quarantined
-/// `apvm.db.corrupt-*` files.
-fn has_store_leftovers(base_dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(base_dir) else {
-        return false;
+/// What the store database file holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Database {
+    /// No file.
+    Absent,
+    /// A file with no content: 0 bytes, with no WAL data either (truncated,
+    /// or created by an open that never finished).
+    Blank,
+    /// Anything else — including a database SQLite will reject.
+    Present,
+}
+
+/// Classify `base_dir`'s database file.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the file cannot be inspected, or is a symbolic link:
+/// the store never creates one, and following it would let a read-only
+/// action migrate (write to) a database elsewhere.
+fn database(base_dir: &Path) -> Result<Database> {
+    let db_path = base_dir.join(paths::DB_FILE_NAME);
+    let meta = match fs::symlink_metadata(&db_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Database::Absent),
+        Err(err) => {
+            return Err(Error::Io {
+                context: format!("cannot access store database {}", db_path.display()),
+                source: err,
+            });
+        }
     };
-    entries.flatten().any(|entry| {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        name == paths::LOCK_FILE_NAME
-            || name.starts_with(&format!("{}-", paths::DB_FILE_NAME))
-            || name.starts_with(&format!("{}.corrupt-", paths::DB_FILE_NAME))
+    if meta.file_type().is_symlink() {
+        return Err(Error::Io {
+            context: format!(
+                "store database {} is a symbolic link; refusing to follow it",
+                db_path.display()
+            ),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "symbolic link"),
+        });
+    }
+    if !meta.is_file() || meta.len() > 0 {
+        return Ok(Database::Present);
+    }
+    // A new database in WAL mode may keep all its content in the WAL.
+    let wal = base_dir.join(format!("{}-wal", paths::DB_FILE_NAME));
+    Ok(match fs::metadata(wal) {
+        Ok(meta) if meta.len() > 0 => Database::Present,
+        _ => Database::Blank,
     })
+}
+
+/// Whether `base_dir` holds the store's lock file — created with the
+/// database, never removed: proof the directory has been a store.
+fn has_lock_file(base_dir: &Path) -> bool {
+    fs::symlink_metadata(base_dir.join(paths::LOCK_FILE_NAME)).is_ok_and(|meta| meta.is_file())
+}
+
+/// How many build directories repair would adopt.
+fn count_adoptable_builds(base_dir: &Path) -> u64 {
+    build_dirs(base_dir, &mut 0)
+        .iter()
+        .filter(|build| !adoptable_files(&build.path).is_empty())
+        .count() as u64
 }
 
 /// A build directory whose every path component is a store-produced name.

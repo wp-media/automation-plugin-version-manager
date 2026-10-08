@@ -53,12 +53,9 @@ pub enum Error {
 
     /// The database file is not a valid SQLite database or failed the
     /// integrity check. Use [`crate::ArtifactStore::repair`] to quarantine
-    /// the corrupt file and rebuild a fresh index.
-    #[error(
-        "storage database corrupted at {}: {details} \
-         (run ArtifactStore::repair to quarantine and rebuild it)",
-        path.display()
-    )]
+    /// the corrupt file and rebuild a fresh index. The message names no
+    /// remedy: each front end adds its own (`apvm cache repair`, …).
+    #[error("storage database corrupted at {}: {details}", path.display())]
     DatabaseCorrupted {
         /// Path of the corrupt database file.
         path: PathBuf,
@@ -107,13 +104,15 @@ pub enum Error {
         entry: String,
     },
 
-    /// The store database is missing while store content remains on disk
-    /// (a store whose database was deleted). Opening would silently orphan
-    /// that content, so it is refused; [`crate::ArtifactStore::repair`]
-    /// rebuilds the index.
+    /// The store database is missing — or blank (0 bytes) — while store
+    /// content remains on disk (a store whose database was deleted or
+    /// truncated, or a repair that was interrupted). Opening would silently
+    /// orphan that content, so it is refused; [`crate::ArtifactStore::repair`]
+    /// rebuilds the index. The message names no remedy: each front end adds
+    /// its own.
     #[error(
-        "the store database at {} is missing but store content remains \
-         ({adoptable_builds} re-indexable build(s)); run ArtifactStore::repair to rebuild the index",
+        "the store database at {} is missing or empty but store content remains \
+         ({adoptable_builds} re-indexable build(s))",
         path.display()
     )]
     MissingDatabase {
@@ -121,6 +120,32 @@ pub enum Error {
         path: PathBuf,
         /// Build directories repair would re-index.
         adoptable_builds: u64,
+    },
+
+    /// The database is held open by another process or store handle, so it
+    /// cannot be reset in place. Repair refuses rather than swap the file
+    /// out from under them (which can crash them or mix their files): close
+    /// the other users and run repair again.
+    #[error(
+        "the store database at {} is in use by another process or store handle; \
+         close them and try again",
+        path.display()
+    )]
+    DatabaseInUse {
+        /// Path of the database file.
+        path: PathBuf,
+    },
+
+    /// The file at the database path is an SQLite database the store did not
+    /// create (no schema version, yet tables). It is never migrated or
+    /// written to.
+    #[error(
+        "{} is an SQLite database that apvm did not create; refusing to use it",
+        path.display()
+    )]
+    ForeignDatabase {
+        /// Path of the database file.
+        path: PathBuf,
     },
 
     /// This handle's database file is no longer the store's: it was renamed
@@ -146,6 +171,24 @@ impl Error {
         match self {
             Self::Io { context, source } => format!("{context}: {source}"),
             other => other.to_string(),
+        }
+    }
+
+    /// Whether the store database is damaged in a way
+    /// [`crate::ArtifactStore::repair`] fixes: [`Error::DatabaseCorrupted`],
+    /// unreadable rows ([`Error::Data`]), or an SQLite "corrupt" / "not a
+    /// database" failure met after opening ([`Error::Database`]).
+    /// [`Error::MissingDatabase`] is not included: it is a lost database,
+    /// which repair also rebuilds.
+    pub fn is_corruption(&self) -> bool {
+        use rusqlite::ErrorCode;
+        match self {
+            Self::DatabaseCorrupted { .. } | Self::Data { .. } => true,
+            Self::Database(rusqlite::Error::SqliteFailure(err, _)) => matches!(
+                err.code,
+                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
+            ),
+            _ => false,
         }
     }
 

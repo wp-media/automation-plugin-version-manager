@@ -188,6 +188,7 @@ impl Apvm {
     /// This is the synchronous constructor that uses only the config token.
     /// For automatic token resolution from gh CLI, use [`Apvm::new_with_token_resolution`].
     pub fn new(config: Config) -> Result<Self> {
+        let config = config_io::pin_cache_dir(config);
         let github = match &config.github_token {
             Some(token) => GitHubClient::new(token)?,
             None => GitHubClient::anonymous()?,
@@ -228,7 +229,8 @@ impl Apvm {
     ///     println!("Using token from: {}", source);
     /// }
     /// ```
-    pub async fn new_with_token_resolution(mut config: Config) -> Result<Self> {
+    pub async fn new_with_token_resolution(config: Config) -> Result<Self> {
+        let mut config = config_io::pin_cache_dir(config);
         // Resolve token from multiple sources
         let resolved = git::resolve_github_token(config.github_token.as_deref()).await;
 
@@ -271,6 +273,7 @@ impl Apvm {
     /// apvm.register_project("my-plugin", my_project_info);
     /// ```
     pub fn new_empty(config: Config) -> Result<Self> {
+        let config = config_io::pin_cache_dir(config);
         let github = match &config.github_token {
             Some(token) => GitHubClient::new(token)?,
             None => GitHubClient::anonymous()?,
@@ -333,7 +336,7 @@ impl Apvm {
     /// Checks the cache again, exactly as each build does: it opens the
     /// cache when none is open — picking up a cache repaired meanwhile, by
     /// any front end or process — and replaces an open one whose database
-    /// was renamed aside (a repair's quarantine), deleted or replaced.
+    /// was deleted or replaced.
     /// Builds still work whatever the status; they only run uncached.
     ///
     /// Blocking (a stat, plus a SQLite open when nothing usable is open):
@@ -349,7 +352,8 @@ impl Apvm {
     }
 
     /// The configured artifact cache directory (regardless of whether the
-    /// store opened successfully).
+    /// store opened successfully), made absolute at construction
+    /// ([`config_io::pin_cache_dir`]).
     pub fn cache_dir(&self) -> &Path {
         &self.config.cache_dir
     }
@@ -663,6 +667,55 @@ mod tests {
             "store should open for a writable cache dir"
         );
         assert!(apvm.cache_dir().ends_with("cache"));
+    }
+
+    /// `path` (absolute) relative to the current directory — `..` up to the
+    /// root, then `path` — so no test changes the process-wide cwd. `None`
+    /// when no relative path exists (another drive on Windows).
+    fn relative_to_cwd(path: &Path) -> Option<std::path::PathBuf> {
+        use std::path::{Component, PathBuf};
+        let cwd = std::env::current_dir().unwrap();
+        let prefix = |p: &Path| match p.components().next() {
+            Some(Component::Prefix(prefix)) => Some(prefix.as_os_str().to_owned()),
+            _ => None,
+        };
+        if prefix(&cwd) != prefix(path) {
+            return None;
+        }
+        let normal = |c: &Component| matches!(c, Component::Normal(_));
+        let mut relative: PathBuf = cwd.components().filter(normal).map(|_| "..").collect();
+        relative.extend(path.components().filter(normal));
+        Some(relative)
+    }
+
+    #[tokio::test]
+    async fn relative_cache_dir_is_pinned_and_its_store_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cache");
+        let Some(relative) = relative_to_cwd(&dir) else {
+            return;
+        };
+        assert!(relative.is_relative());
+        let apvm = Apvm::new(Config::new(relative)).unwrap();
+
+        // Pinned at construction: a later `chdir` cannot move the cache.
+        assert!(
+            apvm.cache_dir().is_absolute(),
+            "{}",
+            apvm.cache_dir().display()
+        );
+        assert_eq!(
+            std::fs::canonicalize(apvm.cache_dir()).unwrap(),
+            std::fs::canonicalize(&dir).unwrap()
+        );
+        // Re-checks keep the open store instead of reopening it each time.
+        let first = apvm.store.current().expect("store open");
+        assert!(apvm.cache_status().is_active());
+        let second = apvm.store.current().expect("store open");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "store was reopened"
+        );
     }
 
     #[tokio::test]

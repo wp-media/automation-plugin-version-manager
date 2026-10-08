@@ -2030,10 +2030,13 @@ fn gc_drops_a_record_whose_size_cannot_be_read_back() {
             .unwrap();
     }
     let store = ArtifactStore::open(&base).unwrap();
-    assert!(matches!(
-        store.verify(VerifyMode::Size).unwrap()[0].problem,
-        VerifyProblem::Unreadable { .. }
-    ));
+    // At every depth: even a presence check cannot trust the record.
+    for mode in [VerifyMode::Presence, VerifyMode::Size, VerifyMode::Checksum] {
+        assert!(matches!(
+            store.verify(mode).unwrap()[0].problem,
+            VerifyProblem::InvalidRecord { .. }
+        ));
+    }
 
     let report = store.gc().unwrap();
     assert_eq!(report.damaged_artifacts, 1);
@@ -2667,4 +2670,282 @@ fn repair_recovers_a_database_with_a_negative_schema_version() {
     assert!(report.quarantined_database.is_some());
     assert_eq!(report.builds_adopted, 1);
     assert_eq!(store.usage().unwrap().build_count, 1);
+}
+
+#[test]
+fn clean_report_saturates_hostile_recorded_sizes() {
+    let (_root, store, scratch) = make_store();
+    for (version, commit) in [
+        ("3.17.4", COMMIT_A),
+        ("3.17.5", "b1b2c3d4e5f60718293a4b5c6d7e8f9012345678"),
+    ] {
+        store
+            .store(
+                &metadata("wp-rocket", version, commit),
+                &[artifact(&scratch, "a.zip", b"artifact", None)],
+            )
+            .unwrap();
+    }
+    store
+        .store_release(
+            &ReleaseMetadata::new("backwpup", "v5.3.0"),
+            &[artifact(&scratch, "backwpup.zip", b"release-bytes", None)],
+        )
+        .unwrap();
+    {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute("UPDATE build_artifacts SET size_bytes = ?1", [i64::MAX])
+            .unwrap();
+        conn.execute("UPDATE release_assets SET size_bytes = ?1", [i64::MAX])
+            .unwrap();
+    }
+    // The builds sum to 2 × i64::MAX (= u64::MAX − 1) and the release adds
+    // i64::MAX more: the total must saturate, not overflow (a panic in
+    // debug builds, a wrapped total in release builds).
+    let report = store.clean(&CleanOptions::default().dry_run(true)).unwrap();
+    assert_eq!((report.builds_deleted, report.releases_deleted), (2, 1));
+    assert_eq!(report.bytes_freed, u64::MAX);
+}
+
+/// A closed store at `<root>/store` holding two builds; returns its base.
+fn closed_store_with_two_builds(root: &Path) -> PathBuf {
+    let base = root.join("store");
+    let scratch = root.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let store = ArtifactStore::open(&base).unwrap();
+    for (version, commit) in [
+        ("5.6.0", COMMIT_A),
+        ("5.6.1", "b1b2c3d4e5f60718293a4b5c6d7e8f9012345678"),
+    ] {
+        store
+            .store(
+                &metadata("backwpup", version, commit),
+                &[artifact(&scratch, "a.zip", b"kept-bytes", None)],
+            )
+            .unwrap();
+    }
+    base
+}
+
+/// Remove `<base>/apvm.db` and its sidecars.
+fn remove_database(base: &Path) {
+    for name in ["apvm.db", "apvm.db-wal", "apvm.db-shm"] {
+        let _ = std::fs::remove_file(base.join(name));
+    }
+}
+
+/// Identity of a file (device, inode) — to prove repair works in place.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).unwrap();
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_resets_a_corrupt_database_in_place_and_keeps_a_copy() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_two_builds(root.path());
+    let db = base.join("apvm.db");
+    std::fs::write(&db, b"garbage, not a database").unwrap();
+    let _ = std::fs::remove_file(base.join("apvm.db-wal"));
+    let identity = file_identity(&db);
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    let copy = report.quarantined_database.clone().expect("copy kept");
+    assert_eq!(std::fs::read(&copy).unwrap(), b"garbage, not a database");
+    assert_eq!(report.builds_adopted, 2);
+    assert!(!report.rebuilt_missing_database);
+    assert_eq!(file_identity(&db), identity, "the database was replaced");
+    assert!(!base.join("apvm.db.repairing").exists());
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    assert_eq!(recorded(&store), (2, 0));
+}
+
+#[test]
+fn repair_refuses_a_corrupt_database_another_connection_holds() {
+    // Resetting it would pull it from under that connection; renaming it
+    // could crash that connection's process (shared-memory SIGBUS).
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_two_builds(root.path());
+    let db = base.join("apvm.db");
+    let holder = rusqlite::Connection::open(&db).unwrap();
+    let _: i64 = holder
+        .query_row("SELECT count(*) FROM builds", [], |row| row.get(0))
+        .unwrap();
+    holder
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"damaged header, in place").unwrap();
+    }
+    let damaged = std::fs::read(&db).unwrap();
+
+    let err = ArtifactStore::repair(&base).unwrap_err();
+    assert!(matches!(err, Error::DatabaseInUse { .. }), "{err:?}");
+    let copies = std::fs::read_dir(&base)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+        .count();
+    assert_eq!(copies, 0, "a refused repair keeps no copy");
+    assert!(std::fs::read(&db).unwrap() == damaged, "nothing changed");
+    assert!(!base.join("apvm.db.repairing").exists());
+
+    // Once the other user is gone, repair succeeds.
+    drop(holder);
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert_eq!(report.builds_adopted, 2);
+    assert_eq!(recorded(&store), (2, 0));
+}
+
+#[test]
+fn interrupted_repair_stays_orphaned_until_repaired() {
+    // A repair killed after it reset the database: the marker remains, the
+    // index holds only part of the builds. Nothing may trust that index —
+    // gc would delete the builds it does not list.
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_two_builds(root.path());
+    {
+        let conn = rusqlite::Connection::open(base.join("apvm.db")).unwrap();
+        conn.execute("DELETE FROM builds WHERE version = '5.6.1'", [])
+            .unwrap();
+    }
+    std::fs::write(base.join("apvm.db.repairing"), b"").unwrap();
+
+    assert_eq!(
+        ArtifactStore::inspect(&base).unwrap(),
+        StoreState::Orphaned {
+            adoptable_builds: 2
+        }
+    );
+    assert!(matches!(
+        ArtifactStore::open(&base),
+        Err(Error::MissingDatabase { .. })
+    ));
+    assert!(matches!(ArtifactStore::open_existing(&base), Ok(None)));
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert!(report.rebuilt_missing_database);
+    assert_eq!(report.builds_adopted, 2);
+    assert!(!base.join("apvm.db.repairing").exists());
+    assert_eq!(recorded(&store), (2, 0));
+}
+
+#[test]
+fn a_foreign_sqlite_database_is_never_migrated() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("store");
+    std::fs::create_dir_all(&base).unwrap();
+    let db = base.join("apvm.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE notes (body TEXT); INSERT INTO notes VALUES ('mine');")
+            .unwrap();
+    }
+    let before = std::fs::read(&db).unwrap();
+    assert!(matches!(
+        ArtifactStore::open(&base),
+        Err(Error::ForeignDatabase { .. })
+    ));
+    assert!(matches!(
+        ArtifactStore::open_existing(&base),
+        Err(Error::ForeignDatabase { .. })
+    ));
+    assert!(matches!(
+        ArtifactStore::repair(&base),
+        Err(Error::ForeignDatabase { .. })
+    ));
+    assert!(
+        std::fs::read(&db).unwrap() == before,
+        "the file was written to"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_database_is_never_followed() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_two_builds(root.path());
+    let elsewhere = root.path().join("elsewhere.db");
+    {
+        let conn = rusqlite::Connection::open(&elsewhere).unwrap();
+        conn.execute_batch("CREATE TABLE t (x);").unwrap();
+    }
+    let before = std::fs::read(&elsewhere).unwrap();
+    remove_database(&base);
+    std::os::unix::fs::symlink(&elsewhere, base.join("apvm.db")).unwrap();
+    assert!(matches!(
+        ArtifactStore::inspect(&base),
+        Err(Error::Io { .. })
+    ));
+    assert!(matches!(
+        ArtifactStore::open_existing(&base),
+        Err(Error::Io { .. })
+    ));
+    assert!(matches!(
+        ArtifactStore::repair(&base),
+        Err(Error::Io { .. })
+    ));
+    assert!(
+        std::fs::read(&elsewhere).unwrap() == before,
+        "the target was written to"
+    );
+}
+
+#[test]
+fn blank_database_beside_builds_is_a_lost_database() {
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_two_builds(root.path());
+    remove_database(&base);
+    std::fs::write(base.join("apvm.db"), b"").unwrap();
+
+    assert_eq!(
+        ArtifactStore::inspect(&base).unwrap(),
+        StoreState::Orphaned {
+            adoptable_builds: 2
+        }
+    );
+    assert!(matches!(
+        ArtifactStore::open(&base),
+        Err(Error::MissingDatabase { .. })
+    ));
+    // Read-only access finds no store and leaves the blank file untouched.
+    assert!(matches!(ArtifactStore::open_existing(&base), Ok(None)));
+    assert_eq!(std::fs::metadata(base.join("apvm.db")).unwrap().len(), 0);
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert!(report.rebuilt_missing_database);
+    assert_eq!(report.builds_adopted, 2);
+    assert_eq!(recorded(&store), (2, 0));
+}
+
+#[test]
+fn blank_database_alone_is_initialized_on_open() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("store");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("apvm.db"), b"").unwrap();
+    assert_eq!(ArtifactStore::inspect(&base).unwrap(), StoreState::Present);
+    let store = ArtifactStore::open(&base).unwrap();
+    assert_eq!(recorded(&store), (0, 0));
+}
+
+#[test]
+fn blank_database_file_with_wal_content_is_present() {
+    // A fresh WAL database may hold everything in its WAL.
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_two_builds(root.path());
+    remove_database(&base);
+    std::fs::write(base.join("apvm.db"), b"").unwrap();
+    std::fs::write(base.join("apvm.db-wal"), b"frames").unwrap();
+    assert_eq!(ArtifactStore::inspect(&base).unwrap(), StoreState::Present);
 }

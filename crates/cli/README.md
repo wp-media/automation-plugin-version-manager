@@ -192,8 +192,10 @@ apvm cache verify --checksum
 apvm cache gc
 apvm cache gc --checksum
 
-# Recover the cache database: quarantine a corrupt one, clear an unreadable
-# one (a copy is kept), or rebuild a deleted one, then re-index the builds
+# Recover the cache database: reset a corrupt one in place or clear an
+# unreadable one (a copy of either is kept), or rebuild a missing, empty or
+# half-repaired one; then re-index the builds. Refuses (changing nothing)
+# while another process holds a corrupt database open.
 apvm cache repair
 
 # Remove everything (prompts unless -y)

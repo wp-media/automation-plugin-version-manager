@@ -32,6 +32,12 @@ use crate::fsx;
 /// Filename of the SQLite database inside the store base directory.
 pub(crate) const DB_FILE_NAME: &str = "apvm.db";
 
+/// Marker repair writes before it changes the database and removes once the
+/// rebuilt index is committed. Left behind only by an interrupted repair: it
+/// marks the store as needing repair, so nothing trusts (or `gc` acts on) a
+/// half-built index.
+pub(crate) const REPAIR_MARKER_NAME: &str = "apvm.db.repairing";
+
 /// Filename of the advisory lock taken by mutating operations.
 pub(crate) const LOCK_FILE_NAME: &str = ".apvm.lock";
 

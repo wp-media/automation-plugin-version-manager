@@ -37,3 +37,9 @@ openssl = { workspace = true, optional = true }
 
 [build-dependencies]
 napi-build = { workspace = true }
+
+[dev-dependencies]
+# Builds the timestamps the cache-report conversion tests feed in.
+chrono = { workspace = true }
+# Builds the SQLite errors the cache error-code tests classify.
+rusqlite = { workspace = true }

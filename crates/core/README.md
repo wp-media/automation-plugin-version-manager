@@ -77,6 +77,8 @@ apvm-core/src/
 
 The `Apvm` struct is the primary interface. It holds the config, GitHub client, project registry, and token source.
 
+Every constructor makes `config.cache_dir` absolute against the current directory (`config_io::pin_cache_dir`), so a process that later changes directory keeps using the same cache, and the open store is reused across builds.
+
 ```rust,ignore
 use apvm_core::Apvm;
 
@@ -359,8 +361,8 @@ artifact came from the cache (a partial build is `false`).
 
 `maintenance::CacheMaintenance` is the single implementation of the
 `apvm cache` actions — `usage`, `clean`, `clear`, `gc`, `verify`, `repair`.
-The CLI is a thin adapter over it; other front ends are meant to wrap it the
-same way. It works on a cache directory directly (no `Apvm`, no GitHub
+The CLI (`apvm cache`) and the Node bindings (`ApvmCache`) are thin adapters
+over it, so they cannot drift apart. It works on a cache directory directly (no `Apvm`, no GitHub
 client) and ignores `cache_enabled`.
 
 - **Validates first:** a bad `CleanRequest` (`older_than` spec, `project`)
@@ -370,13 +372,18 @@ client) and ignores `cache_enabled`.
   created. Someone else's data (`ForeignDirectory`), a lost database
   (`MissingDatabase`), a regular file, an empty path, or a path that can't be
   inspected are errors — never "empty".
+- **Repair resets in place:** `repair()` first makes the `Apvm` instances of
+  this process let go of the cache, then resets a corrupt database in place
+  (keeping a copy). Another process holding it open makes it fail with
+  `DatabaseInUse`, nothing changed. Crash-safe: an interrupted repair leaves
+  the cache "needs repair" (`MissingDatabase`), never half-indexed.
 - **Surfaces errors:** a corrupt database (`DatabaseCorrupted`, or unreadable
   rows: `Data`) comes back inside `Error::Storage` for each front end to
   annotate. `repair()` is the remedy — it also rebuilds a lost database — and
   a no-op on a healthy one.
-- **`gc(mode)` removes what `verify(mode)` reports:** records whose files are
+- **`gc(mode)` removes what `verify(mode)` reports** (except unreadable files): records whose files are
   missing or the wrong size (`VerifyMode::Checksum`: also the wrong content),
-  with the bad files; builds left without files go too, and the next build
+  or whose record is corrupt (`VerifyProblem::InvalidRecord`), with the bad files; builds left without files go too, and the next build
   caches them again. Files it cannot read are kept and listed in
   `GcReport::failures`.
 
@@ -421,7 +428,7 @@ database was renamed aside by a repair, deleted or replaced, it opens it
 again. While caching is on but the cache is `Corrupted` or `Unavailable`,
 each build emits exactly one `BuildEvent::Warning` with the reason (and, for
 `Corrupted`, the remedy) and runs uncached. `cache_active()` is
-`cache_status().is_active()`. `cache_status()` is blocking; from async code,
+`cache_status().is_active()`; Node exposes it as `apvm.cacheStatus()`. `cache_status()` is blocking; from async code,
 call it inside `spawn_blocking`.
 
 ## Configuration I/O

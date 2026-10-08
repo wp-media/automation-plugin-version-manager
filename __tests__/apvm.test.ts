@@ -478,6 +478,15 @@ describe('warmCache() basic functionality', () => {
       for (const artifact of build.result.artifacts) {
         expect(artifact.origin).toBe('cache');
       }
+
+      // apvm.cache() maintains the very cache the instance built into.
+      const cacheDir = apvm.cache().dir();
+      for (const artifact of warm.result.artifacts) {
+        expect(artifact.path.startsWith(cacheDir)).toBe(true);
+      }
+      const usage = await apvm.cache().info();
+      expect(usage.exists).toBe(true);
+      expect(usage.projects.map((p) => p.project)).toContain('wp-rocket');
     } finally {
       if (tempRoot) {
         await rm(tempRoot, { recursive: true, force: true });

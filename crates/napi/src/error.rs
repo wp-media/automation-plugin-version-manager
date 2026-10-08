@@ -25,7 +25,13 @@ use napi::Status;
 /// The full error message (including any chained context) is preserved
 /// in the JavaScript `Error.message` property.
 pub fn core_error_to_napi(err: apvm_core::Error) -> napi::Error {
-    let status = match &err {
+    napi::Error::new(core_error_status(&err), err.to_string())
+}
+
+/// The N-API [`Status`] for an [`apvm_core::Error`] — the classification
+/// [`core_error_to_napi`] applies, shared with the cache bindings' error codes.
+pub fn core_error_status(err: &apvm_core::Error) -> Status {
+    match err {
         apvm_core::Error::ProjectNotFound(_) => Status::InvalidArg,
         apvm_core::Error::RepositoryNotFound(_) => Status::InvalidArg,
         apvm_core::Error::PrivateRepoNoToken { .. } => Status::InvalidArg,
@@ -51,8 +57,7 @@ pub fn core_error_to_napi(err: apvm_core::Error) -> napi::Error {
         // CLI-only (skill management is not exposed through the bindings),
         // but mapped anyway so the conversion stays total.
         apvm_core::Error::Skill(_) => Status::GenericFailure,
-    };
-    napi::Error::new(status, err.to_string())
+    }
 }
 
 /// Classify an [`apvm_storage::Error`] into an N-API [`Status`].

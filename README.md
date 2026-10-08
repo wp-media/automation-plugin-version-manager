@@ -135,6 +135,14 @@ const output = await apvm.buildFromBranch('wp-rocket', 'develop', '/tmp/apvm-out
 console.log(output.result.artifacts.map((a) => a.filename));
 ```
 
+The cache is maintainable from Node too, at parity with `apvm cache`:
+
+```ts
+const cache = apvm.cache(); // or ApvmCache.open({ cacheDir }) — no GitHub client needed
+await cache.clean({ olderThan: '30d' });
+const issues = await cache.verify(); // [] = healthy; rejections carry err.code ('CacheCorrupted' → cache.repair())
+```
+
 For extended documentation about the Node.js bindings, see the [NAPI crate README](crates/napi/README.md).
 
 ## CLI Usage

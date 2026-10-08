@@ -59,7 +59,7 @@ pub enum CacheAction {
         #[arg(long)]
         checksum: bool,
     },
-    /// Recover a corrupt cache database (quarantine it, rebuild the index)
+    /// Recover the cache database (reset a corrupt one in place, keeping a copy; re-index builds)
     Repair,
     /// Remove everything from the cache
     Clear {
@@ -440,6 +440,7 @@ fn issues_text(issues: &[VerifyIssue]) -> String {
 /// What to do about `issues`: the `gc` that removes them — `--checksum` when
 /// only a checksum pass sees some of them; none when every issue is an
 /// unreadable file, which gc keeps — and, for those, a permissions hint.
+/// (An invalid record is not unreadable: gc removes it.)
 fn remedy_lines(issues: &[VerifyIssue]) -> Vec<String> {
     let has = |wanted: fn(&VerifyProblem) -> bool| issues.iter().any(|i| wanted(&i.problem));
     let mut lines = Vec::new();
@@ -471,6 +472,7 @@ fn problem_text(problem: &VerifyProblem) -> String {
         }
         VerifyProblem::ChecksumMismatch { .. } => "checksum mismatch".to_string(),
         VerifyProblem::Unreadable { details } => format!("unreadable: {details}"),
+        VerifyProblem::InvalidRecord { details } => format!("invalid record: {details}"),
     }
 }
 
@@ -482,9 +484,12 @@ fn repair_text(report: &RepairReport) -> String {
     ) {
         (Some(path), _) => vec![
             "Recovered a corrupt cache database.".to_string(),
-            format!("  Quarantined the damaged file at: {}", path.display()),
+            format!(
+                "  Kept a copy of the damaged database at: {}",
+                path.display()
+            ),
         ],
-        (None, true) => vec!["Rebuilt the missing cache database.".to_string()],
+        (None, true) => vec!["Rebuilt the missing or incomplete cache database.".to_string()],
         (None, false) => {
             return lines_text(&["Cache database is healthy — nothing to repair.".to_string()]);
         }
@@ -529,13 +534,11 @@ fn hint_without_repair(err: Error) -> Error {
 fn with_hint(err: Error, offer_repair: bool) -> Error {
     use apvm_storage::Error as Storage;
     let hint = match &err {
-        Error::Storage(Storage::DatabaseCorrupted { .. } | Storage::Data { .. })
-            if offer_repair =>
-        {
+        Error::Storage(inner) if offer_repair && inner.is_corruption() => {
             "The cache database is corrupt — run `apvm cache repair` to recover it."
         }
         Error::Storage(Storage::MissingDatabase { .. }) if offer_repair => {
-            "The cache database is missing — run `apvm cache repair` to re-index the cache from disk."
+            "The cache database is missing or empty — run `apvm cache repair` to re-index the cache from disk."
         }
         Error::Storage(Storage::ForeignDirectory { .. }) => {
             "Check the cache location: APVM_CACHE_DIR if set, else config `cache-dir`, else ~/.apvm/cache."
@@ -1127,7 +1130,10 @@ mod tests {
             assert!(text.contains("corrupt — run `apvm cache repair`"), "{text}");
         }
         let text = hint_with_repair(missing()).to_string();
-        assert!(text.contains("missing — run `apvm cache repair`"), "{text}");
+        assert!(
+            text.contains("missing or empty — run `apvm cache repair`"),
+            "{text}"
+        );
         for err in [hint_with_repair(foreign()), hint_without_repair(foreign())] {
             assert!(
                 err.to_string().contains("Check the cache location"),
@@ -1172,7 +1178,7 @@ mod tests {
             .expect_err("a lost database is not an empty cache");
         assert!(
             err.to_string()
-                .contains("missing — run `apvm cache repair`"),
+                .contains("missing or empty — run `apvm cache repair`"),
             "{err}"
         );
 
@@ -1180,7 +1186,7 @@ mod tests {
         assert!(repaired.result.is_ok(), "{:?}", repaired.result);
         assert_eq!(
             repaired.out,
-            "Rebuilt the missing cache database.\n  Re-indexed 1 build(s) / 1 artifact(s) from disk.\n"
+            "Rebuilt the missing or incomplete cache database.\n  Re-indexed 1 build(s) / 1 artifact(s) from disk.\n"
         );
     }
 
@@ -1329,7 +1335,7 @@ mod tests {
         };
         assert_eq!(
             repair_text(&recovered),
-            "Recovered a corrupt cache database.\n  Quarantined the damaged file at: /c/apvm.db.corrupt-1\n  Re-indexed 2 build(s) / 3 artifact(s) from disk.\n  Skipped 1 unadoptable entr(ies).\n  1 cached release(s) could not be re-indexed (re-download or `apvm cache gc`).\n"
+            "Recovered a corrupt cache database.\n  Kept a copy of the damaged database at: /c/apvm.db.corrupt-1\n  Re-indexed 2 build(s) / 3 artifact(s) from disk.\n  Skipped 1 unadoptable entr(ies).\n  1 cached release(s) could not be re-indexed (re-download or `apvm cache gc`).\n"
         );
         let rebuilt = RepairReport {
             rebuilt_missing_database: true,
@@ -1339,7 +1345,7 @@ mod tests {
         };
         assert_eq!(
             repair_text(&rebuilt),
-            "Rebuilt the missing cache database.\n  Re-indexed 1 build(s) / 1 artifact(s) from disk.\n"
+            "Rebuilt the missing or incomplete cache database.\n  Re-indexed 1 build(s) / 1 artifact(s) from disk.\n"
         );
     }
 
@@ -1409,6 +1415,20 @@ mod tests {
                 details: "denied".to_string(),
             })
         };
+        let tampered_record = || {
+            issue(VerifyProblem::InvalidRecord {
+                details: "negative size".to_string(),
+            })
+        };
+        assert_eq!(
+            remedy_lines(&[tampered_record()]),
+            [gc],
+            "gc removes an invalid record; no permissions to fix"
+        );
+        assert_eq!(
+            remedy_lines(&[tampered_record(), locked()]),
+            [gc, unreadable]
+        );
 
         assert_eq!(remedy_lines(&[missing()]), [gc]);
         assert_eq!(remedy_lines(&[resized()]), [gc]);

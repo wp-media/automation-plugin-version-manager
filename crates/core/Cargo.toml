@@ -47,3 +47,7 @@ tempfile = { workspace = true }
 
 # HTTP client (for release asset downloads)
 reqwest = { workspace = true }
+
+[dev-dependencies]
+# Lets cache tests checkpoint and damage a live cache database in place.
+rusqlite = { workspace = true }

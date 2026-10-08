@@ -46,7 +46,10 @@ use napi_derive::napi;
 pub struct ApvmConfig {
     /// Base directory of the artifact cache (the `apvm-storage` store).
     ///
-    /// When omitted (`null` or `undefined`), defaults to `~/.apvm/cache`.
+    /// When omitted, defaults to `~/.apvm/cache`; `APVM_CACHE_DIR`, when set,
+    /// overrides either. `Apvm.create` also takes `undefined` as omitted (but
+    /// throws `StringExpected` for `null`); `ApvmCache.open` refuses both, so
+    /// an unset variable cannot silently select the default cache.
     /// This is where cached build artifacts and release assets live; it is
     /// distinct from a build's per-invocation `outputDir`.
     ///
@@ -100,6 +103,31 @@ impl From<ApvmConfig> for apvm_config::Config {
     }
 }
 
+/// Resolve a JS config into the core [`apvm_config::Config`] every factory
+/// uses (`Apvm.create`, `Apvm.createWithTokenResolution`, `ApvmCache.open`):
+/// absent config → defaults, then `APVM_CACHE_DIR` (when set and non-empty)
+/// overrides `cacheDir`, so one env var isolates a whole run (e.g. tests)
+/// from `~/.apvm/cache`. A relative directory is then made absolute against
+/// the current directory, so a later `process.chdir()` cannot point an
+/// instance and its `cache()` handle at different caches. Touches nothing
+/// on disk.
+pub fn resolve_config(config: Option<ApvmConfig>) -> apvm_config::Config {
+    resolve_config_with(config, apvm_core::config_io::cache_dir_env_override())
+}
+
+/// [`resolve_config`] with the `APVM_CACHE_DIR` value passed in (`None` =
+/// unset or empty): pure, so both branches are tested without touching the
+/// process environment. Mirrors `config_io::apply_env_overrides`, whose only
+/// override is the cache directory.
+fn resolve_config_with(
+    config: Option<ApvmConfig>,
+    env_cache_dir: Option<PathBuf>,
+) -> apvm_config::Config {
+    let config =
+        apvm_core::config_io::override_cache_dir(config.unwrap_or_default().into(), env_cache_dir);
+    apvm_core::config_io::pin_cache_dir(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +151,58 @@ mod tests {
         assert_eq!(config.cache_dir, PathBuf::from("/custom/cache"));
         assert!(!config.cache_enabled);
         assert_eq!(config.github_token.as_deref(), Some("ghp_test"));
+    }
+
+    fn explicit(dir: &str) -> Option<ApvmConfig> {
+        Some(ApvmConfig {
+            cache_dir: Some(dir.to_string()),
+            cache_enabled: Some(false),
+            github_token: Some("ghp_test".to_string()),
+        })
+    }
+
+    #[test]
+    fn env_override_wins_over_an_explicit_dir() {
+        let env = std::env::temp_dir().join("from-env");
+        let config = resolve_config_with(explicit("/explicit/cache"), Some(env.clone()));
+        assert_eq!(config.cache_dir, env);
+        // The override touches only the directory.
+        assert!(!config.cache_enabled);
+        assert_eq!(config.github_token.as_deref(), Some("ghp_test"));
+    }
+
+    #[test]
+    fn explicit_dir_is_used_without_an_env_override() {
+        let dir = std::env::temp_dir().join("explicit");
+        let config = resolve_config_with(explicit(&dir.to_string_lossy()), None);
+        assert_eq!(config.cache_dir, dir);
+    }
+
+    #[test]
+    fn no_config_and_no_override_is_the_default_dir() {
+        let config = resolve_config_with(None, None);
+        assert_eq!(config.cache_dir, default_cache_dir());
+        assert!(config.cache_enabled);
+        assert!(config.github_token.is_none());
+    }
+
+    #[test]
+    fn relative_dirs_are_pinned_from_either_source() {
+        let cwd = std::env::current_dir().unwrap();
+        let from_config = resolve_config_with(explicit("rel/cache"), None);
+        assert_eq!(from_config.cache_dir, cwd.join("rel/cache"));
+        let from_env = resolve_config_with(None, Some(PathBuf::from("rel/env")));
+        assert_eq!(from_env.cache_dir, cwd.join("rel/env"));
+    }
+
+    #[test]
+    fn resolve_config_reads_the_environment() {
+        // Whatever APVM_CACHE_DIR holds in this process, resolve_config must
+        // agree with the pure function fed that value.
+        let env = apvm_core::config_io::cache_dir_env_override();
+        assert_eq!(
+            resolve_config(explicit("/explicit/cache")).cache_dir,
+            resolve_config_with(explicit("/explicit/cache"), env).cache_dir
+        );
     }
 }

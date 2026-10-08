@@ -688,6 +688,70 @@ async fn a_corrupt_cache_warns_then_resumes_after_repair() {
     );
 }
 
+#[tokio::test]
+async fn repair_in_process_releases_idle_instances_and_resets_in_place() {
+    // An instance that has built holds its cache open. Damage made in place
+    // is invisible to it, and resetting the database needs it closed:
+    // repair must make the instance let go, reset the very same file, and
+    // the instance must cache again afterwards.
+    let repo = init_repo();
+    let cache = tempfile::tempdir().unwrap();
+    let store_dir = cache.path().join("store");
+    let apvm = apvm_for(repo.path(), &store_dir, "single", Box::new(SingleBuilder));
+    let request = |out: &Path| {
+        BuildRequest::new("single", "branch:main", out).version(Some("1.0.0".to_string()))
+    };
+    let out = tempfile::tempdir().unwrap();
+    apvm.build(request(out.path()), &NullReporter)
+        .await
+        .expect("build");
+    assert_eq!(apvm.cache_status(), CacheStatus::Active);
+
+    let db = store_dir.join("apvm.db");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"damaged header, in place").unwrap();
+    }
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&db).unwrap().ino()
+    };
+
+    let report = CacheMaintenance::new(&store_dir)
+        .repair()
+        .expect("repair succeeds although the instance had the cache open")
+        .expect("there is a cache to repair");
+    assert!(report.quarantined_database.is_some());
+    assert_eq!(report.builds_adopted, 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().ino(),
+            identity,
+            "reset in place"
+        );
+    }
+
+    assert_eq!(apvm.cache_status(), CacheStatus::Active);
+    let out = tempfile::tempdir().unwrap();
+    let hit = apvm
+        .build(request(out.path()), &NullReporter)
+        .await
+        .expect("build");
+    assert!(
+        hit.from_cache(),
+        "the adopted build is served from the cache"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Version override (WP Rocket / Imagify style): a pinned --ver is rewritten into
 // the checked-out source before packaging, end-to-end through the real pipeline.
