@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Apvm, ApvmCache, JsCleanTarget } from '../index.js';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -836,36 +836,79 @@ describe('strict options', () => {
 // =============================================================================
 
 describe('a second copy of the addon', () => {
-  it('is refused, so two SQLite libraries never share a cache', async () => {
-    const require = createRequire(import.meta.url);
-    require('../index.js');
-    const loaded = Object.keys(require.cache).find((path) => path.endsWith('.node'));
-    expect(loaded).toBeTruthy();
-    ApvmCache.open(); // this copy is in use
+  /** Longest a child script may run: under the 30 s `testTimeout`, which
+   *  cannot fire while `execFileSync` blocks the event loop. */
+  const CHILD_TIMEOUT_MS = 20_000;
 
-    const copyPath = join(root, 'apvm-copy.node');
-    copyFileSync(loaded as string, copyPath);
-    const copy = require(copyPath) as typeof import('../index.js');
-    expect(copy.ApvmCache).not.toBe(ApvmCache);
-    for (const call of [
-      () => copy.ApvmCache.open(),
-      () => copy.Apvm.create({}),
-      () => copy.Apvm.createWithTokenResolution({}),
-    ]) {
-      expect(call).toThrow(/second copy of apvm-napi/);
-    }
-    // The first copy keeps working.
-    expect((await ApvmCache.open().info()).exists).toBe(false);
+  /**
+   * Run `source` as a CommonJS script in a fresh Node process and parse the
+   * JSON it prints. The script finds the addon's `index.js` path in `ADDON`,
+   * and this test's cache in `APVM_CACHE_DIR`.
+   *
+   * A child process, because a loaded `.node` stays mapped until its process
+   * exits, and Windows refuses to delete a mapped DLL: loaded in this worker,
+   * a copy would block `afterEach` from removing `root`.
+   *
+   * @param name - File name of the script, written under `root`.
+   * @param source - The script body.
+   * @returns The parsed JSON of the child's stdout.
+   * @throws When the child exits non-zero, or runs past `CHILD_TIMEOUT_MS`
+   *   (it is killed, which frees what it loaded).
+   */
+  async function runChild(name: string, source: string): Promise<unknown> {
+    const addon = createRequire(import.meta.url).resolve('../index.js');
+    const script = join(root, name);
+    await writeFile(script, `const ADDON = ${JSON.stringify(addon)};\n${source}`);
+    const output = execFileSync(process.execPath, [script], {
+      env: { ...process.env, APVM_CACHE_DIR: cacheDir },
+      encoding: 'utf8',
+      timeout: CHILD_TIMEOUT_MS,
+    });
+    return JSON.parse(output);
+  }
+
+  it('is refused, so two SQLite libraries never share a cache', async () => {
+    const result = await runChild(
+      'second-copy.cjs',
+      `const { copyFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      const first = require(ADDON);
+      first.ApvmCache.open(); // this copy is in use
+      const loaded = Object.keys(require.cache).find((path) => path.endsWith('.node'));
+      if (loaded === undefined) {
+        throw new Error('the addon .node file is not in require.cache');
+      }
+      const copyPath = join(__dirname, 'apvm-copy.node');
+      copyFileSync(loaded, copyPath);
+      const copy = require(copyPath);
+      // Each entry point's error message, or null when it did not throw.
+      const errors = [
+        () => copy.ApvmCache.open(),
+        () => copy.Apvm.create({}),
+        () => copy.Apvm.createWithTokenResolution({}),
+      ].map((call) => {
+        try { call(); return null; } catch (err) { return String(err.message); }
+      });
+      first.ApvmCache.open().info().then(
+        (usage) => console.log(JSON.stringify({
+          distinct: copy.ApvmCache !== first.ApvmCache,
+          errors,
+          exists: usage.exists,
+        })),
+        (err) => { console.error(err); process.exitCode = 1; },
+      );`,
+    );
+    const refused = expect.stringMatching(/second copy of apvm-napi/);
+    // `exists: false`: the first copy keeps working.
+    expect(result).toStrictEqual({ distinct: true, errors: [refused, refused, refused], exists: false });
   });
 
   it('does not lock the addon out where globalThis cannot be extended', async () => {
     // Hardened environments freeze `globalThis`, where the guard cannot
     // record this copy: it is skipped instead of failing every entry point.
-    const addon = createRequire(import.meta.url).resolve('../index.js');
-    const script = join(root, 'frozen-global.cjs');
-    await writeFile(
-      script,
-      `const { Apvm, ApvmCache } = require(${JSON.stringify(addon)});
+    const result = await runChild(
+      'frozen-global.cjs',
+      `const { Apvm, ApvmCache } = require(ADDON);
       Object.freeze(globalThis);
       const cache = ApvmCache.open();
       Promise.all([cache.info(), Apvm.create({ cacheEnabled: false })]).then(
@@ -873,10 +916,6 @@ describe('a second copy of the addon', () => {
         (err) => { console.error(err); process.exitCode = 1; },
       );`,
     );
-    const output = execFileSync(process.execPath, [script], {
-      env: { ...process.env, APVM_CACHE_DIR: cacheDir },
-      encoding: 'utf8',
-    });
-    expect(JSON.parse(output)).toStrictEqual({ dir: cacheDir, exists: false });
+    expect(result).toStrictEqual({ dir: cacheDir, exists: false });
   });
 });
