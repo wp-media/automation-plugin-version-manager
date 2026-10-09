@@ -1,0 +1,13 @@
+# Clippy configuration for the whole workspace.
+# https://doc.rust-lang.org/clippy/lint_configuration.html
+
+disallowed-methods = [
+  # A child process — and everything it starts — must stop when the future
+  # awaiting it is dropped (a cancelled build, a Node.js worker exiting).
+  # Core spawns only through `process::command` + `process::output`, which
+  # kill the whole process tree in that case; see crates/core/src/process.rs.
+  { path = "tokio::process::Command::new", reason = "use crate::process::command so cancelled work stops its child processes" },
+  { path = "tokio::process::Command::output", reason = "use crate::process::output so cancelled work stops the whole process tree" },
+  { path = "tokio::process::Command::spawn", reason = "use crate::process::output so cancelled work stops the whole process tree" },
+  { path = "tokio::process::Command::status", reason = "use crate::process::output so cancelled work stops the whole process tree" },
+]

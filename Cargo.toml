@@ -72,6 +72,10 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # Process utilities
 # https://docs.rs/which/8 — SemVer stable since 8.0
 which = "8"
+# Safe `kill(2)` (Unix): stops and kills a cancelled command's process tree
+# without a `kill` program, which slim container images lack.
+# https://docs.rs/rustix/1 — SemVer stable since 1.0
+rustix = { version = "1.1.5", features = ["process"] }
 
 # Progress indicators
 # https://docs.rs/indicatif/0.18 — pre-1.0, 0.18.x is compatible range

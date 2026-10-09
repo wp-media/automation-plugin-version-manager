@@ -50,6 +50,11 @@ cached variants and builds only the rest. `release:` downloads are cached too
 asset downloads only the missing one. See [Config Command](#config-command)
 for the `cache` / `cache-dir` settings.
 
+git and the build tools (npm, composer, gulp) run non-interactively: their
+output is captured and their stdin is closed, so a tool that would ask a
+question takes its default or fails instead of waiting for an answer nobody
+could see.
+
 ### Git Reference Formats
 
 The `<GIT_REF>` argument supports automatic detection or explicit prefixes:

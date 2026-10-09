@@ -151,12 +151,12 @@ impl RemoteGit {
     pub async fn ls_remote(&self) -> Result<RemoteRefs> {
         tracing::debug!("Listing remote refs for {}", self.url);
 
-        let output = self
-            .git_command()
-            .args(["ls-remote", &self.effective_url()])
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to execute git ls-remote: {e}")))?;
+        let output = crate::process::output(
+            self.git_command()
+                .args(["ls-remote", &self.effective_url()]),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to execute git ls-remote: {e}")))?;
 
         if !output.status.success() {
             let stderr = self.redact(&String::from_utf8_lossy(&output.stderr));
@@ -253,12 +253,13 @@ impl RemoteGit {
 
     /// Whether the remote advertises at least one tag (`ls-remote --tags`).
     async fn has_any_tags(&self) -> Result<bool> {
-        let output = self
-            .git_command()
-            .args(["ls-remote", "--tags", &self.effective_url()])
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to execute git ls-remote: {e}")))?;
+        let output = crate::process::output(self.git_command().args([
+            "ls-remote",
+            "--tags",
+            &self.effective_url(),
+        ]))
+        .await
+        .map_err(|e| Error::Git(format!("Failed to execute git ls-remote: {e}")))?;
 
         if !output.status.success() {
             let stderr = self.redact(&String::from_utf8_lossy(&output.stderr));
@@ -273,11 +274,7 @@ impl RemoteGit {
 
     /// Run a git subcommand inside `dir`, returning stdout on success.
     async fn run_git_in(&self, dir: &Path, args: &[&str], what: &str) -> Result<String> {
-        let output = self
-            .git_command()
-            .args(args)
-            .current_dir(dir)
-            .output()
+        let output = crate::process::output(self.git_command().args(args).current_dir(dir))
             .await
             .map_err(|e| Error::Git(format!("Failed to execute git while {what}: {e}")))?;
 
@@ -293,7 +290,7 @@ impl RemoteGit {
     /// rejected credential must fail immediately, not hang a CI pipeline
     /// waiting for terminal input.
     fn git_command(&self) -> Command {
-        let mut cmd = Command::new("git");
+        let mut cmd = crate::process::command("git");
         cmd.env("GIT_TERMINAL_PROMPT", "0");
         cmd
     }

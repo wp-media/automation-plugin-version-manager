@@ -98,6 +98,10 @@ After a build you get: `Build complete: ...`, `Commit: <short>`, `Version: ...`,
 a per-artifact provenance line (`built` / `cache` / `downloaded`), and a
 `Source:` summary (`all built` / `all from cache` / `1 built, 2 from cache` / ...).
 
+git and the build tools (npm, composer, gulp) run non-interactively: their
+output is captured and their stdin is closed, so a tool that would ask a
+question takes its default or fails instead of waiting.
+
 **Git reference formats are extensive** — see
 [references/git-refs.md](references/git-refs.md) for the full guide
 (auto-detection, explicit prefixes, `tag:latest-stable`, `release:previous-latest`,

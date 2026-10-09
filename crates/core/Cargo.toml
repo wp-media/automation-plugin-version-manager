@@ -48,6 +48,10 @@ tempfile = { workspace = true }
 # HTTP client (for release asset downloads)
 reqwest = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# `kill(2)` for stopping a cancelled command's process tree
+rustix = { workspace = true }
+
 [dev-dependencies]
 # Lets cache tests checkpoint and damage a live cache database in place.
 rusqlite = { workspace = true }

@@ -61,6 +61,7 @@ pub mod error;
 pub mod git;
 pub mod github;
 pub mod maintenance;
+mod process;
 pub mod projects;
 
 // Re-export Config from apvm-config
@@ -77,6 +78,7 @@ pub use cache_status::CacheStatus;
 pub use commands::{BuildOutput, BuildRequest, WarmRequest};
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 pub use maintenance::{CacheMaintenance, CleanRequest};
+pub use process::ProcessScope;
 
 use std::path::Path;
 

@@ -27,7 +27,6 @@
 use std::path::Path;
 
 use apvm_storage::BuildSource;
-use tokio::process::Command;
 use tokio::sync::OnceCell;
 
 use crate::error::{Error, Result};
@@ -680,17 +679,18 @@ impl<'a> RefResolver<'a> {
             Error::Git("Local repository path required for tag lookup".to_string())
         })?;
 
-        let output = Command::new("git")
-            .args([
-                "show-ref",
-                "--tags",
-                "--verify",
-                &format!("refs/tags/{name}"),
-            ])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to check tag: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args([
+                    "show-ref",
+                    "--tags",
+                    "--verify",
+                    &format!("refs/tags/{name}"),
+                ])
+                .current_dir(repo_path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to check tag: {e}")))?;
 
         Ok(output.status.success())
     }
@@ -802,12 +802,13 @@ impl<'a> RefResolver<'a> {
             Error::Git("Local repository path required for tag lookup".to_string())
         })?;
 
-        let output = Command::new("git")
-            .args(["tag", "--sort=-creatordate"])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to list tags: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["tag", "--sort=-creatordate"])
+                .current_dir(repo_path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to list tags: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -846,12 +847,13 @@ async fn local_branch_ref(repo_path: &Path, name: &str) -> Result<Option<String>
         format!("refs/heads/{name}"),
         format!("refs/remotes/origin/{name}"),
     ] {
-        let output = Command::new("git")
-            .args(["show-ref", "--verify", "--quiet", &full_ref])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to check branch '{name}': {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["show-ref", "--verify", "--quiet", &full_ref])
+                .current_dir(repo_path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to check branch '{name}': {e}")))?;
         if output.status.success() {
             return Ok(Some(full_ref));
         }
@@ -877,17 +879,18 @@ async fn local_branch_ref(repo_path: &Path, name: &str) -> Result<Option<String>
 ///
 /// [`Error::Git`] when git cannot be started.
 async fn peeled_commit(repo_path: &Path, full_ref: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{full_ref}^{{commit}}"),
-        ])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| Error::Git(format!("Failed to resolve '{full_ref}': {e}")))?;
+    let output = crate::process::output(
+        crate::process::command("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{full_ref}^{{commit}}"),
+            ])
+            .current_dir(repo_path),
+    )
+    .await
+    .map_err(|e| Error::Git(format!("Failed to resolve '{full_ref}': {e}")))?;
 
     if !output.status.success() {
         return Ok(None);
@@ -942,12 +945,13 @@ pub(crate) async fn expand_commit(repo_path: &Path, prefix: &str) -> Result<Stri
 ///
 /// [`Error::Git`] when git cannot be started or the lookup fails.
 async fn objects_with_prefix(repo_path: &Path, prefix: &str) -> Result<Vec<(String, String)>> {
-    let listed = Command::new("git")
-        .args(["rev-parse", &format!("--disambiguate={prefix}")])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| Error::Git(format!("Failed to look up commit '{prefix}': {e}")))?;
+    let listed = crate::process::output(
+        crate::process::command("git")
+            .args(["rev-parse", &format!("--disambiguate={prefix}")])
+            .current_dir(repo_path),
+    )
+    .await
+    .map_err(|e| Error::Git(format!("Failed to look up commit '{prefix}': {e}")))?;
     if !listed.status.success() {
         let stderr = String::from_utf8_lossy(&listed.stderr);
         return Err(Error::Git(format!(
@@ -958,12 +962,13 @@ async fn objects_with_prefix(repo_path: &Path, prefix: &str) -> Result<Vec<(Stri
 
     let mut objects = Vec::new();
     for oid in String::from_utf8_lossy(&listed.stdout).split_whitespace() {
-        let typed = Command::new("git")
-            .args(["cat-file", "-t", oid])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to read object '{oid}': {e}")))?;
+        let typed = crate::process::output(
+            crate::process::command("git")
+                .args(["cat-file", "-t", oid])
+                .current_dir(repo_path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to read object '{oid}': {e}")))?;
         if typed.status.success() {
             let kind = String::from_utf8_lossy(&typed.stdout).trim().to_string();
             objects.push((oid.to_string(), kind));

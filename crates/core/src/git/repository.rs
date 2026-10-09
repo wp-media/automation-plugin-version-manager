@@ -5,8 +5,6 @@
 
 use std::path::{Path, PathBuf};
 
-use tokio::process::Command;
-
 use crate::error::{Error, Result};
 
 /// A Git repository wrapper.
@@ -57,12 +55,13 @@ impl Repository {
     pub async fn clone(url: &str, path: &Path) -> Result<Self> {
         tracing::info!("Cloning {} into {}", url, path.display());
 
-        let output = Command::new("git")
-            .args(["clone", url])
-            .arg(path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to execute git: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["clone", url])
+                .arg(path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to execute git: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -118,12 +117,13 @@ impl Repository {
         let authenticated_url =
             url.replacen("https://", &format!("https://x-access-token:{token}@"), 1);
 
-        let output = Command::new("git")
-            .args(["clone", &authenticated_url])
-            .arg(path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to execute git: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["clone", &authenticated_url])
+                .arg(path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to execute git: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -155,12 +155,13 @@ impl Repository {
     pub async fn fetch(&self) -> Result<()> {
         tracing::debug!("Fetching updates in {}", self.path.display());
 
-        let output = Command::new("git")
-            .args(["fetch", "--all", "--prune"])
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to execute git fetch: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["fetch", "--all", "--prune"])
+                .current_dir(&self.path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to execute git fetch: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -272,13 +273,14 @@ impl Repository {
     async fn run_checkout(&self, args: &[&str]) -> Result<()> {
         tracing::debug!("git checkout {} in {}", args.join(" "), self.path.display());
 
-        let output = Command::new("git")
-            .arg("checkout")
-            .args(args)
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to execute git checkout: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .arg("checkout")
+                .args(args)
+                .current_dir(&self.path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to execute git checkout: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -290,12 +292,13 @@ impl Repository {
 
     /// Get the current branch name.
     pub async fn current_branch(&self) -> Result<String> {
-        let output = Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to get current branch: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(&self.path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to get current branch: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -309,12 +312,13 @@ impl Repository {
     pub async fn pull(&self) -> Result<()> {
         tracing::debug!("Pulling latest changes in {}", self.path.display());
 
-        let output = Command::new("git")
-            .args(["pull", "--ff-only"])
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to execute git pull: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["pull", "--ff-only"])
+                .current_dir(&self.path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to execute git pull: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -359,12 +363,13 @@ impl Repository {
     pub async fn reset_hard(&self) -> Result<()> {
         tracing::debug!("Resetting repository in {}", self.path.display());
 
-        let output = Command::new("git")
-            .args(["reset", "--hard", "HEAD"])
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to execute git reset: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["reset", "--hard", "HEAD"])
+                .current_dir(&self.path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to execute git reset: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -372,12 +377,13 @@ impl Repository {
         }
 
         // Also clean untracked files
-        let output = Command::new("git")
-            .args(["clean", "-fdx"])
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to execute git clean: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["clean", "-fdx"])
+                .current_dir(&self.path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to execute git clean: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -389,12 +395,13 @@ impl Repository {
 
     /// Set the URL for a remote.
     async fn set_remote_url(&self, remote: &str, url: &str) -> Result<()> {
-        let output = Command::new("git")
-            .args(["remote", "set-url", remote, url])
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to set remote URL: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["remote", "set-url", remote, url])
+                .current_dir(&self.path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to set remote URL: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -406,12 +413,13 @@ impl Repository {
 
     /// Get the URL for a remote.
     async fn get_remote_url(&self, remote: &str) -> Result<String> {
-        let output = Command::new("git")
-            .args(["remote", "get-url", remote])
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to get remote URL: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["remote", "get-url", remote])
+                .current_dir(&self.path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to get remote URL: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -440,12 +448,13 @@ impl Repository {
     ///
     /// - [git-rev-parse(1)](https://git-scm.com/docs/git-rev-parse)
     pub async fn get_head_commit(&self) -> Result<String> {
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to get HEAD commit: {e}")))?;
+        let output = crate::process::output(
+            crate::process::command("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&self.path),
+        )
+        .await
+        .map_err(|e| Error::Git(format!("Failed to get HEAD commit: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
