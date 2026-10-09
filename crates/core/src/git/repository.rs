@@ -518,4 +518,315 @@ mod tests {
         assert_eq!(full, commit);
         assert_eq!(short2, short);
     }
+
+    // =========================================================================
+    // Live behavior against local repositories (file:// — no network)
+    // =========================================================================
+
+    use crate::git::testutil::{commit_change, file_url, git, git_stdout, make_remote_repo};
+    use tempfile::TempDir;
+
+    /// Token used by the auth-plumbing tests; distinctive so a leak is
+    /// unmistakable in an assertion message.
+    const TOKEN: &str = "ghp_TESTTOKEN_must_never_leak";
+
+    /// An HTTPS URL nothing listens on: loopback port 1 is refused
+    /// immediately, so token-auth paths fail fast without leaving the host.
+    const DEAD_HTTPS_URL: &str = "https://127.0.0.1:1/org/repo.git";
+
+    /// Clone `origin` (via `file://`) into a fresh temp dir. Returns the
+    /// holder (keeps the clone alive) and the opened [`Repository`].
+    async fn clone_of(origin: &TempDir) -> (TempDir, Repository) {
+        let holder = TempDir::new().unwrap();
+        let repo = Repository::clone(&file_url(origin), &holder.path().join("clone"))
+            .await
+            .expect("local clone must succeed");
+        (holder, repo)
+    }
+
+    /// Point `origin` of `repo` at `url` (simulates an HTTPS-cloned repo).
+    fn set_origin(repo: &Repository, url: &str) {
+        git(
+            repo.path(),
+            &["remote", "set-url", "origin", url],
+            "2025-01-01T00:00:00",
+        );
+    }
+
+    #[test]
+    fn open_rejects_directory_without_git_metadata() {
+        let dir = TempDir::new().unwrap();
+        let err = Repository::open(dir.path()).err().expect("must fail");
+        assert!(
+            matches!(&err, Error::RepositoryNotFound(p) if p == dir.path()),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_accepts_initialized_repository() {
+        let origin = make_remote_repo();
+        let repo = Repository::open(origin.path()).expect("must open");
+        assert_eq!(repo.path(), origin.path());
+    }
+
+    #[tokio::test]
+    async fn clone_checks_out_default_branch_at_remote_tip() {
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+
+        assert_eq!(repo.current_branch().await.unwrap(), "main");
+        let (full, short) = repo.get_head_commit_pair().await.unwrap();
+        assert_eq!(full, git_stdout(origin.path(), &["rev-parse", "main"]));
+        assert_eq!(full.len(), 40);
+        assert_eq!(short, &full[..7]);
+        assert_eq!(repo.get_head_commit().await.unwrap(), full);
+        assert_eq!(repo.get_head_commit_short().await.unwrap(), short);
+    }
+
+    #[tokio::test]
+    async fn clone_of_missing_source_fails_with_git_error() {
+        let missing = TempDir::new().unwrap();
+        let url = format!("file://{}/nope", missing.path().display());
+        let dest = missing.path().join("dest");
+
+        let err = Repository::clone(&url, &dest)
+            .await
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("git clone failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn checkout_moves_head_to_tags_commits_and_branches() {
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+
+        // Annotated tag → detached HEAD on the *tagged commit*.
+        repo.checkout("v2.0.0-beta1").await.unwrap();
+        assert_eq!(repo.current_branch().await.unwrap(), "HEAD");
+        assert_eq!(
+            repo.get_head_commit().await.unwrap(),
+            git_stdout(origin.path(), &["rev-parse", "v2.0.0-beta1^{commit}"])
+        );
+
+        // Full commit SHA → detached HEAD on exactly that commit.
+        let c1 = git_stdout(origin.path(), &["rev-parse", "v1.0.0"]);
+        repo.checkout(&c1).await.unwrap();
+        assert_eq!(repo.get_head_commit().await.unwrap(), c1);
+
+        // Remote-only branch → DWIM creates a tracking branch (what builds
+        // rely on for PR head branches that exist only on origin).
+        repo.checkout("feature/x").await.unwrap();
+        assert_eq!(repo.current_branch().await.unwrap(), "feature/x");
+    }
+
+    #[tokio::test]
+    async fn checkout_of_unknown_ref_fails_with_git_error() {
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+
+        let err = repo.checkout("no-such-ref").await.unwrap_err();
+        assert!(err.to_string().contains("git checkout failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_and_pull_bring_in_new_remote_commits() {
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+        let new_tip = commit_change(origin.path(), "four", "2025-02-01T10:00:00");
+
+        repo.fetch().await.unwrap();
+        // Fetch updates the remote-tracking ref but not the checkout...
+        assert_eq!(
+            git_stdout(repo.path(), &["rev-parse", "origin/main"]),
+            new_tip
+        );
+        assert_ne!(repo.get_head_commit().await.unwrap(), new_tip);
+
+        // ...pull fast-forwards the checkout.
+        repo.pull().await.unwrap();
+        assert_eq!(repo.get_head_commit().await.unwrap(), new_tip);
+    }
+
+    #[tokio::test]
+    async fn pull_refuses_non_fast_forward() {
+        // `--ff-only` must never create a merge commit in a build workspace:
+        // diverged histories fail instead.
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+        commit_change(origin.path(), "remote side", "2025-02-01T10:00:00");
+        commit_change(repo.path(), "local side", "2025-02-01T11:00:00");
+
+        let err = repo.pull().await.unwrap_err();
+        assert!(err.to_string().contains("git pull failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_without_reachable_remote_fails_with_git_error() {
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+        set_origin(&repo, "file:///definitely/not/a/repo");
+
+        let err = repo.fetch().await.unwrap_err();
+        assert!(err.to_string().contains("git fetch failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn reset_hard_discards_changes_untracked_and_ignored_files() {
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+        let path = repo.path();
+        std::fs::write(path.join(".gitignore"), "ignored.log\n").unwrap();
+        std::fs::write(path.join("f"), "dirty").unwrap();
+        std::fs::create_dir(path.join("untracked-dir")).unwrap();
+        std::fs::write(path.join("untracked-dir/x"), "x").unwrap();
+        std::fs::write(path.join("ignored.log"), "build output").unwrap();
+
+        repo.reset_hard().await.unwrap();
+
+        // Tracked edits reverted; untracked AND ignored files (`-x`) gone, so
+        // a reused workspace can never leak artifacts into the next build.
+        assert_eq!(std::fs::read_to_string(path.join("f")).unwrap(), "three");
+        assert!(!path.join(".gitignore").exists());
+        assert!(!path.join("untracked-dir").exists());
+        assert!(!path.join("ignored.log").exists());
+    }
+
+    #[tokio::test]
+    async fn head_commit_of_repository_without_commits_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "--quiet"], "2025-01-01T00:00:00");
+        let repo = Repository::open(dir.path()).unwrap();
+
+        let err = repo.get_head_commit().await.unwrap_err();
+        assert!(err.to_string().contains("rev-parse HEAD failed"), "{err}");
+        // The short/pair variants must propagate, never slice an empty SHA.
+        assert!(repo.get_head_commit_short().await.is_err());
+        assert!(repo.get_head_commit_pair().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn head_commit_supports_sha256_repositories() {
+        let dir = TempDir::new().unwrap();
+        git(
+            dir.path(),
+            &["init", "--quiet", "--object-format=sha256"],
+            "2025-01-01T00:00:00",
+        );
+        commit_change(dir.path(), "one", "2025-01-01T00:00:00");
+        let repo = Repository::open(dir.path()).unwrap();
+
+        let (full, short) = repo.get_head_commit_pair().await.unwrap();
+        assert_eq!(full.len(), 64);
+        assert_eq!(short, &full[..7]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Token authentication plumbing
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn clone_with_token_rejects_non_https_urls_before_running_git() {
+        let dir = TempDir::new().unwrap();
+        for url in [
+            "git@github.com:org/repo.git",
+            "file:///tmp/repo",
+            "http://h/r",
+        ] {
+            let dest = dir.path().join("dest");
+            let err = Repository::clone_with_token(url, TOKEN, &dest)
+                .await
+                .err()
+                .expect("must fail");
+            assert!(err.to_string().contains("requires HTTPS"), "{url}: {err}");
+            assert!(!dest.exists(), "{url}: nothing may be cloned");
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_with_token_failure_never_leaks_the_token() {
+        let dir = TempDir::new().unwrap();
+        let err = Repository::clone_with_token(DEAD_HTTPS_URL, TOKEN, &dir.path().join("d"))
+            .await
+            .err()
+            .expect("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("git clone failed"), "{msg}");
+        assert!(!msg.contains(TOKEN), "token leaked: {msg}");
+    }
+
+    #[tokio::test]
+    async fn token_fetch_and_pull_reject_non_https_origin_untouched() {
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+        let url_before = repo.get_remote_url("origin").await.unwrap();
+
+        let err = repo.fetch_with_token(TOKEN).await.unwrap_err();
+        assert!(err.to_string().contains("requires HTTPS"), "{err}");
+        let err = repo.pull_with_token(TOKEN).await.unwrap_err();
+        assert!(err.to_string().contains("requires HTTPS"), "{err}");
+
+        assert_eq!(repo.get_remote_url("origin").await.unwrap(), url_before);
+    }
+
+    #[tokio::test]
+    async fn token_fetch_and_pull_restore_clean_url_even_on_failure() {
+        // SECURITY: the token-bearing URL is only temporary — a failed
+        // network operation must not leave it persisted in .git/config.
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+        set_origin(&repo, DEAD_HTTPS_URL);
+
+        let err = repo.fetch_with_token(TOKEN).await.unwrap_err();
+        assert!(err.to_string().contains("git fetch failed"), "{err}");
+        assert!(!err.to_string().contains(TOKEN), "token leaked: {err}");
+        assert_eq!(repo.get_remote_url("origin").await.unwrap(), DEAD_HTTPS_URL);
+
+        let err = repo.pull_with_token(TOKEN).await.unwrap_err();
+        assert!(err.to_string().contains("git pull failed"), "{err}");
+        assert!(!err.to_string().contains(TOKEN), "token leaked: {err}");
+        assert_eq!(repo.get_remote_url("origin").await.unwrap(), DEAD_HTTPS_URL);
+    }
+
+    // Unix-only: on Windows `file_url` embeds a backslash path, which would
+    // become the `url.<base>.insteadOf` config subsection — untested there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_fetch_and_pull_authenticate_then_restore_clean_url() {
+        // Route the exact token-bearing URL to the local origin with a
+        // repo-local `insteadOf`, so the success path runs hermetically.
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+        let clean_url = "https://example.invalid/org/repo.git";
+        let auth_url = format!("https://x-access-token:{TOKEN}@example.invalid/org/repo.git");
+        set_origin(&repo, clean_url);
+        git(
+            repo.path(),
+            &[
+                "config",
+                &format!("url.{}.insteadOf", file_url(&origin)),
+                &auth_url,
+            ],
+            "2025-01-01T00:00:00",
+        );
+        let new_tip = commit_change(origin.path(), "four", "2025-02-01T10:00:00");
+
+        repo.fetch_with_token(TOKEN).await.unwrap();
+        assert_eq!(repo.get_remote_url("origin").await.unwrap(), clean_url);
+        assert_eq!(
+            git_stdout(repo.path(), &["rev-parse", "origin/main"]),
+            new_tip
+        );
+
+        repo.pull_with_token(TOKEN).await.unwrap();
+        assert_eq!(repo.get_remote_url("origin").await.unwrap(), clean_url);
+        assert_eq!(repo.get_head_commit().await.unwrap(), new_tip);
+
+        let config = std::fs::read_to_string(repo.path().join(".git/config")).unwrap();
+        assert!(
+            !config.contains(&format!("url = {auth_url}")),
+            "token-bearing remote URL persisted"
+        );
+    }
 }

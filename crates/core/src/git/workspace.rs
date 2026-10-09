@@ -379,4 +379,193 @@ mod tests {
         assert!(!test_file.exists());
         assert_eq!(fs::read_to_string(&collected[0]).unwrap(), "test content");
     }
+
+    #[test]
+    fn repo_name_from_url_scp_style_ssh() {
+        assert_eq!(
+            BuildWorkspace::repo_name_from_url("git@github.com:org/repo.git"),
+            "repo"
+        );
+    }
+
+    #[test]
+    fn workspace_exposes_token_and_repo_path() {
+        let workspace = BuildWorkspace::new(
+            "test",
+            "https://github.com/org/my-plugin.git",
+            Some("ghp_x"),
+        )
+        .unwrap();
+        assert_eq!(workspace.github_token(), Some("ghp_x"));
+        assert_eq!(workspace.repo_path(), workspace.path().join("my-plugin"));
+
+        let anonymous =
+            BuildWorkspace::new("test", "https://github.com/org/repo.git", None).unwrap();
+        assert_eq!(anonymous.github_token(), None);
+    }
+
+    #[test]
+    fn to_build_context_maps_workspace_and_repo_dirs() {
+        let workspace =
+            BuildWorkspace::new("test", "https://github.com/org/my-plugin.git", None).unwrap();
+        let context = workspace.to_build_context();
+        assert_eq!(context.workspace_dir(), workspace.path());
+        assert_eq!(context.repo_dir(), workspace.repo_path());
+    }
+
+    #[test]
+    #[should_panic(expected = "repository() called before clone_repo()")]
+    fn repository_before_clone_panics() {
+        let workspace =
+            BuildWorkspace::new("test", "https://github.com/org/repo.git", None).unwrap();
+        let _ = workspace.repository();
+    }
+
+    #[test]
+    fn collect_artifacts_skips_missing_and_creates_output_dir() {
+        let workspace =
+            BuildWorkspace::new("test", "https://github.com/org/repo.git", None).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let output_dir = out.path().join("nested/out");
+        let present = workspace.path().join("present.zip");
+        fs::write(&present, b"ok").unwrap();
+        let missing = workspace.path().join("missing.zip");
+
+        let collected = workspace
+            .collect_artifacts(&[missing, present], &output_dir)
+            .unwrap();
+
+        // A missing artifact is skipped (warned), not fatal for the rest.
+        assert_eq!(collected, vec![output_dir.join("present.zip")]);
+        assert_eq!(fs::read(&collected[0]).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn collect_artifacts_replaces_stale_output_file() {
+        let workspace =
+            BuildWorkspace::new("test", "https://github.com/org/repo.git", None).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        fs::write(out.path().join("a.zip"), b"stale").unwrap();
+        let src = workspace.path().join("a.zip");
+        fs::write(&src, b"fresh").unwrap();
+
+        workspace
+            .collect_artifacts(std::slice::from_ref(&src), out.path())
+            .unwrap();
+
+        assert_eq!(fs::read(out.path().join("a.zip")).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn collect_artifacts_rejects_path_without_file_name() {
+        let workspace =
+            BuildWorkspace::new("test", "https://github.com/org/repo.git", None).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        // Exists on disk but has no final file-name component.
+        let bogus = workspace.path().join("..");
+
+        let err = workspace
+            .collect_artifacts(&[bogus], out.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid artifact path"), "{err}");
+    }
+
+    #[test]
+    fn collect_artifacts_failed_fallback_keeps_source_and_no_temp_files() {
+        // A directory squatting on the destination name makes the fast
+        // rename AND the copy-then-rename fallback fail. The artifact must
+        // survive in the workspace and no `.apvm-artifact-*.tmp` may linger.
+        let workspace =
+            BuildWorkspace::new("test", "https://github.com/org/repo.git", None).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        fs::create_dir(out.path().join("a.zip")).unwrap();
+        fs::write(out.path().join("a.zip/occupant"), b"x").unwrap();
+        let src = workspace.path().join("a.zip");
+        fs::write(&src, b"artifact").unwrap();
+
+        assert!(
+            workspace
+                .collect_artifacts(std::slice::from_ref(&src), out.path())
+                .is_err()
+        );
+
+        assert_eq!(fs::read(&src).unwrap(), b"artifact");
+        let leftovers: Vec<_> = fs::read_dir(out.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".apvm-artifact-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    }
+
+    // =========================================================================
+    // Clone / fetch / pull against a local origin (file:// — no network)
+    //
+    // Unix-only: the clone directory is named after the URL's last `/`
+    // segment, and a Windows `file://C:\…` URL has none — the derived name
+    // would be the whole origin path. Real remotes are `https://` URLs.
+    // =========================================================================
+
+    #[cfg(unix)]
+    use crate::git::testutil::{commit_change, file_url, git_stdout, make_remote_repo};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clone_repo_clones_once_and_caches_the_handle() {
+        let origin = make_remote_repo();
+        let workspace = BuildWorkspace::new("test", &file_url(&origin), None).unwrap();
+
+        let first = workspace.clone_repo().await.unwrap().path().to_path_buf();
+        // Clone dir is named after the URL's last path segment.
+        assert_eq!(first, workspace.repo_path());
+        assert!(first.join(".git").exists());
+
+        // A second call must reuse the clone (a re-clone into the existing
+        // non-empty dir would fail).
+        let second = workspace.clone_repo().await.unwrap().path().to_path_buf();
+        assert_eq!(first, second);
+        assert_eq!(workspace.repository().path(), first);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clone_repo_with_token_on_non_https_url_uses_plain_clone() {
+        // Tokens only apply to HTTPS; other transports (SSH, file) must
+        // clone with the system git's own auth instead of failing.
+        let origin = make_remote_repo();
+        let workspace = BuildWorkspace::new("test", &file_url(&origin), Some("ghp_x")).unwrap();
+
+        let repo = workspace.clone_repo().await.unwrap();
+        assert_eq!(
+            git_stdout(repo.path(), &["remote", "get-url", "origin"]),
+            file_url(&origin)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_and_pull_without_token_update_the_clone() {
+        let origin = make_remote_repo();
+        let workspace = BuildWorkspace::new("test", &file_url(&origin), None).unwrap();
+        workspace.clone_repo().await.unwrap();
+        let new_tip = commit_change(origin.path(), "four", "2025-02-01T10:00:00");
+
+        workspace.fetch().await.unwrap();
+        workspace.pull().await.unwrap();
+
+        assert_eq!(
+            workspace.repository().get_head_commit().await.unwrap(),
+            new_tip
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_repo_failure_propagates() {
+        let missing = tempfile::tempdir().unwrap();
+        let url = format!("file://{}/nope", missing.path().display());
+        let workspace = BuildWorkspace::new("test", &url, None).unwrap();
+
+        let err = workspace.clone_repo().await.err().expect("must fail");
+        assert!(err.to_string().contains("git clone failed"), "{err}");
+    }
 }

@@ -96,28 +96,13 @@ impl ResolvedToken {
 /// let token = resolve_github_token(None).await;
 /// ```
 pub async fn resolve_github_token(config_token: Option<&str>) -> Option<ResolvedToken> {
-    // 1. Explicit config token
-    if let Some(token) = config_token
-        && !token.is_empty()
-    {
-        debug!("Using GitHub token from config file");
-        return Some(ResolvedToken::new(token.to_string(), TokenSource::Config));
-    }
-
-    // 2. GITHUB_TOKEN environment variable
-    if let Ok(token) = std::env::var("GITHUB_TOKEN")
-        && !token.is_empty()
-    {
-        debug!("Using GitHub token from GITHUB_TOKEN env");
-        return Some(ResolvedToken::new(token, TokenSource::EnvGithubToken));
-    }
-
-    // 3. GH_TOKEN environment variable
-    if let Ok(token) = std::env::var("GH_TOKEN")
-        && !token.is_empty()
-    {
-        debug!("Using GitHub token from GH_TOKEN env");
-        return Some(ResolvedToken::new(token, TokenSource::EnvGhToken));
+    // 1-3. Config, then GITHUB_TOKEN, then GH_TOKEN (cheap, no I/O)
+    if let Some(resolved) = token_from_explicit_sources(
+        config_token,
+        std::env::var("GITHUB_TOKEN").ok(),
+        std::env::var("GH_TOKEN").ok(),
+    ) {
+        return Some(resolved);
     }
 
     // 4. Try `gh auth token` command (gh >= 2.17.0)
@@ -136,6 +121,50 @@ pub async fn resolve_github_token(config_token: Option<&str>) -> Option<Resolved
     None
 }
 
+/// Pick a token from the explicit sources, in priority order: config file,
+/// then `GITHUB_TOKEN`, then `GH_TOKEN`. Empty values are skipped.
+///
+/// Pure (the caller reads the environment) so the precedence contract is
+/// unit-testable without mutating process-global env vars.
+///
+/// # Arguments
+///
+/// * `config_token` - Token from the APVM config file, if any
+/// * `github_token_env` - Value of `GITHUB_TOKEN`, if set and valid UTF-8
+/// * `gh_token_env` - Value of `GH_TOKEN`, if set and valid UTF-8
+///
+/// # Returns
+///
+/// The first non-empty token with its source, or `None`.
+fn token_from_explicit_sources(
+    config_token: Option<&str>,
+    github_token_env: Option<String>,
+    gh_token_env: Option<String>,
+) -> Option<ResolvedToken> {
+    if let Some(token) = config_token
+        && !token.is_empty()
+    {
+        debug!("Using GitHub token from config file");
+        return Some(ResolvedToken::new(token.to_string(), TokenSource::Config));
+    }
+
+    if let Some(token) = github_token_env
+        && !token.is_empty()
+    {
+        debug!("Using GitHub token from GITHUB_TOKEN env");
+        return Some(ResolvedToken::new(token, TokenSource::EnvGithubToken));
+    }
+
+    if let Some(token) = gh_token_env
+        && !token.is_empty()
+    {
+        debug!("Using GitHub token from GH_TOKEN env");
+        return Some(ResolvedToken::new(token, TokenSource::EnvGhToken));
+    }
+
+    None
+}
+
 /// Try to get token using `gh auth token` command.
 ///
 /// This command is available in gh CLI >= 2.17.0 (December 2022).
@@ -148,15 +177,23 @@ async fn try_gh_auth_token() -> Option<String> {
         .await
         .ok()?;
 
-    if output.status.success() {
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !token.is_empty() && token.starts_with("gh") {
-            return Some(token);
-        }
+    if output.status.success()
+        && let Some(token) = parse_gh_auth_token_stdout(&output.stdout)
+    {
+        return Some(token);
     }
 
     trace!("'gh auth token' not available (older gh version?)");
     None
+}
+
+/// Extract a token from successful `gh auth token` stdout.
+///
+/// Accepts only a trimmed, non-empty value starting with `gh`, so unrelated
+/// output from an old or wrapped `gh` is never mistaken for a credential.
+fn parse_gh_auth_token_stdout(stdout: &[u8]) -> Option<String> {
+    let token = String::from_utf8_lossy(stdout).trim().to_string();
+    (!token.is_empty() && token.starts_with("gh")).then_some(token)
 }
 
 /// Read token from gh CLI config file.
@@ -181,7 +218,15 @@ async fn try_gh_auth_token() -> Option<String> {
 /// | Windows | `%APPDATA%\gh\hosts.yml` |
 fn read_gh_config_token() -> Option<String> {
     let config_path = get_gh_config_path()?;
+    read_gh_hosts_file(&config_path)
+}
 
+/// Read and parse a gh `hosts.yml` at `config_path`.
+///
+/// Returns `None` when the file is missing, unreadable, or has no
+/// `github.com` `oauth_token` — never an error, since this is only a
+/// fallback source.
+fn read_gh_hosts_file(config_path: &std::path::Path) -> Option<String> {
     trace!("Reading gh config from: {}", config_path.display());
 
     if !config_path.exists() {
@@ -189,7 +234,7 @@ fn read_gh_config_token() -> Option<String> {
         return None;
     }
 
-    let content = std::fs::read_to_string(&config_path).ok()?;
+    let content = std::fs::read_to_string(config_path).ok()?;
 
     // Parse the YAML manually (simple case - avoid adding yaml dependency)
     // We're looking for oauth_token under github.com
@@ -212,8 +257,31 @@ fn read_gh_config_token() -> Option<String> {
 /// - [gh CLI config docs](https://cli.github.com/manual/gh_config)
 /// - [directories crate](https://docs.rs/directories)
 fn get_gh_config_path() -> Option<PathBuf> {
+    gh_hosts_path(
+        std::env::var("GH_CONFIG_DIR").ok(),
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        BaseDirs::new().as_ref(),
+    )
+}
+
+/// Compute the gh `hosts.yml` path from already-read inputs (see
+/// [`get_gh_config_path`] for the resolution order).
+///
+/// Pure so the precedence is unit-testable without mutating process env.
+///
+/// # Arguments
+///
+/// * `gh_config_dir` - Value of `GH_CONFIG_DIR`, if set
+/// * `xdg_config_home` - Value of `XDG_CONFIG_HOME`, if set (Unix only)
+/// * `base_dirs` - Platform directories, if the home dir is known
+#[cfg_attr(windows, allow(unused_variables))]
+fn gh_hosts_path(
+    gh_config_dir: Option<String>,
+    xdg_config_home: Option<String>,
+    base_dirs: Option<&BaseDirs>,
+) -> Option<PathBuf> {
     // 1. Check GH_CONFIG_DIR environment variable first (gh CLI respects this)
-    if let Ok(config_dir) = std::env::var("GH_CONFIG_DIR") {
+    if let Some(config_dir) = gh_config_dir {
         return Some(PathBuf::from(config_dir).join("hosts.yml"));
     }
 
@@ -222,14 +290,14 @@ fn get_gh_config_path() -> Option<PathBuf> {
     //    - Linux: $XDG_CONFIG_HOME or ~/.config
     //    - macOS: ~/.config (gh uses XDG, not ~/Library)
     //    - Windows: %APPDATA% (e.g., C:\Users\<user>\AppData\Roaming)
-    if let Some(base_dirs) = BaseDirs::new() {
+    if let Some(base_dirs) = base_dirs {
         // gh CLI uses XDG on all Unix platforms, including macOS
         #[cfg(unix)]
         {
             // On Unix, gh uses $XDG_CONFIG_HOME/gh or ~/.config/gh
-            let config_home = std::env::var("XDG_CONFIG_HOME")
+            let config_home = xdg_config_home
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| base_dirs.home_dir().join(".config"));
+                .unwrap_or_else(|| base_dirs.home_dir().join(".config"));
             return Some(config_home.join("gh").join("hosts.yml"));
         }
 
@@ -451,5 +519,183 @@ enterprise.example.com:
         assert_eq!(TokenSource::Config.to_string(), "config file");
         assert_eq!(TokenSource::EnvGithubToken.to_string(), "GITHUB_TOKEN env");
         assert_eq!(TokenSource::GhConfigFile.to_string(), "gh config file");
+    }
+
+    #[test]
+    fn test_token_source_display_all_variants() {
+        // Shown to users (e.g. "GitHub token from: …"); keep wording stable.
+        assert_eq!(TokenSource::EnvGhToken.to_string(), "GH_TOKEN env");
+        assert_eq!(TokenSource::GhAuthToken.to_string(), "gh auth token");
+    }
+
+    // =========================================================================
+    // Explicit-source precedence: config → GITHUB_TOKEN → GH_TOKEN
+    // =========================================================================
+
+    /// Shorthand: resolve from explicit sources and return `(token, source)`.
+    fn explicit(
+        config: Option<&str>,
+        github: Option<&str>,
+        gh: Option<&str>,
+    ) -> Option<(String, TokenSource)> {
+        token_from_explicit_sources(config, github.map(String::from), gh.map(String::from))
+            .map(|r| (r.token, r.source))
+    }
+
+    #[test]
+    fn explicit_sources_follow_documented_precedence() {
+        assert_eq!(
+            explicit(Some("cfg"), Some("gh_env"), Some("gh2")),
+            Some(("cfg".into(), TokenSource::Config))
+        );
+        assert_eq!(
+            explicit(None, Some("gh_env"), Some("gh2")),
+            Some(("gh_env".into(), TokenSource::EnvGithubToken))
+        );
+        assert_eq!(
+            explicit(None, None, Some("gh2")),
+            Some(("gh2".into(), TokenSource::EnvGhToken))
+        );
+        assert_eq!(explicit(None, None, None), None);
+    }
+
+    #[test]
+    fn explicit_sources_skip_empty_values() {
+        // An empty config value or `GITHUB_TOKEN=` must not shadow a real
+        // token further down the chain (nor yield an empty credential).
+        assert_eq!(
+            explicit(Some(""), Some(""), Some("gh2")),
+            Some(("gh2".into(), TokenSource::EnvGhToken))
+        );
+        assert_eq!(
+            explicit(Some(""), Some("env"), None),
+            Some(("env".into(), TokenSource::EnvGithubToken))
+        );
+        assert_eq!(explicit(Some(""), Some(""), Some("")), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_prefers_non_empty_config_token_without_other_lookups() {
+        let resolved = resolve_github_token(Some("ghp_from_config")).await.unwrap();
+        assert_eq!(resolved.token, "ghp_from_config");
+        assert_eq!(resolved.source, TokenSource::Config);
+    }
+
+    // =========================================================================
+    // `gh auth token` output parsing
+    // =========================================================================
+
+    #[test]
+    fn gh_auth_token_stdout_accepts_trimmed_gh_tokens_only() {
+        assert_eq!(
+            parse_gh_auth_token_stdout(b"gho_abc123\n"),
+            Some("gho_abc123".into())
+        );
+        assert_eq!(
+            parse_gh_auth_token_stdout(b"  ghp_x  \r\n"),
+            Some("ghp_x".into())
+        );
+        assert_eq!(parse_gh_auth_token_stdout(b""), None);
+        assert_eq!(parse_gh_auth_token_stdout(b"  \n"), None);
+        // Unrelated text (e.g. an old gh printing help) is not a token.
+        assert_eq!(
+            parse_gh_auth_token_stdout(b"unknown command \"token\""),
+            None
+        );
+    }
+
+    // =========================================================================
+    // gh hosts.yml location and reading
+    // =========================================================================
+
+    #[test]
+    fn gh_hosts_path_prefers_gh_config_dir() {
+        let base = BaseDirs::new();
+        assert_eq!(
+            gh_hosts_path(Some("/gh/dir".into()), Some("/xdg".into()), base.as_ref()),
+            Some(PathBuf::from("/gh/dir/hosts.yml"))
+        );
+        // GH_CONFIG_DIR alone is enough, even without a home directory.
+        assert_eq!(
+            gh_hosts_path(Some("/gh/dir".into()), None, None),
+            Some(PathBuf::from("/gh/dir/hosts.yml"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_hosts_path_uses_xdg_then_home_config_on_unix() {
+        let base = BaseDirs::new().expect("tests need a home directory");
+        assert_eq!(
+            gh_hosts_path(None, Some("/xdg".into()), Some(&base)),
+            Some(PathBuf::from("/xdg/gh/hosts.yml"))
+        );
+        // gh uses ~/.config on macOS too — never ~/Library/Application Support.
+        assert_eq!(
+            gh_hosts_path(None, None, Some(&base)),
+            Some(base.home_dir().join(".config/gh/hosts.yml"))
+        );
+    }
+
+    #[test]
+    fn gh_hosts_path_is_none_without_any_base() {
+        assert_eq!(gh_hosts_path(None, Some("/xdg".into()), None), None);
+    }
+
+    #[test]
+    fn read_gh_hosts_file_reads_token_or_degrades_to_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("hosts.yml");
+
+        // Missing file → None (fallback source, never an error).
+        assert_eq!(read_gh_hosts_file(&path), None);
+
+        std::fs::write(&path, "github.com:\n    oauth_token: gho_file\n").unwrap();
+        assert_eq!(read_gh_hosts_file(&path), Some("gho_file".into()));
+
+        // Unreadable as text (a directory) → None.
+        assert_eq!(read_gh_hosts_file(dir.path()), None);
+    }
+
+    #[test]
+    fn parse_gh_hosts_yaml_ignores_tokens_of_hosts_listed_before_github() {
+        let yaml = "\
+enterprise.example.com:
+    oauth_token: ghp_enterprise
+github.com:
+    user: me
+    oauth_token: ghp_public
+";
+        assert_eq!(parse_gh_hosts_yaml(yaml), Some("ghp_public".into()));
+    }
+
+    #[test]
+    fn parse_gh_hosts_yaml_without_token_for_github_is_none() {
+        // Newer gh keeps the token in the OS keyring; hosts.yml has no
+        // oauth_token, and another host's token must not be picked up.
+        let yaml = "\
+github.com:
+    user: me
+    git_protocol: https
+other.example.com:
+    oauth_token: ghp_other
+";
+        assert_eq!(parse_gh_hosts_yaml(yaml), None);
+    }
+
+    #[test]
+    fn parse_gh_hosts_yaml_skips_comments_and_tab_indentation() {
+        let yaml = "# managed by gh\ngithub.com:\n# comment\n\toauth_token: ghp_tabbed\n";
+        assert_eq!(parse_gh_hosts_yaml(yaml), Some("ghp_tabbed".into()));
+    }
+
+    #[test]
+    fn extract_oauth_token_handles_quoted_empty_values() {
+        assert_eq!(extract_oauth_token("oauth_token: \"\""), None);
+        assert_eq!(extract_oauth_token("oauth_token: ''"), None);
+        assert_eq!(
+            extract_oauth_token("oauth_token:   ghp_spaced   "),
+            Some("ghp_spaced".into())
+        );
     }
 }

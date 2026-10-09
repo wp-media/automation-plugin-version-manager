@@ -1139,9 +1139,14 @@ mod tests {
     /// is anonymous and unused by these paths (tags/branches/keywords go
     /// through git, not the API).
     fn remote_resolver(url: &str) -> RefResolver<'_> {
-        // Leak the client: tests only — keeps the borrow-based API simple.
-        let github: &'static GitHubClient = Box::leak(Box::new(GitHubClient::anonymous().unwrap()));
-        RefResolver::new(github, "owner", "repo").with_remote(RemoteGit::new(url, None))
+        RefResolver::new(leaked_client(), "owner", "repo").with_remote(RemoteGit::new(url, None))
+    }
+
+    /// An anonymous GitHub client with a `'static` lifetime. Leaked: tests
+    /// only — keeps the borrow-based resolver API simple. Never called over
+    /// the network by these tests (no PR inputs are resolved).
+    fn leaked_client() -> &'static GitHubClient {
+        Box::leak(Box::new(GitHubClient::anonymous().unwrap()))
     }
 
     #[tokio::test]
@@ -1298,5 +1303,413 @@ mod tests {
         assert!(!is_prerelease_tag("v3.21.0"));
         assert!(!is_prerelease_tag("3.21.1"));
         assert!(!is_prerelease_tag("release-1.0"));
+    }
+
+    // =========================================================================
+    // Pure conversions / descriptions not covered above
+    // =========================================================================
+
+    #[test]
+    fn release_source_round_trips_and_describes() {
+        let source = RefSource::Release("v3.0.0".into());
+        assert_eq!(source.description(), "release 'v3.0.0'");
+        assert_eq!(source.to_string(), "release 'v3.0.0'");
+
+        let build: BuildSource = (&source).into();
+        assert_eq!(build, BuildSource::Release("v3.0.0".into()));
+        let back: RefSource = (&build).into();
+        assert_eq!(back, source);
+        let owned: RefSource = build.into();
+        assert_eq!(owned, source);
+    }
+
+    #[test]
+    fn borrowed_conversions_match_owned_for_every_variant() {
+        let all = [
+            RefSource::PullRequest(7),
+            RefSource::Branch("b".into()),
+            RefSource::Tag("t".into()),
+            RefSource::Commit("abcdef1".into()),
+            RefSource::Release("r".into()),
+        ];
+        for source in all {
+            let borrowed = BuildSource::from(&source);
+            assert_eq!(RefSource::from(&borrowed), source);
+            assert_eq!(borrowed, BuildSource::from(source));
+        }
+    }
+
+    #[test]
+    fn commit_description_never_panics_on_multibyte_input() {
+        // Byte slicing at 7 would split "é"; chars() must be used.
+        let source = RefSource::Commit("abcdeéfgh".into());
+        assert_eq!(source.description(), "commit abcdeéf");
+    }
+
+    #[test]
+    fn resolved_ref_build_source_helpers_use_the_source() {
+        let resolved = ResolvedRef {
+            input: "tag:v1".into(),
+            source: RefSource::Tag("v1".into()),
+            git_ref: "v1".into(),
+            commit_sha: None,
+        };
+        assert_eq!(resolved.to_build_source(), BuildSource::Tag("v1".into()));
+        assert_eq!(resolved.into_build_source(), BuildSource::Tag("v1".into()));
+    }
+
+    // =========================================================================
+    // Input validation and standalone (no repo, no remote) mode
+    // =========================================================================
+
+    /// Resolver with neither a local repo nor a remote: the trust-the-user
+    /// fallback. Every path exercised here is offline (no PR inputs).
+    fn standalone_resolver() -> RefResolver<'static> {
+        RefResolver::new(leaked_client(), "owner", "repo")
+    }
+
+    #[tokio::test]
+    async fn empty_or_blank_input_is_rejected() {
+        for input in ["", "   ", "\t\n"] {
+            let err = standalone_resolver().resolve(input).await.unwrap_err();
+            assert!(err.to_string().contains("cannot be empty"), "{input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn input_is_trimmed_before_resolution() {
+        let resolved = standalone_resolver()
+            .resolve("  branch:develop \n")
+            .await
+            .unwrap();
+        assert_eq!(resolved.git_ref, "develop");
+        assert_eq!(resolved.input, "branch:develop");
+    }
+
+    #[tokio::test]
+    async fn invalid_pr_numbers_fail_before_any_api_call() {
+        for input in ["pr:abc", "pr:-1", "pr:1.5", "PR:x"] {
+            let err = standalone_resolver().resolve(input).await.unwrap_err();
+            assert!(err.to_string().contains("Invalid PR number"), "{input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_prefix_or_empty_value_is_rejected_with_help() {
+        // ':' is illegal in git refs, so these can never be valid names.
+        for input in ["foo:bar", "tag:", "branch:", "v1:2"] {
+            let err = standalone_resolver().resolve(input).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("Invalid reference"), "{input}: {msg}");
+            assert!(msg.contains("Valid prefixes"), "{input}: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prefixes_are_case_insensitive() {
+        let resolved = standalone_resolver().resolve("TAG:v1.0.0").await.unwrap();
+        assert_eq!(resolved.source, RefSource::Tag("v1.0.0".into()));
+        let resolved = standalone_resolver().resolve("Branch:Main").await.unwrap();
+        // Only the prefix is case-folded; the ref name is kept verbatim.
+        assert_eq!(resolved.source, RefSource::Branch("Main".into()));
+    }
+
+    #[tokio::test]
+    async fn release_prefix_resolves_without_any_lookup() {
+        for value in ["v3.1.0", "latest-stable", "previous-latest"] {
+            let input = format!("release:{value}");
+            let resolved = standalone_resolver().resolve(&input).await.unwrap();
+            assert_eq!(resolved.source, RefSource::Release(value.into()));
+            assert_eq!(resolved.git_ref, value);
+            assert!(resolved.commit_sha.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_commit_values_are_rejected() {
+        let err = standalone_resolver()
+            .resolve("commit:xyz1234")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid commit SHA"), "{err}");
+
+        let err = standalone_resolver()
+            .resolve("commit:abc12")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too short"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn standalone_trusts_explicit_refs_unverified() {
+        let r = standalone_resolver();
+        let tag = r.resolve("tag:v9.9.9").await.unwrap();
+        assert_eq!(tag.source, RefSource::Tag("v9.9.9".into()));
+        assert!(tag.commit_sha.is_none());
+
+        let branch = r.resolve("branch:anything").await.unwrap();
+        assert_eq!(branch.source, RefSource::Branch("anything".into()));
+        assert!(branch.commit_sha.is_none());
+
+        // A trusted commit is its own (unexpanded) commit SHA.
+        let commit = r.resolve("commit:abcdef1").await.unwrap();
+        assert_eq!(commit.source, RefSource::Commit("abcdef1".into()));
+        assert_eq!(commit.commit_sha.as_deref(), Some("abcdef1"));
+    }
+
+    #[tokio::test]
+    async fn standalone_assumes_bare_names_are_branches() {
+        for input in ["feature/foo", "abcdef1"] {
+            let resolved = standalone_resolver().resolve(input).await.unwrap();
+            assert_eq!(resolved.source, RefSource::Branch(input.into()), "{input}");
+            assert!(resolved.commit_sha.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_tag_keywords_need_a_backend() {
+        let err = standalone_resolver()
+            .resolve("tag:latest")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires a local repository or a configured remote"),
+            "{err}"
+        );
+    }
+
+    // =========================================================================
+    // Local-repository mode (post-clone validation)
+    // =========================================================================
+
+    use crate::git::testutil::{git, git_stdout, make_repo_with_tags};
+
+    /// Clone `origin` into a temp dir and return it. The clone has a local
+    /// `main`, remote-tracking `origin/*` branches only, and all tags.
+    fn local_clone(origin: &tempfile::TempDir) -> tempfile::TempDir {
+        let holder = tempfile::TempDir::new().unwrap();
+        git(
+            holder.path(),
+            &["clone", "--quiet", &file_url(origin), "."],
+            "2025-01-01T00:00:00",
+        );
+        holder
+    }
+
+    /// Resolver in local mode over `path` (no test here resolves a PR, so
+    /// the GitHub client is never used).
+    fn local_resolver(path: &Path) -> RefResolver<'_> {
+        RefResolver::new(leaked_client(), "owner", "repo").with_repo_path(path)
+    }
+
+    #[tokio::test]
+    async fn local_resolves_explicit_and_bare_tags_with_sha() {
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let expected = git_stdout(clone.path(), &["rev-parse", "v1.0.0"]);
+
+        for input in ["tag:v1.0.0", "v1.0.0"] {
+            let resolved = local_resolver(clone.path()).resolve(input).await.unwrap();
+            assert_eq!(resolved.source, RefSource::Tag("v1.0.0".into()), "{input}");
+            assert_eq!(resolved.git_ref, "v1.0.0");
+            assert_eq!(resolved.commit_sha.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_resolves_local_branch_with_sha() {
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let main = git_stdout(clone.path(), &["rev-parse", "main"]);
+
+        for input in ["main", "branch:main"] {
+            let resolved = local_resolver(clone.path()).resolve(input).await.unwrap();
+            assert_eq!(resolved.source, RefSource::Branch("main".into()), "{input}");
+            assert_eq!(resolved.commit_sha.as_deref(), Some(main.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_resolves_branch_that_exists_only_on_origin() {
+        // A fresh clone has `feature/x` only as refs/remotes/origin/feature/x;
+        // it must still resolve as a branch (checkout DWIM-creates it).
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+
+        let resolved = local_resolver(clone.path())
+            .resolve("feature/x")
+            .await
+            .unwrap();
+        assert_eq!(resolved.source, RefSource::Branch("feature/x".into()));
+        assert_eq!(resolved.git_ref, "feature/x");
+    }
+
+    #[tokio::test]
+    async fn local_tag_wins_over_same_named_branch() {
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        git(
+            clone.path(),
+            &["branch", "v1.0.0", "main"],
+            "2025-01-01T00:00:00",
+        );
+
+        let resolved = local_resolver(clone.path())
+            .resolve("v1.0.0")
+            .await
+            .unwrap();
+        assert_eq!(resolved.source, RefSource::Tag("v1.0.0".into()));
+    }
+
+    #[tokio::test]
+    async fn local_expands_short_commit_sha_to_full() {
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let full = git_stdout(clone.path(), &["rev-parse", "v1.0.0"]);
+        let short = &full[..8];
+
+        for input in [format!("commit:{short}"), short.to_string()] {
+            let resolved = local_resolver(clone.path()).resolve(&input).await.unwrap();
+            assert_eq!(resolved.source, RefSource::Commit(full.clone()), "{input}");
+            assert_eq!(resolved.git_ref, full);
+            assert_eq!(resolved.commit_sha.as_deref(), Some(full.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_rejects_non_commit_objects_and_unknown_shas() {
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let tree = git_stdout(clone.path(), &["rev-parse", "HEAD^{tree}"]);
+
+        let err = local_resolver(clone.path())
+            .resolve(&format!("commit:{tree}"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a tree, not a commit"), "{err}");
+
+        let err = local_resolver(clone.path())
+            .resolve("commit:0123456789abcdef")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn local_missing_refs_fail_with_specific_errors() {
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let r = local_resolver(clone.path());
+
+        let err = r.resolve("tag:v9.9.9").await.unwrap_err();
+        assert!(err.to_string().contains("Tag 'v9.9.9' not found"), "{err}");
+        let err = r.resolve("branch:nope").await.unwrap_err();
+        assert!(err.to_string().contains("Branch 'nope' not found"), "{err}");
+        // With a repo available, an unknown bare name is an error, not a
+        // guessed branch.
+        let err = r.resolve("totally-unknown").await.unwrap_err();
+        assert!(err.to_string().contains("Could not resolve"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn local_and_remote_tag_keywords_agree() {
+        // Both backends must order tags identically (creation date, newest
+        // first), or a pre-clone resolve and a post-clone resolve could pick
+        // different tags for the same keyword.
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let url = file_url(&origin);
+        let expected = [
+            ("tag:latest", "v2.0.0"),
+            ("tag:latest-stable", "v2.0.0"),
+            ("tag:previous-latest", "v2.0.0-beta1"),
+            ("tag:previous-stable", "v1.0.0"),
+            ("tag:LATEST", "v2.0.0"),
+        ];
+
+        for (input, tag) in expected {
+            let local = local_resolver(clone.path()).resolve(input).await.unwrap();
+            let remote = remote_resolver(&url).resolve(input).await.unwrap();
+            assert_eq!(local.source, RefSource::Tag(tag.into()), "local {input}");
+            assert_eq!(remote.source, local.source, "remote {input}");
+            assert_eq!(local.input, input);
+        }
+    }
+
+    #[tokio::test]
+    async fn tag_keywords_report_missing_or_insufficient_tags() {
+        // (tags in creation order, keyword, expected error fragment)
+        let cases: [(&[&str], &str, &str); 4] = [
+            (&[], "tag:latest", "No tags found"),
+            (
+                &["v1.0.0-beta1"],
+                "tag:latest-stable",
+                "No stable tags found",
+            ),
+            (
+                &["v1.0.0"],
+                "tag:previous-stable",
+                "need at least 2, found 1",
+            ),
+            (
+                &["v1.0.0"],
+                "tag:previous-latest",
+                "need at least 2, found 1",
+            ),
+        ];
+
+        for (tags, input, fragment) in cases {
+            let origin = make_repo_with_tags(tags);
+            for err in [
+                local_resolver(origin.path())
+                    .resolve(input)
+                    .await
+                    .unwrap_err(),
+                remote_resolver(&file_url(&origin))
+                    .resolve(input)
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert!(
+                    err.to_string().contains(fragment),
+                    "{tags:?} {input}: {err}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_keyword_tag_values_resolve_literally() {
+        // A tag literally named like a near-keyword must not be mistaken for
+        // one (only the four exact keywords are special).
+        let origin = make_repo_with_tags(&["latest-beta"]);
+        let resolved = local_resolver(origin.path())
+            .resolve("tag:latest-beta")
+            .await
+            .unwrap();
+        assert_eq!(resolved.source, RefSource::Tag("latest-beta".into()));
+    }
+
+    // =========================================================================
+    // Remote mode: session caching
+    // =========================================================================
+
+    #[tokio::test]
+    async fn remote_ls_remote_snapshot_is_reused_within_a_session() {
+        // One resolver = one ls-remote round-trip. Proven by deleting the
+        // remote after the first lookup: later lookups still succeed from
+        // the cached snapshot.
+        let origin = make_remote_repo();
+        let url = file_url(&origin);
+        let resolver = remote_resolver(&url);
+
+        resolver.resolve("branch:main").await.unwrap();
+        drop(origin);
+
+        let resolved = resolver.resolve("feature/x").await.unwrap();
+        assert_eq!(resolved.source, RefSource::Branch("feature/x".into()));
+        let resolved = resolver.resolve("tag:v1.0.0").await.unwrap();
+        assert_eq!(resolved.source, RefSource::Tag("v1.0.0".into()));
     }
 }

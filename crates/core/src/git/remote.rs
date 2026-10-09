@@ -486,4 +486,70 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/pull/12/head
         let open = RemoteGit::new("https://github.com/o/r.git", None);
         assert_eq!(open.redact("plain"), "plain");
     }
+
+    #[test]
+    fn parse_skips_lines_with_blank_sha_or_name() {
+        let refs = RemoteRefs::parse("\trefs/heads/no-sha\n1234567\t \n  \t\n");
+        assert_eq!(refs.branch_count(), 0);
+        assert_eq!(refs.tag_count(), 0);
+    }
+
+    #[test]
+    fn parse_prefers_peeled_sha_regardless_of_line_order() {
+        // The peeled `^{}` line may precede the tag-object line; the later
+        // object SHA must not overwrite the commit SHA.
+        let out = "\
+cccccccccccccccccccccccccccccccccccccccc\trefs/tags/v3^{}
+0000000000000000000000000000000000000000\trefs/tags/v3
+";
+        let refs = RemoteRefs::parse(out);
+        assert_eq!(
+            refs.tag_sha("v3"),
+            Some("cccccccccccccccccccccccccccccccccccccccc")
+        );
+        assert_eq!(refs.tag_count(), 1);
+    }
+
+    #[test]
+    fn url_is_always_the_token_free_url() {
+        let remote = RemoteGit::new("https://github.com/o/r.git", Some("tok123"));
+        assert_eq!(remote.url(), "https://github.com/o/r.git");
+    }
+
+    #[test]
+    fn redact_ignores_empty_token() {
+        // An empty token would otherwise "redact" between every character.
+        let remote = RemoteGit::new("https://github.com/o/r.git", Some(""));
+        assert_eq!(remote.redact("abc"), "abc");
+    }
+
+    #[tokio::test]
+    async fn tags_by_creatordate_unreachable_remote_fails() {
+        let missing = TempDir::new().unwrap();
+        let url = format!("file://{}/does-not-exist", missing.path().display());
+
+        let err = RemoteGit::new(url, None)
+            .tags_by_creatordate()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ls-remote --tags failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ls_remote_failure_with_token_names_clean_url_and_hides_token() {
+        // Loopback port 1 refuses instantly: exercises the authenticated
+        // HTTPS path without leaving the host.
+        let url = "https://127.0.0.1:1/o/r.git";
+        let token = "ghp_TESTTOKEN_must_never_leak";
+        let remote = RemoteGit::new(url, Some(token));
+
+        for err in [
+            remote.ls_remote().await.unwrap_err(),
+            remote.tags_by_creatordate().await.unwrap_err(),
+        ] {
+            let msg = err.to_string();
+            assert!(msg.contains(url), "{msg}");
+            assert!(!msg.contains(token), "token leaked: {msg}");
+        }
+    }
 }

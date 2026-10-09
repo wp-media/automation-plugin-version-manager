@@ -84,3 +84,51 @@ pub(crate) fn make_remote_repo() -> TempDir {
 pub(crate) fn file_url(dir: &TempDir) -> String {
     format!("file://{}", dir.path().display())
 }
+
+/// Run a git command in `dir` and return its trimmed stdout; panics with
+/// stderr on failure. For reading state (`rev-parse`, `remote get-url`)
+/// that tests assert against.
+pub(crate) fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git must be runnable in tests");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Commit a change to `f` in `dir` so the repo gains a new tip, returning the
+/// new commit's full SHA. Used to make an "origin" move ahead of a clone.
+pub(crate) fn commit_change(dir: &std::path::Path, contents: &str, date: &str) -> String {
+    std::fs::write(dir.join("f"), contents).unwrap();
+    git(dir, &["add", "f"], date);
+    git(dir, &["commit", "-qm", contents], date);
+    git_stdout(dir, &["rev-parse", "HEAD"])
+}
+
+/// Build a git repo whose tags are exactly `tags` (in creation order, one
+/// dated commit each, lightweight). An empty slice yields a repo with one
+/// commit and no tags. Used to probe tag-keyword edge cases.
+pub(crate) fn make_repo_with_tags(tags: &[&str]) -> TempDir {
+    assert!(tags.len() <= 11, "one tag per month of 2024 (Feb..Dec)");
+    let dir = TempDir::new().unwrap();
+    let path = dir.path();
+    git(
+        path,
+        &["init", "--quiet", "--initial-branch=main"],
+        "2024-01-01T10:00:00",
+    );
+    commit_change(path, "base", "2024-01-01T10:00:00");
+    for (i, tag) in tags.iter().enumerate() {
+        // One month apart so `--sort=-creatordate` order is unambiguous.
+        let date = format!("2024-{:02}-01T10:00:00", i + 2);
+        commit_change(path, tag, &date);
+        git(path, &["tag", tag], &date);
+    }
+    dir
+}
