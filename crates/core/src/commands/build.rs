@@ -3198,4 +3198,171 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0], Some("free".to_string()));
     }
+
+    // =========================================================================
+    // Pure helpers: labels, variant lists, pre-clone detection, re-pointing
+    // =========================================================================
+
+    /// A resolved ref of `source` whose checked-out name is `git_ref`.
+    fn resolved(source: RefSource, git_ref: &str) -> ResolvedRef {
+        ResolvedRef {
+            input: git_ref.to_string(),
+            source,
+            git_ref: git_ref.to_string(),
+            commit_sha: None,
+        }
+    }
+
+    #[test]
+    fn branch_label_names_each_source_kind() {
+        // Stored as build metadata and shown to users, so the format matters.
+        let label = |source, git_ref| branch_label(&resolved(source, git_ref));
+        assert_eq!(
+            label(RefSource::PullRequest(7), "feature/pr-head"),
+            "feature/pr-head"
+        );
+        assert_eq!(label(RefSource::Branch("dev".into()), "dev"), "dev");
+        assert_eq!(label(RefSource::Tag("v1.2".into()), "v1.2"), "tag/v1.2");
+        assert_eq!(
+            label(RefSource::Commit(TEST_SHA.into()), TEST_SHA),
+            "commit/a1b2c3d"
+        );
+        assert_eq!(
+            label(RefSource::Release("5.6.8".into()), "5.6.8"),
+            "release/5.6.8"
+        );
+    }
+
+    #[test]
+    fn branch_label_tolerates_a_sha_shorter_than_seven_chars() {
+        // Must not panic slicing `[..7]` on an unvalidated short SHA.
+        let label = branch_label(&resolved(RefSource::Commit("abc".into()), "abc"));
+        assert_eq!(label, "commit/abc");
+    }
+
+    #[test]
+    fn variants_built_dedupes_in_first_seen_order_and_skips_single_output() {
+        let with_variant = |variant: Option<&str>| {
+            ProducedArtifact::new(
+                variant.map(str::to_string),
+                PathBuf::from("/a.zip"),
+                "a.zip".to_string(),
+                1,
+            )
+        };
+        let artifacts = [
+            with_variant(Some("pro")),
+            with_variant(None),
+            with_variant(Some("free")),
+            with_variant(Some("pro")),
+        ];
+
+        assert_eq!(variants_built(&artifacts), ["pro", "free"]);
+        assert!(variants_built(&[with_variant(None)]).is_empty());
+    }
+
+    /// Detects the version from `sub/plugin.php`, so pre-clone detection must
+    /// recreate the file's repo-relative directory layout.
+    struct NestedVersionBuilder;
+
+    impl Builder for NestedVersionBuilder {
+        fn version_requirement(&self) -> VersionRequirement {
+            VersionRequirement::Optional
+        }
+        fn detect_version(&self, working_dir: &std::path::Path) -> Result<Option<String>> {
+            crate::build::detect_wordpress_plugin_version(&working_dir.join("sub/plugin.php"))
+        }
+        fn setup_commands(&self) -> Vec<BuildStep> {
+            vec![]
+        }
+        fn build_commands(&self, _: &BuildContext, _: &str, _: &[&str]) -> Vec<BuildStep> {
+            vec![]
+        }
+        fn artifacts(
+            &self,
+            _: &BuildContext,
+            _: &str,
+            _: &[&str],
+        ) -> crate::Result<Vec<BuildArtifact>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn detect_version_from_files_recreates_nested_paths() {
+        let header = b"<?php\n/**\n * Plugin Name: Demo\n * Version: 4.5.6\n */\n".to_vec();
+
+        let detected =
+            detect_version_from_files(&NestedVersionBuilder, &[("sub/plugin.php", header)]);
+
+        assert_eq!(detected.as_deref(), Some("4.5.6"));
+    }
+
+    #[test]
+    fn repoint_to_cache_swaps_paths_by_filename_and_keeps_origin() {
+        let mut artifacts = vec![
+            ProducedArtifact::new(None, PathBuf::from("/ws/a.zip"), "a.zip".into(), 1)
+                .with_origin(ArtifactOrigin::Built),
+            ProducedArtifact::new(None, PathBuf::from("/ws/b.zip"), "b.zip".into(), 1)
+                .with_origin(ArtifactOrigin::Cache),
+        ];
+        let stored = [StoredArtifact {
+            variant_id: None,
+            filename: "a.zip".into(),
+            size_bytes: 1,
+            sha256: String::new(),
+            path: PathBuf::from("/cache/a.zip"),
+        }];
+
+        repoint_to_cache(&mut artifacts, &stored);
+
+        assert_eq!(artifacts[0].path, PathBuf::from("/cache/a.zip"));
+        assert_eq!(artifacts[0].origin, ArtifactOrigin::Built);
+        // No stored match: the path is left alone rather than dropped.
+        assert_eq!(artifacts[1].path, PathBuf::from("/ws/b.zip"));
+    }
+
+    #[test]
+    fn to_source_artifacts_filtered_skips_variants_already_cached() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = apvm_storage::ArtifactStore::open(dir.path()).unwrap();
+        let src = tempfile::TempDir::new().unwrap();
+        let file = |name: &str| {
+            let path = src.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        };
+        let produced = |variant: &str| {
+            ProducedArtifact::new(
+                Some(variant.to_string()),
+                file(&format!("{variant}.zip")),
+                format!("{variant}.zip"),
+                1,
+            )
+        };
+        let output = make_build_output(
+            vec![produced("free"), produced("pro")],
+            "5.1.0",
+            RefSource::Branch("develop".into()),
+            TEST_SHA,
+            "develop",
+        );
+        // Cache only `free` for this exact (version, commit).
+        let free_only: Vec<SourceArtifact> = output
+            .to_source_artifacts()
+            .into_iter()
+            .filter(|a| a.variant_id.as_deref() == Some("free"))
+            .collect();
+        store
+            .store(&output.to_build_metadata("backwpup"), &free_only)
+            .unwrap();
+
+        let remaining = output
+            .to_source_artifacts_filtered(&store, "backwpup")
+            .unwrap();
+
+        assert_eq!(remaining.len(), 1, "{remaining:?}");
+        assert_eq!(remaining[0].variant_id.as_deref(), Some("pro"));
+        assert_eq!(remaining[0].target_name, "pro.zip");
+    }
 }

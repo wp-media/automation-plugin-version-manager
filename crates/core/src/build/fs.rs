@@ -866,4 +866,95 @@ mod tests {
             "error should name the unreadable directory"
         );
     }
+
+    // =========================================================================
+    // Symlinks and error paths
+    // =========================================================================
+
+    /// A source tree with one real file plus a file symlink and a directory
+    /// symlink (the latter pointing outside the tree).
+    #[cfg(unix)]
+    fn tree_with_symlinks() -> (TempDir, TempDir) {
+        let src = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(src.path().join("real.txt"), "real").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(src.path().join("real.txt"), src.path().join("link.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path(), src.path().join("linked-dir")).unwrap();
+        (src, outside)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_copy_dir_skips_symlinks() {
+        // Following a link could pull files from outside the plugin tree into
+        // the package; links are neither followed nor copied.
+        let (src, _outside) = tree_with_symlinks();
+        let dst = TempDir::new().unwrap();
+
+        let count = copy_dir_with_exclusions(src.path(), dst.path(), &[]).unwrap();
+
+        assert_eq!(count, 1);
+        assert!(dst.path().join("real.txt").is_file());
+        assert!(!dst.path().join("link.txt").exists());
+        assert!(!dst.path().join("linked-dir").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_zip_skips_symlinks() {
+        let (src, _outside) = tree_with_symlinks();
+        let out = TempDir::new().unwrap();
+        let archive_path = out.path().join("plugin.zip");
+
+        let entries = create_zip_archive(src.path(), &archive_path, "plugin", &[]).unwrap();
+
+        assert_eq!(entries, 2, "archive root + the real file");
+        assert_eq!(
+            archive_entry_names(&archive_path),
+            ["plugin/", "plugin/real.txt"]
+        );
+    }
+
+    #[test]
+    fn test_copy_dir_missing_source_errors() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+
+        let err = copy_dir_with_exclusions(&missing, &dir.path().join("dst"), &[]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Failed to walk source directory"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_copy_dir_uncreatable_destination_errors() {
+        let src = TempDir::new().unwrap();
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+
+        let err =
+            copy_dir_with_exclusions(src.path(), &blocker.path().join("dst"), &[]).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Failed to create destination directory"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_create_zip_uncreatable_archive_errors() {
+        let src = TempDir::new().unwrap();
+        let archive_path = src.path().join("missing-parent").join("plugin.zip");
+
+        let err = create_zip_archive(src.path(), &archive_path, "plugin", &[]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Failed to create archive file"),
+            "{err}"
+        );
+    }
 }

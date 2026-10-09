@@ -510,3 +510,602 @@ impl<'r> BuildRunner<'r> {
         &self.context
     }
 }
+
+// The runner shells out through `sh -c`, so these tests are Unix-gated (the
+// same assumption the git and end-to-end cache tests make).
+#[cfg(all(test, unix))]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::build::plugins::BuildVariant;
+
+    /// A tool name that is never on `PATH`, to drive the "missing tool" paths.
+    const MISSING_TOOL: &str = "apvm-test-tool-that-does-not-exist";
+    /// A second never-installed tool, for the batched-error case.
+    const OTHER_MISSING_TOOL: &str = "apvm-test-other-missing-tool";
+
+    /// Reporter that keeps every event, so tests can assert on the timeline.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<BuildEvent>>);
+
+    impl ProgressReporter for Recorder {
+        fn report(&self, event: &BuildEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    impl Recorder {
+        /// Snapshot of all events received so far.
+        fn events(&self) -> Vec<BuildEvent> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// The phases that were started, in order.
+        fn phases_started(&self) -> Vec<BuildPhase> {
+            self.events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    BuildEvent::PhaseStarted { phase, .. } => Some(phase),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Messages of every `Warning` event, in order.
+        fn warnings(&self) -> Vec<String> {
+            self.events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    BuildEvent::Warning(message) => Some(message),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Labels of every completed step, in order.
+        fn completed_steps(&self) -> Vec<String> {
+            self.events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    BuildEvent::StepCompleted { step } => Some(step.label),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// Fully scriptable builder: every hook records its call (and the repo dir
+    /// it saw) so tests can verify ordering and the build-subdirectory switch.
+    #[derive(Default)]
+    struct ScriptBuilder {
+        deps: Vec<ToolDependency>,
+        setup: Vec<&'static str>,
+        build: Vec<&'static str>,
+        artifacts: Vec<BuildArtifact>,
+        variants: Vec<&'static str>,
+        subdir: Option<&'static str>,
+        hook_calls: Mutex<Vec<(&'static str, PathBuf)>>,
+    }
+
+    impl ScriptBuilder {
+        /// Record that hook `name` ran with `context`.
+        fn record_hook(&self, name: &'static str, context: &BuildContext) {
+            self.hook_calls
+                .lock()
+                .unwrap()
+                .push((name, context.repo_dir().to_path_buf()));
+        }
+
+        /// Names of the hooks that ran, in order.
+        fn hooks_run(&self) -> Vec<&'static str> {
+            self.hook_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect()
+        }
+    }
+
+    impl Builder for ScriptBuilder {
+        fn tool_dependencies(&self) -> Vec<ToolDependency> {
+            self.deps.clone()
+        }
+        fn setup_commands(&self) -> Vec<BuildStep> {
+            self.setup
+                .iter()
+                .map(|cmd| BuildStep::new("setup", *cmd))
+                .collect()
+        }
+        fn pre_build_hook(
+            &self,
+            context: &BuildContext,
+            _: &str,
+            _: &[&str],
+            _: &dyn ProgressReporter,
+        ) -> Result<()> {
+            self.record_hook("pre", context);
+            Ok(())
+        }
+        fn build_hook(
+            &self,
+            context: &BuildContext,
+            _: &str,
+            _: &[&str],
+            _: &dyn ProgressReporter,
+        ) -> Result<()> {
+            self.record_hook("build", context);
+            Ok(())
+        }
+        fn post_build_hook(
+            &self,
+            context: &BuildContext,
+            _: &str,
+            _: &[&str],
+            _: &dyn ProgressReporter,
+        ) -> Result<()> {
+            self.record_hook("post", context);
+            Ok(())
+        }
+        fn variants(&self) -> Vec<BuildVariant> {
+            self.variants
+                .iter()
+                .map(|id| BuildVariant {
+                    id,
+                    name: id,
+                    description: id,
+                })
+                .collect()
+        }
+        fn build_commands(&self, _: &BuildContext, _: &str, _: &[&str]) -> Vec<BuildStep> {
+            self.build
+                .iter()
+                .map(|cmd| BuildStep::new("build", *cmd))
+                .collect()
+        }
+        fn artifacts(&self, _: &BuildContext, _: &str, _: &[&str]) -> Result<Vec<BuildArtifact>> {
+            Ok(self.artifacts.clone())
+        }
+        fn build_subdirectory(&self) -> Option<&'static str> {
+            self.subdir
+        }
+    }
+
+    /// A single-output artifact at `source_path`, delivered as `plugin.zip`.
+    fn artifact(source_path: impl Into<String>) -> BuildArtifact {
+        BuildArtifact {
+            variant_id: None,
+            source_path: source_path.into(),
+            target_name: "plugin.zip".to_string(),
+        }
+    }
+
+    /// A temp workspace containing a `repo/` directory, plus its context.
+    fn workspace() -> (TempDir, BuildContext) {
+        let workspace = TempDir::new().unwrap();
+        let repo = workspace.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let context = BuildContext::new(repo, workspace.path().to_path_buf());
+        (workspace, context)
+    }
+
+    /// Unwrap a [`Error::Build`] message, failing on any other outcome.
+    fn build_error<T: std::fmt::Debug>(result: Result<T>) -> String {
+        match result {
+            Err(Error::Build(message)) => message,
+            other => panic!("expected Error::Build, got {other:?}"),
+        }
+    }
+
+    /// Resolve symlinks (macOS `/var` → `/private/var`) for path equality.
+    fn canonical(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap()
+    }
+
+    // ---- run -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_captures_stdout_and_executes_in_the_repo_dir() {
+        let (_ws, context) = workspace();
+        let runner = BuildRunner::new(context.clone());
+
+        let output = runner.run("echo hello; pwd -P").await.unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.exit_code, Some(0));
+        let mut lines = output.stdout.lines();
+        assert_eq!(lines.next(), Some("hello"));
+        assert_eq!(
+            lines.next().map(PathBuf::from),
+            Some(canonical(context.repo_dir()))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_failure_reports_command_exit_code_and_stderr() {
+        let (_ws, context) = workspace();
+        let runner = BuildRunner::new(context);
+
+        let message = build_error(runner.run("echo boom >&2; exit 3").await);
+
+        // All three are what a user needs to diagnose a failed build step.
+        assert!(message.contains("echo boom >&2; exit 3"), "{message}");
+        assert!(message.contains("exit code Some(3)"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+    }
+
+    #[test]
+    fn command_exists_detects_present_and_missing_tools() {
+        assert!(BuildRunner::command_exists("sh"));
+        assert!(!BuildRunner::command_exists(MISSING_TOOL));
+    }
+
+    // ---- ensure_tool_dependencies -------------------------------------------
+
+    #[tokio::test]
+    async fn present_tools_never_run_their_install_commands() {
+        let (_ws, context) = workspace();
+        let recorder = Recorder::default();
+        let runner = BuildRunner::with_reporter(context.clone(), &recorder);
+        let deps = [ToolDependency::required_with_install(
+            "sh",
+            vec!["touch installed"],
+        )];
+
+        runner.ensure_tool_dependencies(&deps).await.unwrap();
+
+        assert!(!context.repo_dir().join("installed").exists());
+        assert!(recorder.events().is_empty(), "{:?}", recorder.events());
+    }
+
+    #[tokio::test]
+    async fn missing_required_tools_fail_together_in_one_error() {
+        let (_ws, context) = workspace();
+        let runner = BuildRunner::new(context);
+        let deps = [
+            ToolDependency::required(MISSING_TOOL),
+            ToolDependency::required("sh"),
+            ToolDependency::required(OTHER_MISSING_TOOL),
+        ];
+
+        let message = build_error(runner.ensure_tool_dependencies(&deps).await);
+
+        // Batched: the user learns about every missing tool at once.
+        assert!(
+            message.contains(&format!(
+                "Missing required commands: {MISSING_TOOL}, {OTHER_MISSING_TOOL}."
+            )),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_required_tool_runs_install_commands_in_order() {
+        let (_ws, context) = workspace();
+        let recorder = Recorder::default();
+        let runner = BuildRunner::with_reporter(context.clone(), &recorder);
+        let deps = [ToolDependency::required_with_install(
+            MISSING_TOOL,
+            vec!["echo one >> log", "echo two >> log"],
+        )];
+
+        runner.ensure_tool_dependencies(&deps).await.unwrap();
+
+        let log = std::fs::read_to_string(context.repo_dir().join("log")).unwrap();
+        assert_eq!(log, "one\ntwo\n");
+        assert_eq!(
+            recorder.completed_steps(),
+            [format!("Installing required tool '{MISSING_TOOL}'")]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_required_install_aborts_without_running_later_commands() {
+        let (_ws, context) = workspace();
+        let runner = BuildRunner::new(context.clone());
+        let deps = [ToolDependency::required_with_install(
+            MISSING_TOOL,
+            vec!["exit 7", "touch after"],
+        )];
+
+        let message = build_error(runner.ensure_tool_dependencies(&deps).await);
+
+        assert!(message.contains("exit code Some(7)"), "{message}");
+        assert!(!context.repo_dir().join("after").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_optional_install_only_warns_and_stops_installing() {
+        let (_ws, context) = workspace();
+        let recorder = Recorder::default();
+        let runner = BuildRunner::with_reporter(context.clone(), &recorder);
+        let deps = [ToolDependency::optional_with_install(
+            MISSING_TOOL,
+            vec!["exit 1", "touch after"],
+        )];
+
+        runner.ensure_tool_dependencies(&deps).await.unwrap();
+
+        let warnings = recorder.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(&format!("Failed to install optional tool '{MISSING_TOOL}'"))
+        );
+        assert!(!context.repo_dir().join("after").exists());
+        assert!(
+            recorder.completed_steps().is_empty(),
+            "a failed install must not be reported as completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_optional_install_completes_without_warning() {
+        let (_ws, context) = workspace();
+        let recorder = Recorder::default();
+        let runner = BuildRunner::with_reporter(context.clone(), &recorder);
+        let deps = [ToolDependency::optional_with_install(
+            MISSING_TOOL,
+            vec!["touch installed"],
+        )];
+
+        runner.ensure_tool_dependencies(&deps).await.unwrap();
+
+        assert!(context.repo_dir().join("installed").exists());
+        assert!(recorder.warnings().is_empty());
+        assert_eq!(
+            recorder.completed_steps(),
+            [format!("Installing optional tool '{MISSING_TOOL}'")]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_optional_tool_without_install_only_warns() {
+        let (_ws, context) = workspace();
+        let recorder = Recorder::default();
+        let runner = BuildRunner::with_reporter(context, &recorder);
+        let deps = [ToolDependency::optional(MISSING_TOOL)];
+
+        runner.ensure_tool_dependencies(&deps).await.unwrap();
+
+        assert_eq!(
+            recorder.warnings(),
+            [format!(
+                "Optional tool '{MISSING_TOOL}' is not installed. Some features may not work."
+            )]
+        );
+    }
+
+    // ---- execute_build ------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_build_runs_every_phase_in_order_and_collects_artifacts() {
+        let (_ws, context) = workspace();
+        let recorder = Recorder::default();
+        let builder = ScriptBuilder {
+            setup: vec!["echo setup > setup.txt"],
+            build: vec!["test -f setup.txt && printf 'zipbytes' > out.zip"],
+            artifacts: vec![artifact("out.zip")],
+            ..ScriptBuilder::default()
+        };
+        let mut runner = BuildRunner::with_reporter(context.clone(), &recorder);
+
+        let result = runner.execute_build(&builder, "1.2.3", &[]).await.unwrap();
+
+        assert_eq!(
+            recorder.phases_started(),
+            [
+                BuildPhase::DependencyCheck,
+                BuildPhase::Setup,
+                BuildPhase::PreBuild,
+                BuildPhase::Build,
+                BuildPhase::BuildHook,
+                BuildPhase::PostBuild,
+                BuildPhase::CollectArtifacts,
+            ]
+        );
+        assert_eq!(builder.hooks_run(), ["pre", "build", "post"]);
+
+        let expected = context.repo_dir().join("out.zip");
+        assert_eq!(result.version, "1.2.3");
+        assert_eq!(result.build_dir, context.repo_dir());
+        assert!(result.variants_built.is_empty(), "single-output build");
+        assert_eq!(result.artifacts.len(), 1);
+        let produced = &result.artifacts[0];
+        assert_eq!(produced.path, expected);
+        assert_eq!(produced.filename, "plugin.zip");
+        assert_eq!(produced.size, "zipbytes".len() as u64);
+        assert!(matches!(
+            recorder.events().last(),
+            Some(BuildEvent::BuildSucceeded { artifacts }) if *artifacts == [expected.clone()]
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_build_skips_the_setup_phase_without_setup_commands() {
+        let (_ws, context) = workspace();
+        let recorder = Recorder::default();
+        let builder = ScriptBuilder::default();
+        let mut runner = BuildRunner::with_reporter(context, &recorder);
+
+        runner.execute_build(&builder, "1.0.0", &[]).await.unwrap();
+
+        assert!(!recorder.phases_started().contains(&BuildPhase::Setup));
+    }
+
+    #[tokio::test]
+    async fn execute_build_rejects_an_unknown_variant_before_doing_anything() {
+        let (_ws, context) = workspace();
+        let recorder = Recorder::default();
+        let builder = ScriptBuilder {
+            variants: vec!["free", "pro"],
+            setup: vec!["touch ran"],
+            ..ScriptBuilder::default()
+        };
+        let mut runner = BuildRunner::with_reporter(context.clone(), &recorder);
+
+        let message = build_error(runner.execute_build(&builder, "1.0.0", &["gold"]).await);
+
+        assert_eq!(message, "Unknown variant 'gold'. Available: free, pro");
+        assert!(recorder.events().is_empty(), "nothing may start");
+        assert!(!context.repo_dir().join("ran").exists());
+    }
+
+    #[tokio::test]
+    async fn execute_build_switches_into_the_build_subdirectory() {
+        let (_ws, context) = workspace();
+        let subdir = context.repo_dir().join("plugin");
+        std::fs::create_dir(&subdir).unwrap();
+        let builder = ScriptBuilder {
+            subdir: Some("plugin"),
+            setup: vec!["pwd -P > setup-dir"],
+            build: vec!["printf x > out.zip"],
+            artifacts: vec![artifact("out.zip")],
+            ..ScriptBuilder::default()
+        };
+        let mut runner = BuildRunner::new(context.clone());
+
+        let result = runner.execute_build(&builder, "1.0.0", &[]).await.unwrap();
+
+        // Commands, hooks, artifact resolution and the result all use the
+        // subdirectory — not the repo root.
+        let setup_dir = std::fs::read_to_string(subdir.join("setup-dir")).unwrap();
+        assert_eq!(PathBuf::from(setup_dir.trim()), canonical(&subdir));
+        assert!(
+            builder
+                .hook_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, dir)| *dir == subdir)
+        );
+        assert_eq!(result.artifacts[0].path, subdir.join("out.zip"));
+        assert_eq!(result.build_dir, subdir);
+        assert_eq!(runner.context().repo_dir(), subdir);
+    }
+
+    #[tokio::test]
+    async fn execute_build_fails_when_the_build_subdirectory_is_missing() {
+        let (_ws, context) = workspace();
+        let builder = ScriptBuilder {
+            subdir: Some("missing"),
+            setup: vec!["touch ran"],
+            ..ScriptBuilder::default()
+        };
+        let mut runner = BuildRunner::new(context.clone());
+
+        let message = build_error(runner.execute_build(&builder, "1.0.0", &[]).await);
+
+        assert!(message.starts_with("Build directory '"), "{message}");
+        assert!(message.contains("missing"), "{message}");
+        assert!(!context.repo_dir().join("ran").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failing_build_command_stops_the_pipeline() {
+        let (_ws, context) = workspace();
+        let recorder = Recorder::default();
+        let builder = ScriptBuilder {
+            build: vec!["exit 2", "touch after"],
+            artifacts: vec![artifact("out.zip")],
+            ..ScriptBuilder::default()
+        };
+        let mut runner = BuildRunner::with_reporter(context.clone(), &recorder);
+
+        let message = build_error(runner.execute_build(&builder, "1.0.0", &[]).await);
+
+        assert!(message.contains("exit code Some(2)"), "{message}");
+        assert!(!context.repo_dir().join("after").exists());
+        // Only the pre-build hook ran; nothing after the failed step did.
+        assert_eq!(builder.hooks_run(), ["pre"]);
+        assert!(
+            !recorder
+                .phases_started()
+                .contains(&BuildPhase::CollectArtifacts)
+        );
+        assert!(
+            !recorder
+                .events()
+                .iter()
+                .any(|e| matches!(e, BuildEvent::BuildSucceeded { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_artifact_fails_the_build_with_its_path() {
+        let (_ws, context) = workspace();
+        let builder = ScriptBuilder {
+            artifacts: vec![artifact("never-built.zip")],
+            ..ScriptBuilder::default()
+        };
+        let mut runner = BuildRunner::new(context.clone());
+
+        let message = build_error(runner.execute_build(&builder, "1.0.0", &[]).await);
+
+        let expected = context.repo_dir().join("never-built.zip");
+        assert!(
+            message.starts_with(&format!(
+                "Expected artifact not found: '{}'",
+                expected.display()
+            )),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absolute_artifact_path_is_used_as_is() {
+        // Builders such as WP Rocket package into the workspace, outside the
+        // repo; an absolute path must not be re-rooted under `repo_dir`.
+        let (ws, context) = workspace();
+        let outside = ws.path().join("staged.zip");
+        std::fs::write(&outside, b"abc").unwrap();
+        let builder = ScriptBuilder {
+            artifacts: vec![artifact(outside.to_string_lossy())],
+            ..ScriptBuilder::default()
+        };
+        let mut runner = BuildRunner::new(context);
+
+        let result = runner.execute_build(&builder, "1.0.0", &[]).await.unwrap();
+
+        assert_eq!(result.artifacts[0].path, outside);
+        assert_eq!(result.artifacts[0].size, 3);
+    }
+
+    #[tokio::test]
+    async fn variants_built_lists_every_variant_when_none_requested() {
+        let (_ws, context) = workspace();
+        let builder = ScriptBuilder {
+            variants: vec!["free", "pro"],
+            ..ScriptBuilder::default()
+        };
+        let mut runner = BuildRunner::new(context);
+
+        let all = runner.execute_build(&builder, "1.0.0", &[]).await.unwrap();
+        let some = runner
+            .execute_build(&builder, "1.0.0", &["pro"])
+            .await
+            .unwrap();
+
+        assert_eq!(all.variants_built, ["free", "pro"]);
+        assert_eq!(some.variants_built, ["pro"]);
+    }
+
+    #[tokio::test]
+    async fn a_lone_variant_counts_as_single_output() {
+        // `has_variants` needs more than one variant; a single one is treated
+        // as a variant-less build (empty `variants_built`).
+        let (_ws, context) = workspace();
+        let builder = ScriptBuilder {
+            variants: vec!["only"],
+            ..ScriptBuilder::default()
+        };
+        let mut runner = BuildRunner::new(context);
+
+        let result = runner.execute_build(&builder, "1.0.0", &[]).await.unwrap();
+
+        assert!(result.variants_built.is_empty());
+    }
+}

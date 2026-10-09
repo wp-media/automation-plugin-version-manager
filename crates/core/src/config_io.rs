@@ -786,4 +786,149 @@ mod tests {
         let unchanged = override_cache_dir(config, None);
         assert_eq!(unchanged.cache_dir, PathBuf::from("/from/config"));
     }
+
+    // =========================================================================
+    // Error paths: every loader distinguishes "absent" from "broken"
+    // =========================================================================
+
+    /// Unwrap an [`Error::Io`] message, failing on any other outcome.
+    fn io_message<T: std::fmt::Debug>(result: Result<T>) -> String {
+        match result {
+            Err(Error::Io(e)) => e.to_string(),
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
+    }
+
+    /// Unwrap an [`Error::Config`] message, failing on any other outcome.
+    fn config_message<T: std::fmt::Debug>(result: Result<T>) -> String {
+        match result {
+            Err(Error::Config(message)) => message,
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
+    }
+
+    /// A temp dir with an `invalid.json` holding malformed JSON.
+    fn invalid_json_file() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("invalid.json");
+        fs::write(&path, "{ not json").unwrap();
+        (temp, path)
+    }
+
+    #[test]
+    fn load_config_file_treats_a_blank_file_as_defaults() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, "  \n\t").unwrap();
+        let defaults = test_config(PathBuf::from("/default/cache"));
+
+        let config = load_config_file(&path, &defaults).unwrap();
+
+        assert_eq!(config.cache_dir, defaults.cache_dir);
+        assert!(config.github_token.is_none());
+    }
+
+    #[test]
+    fn load_config_file_rejects_invalid_json_with_a_fix_hint() {
+        let (_temp, path) = invalid_json_file();
+
+        let message = config_message(load_config_file(&path, &test_config(PathBuf::new())));
+
+        // Users must learn which file is broken and how to recover.
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("Delete the file to reset"), "{message}");
+    }
+
+    #[test]
+    fn load_config_file_raw_treats_a_blank_file_as_empty() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, "\n").unwrap();
+
+        assert!(load_config_file_raw(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_config_file_raw_rejects_invalid_json() {
+        let (_temp, path) = invalid_json_file();
+
+        let message = config_message(load_config_file_raw(&path));
+
+        assert!(message.contains("Invalid config file"), "{message}");
+    }
+
+    #[test]
+    fn load_config_rejects_a_blank_file() {
+        // The strict loader has no defaults to fall back on.
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, " ").unwrap();
+
+        let message = config_message(load_config(&path));
+
+        assert!(
+            message.ends_with("is empty. Delete it or add valid JSON."),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn unreadable_config_is_an_io_error_not_silent_defaults() {
+        // A directory where the file should be: present but unreadable, so it
+        // must NOT be mistaken for "missing" and replaced by defaults.
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let defaults = test_config(PathBuf::from("/default/cache"));
+
+        for message in [
+            io_message(load_config(&path)),
+            io_message(load_config_or_default(&path, defaults.clone())),
+            io_message(load_config_file(&path, &defaults)),
+            io_message(load_config_file_raw(&path)),
+        ] {
+            assert!(
+                message.starts_with("Failed to read config file"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_reports_an_uncreatable_config_directory() {
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let path = blocker.path().join("sub").join("config.json");
+
+        let message = io_message(save_config_file(&ConfigFile::default(), &path));
+
+        assert!(
+            message.starts_with("Failed to create config directory"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn save_reports_an_unwritable_config_path() {
+        // The target path is an existing directory, so the write itself fails.
+        let temp = TempDir::new().unwrap();
+
+        let message = io_message(save_config(&test_config(PathBuf::new()), temp.path()));
+
+        assert!(
+            message.starts_with("Failed to write config file"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn ensure_directories_reports_the_directory_it_could_not_create() {
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let bad = blocker.path().join("child");
+
+        let message = io_message(ensure_directories(std::slice::from_ref(&bad)));
+
+        assert!(
+            message.starts_with(&format!("Failed to create directory '{}'", bad.display())),
+            "{message}"
+        );
+    }
 }

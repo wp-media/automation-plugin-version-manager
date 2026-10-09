@@ -322,22 +322,32 @@ impl GitHubClient {
             .await;
 
         match result {
-            Ok(page) => {
-                let found = page
-                    .items
-                    .iter()
-                    .filter(|r| !r.draft)
-                    .filter(|r| !stable_only || !r.prerelease)
-                    .nth(index)
-                    .map(Self::convert_release);
-
-                Ok(found)
-            }
+            Ok(page) => Ok(Self::select_nth_release(&page.items, index, stable_only)),
             Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
                 Ok(None)
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Pick the `index`-th (zero-based) non-draft release from `releases`,
+    /// also skipping prereleases when `stable_only`, converted to our model.
+    ///
+    /// `releases` is expected newest first (GitHub's list order), so index 0
+    /// is the latest and index 1 the previous. Split from
+    /// [`get_nth_release`](Self::get_nth_release) so the selection rules are
+    /// testable without the network.
+    fn select_nth_release(
+        releases: &[octocrab::models::repos::Release],
+        index: usize,
+        stable_only: bool,
+    ) -> Option<Release> {
+        releases
+            .iter()
+            .filter(|r| !r.draft)
+            .filter(|r| !stable_only || !r.prerelease)
+            .nth(index)
+            .map(Self::convert_release)
     }
 
     /// Convert an octocrab `Release` model into our simplified `Release`.
@@ -479,4 +489,120 @@ pub async fn download_asset_owned(
         .to_vec();
 
     Ok((asset.name, bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An octocrab release as GitHub's REST API returns it (fields the model
+    /// treats as optional are omitted), with one asset.
+    fn api_release(id: u64, tag: &str, draft: bool, prerelease: bool) -> serde_json::Value {
+        serde_json::json!({
+            "url": format!("https://api.github.com/repos/o/r/releases/{id}"),
+            "html_url": format!("https://github.com/o/r/releases/tag/{tag}"),
+            "assets_url": format!("https://api.github.com/repos/o/r/releases/{id}/assets"),
+            "upload_url": "https://uploads.github.com/repos/o/r/releases/1/assets{?name,label}",
+            "id": id,
+            "node_id": "RE_x",
+            "tag_name": tag,
+            "target_commitish": "main",
+            "name": format!("Release {tag}"),
+            "draft": draft,
+            "prerelease": prerelease,
+            "assets": [{
+                "url": "https://api.github.com/repos/o/r/releases/assets/77",
+                "browser_download_url": format!("https://github.com/o/r/releases/download/{tag}/plugin.zip"),
+                "id": 77,
+                "node_id": "RA_x",
+                "name": "plugin.zip",
+                "state": "uploaded",
+                "content_type": "application/zip",
+                "size": 2048,
+                "download_count": 3,
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z"
+            }]
+        })
+    }
+
+    /// Deserialize [`api_release`] into octocrab's model.
+    fn release(
+        id: u64,
+        tag: &str,
+        draft: bool,
+        prerelease: bool,
+    ) -> octocrab::models::repos::Release {
+        serde_json::from_value(api_release(id, tag, draft, prerelease)).unwrap()
+    }
+
+    #[test]
+    fn convert_release_maps_every_field() {
+        let converted = GitHubClient::convert_release(&release(42, "v1.2.3", false, true));
+
+        assert_eq!(converted.id, 42);
+        assert_eq!(converted.tag_name, "v1.2.3");
+        assert_eq!(converted.name, "Release v1.2.3");
+        assert!(converted.prerelease);
+        assert!(!converted.draft);
+        assert_eq!(
+            converted.html_url.as_deref(),
+            Some("https://github.com/o/r/releases/tag/v1.2.3")
+        );
+        assert_eq!(converted.assets.len(), 1);
+        let asset = &converted.assets[0];
+        // The asset id drives the download URL, so it must survive conversion.
+        assert_eq!(asset.id, 77);
+        assert_eq!(asset.name, "plugin.zip");
+        assert_eq!(asset.size, 2048);
+        assert_eq!(asset.content_type, "application/zip");
+        assert_eq!(
+            asset.download_url,
+            "https://github.com/o/r/releases/download/v1.2.3/plugin.zip"
+        );
+    }
+
+    #[test]
+    fn convert_release_defaults_a_missing_name_to_empty() {
+        let mut json = api_release(1, "v1", false, false);
+        json["name"] = serde_json::Value::Null;
+        let release: octocrab::models::repos::Release = serde_json::from_value(json).unwrap();
+
+        assert_eq!(GitHubClient::convert_release(&release).name, "");
+    }
+
+    #[test]
+    fn select_nth_release_never_picks_drafts_and_honors_stable_only() {
+        // Newest first, as GitHub lists them.
+        let releases = [
+            release(5, "v3.0.0-draft", true, false),
+            release(4, "v3.0.0-rc1", false, true),
+            release(3, "v2.1.0", false, false),
+            release(2, "v2.1.0-beta", false, true),
+            release(1, "v2.0.0", false, false),
+        ];
+        let tag = |index, stable_only| {
+            GitHubClient::select_nth_release(&releases, index, stable_only).map(|r| r.tag_name)
+        };
+
+        // release:latest / release:previous-latest
+        assert_eq!(tag(0, false).as_deref(), Some("v3.0.0-rc1"));
+        assert_eq!(tag(1, false).as_deref(), Some("v2.1.0"));
+        // release:latest-stable / release:previous-stable
+        assert_eq!(tag(0, true).as_deref(), Some("v2.1.0"));
+        assert_eq!(tag(1, true).as_deref(), Some("v2.0.0"));
+        // Not enough matching releases.
+        assert_eq!(tag(2, true), None);
+        assert!(GitHubClient::select_nth_release(&[], 0, false).is_none());
+    }
+
+    #[tokio::test]
+    async fn token_is_kept_only_for_authenticated_clients() {
+        // Building an octocrab client needs a Tokio reactor but no network.
+        let authed = GitHubClient::new("ghp_secret").unwrap();
+        let anonymous = GitHubClient::anonymous().unwrap();
+
+        assert_eq!(authed.token().as_deref(), Some("ghp_secret"));
+        assert_eq!(anonymous.token(), None);
+    }
 }

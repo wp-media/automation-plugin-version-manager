@@ -1207,4 +1207,195 @@ mod tests {
         }
         assert_output_empty(out.path());
     }
+
+    // ---- Degraded paths: every failure falls back to building/downloading ----
+
+    const SHA: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    /// An output directory that can never be created (its parent is a file),
+    /// plus the guard keeping that file alive.
+    fn unpreparable_output_dir() -> (tempfile::NamedTempFile, PathBuf) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let dir = file.path().join("out");
+        (file, dir)
+    }
+
+    /// Delete the cached file of `variant` behind the store's back, as an
+    /// external cleanup or disk error would.
+    fn delete_cached_file(store: &ArtifactStore, variant: Option<&str>) {
+        let build = store
+            .find_by_commit("backwpup", "5.6.0", SHA)
+            .unwrap()
+            .expect("seeded build");
+        std::fs::remove_file(&build.artifact(variant).unwrap().path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fast_path_falls_back_to_a_build_when_the_output_dir_is_unusable() {
+        let (_base, store) = seed_store(&[(Some("free"), "free.zip")], "5.6.0", SHA);
+        let (_guard, out) = unpreparable_output_dir();
+
+        let hit = fast_path_lookup_and_copy(
+            store,
+            "backwpup".to_string(),
+            SHA.to_string(),
+            Some("5.6.0".to_string()),
+            vec![Some("free".to_string())],
+            out,
+            true,
+        )
+        .await;
+
+        assert!(hit.is_none(), "a copy failure must mean rebuild, not error");
+    }
+
+    #[tokio::test]
+    async fn fast_path_misses_when_a_cached_file_vanished() {
+        let (_base, store) = seed_store(&[(Some("free"), "free.zip")], "5.6.0", SHA);
+        delete_cached_file(&store, Some("free"));
+        let out = tempfile::tempdir().unwrap();
+
+        let hit = fast_path_lookup_and_copy(
+            store,
+            "backwpup".to_string(),
+            SHA.to_string(),
+            Some("5.6.0".to_string()),
+            vec![Some("free".to_string())],
+            out.path().to_path_buf(),
+            true,
+        )
+        .await;
+
+        assert!(hit.is_none());
+    }
+
+    #[tokio::test]
+    async fn reuse_builds_everything_when_the_output_dir_is_unusable() {
+        let (_base, store) = seed_store(&[(Some("free"), "free.zip")], "5.6.0", SHA);
+        let (_guard, out) = unpreparable_output_dir();
+        let keys = vec![Some("free".to_string()), Some("pro-en".to_string())];
+
+        let outcome = reuse_and_copy(
+            store,
+            "backwpup".to_string(),
+            "5.6.0".to_string(),
+            SHA.to_string(),
+            keys.clone(),
+            out,
+            true,
+        )
+        .await;
+
+        assert!(outcome.reused.is_empty());
+        assert_eq!(outcome.to_build, keys);
+    }
+
+    #[tokio::test]
+    async fn reuse_rebuilds_every_variant_of_a_damaged_build() {
+        // The store only serves healthy builds, so one vanished file makes the
+        // whole build a miss: every variant is rebuilt and none is silently
+        // dropped from the output.
+        let (_base, store) = seed_store(
+            &[(Some("free"), "free.zip"), (Some("pro-en"), "pro-en.zip")],
+            "5.6.0",
+            SHA,
+        );
+        delete_cached_file(&store, Some("free"));
+        let out = tempfile::tempdir().unwrap();
+        let keys = vec![Some("free".to_string()), Some("pro-en".to_string())];
+
+        let outcome = reuse_and_copy(
+            store,
+            "backwpup".to_string(),
+            "5.6.0".to_string(),
+            SHA.to_string(),
+            keys.clone(),
+            out.path().to_path_buf(),
+            true,
+        )
+        .await;
+
+        assert!(outcome.reused.is_empty());
+        assert_eq!(outcome.to_build, keys);
+        assert!(!out.path().join("pro-en.zip").exists());
+    }
+
+    #[tokio::test]
+    async fn release_reuse_downloads_everything_when_the_output_dir_is_unusable() {
+        let (_base, store) = seed_release("backwpup", "v5.6.8", &[FREE]);
+        let (_guard, out) = unpreparable_output_dir();
+        let requested = vec![FREE.to_string()];
+
+        let outcome = reuse_release_assets(
+            store,
+            "backwpup".to_string(),
+            "v5.6.8".to_string(),
+            requested.clone(),
+            out,
+            true,
+        )
+        .await;
+
+        assert!(outcome.cached.is_empty());
+        assert_eq!(outcome.to_download, requested);
+    }
+
+    #[tokio::test]
+    async fn release_reuse_redownloads_an_asset_whose_cached_file_vanished() {
+        let (_base, store) = seed_release("backwpup", "v5.6.8", &[FREE]);
+        let release = store.find_release("backwpup", "v5.6.8").unwrap().unwrap();
+        std::fs::remove_file(&release.assets[0].path).unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let outcome = reuse_release_assets(
+            store,
+            "backwpup".to_string(),
+            "v5.6.8".to_string(),
+            vec![FREE.to_string()],
+            out.path().to_path_buf(),
+            true,
+        )
+        .await;
+
+        assert!(outcome.cached.is_empty());
+        assert_eq!(outcome.to_download, [FREE.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn storing_nothing_is_a_silent_no_op() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = Arc::new(ArtifactStore::open(cache.path()).unwrap());
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        let reporter = crate::ClosureReporter::new(|event| {
+            if matches!(event, BuildEvent::Warning(_)) {
+                warned.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let metadata = BuildMetadata::new(
+            "test",
+            "1.0.0",
+            BuildSource::PullRequest(1),
+            SHA,
+            "main".to_string(),
+        );
+
+        let build = store_build(Arc::clone(&store), metadata, vec![], &reporter).await;
+        let release = store_release(
+            Arc::clone(&store),
+            ReleaseMetadata::new("test", "v1.0.0"),
+            vec![],
+            &reporter,
+        )
+        .await;
+
+        assert!(build.is_none() && release.is_none());
+        assert!(!warned.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            store
+                .find_by_commit("test", "1.0.0", SHA)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.find_release("test", "v1.0.0").unwrap().is_none());
+    }
 }
