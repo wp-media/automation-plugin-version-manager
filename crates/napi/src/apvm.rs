@@ -273,19 +273,24 @@ impl Apvm {
     ///   await apvm.cache().repair();
     /// }
     /// ```
-    #[napi]
-    pub async fn cache_status(&self) -> napi::Result<JsCacheStatus> {
+    #[napi(ts_return_type = "Promise<JsCacheStatus>")]
+    pub fn cache_status<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, JsCacheStatus>> {
         let apvm = Arc::clone(&self.inner);
-        // A SQLite open, which may wait for a running repair: blocking.
-        let status = tokio::task::spawn_blocking(move || apvm.cache_status())
-            .await
-            .map_err(|join| {
-                napi::Error::new(
-                    napi::Status::GenericFailure,
-                    format!("the cache check did not complete: {join}"),
-                )
-            })?;
-        Ok(JsCacheStatus::from(&status))
+        env.spawn_future(async move {
+            // A SQLite open, which may wait for a running repair: blocking.
+            let status = tokio::task::spawn_blocking(move || apvm.cache_status())
+                .await
+                .map_err(|join| {
+                    napi::Error::new(
+                        napi::Status::GenericFailure,
+                        format!("the cache check did not complete: {join}"),
+                    )
+                })?;
+            Ok(JsCacheStatus::from(&status))
+        })
     }
 
     /// List all registered project names.
@@ -368,38 +373,22 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "options: BuildOptions, onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+        ts_args_type = "options: BuildOptions, onProgress?: (err: Error | null, event: JsBuildEvent) => void",
+        ts_return_type = "Promise<JsBuildOutput>"
     )]
-    pub async fn build(
+    pub fn build<'env>(
         &self,
+        env: &'env Env,
         options: BuildOptions,
         on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
-    ) -> napi::Result<JsBuildOutput> {
-        let apvm = Arc::clone(&self.inner);
-
+    ) -> napi::Result<PromiseRaw<'env, JsBuildOutput>> {
         // Assemble the core build request, including per-call cache overrides.
         let request =
             apvm_core::BuildRequest::new(options.project, options.git_ref, options.output_dir)
                 .version(options.version)
                 .variants(options.variants.unwrap_or_default())
                 .no_cache(options.no_cache.unwrap_or(false));
-
-        let output = match on_progress {
-            Some(callback) => {
-                let reporter = JsProgressReporter::new(callback);
-                apvm.build(request, &reporter)
-                    .await
-                    .map_err(core_error_to_napi)?
-            }
-            None => {
-                let reporter = apvm_core::NullReporter;
-                apvm.build(request, &reporter)
-                    .await
-                    .map_err(core_error_to_napi)?
-            }
-        };
-
-        Ok(JsBuildOutput::from(output))
+        env.spawn_future(run_build(Arc::clone(&self.inner), request, on_progress))
     }
 
     /// Warm the artifact cache for a project without producing any output.
@@ -448,38 +437,22 @@ impl Apvm {
     /// console.log(output.fromCache); // true
     /// ```
     #[napi(
-        ts_args_type = "options: WarmOptions, onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+        ts_args_type = "options: WarmOptions, onProgress?: (err: Error | null, event: JsBuildEvent) => void",
+        ts_return_type = "Promise<JsBuildOutput>"
     )]
-    pub async fn warm_cache(
+    pub fn warm_cache<'env>(
         &self,
+        env: &'env Env,
         options: WarmOptions,
         on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
-    ) -> napi::Result<JsBuildOutput> {
-        let apvm = Arc::clone(&self.inner);
-
+    ) -> napi::Result<PromiseRaw<'env, JsBuildOutput>> {
         // Assemble the core warm request. There is intentionally no output
         // directory and no cache-bypass knob here — warming always delivers
         // nothing and consults + populates the cache.
         let request = apvm_core::WarmRequest::new(options.project, options.git_ref)
             .version(options.version)
             .variants(options.variants.unwrap_or_default());
-
-        let output = match on_progress {
-            Some(callback) => {
-                let reporter = JsProgressReporter::new(callback);
-                apvm.warm_cache(request, &reporter)
-                    .await
-                    .map_err(core_error_to_napi)?
-            }
-            None => {
-                let reporter = apvm_core::NullReporter;
-                apvm.warm_cache(request, &reporter)
-                    .await
-                    .map_err(core_error_to_napi)?
-            }
-        };
-
-        Ok(JsBuildOutput::from(output))
+        env.spawn_future(run_warm(Arc::clone(&self.inner), request, on_progress))
     }
 
     /// Build a project from a pull request number.
@@ -508,18 +481,23 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, prNumber: number, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+        ts_args_type = "project: string, prNumber: number, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void",
+        ts_return_type = "Promise<JsBuildOutput>"
     )]
-    pub async fn build_from_pr(
+    // The arguments mirror the published JS signature; napi adds `self`/`env`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_from_pr<'env>(
         &self,
+        env: &'env Env,
         project: String,
         pr_number: u32,
         output_dir: String,
         version: Option<String>,
         variants: Option<Vec<String>>,
         on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
-    ) -> napi::Result<JsBuildOutput> {
+    ) -> napi::Result<PromiseRaw<'env, JsBuildOutput>> {
         self.build(
+            env,
             BuildOptions {
                 project,
                 git_ref: format!("pr:{pr_number}"),
@@ -530,7 +508,6 @@ impl Apvm {
             },
             on_progress,
         )
-        .await
     }
 
     /// Build a project from a branch name.
@@ -554,18 +531,23 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, branch: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+        ts_args_type = "project: string, branch: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void",
+        ts_return_type = "Promise<JsBuildOutput>"
     )]
-    pub async fn build_from_branch(
+    // The arguments mirror the published JS signature; napi adds `self`/`env`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_from_branch<'env>(
         &self,
+        env: &'env Env,
         project: String,
         branch: String,
         output_dir: String,
         version: Option<String>,
         variants: Option<Vec<String>>,
         on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
-    ) -> napi::Result<JsBuildOutput> {
+    ) -> napi::Result<PromiseRaw<'env, JsBuildOutput>> {
         self.build(
+            env,
             BuildOptions {
                 project,
                 git_ref: format!("branch:{branch}"),
@@ -576,7 +558,6 @@ impl Apvm {
             },
             on_progress,
         )
-        .await
     }
 
     /// Build a project from a tag.
@@ -600,18 +581,23 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, tag: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+        ts_args_type = "project: string, tag: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void",
+        ts_return_type = "Promise<JsBuildOutput>"
     )]
-    pub async fn build_from_tag(
+    // The arguments mirror the published JS signature; napi adds `self`/`env`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_from_tag<'env>(
         &self,
+        env: &'env Env,
         project: String,
         tag: String,
         output_dir: String,
         version: Option<String>,
         variants: Option<Vec<String>>,
         on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
-    ) -> napi::Result<JsBuildOutput> {
+    ) -> napi::Result<PromiseRaw<'env, JsBuildOutput>> {
         self.build(
+            env,
             BuildOptions {
                 project,
                 git_ref: format!("tag:{tag}"),
@@ -622,7 +608,6 @@ impl Apvm {
             },
             on_progress,
         )
-        .await
     }
 
     /// Build a project from a specific commit SHA.
@@ -646,18 +631,23 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, commit: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+        ts_args_type = "project: string, commit: string, outputDir: string, version?: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void",
+        ts_return_type = "Promise<JsBuildOutput>"
     )]
-    pub async fn build_from_commit(
+    // The arguments mirror the published JS signature; napi adds `self`/`env`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_from_commit<'env>(
         &self,
+        env: &'env Env,
         project: String,
         commit: String,
         output_dir: String,
         version: Option<String>,
         variants: Option<Vec<String>>,
         on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
-    ) -> napi::Result<JsBuildOutput> {
+    ) -> napi::Result<PromiseRaw<'env, JsBuildOutput>> {
         self.build(
+            env,
             BuildOptions {
                 project,
                 git_ref: format!("commit:{commit}"),
@@ -668,7 +658,6 @@ impl Apvm {
             },
             on_progress,
         )
-        .await
     }
 
     /// Download pre-built assets from a specific GitHub Release.
@@ -709,17 +698,20 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, tag: string, outputDir: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+        ts_args_type = "project: string, tag: string, outputDir: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void",
+        ts_return_type = "Promise<JsBuildOutput>"
     )]
-    pub async fn download_release(
+    pub fn download_release<'env>(
         &self,
+        env: &'env Env,
         project: String,
         tag: String,
         output_dir: String,
         variants: Option<Vec<String>>,
         on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
-    ) -> napi::Result<JsBuildOutput> {
+    ) -> napi::Result<PromiseRaw<'env, JsBuildOutput>> {
         self.build(
+            env,
             BuildOptions {
                 project,
                 git_ref: format!("release:{tag}"),
@@ -730,7 +722,6 @@ impl Apvm {
             },
             on_progress,
         )
-        .await
     }
 
     /// Download pre-built assets using a release selector keyword.
@@ -778,18 +769,21 @@ impl Apvm {
     /// );
     /// ```
     #[napi(
-        ts_args_type = "project: string, selector: JsReleaseSelector, outputDir: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void"
+        ts_args_type = "project: string, selector: JsReleaseSelector, outputDir: string, variants?: string[], onProgress?: (err: Error | null, event: JsBuildEvent) => void",
+        ts_return_type = "Promise<JsBuildOutput>"
     )]
-    pub async fn download_release_by_selector(
+    pub fn download_release_by_selector<'env>(
         &self,
+        env: &'env Env,
         project: String,
         selector: JsReleaseSelector,
         output_dir: String,
         variants: Option<Vec<String>>,
         on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
-    ) -> napi::Result<JsBuildOutput> {
+    ) -> napi::Result<PromiseRaw<'env, JsBuildOutput>> {
         let keyword = release_keyword(&selector);
         self.build(
+            env,
             BuildOptions {
                 project,
                 git_ref: format!("release:{keyword}"),
@@ -800,8 +794,67 @@ impl Apvm {
             },
             on_progress,
         )
-        .await
     }
+}
+
+/// Run a build to completion, reporting progress to `on_progress` if given.
+///
+/// A free function over a cloned `Arc`, not an `async fn(&self)` method: a
+/// napi async method keeps a native borrow of the JS object until its future
+/// ends, and when a worker thread's env is torn down first, napi-rs releases
+/// that borrow off the JS thread and aborts the whole process (or it crashes
+/// outright). Spawning this future from a synchronous method borrows nothing
+/// past the call.
+///
+/// # Arguments
+///
+/// * `apvm` - The core instance
+/// * `request` - What to build
+/// * `on_progress` - Optional JS progress callback
+///
+/// # Errors
+///
+/// The core error, converted for JS ([`core_error_to_napi`]).
+async fn run_build(
+    apvm: Arc<apvm_core::Apvm>,
+    request: apvm_core::BuildRequest,
+    on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
+) -> napi::Result<JsBuildOutput> {
+    let output = match on_progress {
+        Some(callback) => {
+            apvm.build(request, &JsProgressReporter::new(callback))
+                .await
+        }
+        None => apvm.build(request, &apvm_core::NullReporter).await,
+    };
+    output.map(JsBuildOutput::from).map_err(core_error_to_napi)
+}
+
+/// Warm the cache to completion, reporting progress to `on_progress` if
+/// given. A free function for the same reason as [`run_build`].
+///
+/// # Arguments
+///
+/// * `apvm` - The core instance
+/// * `request` - What to warm
+/// * `on_progress` - Optional JS progress callback
+///
+/// # Errors
+///
+/// The core error, converted for JS ([`core_error_to_napi`]).
+async fn run_warm(
+    apvm: Arc<apvm_core::Apvm>,
+    request: apvm_core::WarmRequest,
+    on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
+) -> napi::Result<JsBuildOutput> {
+    let output = match on_progress {
+        Some(callback) => {
+            apvm.warm_cache(request, &JsProgressReporter::new(callback))
+                .await
+        }
+        None => apvm.warm_cache(request, &apvm_core::NullReporter).await,
+    };
+    output.map(JsBuildOutput::from).map_err(core_error_to_napi)
 }
 
 /// The `release:` keyword the core resolves for `selector` (see the core's

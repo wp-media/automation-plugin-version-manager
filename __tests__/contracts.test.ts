@@ -285,6 +285,90 @@ describe('progress callback', () => {
 });
 
 // =============================================================================
+// Worker threads
+// =============================================================================
+
+describe('a worker thread that exits while calls are in flight', () => {
+  // An `async fn(&self)` napi method keeps a native borrow of the JS object
+  // while its future runs. When the worker's env was torn down first, napi-rs
+  // released it on a Tokio thread and called process::abort() — or the process
+  // died with SIGSEGV/SIGBUS. Each case starts calls that are still pending
+  // when the worker exits (synchronously, right after starting them); the
+  // whole process must survive. One child process per case, so a failure
+  // names the method. A single round can miss the race (calls that fail fast
+  // may settle before the teardown), hence several rounds per case and each
+  // method in both setups below.
+  const methods = [
+    'build',
+    'warmCache',
+    'buildFromPr',
+    'buildFromBranch',
+    'buildFromTag',
+    'buildFromCommit',
+    'downloadRelease',
+    'downloadReleaseBySelector',
+    'cacheStatus',
+    'cacheInfo',
+  ] as const;
+  // `mainLoads`: the main thread loads the addon too (the usual setup), so
+  // the Tokio runtime outlives the worker and pending calls settle after its
+  // env is gone — a separate crash path.
+  const cases = methods.flatMap((method) => [
+    { method, mainLoads: false },
+    { method, mainLoads: true },
+  ]);
+
+  it.each(cases)('$method (main thread loads the addon: $mainLoads)', ({ method, mainLoads }) => {
+    const child = runStrictNode(`
+      const { Worker } = require('node:worker_threads');
+      if (${mainLoads}) require(ADDON);
+      const workerSource = \`
+        const { parentPort, workerData } = require('node:worker_threads');
+        const { Apvm, JsReleaseSelector } = require(workerData.addon);
+        const out = '/nonexistent/apvm-worker-test';
+        // Every other call also streams progress to a callback.
+        const calls = {
+          build: (a, p) => a.build({ project: 'nope', gitRef: 'pr:1', outputDir: out }, p),
+          warmCache: (a, p) => a.warmCache({ project: 'wp-rocket', gitRef: 'release:v1.0.0' }, p),
+          buildFromPr: (a, p) => a.buildFromPr('nope', 1, out, undefined, undefined, p),
+          buildFromBranch: (a, p) => a.buildFromBranch('nope', 'main', out, undefined, undefined, p),
+          buildFromTag: (a, p) => a.buildFromTag('nope', 'v1', out, undefined, undefined, p),
+          buildFromCommit: (a, p) => a.buildFromCommit('nope', 'abc1234', out, undefined, undefined, p),
+          downloadRelease: (a, p) => a.downloadRelease('nope', 'v1', out, undefined, p),
+          downloadReleaseBySelector: (a, p) =>
+            a.downloadReleaseBySelector('nope', JsReleaseSelector.LatestStable, out, undefined, p),
+          cacheStatus: (a) => a.cacheStatus(),
+          cacheInfo: (a) => a.cache().info(),
+        };
+        (async () => {
+          const apvm = await Apvm.create({ cacheEnabled: false });
+          for (let i = 0; i < 30; i += 1) {
+            calls[workerData.method](apvm, i % 2 === 0 ? undefined : () => {}).catch(() => {});
+          }
+          parentPort.postMessage('started');
+          process.exit(0);
+        })();
+      \`;
+      (async () => {
+        for (let round = 0; round < 8; round += 1) {
+          const worker = new Worker(workerSource, {
+            eval: true,
+            workerData: { addon: ADDON, method: ${JSON.stringify(method)} },
+          });
+          await new Promise((resolve) => worker.once('message', resolve).once('exit', resolve));
+          await worker.terminate();
+        }
+        // Let calls that outlived their worker settle in this process.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        console.log(JSON.stringify({ survived: true }));
+      })();
+    `);
+    expect(exitOf(child)).toStrictEqual(CLEAN_EXIT);
+    expect(JSON.parse(String(child.stdout))).toStrictEqual({ survived: true });
+  });
+});
+
+// =============================================================================
 // Instances with caching off
 // =============================================================================
 
