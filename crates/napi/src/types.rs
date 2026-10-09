@@ -28,8 +28,8 @@ use napi_derive::napi;
 /// Each build goes through these phases in order. Use this to track
 /// overall build progress in your UI.
 ///
-/// Members are not enumerable (napi-rs): read them by name —
-/// `Object.values()` returns `[]`.
+/// Members are plain enumerable properties, like a compiled TypeScript
+/// enum: `Object.values()` lists every value in declaration order.
 ///
 /// # TypeScript
 ///
@@ -95,8 +95,8 @@ impl From<apvm_core::BuildPhase> for JsBuildPhase {
 ///
 /// Used in `CommandOutput` events to distinguish between stdout and stderr.
 ///
-/// Members are not enumerable (napi-rs): read them by name —
-/// `Object.values()` returns `[]`.
+/// Members are plain enumerable properties, like a compiled TypeScript
+/// enum: `Object.values()` lists every value in declaration order.
 #[napi(string_enum)]
 pub enum JsOutputStream {
     /// Standard output.
@@ -124,8 +124,8 @@ impl From<apvm_core::build::progress::OutputStream> for JsOutputStream {
 /// the latest or previous release without knowing the exact tag.
 /// Drafts are always excluded.
 ///
-/// Members are not enumerable (napi-rs): read them by name —
-/// `Object.values()` returns `[]`.
+/// Members are plain enumerable properties, like a compiled TypeScript
+/// enum: `Object.values()` lists every value in declaration order.
 ///
 /// | Variant          | Resolves to                                                |
 /// |------------------|------------------------------------------------------------|

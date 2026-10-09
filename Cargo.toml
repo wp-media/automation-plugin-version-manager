@@ -109,7 +109,10 @@ apvm-storage = { path = "crates/storage" }
 # N-API bindings
 # https://docs.rs/napi/3 — SemVer stable since 3.0
 napi = { version = "3", default-features = false, features = ["async", "napi8"] }
-napi-derive = "3"
+# Floor = the tested version. From 3.6.11 it requires napi-derive-backend
+# 6.1.5+, whose enum members are enumerable like a compiled TS enum;
+# `__tests__/enums.test.ts` and the enum docs rely on it.
+napi-derive = "3.6.12"
 napi-build = "2"
 
 [profile.release]

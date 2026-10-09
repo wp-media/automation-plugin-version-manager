@@ -47,11 +47,23 @@ describe('string enums', () => {
     }
   });
 
-  it.each(ENUMS)('%s members are not enumerable (napi-rs limitation: never iterate)', (_, runtime) => {
-    // napi-rs defines enum members with default (non-enumerable) attributes, so
-    // `Object.values()` type-checks yet yields nothing. Read members by name.
-    expect(Object.keys(runtime)).toEqual([]);
-    expect(Object.values(runtime)).toEqual([]);
+  it.each(ENUMS)('%s iterates exactly its members, in declaration order', (_, runtime, expected) => {
+    // Since napi-derive-backend 6.1.5 members are enumerable data properties,
+    // like a compiled TypeScript enum (earlier versions hid them). Exact
+    // entries also prove there are no extra or missing keys.
+    expect(Object.entries(runtime)).toEqual(Object.entries(expected));
+  });
+
+  it.each(ENUMS)('%s members are plain data properties, like a compiled TypeScript enum', (_, runtime, expected) => {
+    // tsc emits `E["A"] = "A"`: writable, enumerable, configurable. The docs
+    // promise that shape, so pin every attribute, not just enumerability.
+    const plain = Object.fromEntries(
+      Object.entries(expected).map(([member, value]) => [
+        member,
+        { value, writable: true, enumerable: true, configurable: true },
+      ]),
+    );
+    expect(Object.getOwnPropertyDescriptors(runtime)).toStrictEqual(plain);
   });
 
   it('members are usable as typed values under isolatedModules', () => {

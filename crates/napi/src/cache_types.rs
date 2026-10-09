@@ -23,8 +23,8 @@ use napi_derive::napi;
 /// Which record kinds `clean()` removes — pass a member, e.g.
 /// `JsCleanTarget.Builds`.
 ///
-/// Members are not enumerable (napi-rs): read them by name —
-/// `Object.values()` returns `[]`.
+/// Members are plain enumerable properties, like a compiled TypeScript
+/// enum: `Object.values()` lists every value in declaration order.
 #[napi(string_enum)]
 #[derive(Debug)]
 #[allow(

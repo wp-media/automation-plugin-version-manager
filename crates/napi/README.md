@@ -420,7 +420,7 @@ interface JsProducedArtifact {
 
 String enum for selecting which GitHub Release to download. Used with [`downloadReleaseBySelector()`](#apvmdownloadreleaseselectorproject-selector-outputdir-variants-onprogress-promisejsbuildoutput).
 
-> All string enums (`JsBuildPhase`, `JsCleanTarget`, `JsOutputStream`, `JsReleaseSelector`) are runtime enums, so members such as `JsReleaseSelector.Latest` work under TypeScript's `isolatedModules`. Their members are not enumerable — `Object.values(JsReleaseSelector)` returns `[]` — so read them by name; never iterate.
+> All string enums (`JsBuildPhase`, `JsCleanTarget`, `JsOutputStream`, `JsReleaseSelector`) are runtime enums, so members such as `JsReleaseSelector.Latest` work under TypeScript's `isolatedModules`. Their members are plain enumerable properties, like a compiled TypeScript enum, so `Object.values(JsReleaseSelector)` lists every value in declaration order.
 
 ```ts
 export declare enum JsReleaseSelector {
