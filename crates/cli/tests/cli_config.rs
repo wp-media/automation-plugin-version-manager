@@ -243,3 +243,35 @@ fn corrupt_config_file_is_reported_not_overwritten() {
         "a config that cannot be parsed must be left for the user to fix"
     );
 }
+
+#[test]
+fn show_aligns_values_in_one_column() {
+    // Regression: the key column's `{:<14}` padding was ignored, so values
+    // started wherever each key name ended.
+    let sandbox = Sandbox::new();
+    assert_exit(&sandbox.run(&["config", "set", "cache", "false"]), 0);
+    let out = sandbox.run(&["config"]);
+    assert_exit(&out, 0);
+    let text = stdout(&out);
+
+    let rows: Vec<&str> = text
+        .lines()
+        .filter(|l| l.ends_with("(default)") || l.ends_with("(from config file)"))
+        .collect();
+    assert_eq!(rows.len(), 3, "{text}");
+    for row in &rows {
+        // "  " indent + 14-wide key column + 1 space: every value starts at
+        // byte 17 (0-based).
+        assert_eq!(&row[..2], "  ", "{row:?}");
+        assert_eq!(&row[15..17], "  ", "key column not padded: {row:?}");
+        assert_ne!(row.as_bytes()[17], b' ', "value not at byte 17: {row:?}");
+    }
+    assert!(
+        text.contains("  cache          false (from config file)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  token          (not set) (default)\n"),
+        "{text}"
+    );
+}

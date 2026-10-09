@@ -33,6 +33,8 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use apvm_config::{Config, ConfigFile};
+use serde::de::DeserializeOwned;
+use serde_json::error::Category;
 
 use crate::error::{Error, Result};
 
@@ -118,14 +120,7 @@ pub fn load_config_file<P: AsRef<Path>>(path: P, defaults: &Config) -> Result<Co
                 return Ok(defaults.clone());
             }
 
-            let config_file: ConfigFile = serde_json::from_str(&content).map_err(|e| {
-                Error::Config(format!(
-                    "Invalid config file '{}': {}. \
-                     Delete the file to reset to defaults, or fix the JSON syntax.",
-                    path.display(),
-                    e
-                ))
-            })?;
+            let config_file: ConfigFile = parse_config(path, &content)?;
 
             tracing::debug!("Loaded config file from {:?}", path);
             Ok(config_file.merge(defaults))
@@ -236,14 +231,7 @@ pub fn load_config_file_raw<P: AsRef<Path>>(path: P) -> Result<ConfigFile> {
                 return Ok(ConfigFile::default());
             }
 
-            serde_json::from_str(&content).map_err(|e| {
-                Error::Config(format!(
-                    "Invalid config file '{}': {}. \
-                     Delete the file to reset to defaults, or fix the JSON syntax.",
-                    path.display(),
-                    e
-                ))
-            })
+            parse_config(path, &content)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(ConfigFile::default()),
         Err(e) => Err(Error::Io(io::Error::new(
@@ -273,6 +261,39 @@ pub fn save_config_file<P: AsRef<Path>>(config_file: &ConfigFile, path: P) -> Re
     Ok(config_path)
 }
 
+/// Parse config-file JSON, mapping a failure to an actionable
+/// [`Error::Config`] that names the file.
+///
+/// The hint follows serde's error category: malformed JSON (syntax, or a
+/// truncated document) asks to fix the syntax, while well-formed JSON with a
+/// bad setting — a wrong type (`"cache_enabled": "yes"`), a missing or a
+/// duplicated key, all named by serde's message — asks to fix that setting.
+///
+/// # Arguments
+///
+/// * `path` - The file the JSON was read from (named in the message)
+/// * `content` - The file's contents
+///
+/// # Returns
+///
+/// The parsed value.
+///
+/// # Errors
+///
+/// [`Error::Config`] naming the file, serde's reason and the hint.
+fn parse_config<T: DeserializeOwned>(path: &Path, content: &str) -> Result<T> {
+    serde_json::from_str(content).map_err(|e| {
+        let fix = match e.classify() {
+            Category::Data => "that setting",
+            Category::Syntax | Category::Eof | Category::Io => "the JSON syntax",
+        };
+        Error::Config(format!(
+            "Invalid config file '{}': {e}. Delete the file to reset to defaults, or fix {fix}.",
+            path.display()
+        ))
+    })
+}
+
 /// Load configuration from a specific path.
 ///
 /// Internal implementation that handles all edge cases.
@@ -287,14 +308,7 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
                 )));
             }
 
-            serde_json::from_str(&content).map_err(|e| {
-                Error::Config(format!(
-                    "Invalid config file '{}': {}. \
-                     Delete the file to reset to defaults, or fix the JSON syntax.",
-                    path.display(),
-                    e
-                ))
-            })
+            parse_config(path, &content)
         }
         Err(e) => {
             // File doesn't exist or I/O error
@@ -317,14 +331,7 @@ fn load_config_from_path_with_default(path: &Path, default_config: Config) -> Re
                 return Ok(default_config);
             }
 
-            serde_json::from_str(&content).map_err(|e| {
-                Error::Config(format!(
-                    "Invalid config file '{}': {}. \
-                     Delete the file to reset to defaults, or fix the JSON syntax.",
-                    path.display(),
-                    e
-                ))
-            })
+            parse_config(path, &content)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             // File doesn't exist = use defaults (not an error)
@@ -855,6 +862,73 @@ mod tests {
         let message = config_message(load_config_file_raw(&path));
 
         assert!(message.contains("Invalid config file"), "{message}");
+    }
+
+    #[test]
+    fn invalid_values_get_a_value_hint_not_a_syntax_hint() {
+        // Well-formed JSON with a wrong value type: telling the user to "fix
+        // the JSON syntax" sends them looking for a problem that isn't there.
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, r#"{"cache_enabled": "yes"}"#).unwrap();
+        let defaults = test_config(PathBuf::from("/default/cache"));
+
+        for message in [
+            config_message(load_config_file(&path, &defaults)),
+            config_message(load_config_file_raw(&path)),
+            config_message(load_config_or_default(&path, defaults.clone())),
+        ] {
+            assert!(message.contains("invalid type"), "{message}");
+            assert!(message.ends_with("or fix that setting."), "{message}");
+            assert!(!message.contains("syntax"), "{message}");
+        }
+    }
+
+    #[test]
+    fn missing_or_duplicate_settings_get_the_setting_hint() {
+        // Well-formed JSON again: the problem is a setting, which serde's
+        // message names ("missing field", "duplicate field").
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        let defaults = test_config(PathBuf::from("/default/cache"));
+
+        fs::write(&path, "{}").unwrap();
+        let message = config_message(load_config(&path));
+        assert!(message.contains("missing field `cache_dir`"), "{message}");
+        assert!(message.ends_with("or fix that setting."), "{message}");
+
+        fs::write(&path, r#"{"cache_dir": "/a", "cache_dir": "/b"}"#).unwrap();
+        let message = config_message(load_config_file(&path, &defaults));
+        assert!(message.contains("duplicate field `cache_dir`"), "{message}");
+        assert!(message.ends_with("or fix that setting."), "{message}");
+    }
+
+    #[test]
+    fn malformed_json_gets_a_syntax_hint() {
+        let (_temp, path) = invalid_json_file();
+        let defaults = test_config(PathBuf::from("/default/cache"));
+
+        for message in [
+            config_message(load_config(&path)),
+            config_message(load_config_file(&path, &defaults)),
+            config_message(load_config_file_raw(&path)),
+            config_message(load_config_or_default(&path, defaults.clone())),
+        ] {
+            assert!(message.ends_with("or fix the JSON syntax."), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_file_holding_both_cache_dir_keys_loads() {
+        // Regression: a leftover legacy `builds_dir` next to `cache_dir` used
+        // to fail as a "duplicate field" with a misleading syntax hint.
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, r#"{"builds_dir": "/old", "cache_dir": "/new"}"#).unwrap();
+
+        let config = load_config_file(&path, &test_config(PathBuf::from("/default"))).unwrap();
+
+        assert_eq!(config.cache_dir, PathBuf::from("/new"));
     }
 
     #[test]

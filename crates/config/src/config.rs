@@ -22,7 +22,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Default value for [`Config::cache_enabled`]: caching is on unless the
 /// consumer opts out. Used both by [`Config::new`] and by serde when a config
@@ -51,6 +51,7 @@ fn default_cache_enabled() -> bool {
 /// assert!(config.cache_enabled);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawConfig")]
 pub struct Config {
     /// GitHub Personal Access Token for API requests.
     ///
@@ -58,7 +59,7 @@ pub struct Config {
     /// - Private repositories
     /// - Higher rate limits (5000 vs 60 requests/hour)
     /// - Accessing draft PRs
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub github_token: Option<String>,
 
     /// Base directory of the artifact cache (the `apvm-storage` store).
@@ -67,20 +68,94 @@ pub struct Config {
     /// distinct from a build's per-invocation output directory. There is no
     /// default here — the consumer supplies one.
     ///
-    /// `alias = "builds_dir"` reads config written by versions prior to the
-    /// artifact cache (≤ v2.0.1), where this field held the plain build
-    /// output directory under the same on-disk key. Always serializes back
-    /// out as `cache_dir`, so the file self-migrates on the next save.
-    #[serde(alias = "builds_dir")]
+    /// Also read from the legacy `builds_dir` key (see `RawConfig`); always
+    /// serialized as `cache_dir`, so the file self-migrates on the next save.
     pub cache_dir: PathBuf,
 
     /// Whether the artifact cache is active.
     ///
     /// When `true` (the default), builds are served from the cache when
     /// possible and warm it otherwise. When `false`, builds always run and
-    /// nothing is written to the cache.
-    #[serde(default = "default_cache_enabled")]
+    /// nothing is written to the cache. Defaults to `true` when a document
+    /// omits it.
     pub cache_enabled: bool,
+}
+
+/// Deserialization shape of [`Config`].
+///
+/// Accepts the legacy `builds_dir` key next to `cache_dir`. Versions prior to
+/// the artifact cache (≤ v2.0.1) stored the build output directory under
+/// `builds_dir`; a serde `alias` would read it too, but fails with "duplicate
+/// field" when a hand-edited file carries both keys. Here `cache_dir` wins
+/// when both are present; `builds_dir` is still parsed (a malformed value is
+/// an error) but its value is then unused.
+///
+/// Field order matters for serde's positional (array) form: `builds_dir`
+/// comes last so `[token, cache_dir, cache_enabled]` still deserializes.
+/// `expecting` keeps this internal name out of error messages.
+#[derive(Deserialize)]
+#[serde(expecting = "a JSON object")]
+struct RawConfig {
+    /// See [`Config::github_token`].
+    #[serde(default)]
+    github_token: Option<String>,
+    /// See [`Config::cache_dir`]. May be absent (then `builds_dir` applies),
+    /// but `null` is rejected as a wrong type, with its position.
+    #[serde(default, deserialize_with = "present")]
+    cache_dir: Option<PathBuf>,
+    /// See [`Config::cache_enabled`].
+    #[serde(default = "default_cache_enabled")]
+    cache_enabled: bool,
+    /// Legacy name of `cache_dir`, used only when `cache_dir` is absent.
+    #[serde(default, deserialize_with = "present")]
+    builds_dir: Option<PathBuf>,
+}
+
+/// Deserialize a field that may be absent (pair with `#[serde(default)]`)
+/// but must hold a real value when present: `null` fails like any other
+/// wrong type, instead of being read as "absent".
+///
+/// # Arguments
+///
+/// * `deserializer` - The field's deserializer
+///
+/// # Returns
+///
+/// The value, wrapped in `Some`.
+///
+/// # Errors
+///
+/// Whatever `T` reports for an invalid value, including `null`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+impl TryFrom<RawConfig> for Config {
+    type Error = String;
+
+    /// Resolve the cache directory (`cache_dir`, else the legacy
+    /// `builds_dir`).
+    ///
+    /// # Errors
+    ///
+    /// `missing field `cache_dir`` when neither key is present, since the
+    /// runtime config has no default directory. (This check runs after
+    /// parsing, so serde_json cannot attach a line/column to it.)
+    fn try_from(raw: RawConfig) -> Result<Self, Self::Error> {
+        let cache_dir = raw
+            .cache_dir
+            .or(raw.builds_dir)
+            .ok_or_else(|| "missing field `cache_dir`".to_string())?;
+        Ok(Self {
+            github_token: raw.github_token,
+            cache_dir,
+            cache_enabled: raw.cache_enabled,
+        })
+    }
 }
 
 impl Config {
@@ -174,9 +249,14 @@ impl Config {
 /// # Adding a new key
 ///
 /// 1. Add a variant here.
-/// 2. The compiler will guide you to update [`FromStr`], [`fmt::Display`],
-///    [`ConfigKey::all`], [`ConfigKey::is_sensitive`], and the
-///    [`ConfigFile`] methods that match on this enum.
+/// 2. The compiler will guide you to update [`ConfigKey::as_str`] (the name
+///    [`FromStr`] and [`fmt::Display`] use) and the [`ConfigFile`] methods
+///    that match on this enum.
+/// 3. Add it to [`ConfigKey::all`] by hand — the compiler cannot catch a
+///    missing entry there, and [`FromStr`] only finds keys listed in it. The
+///    exhaustive match in the `all_lists_every_variant_once` test stops
+///    compiling until you list the new variant there too. Update
+///    [`ConfigKey::is_sensitive`]'s list if the value is secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigKey {
     /// GitHub Personal Access Token.
@@ -199,35 +279,40 @@ impl ConfigKey {
     pub fn is_sensitive(&self) -> bool {
         SENSITIVE_KEYS.contains(self)
     }
+
+    /// The CLI-facing key name (e.g. `"cache-dir"`), as [`FromStr`] parses it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConfigKey::Token => "token",
+            ConfigKey::CacheDir => "cache-dir",
+            ConfigKey::Cache => "cache",
+        }
+    }
 }
 
 impl fmt::Display for ConfigKey {
+    /// Write the key name, honoring width/alignment specs such as `{:<14}`
+    /// (`pad` applies them; `write!` would ignore them), which `apvm config`
+    /// uses to align its columns.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConfigKey::Token => write!(f, "token"),
-            ConfigKey::CacheDir => write!(f, "cache-dir"),
-            ConfigKey::Cache => write!(f, "cache"),
-        }
+        f.pad(self.as_str())
     }
 }
 
 impl FromStr for ConfigKey {
     type Err = String;
 
+    /// Parse an exact key name ([`ConfigKey::as_str`]); the error lists every
+    /// valid key.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "token" => Ok(ConfigKey::Token),
-            "cache-dir" => Ok(ConfigKey::CacheDir),
-            "cache" => Ok(ConfigKey::Cache),
-            _ => {
-                let valid: Vec<_> = ConfigKey::all().iter().map(|k| k.to_string()).collect();
-                Err(format!(
-                    "Unknown config key '{}'. Valid keys: {}",
-                    s,
-                    valid.join(", ")
-                ))
-            }
-        }
+        ConfigKey::all()
+            .iter()
+            .copied()
+            .find(|key| key.as_str() == s)
+            .ok_or_else(|| {
+                let valid: Vec<_> = ConfigKey::all().iter().map(ConfigKey::as_str).collect();
+                format!("Unknown config key '{s}'. Valid keys: {}", valid.join(", "))
+            })
     }
 }
 
@@ -252,24 +337,59 @@ impl FromStr for ConfigKey {
 /// Fields absent from the file are silently loaded as `None` and resolved
 /// to defaults at runtime via [`ConfigFile::merge`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "RawConfigFile")]
 pub struct ConfigFile {
     /// GitHub Personal Access Token (optional in file).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub github_token: Option<String>,
 
     /// Cache directory override (optional in file).
     ///
-    /// `alias = "builds_dir"` reads config files written by versions prior to
-    /// the artifact cache (≤ v2.0.1), where a user-set build output directory
-    /// lived under this same on-disk key (`apvm config set builds-dir ...`).
-    /// Always serializes back out as `cache_dir`; the file self-migrates the
-    /// next time any `apvm config set/unset` writes it.
-    #[serde(alias = "builds_dir", default, skip_serializing_if = "Option::is_none")]
+    /// Also read from the legacy `builds_dir` key that ≤ v2.0.1 wrote for
+    /// `apvm config set builds-dir ...` (see `RawConfigFile`). Always
+    /// serialized as `cache_dir`; the file self-migrates the next time any
+    /// `apvm config set/unset` writes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
 
     /// Cache on/off override (optional in file).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_enabled: Option<bool>,
+}
+
+/// Deserialization shape of [`ConfigFile`]: accepts the legacy `builds_dir`
+/// key next to `cache_dir`, with `cache_dir` winning (see [`RawConfig`] for
+/// why a serde `alias` is not enough, and for the field order). In this
+/// sparse format `null` means "not set", so `builds_dir` applies when
+/// `cache_dir` is absent or `null`. Unknown keys are ignored, so a file
+/// written by a newer version still loads.
+#[derive(Deserialize)]
+#[serde(expecting = "a JSON object")]
+struct RawConfigFile {
+    /// See [`ConfigFile::github_token`].
+    #[serde(default)]
+    github_token: Option<String>,
+    /// See [`ConfigFile::cache_dir`].
+    #[serde(default)]
+    cache_dir: Option<PathBuf>,
+    /// See [`ConfigFile::cache_enabled`].
+    #[serde(default)]
+    cache_enabled: Option<bool>,
+    /// Legacy name of `cache_dir`, used only when `cache_dir` is absent or
+    /// `null`.
+    #[serde(default)]
+    builds_dir: Option<PathBuf>,
+}
+
+impl From<RawConfigFile> for ConfigFile {
+    /// Keep every explicit value, preferring `cache_dir` over `builds_dir`.
+    fn from(raw: RawConfigFile) -> Self {
+        Self {
+            github_token: raw.github_token,
+            cache_dir: raw.cache_dir.or(raw.builds_dir),
+            cache_enabled: raw.cache_enabled,
+        }
+    }
 }
 
 impl ConfigFile {
@@ -291,8 +411,8 @@ impl ConfigFile {
 
     /// Check whether this file config has any explicit values.
     ///
-    /// Returns `false` when every field is `None`, meaning the file
-    /// would serialize to `{}`.
+    /// Returns `true` when every field is `None`, meaning the file would
+    /// serialize to `{}`.
     pub fn is_empty(&self) -> bool {
         self.github_token.is_none() && self.cache_dir.is_none() && self.cache_enabled.is_none()
     }
@@ -417,6 +537,65 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.cache_dir, PathBuf::from("/home/user/my-builds"));
         assert_eq!(config.github_token.as_deref(), Some("ghp_legacy"));
+    }
+
+    #[test]
+    fn config_prefers_cache_dir_over_a_leftover_legacy_key() {
+        // A hand-edited file can hold both keys. That must load (the current
+        // key wins, in either order), not fail as a "duplicate field".
+        for json in [
+            r#"{"builds_dir": "/old", "cache_dir": "/new"}"#,
+            r#"{"cache_dir": "/new", "builds_dir": "/old"}"#,
+        ] {
+            let config: Config = serde_json::from_str(json).unwrap();
+            assert_eq!(config.cache_dir, PathBuf::from("/new"), "{json}");
+        }
+    }
+
+    #[test]
+    fn config_rejects_a_null_cache_dir_as_a_wrong_type() {
+        // `null` is a present-but-invalid value: report it as such, with its
+        // position — never as "missing", and never fall back to the legacy key.
+        for json in [
+            r#"{"cache_dir": null}"#,
+            r#"{"cache_dir": null, "builds_dir": "/x"}"#,
+        ] {
+            let err = serde_json::from_str::<Config>(json)
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("invalid type: null"), "{json}: {err}");
+            assert!(err.contains("line 1 column"), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn config_errors_never_name_internal_types() {
+        for json in ["42", "null", r#""x""#] {
+            let err = serde_json::from_str::<Config>(json)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("expected a JSON object"), "{json}: {err}");
+            assert!(!err.contains("Raw"), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn config_still_deserializes_from_its_array_form() {
+        // serde structs also accept a positional array; the legacy key must
+        // not change the expected length.
+        let config: Config = serde_json::from_str(r#"[null, "/x", false]"#).unwrap();
+        assert_eq!(config.cache_dir, PathBuf::from("/x"));
+        assert!(!config.cache_enabled);
+    }
+
+    #[test]
+    fn config_without_any_cache_dir_key_is_rejected() {
+        // The runtime config has no default cache directory.
+        let err = serde_json::from_str::<Config>(r#"{"cache_enabled": true}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `cache_dir`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -613,6 +792,46 @@ mod tests {
     }
 
     #[test]
+    fn config_file_treats_null_as_unset_and_falls_back_to_the_legacy_key() {
+        // In the sparse file `null` means "not set" — so a legacy value next
+        // to it is used, exactly as when `cache_dir` is absent.
+        let cf: ConfigFile = serde_json::from_str(r#"{"cache_dir": null}"#).unwrap();
+        assert_eq!(cf.cache_dir, None);
+        let cf: ConfigFile =
+            serde_json::from_str(r#"{"cache_dir": null, "builds_dir": "/x"}"#).unwrap();
+        assert_eq!(cf.cache_dir, Some(PathBuf::from("/x")));
+    }
+
+    #[test]
+    fn config_file_errors_never_name_internal_types() {
+        for json in ["42", "null", r#""x""#] {
+            let err = serde_json::from_str::<ConfigFile>(json)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("expected a JSON object"), "{json}: {err}");
+            assert!(!err.contains("Raw"), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn config_file_prefers_cache_dir_over_a_leftover_legacy_key() {
+        // Both keys in one file (e.g. hand-edited after an upgrade) must load,
+        // with the current key winning in either order, and re-saving drops
+        // the legacy one.
+        for json in [
+            r#"{"builds_dir": "/old", "cache_dir": "/new"}"#,
+            r#"{"cache_dir": "/new", "builds_dir": "/old"}"#,
+        ] {
+            let cf: ConfigFile = serde_json::from_str(json).unwrap();
+            assert_eq!(cf.cache_dir, Some(PathBuf::from("/new")), "{json}");
+            assert_eq!(
+                serde_json::to_string(&cf).unwrap(),
+                r#"{"cache_dir":"/new"}"#
+            );
+        }
+    }
+
+    #[test]
     fn config_file_resave_upgrades_legacy_key_to_cache_dir() {
         // The next `apvm config set/unset` after loading a legacy file rewrites
         // it — the old key must never reappear.
@@ -666,6 +885,15 @@ mod tests {
     }
 
     #[test]
+    fn config_key_display_honors_width_and_alignment() {
+        // `apvm config` lays out its key column with `{:<14}`; a Display that
+        // ignores the spec collapses the columns.
+        assert_eq!(format!("{:<10}|", ConfigKey::Cache), "cache     |");
+        assert_eq!(format!("{:>11}|", ConfigKey::CacheDir), "  cache-dir|");
+        assert_eq!(format!("{:^7}|", ConfigKey::Token), " token |");
+    }
+
+    #[test]
     fn config_key_display_roundtrip() {
         for key in ConfigKey::all() {
             let s = key.to_string();
@@ -679,6 +907,25 @@ mod tests {
         assert!(ConfigKey::Token.is_sensitive());
         assert!(!ConfigKey::CacheDir.is_sensitive());
         assert!(!ConfigKey::Cache.is_sensitive());
+    }
+
+    #[test]
+    fn all_lists_every_variant_once() {
+        // Exhaustive on purpose: a new variant makes this match fail to
+        // compile — the reminder to add it below and to `ConfigKey::all()`,
+        // which `FromStr` depends on to find it.
+        let listed = |key: ConfigKey| match key {
+            ConfigKey::Token | ConfigKey::CacheDir | ConfigKey::Cache => key,
+        };
+        let every = [
+            listed(ConfigKey::Token),
+            listed(ConfigKey::CacheDir),
+            listed(ConfigKey::Cache),
+        ];
+        assert_eq!(ConfigKey::all(), every);
+        for key in every {
+            assert_eq!(key.as_str().parse::<ConfigKey>(), Ok(key));
+        }
     }
 
     #[test]
