@@ -1,3 +1,5 @@
+import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { describe, expect, it, vi } from 'vitest';
 import { Apvm, type JsBuildEvent, JsReleaseSelector } from '../index.js';
 
@@ -136,6 +138,35 @@ describe('mistyped arguments throw synchronously', () => {
 // Progress events reach JS
 // =============================================================================
 
+/**
+ * Run `script` (CommonJS) in a fresh Node process under the strict Node-API
+ * exception policy, so an exception the addon leaves pending in a callback
+ * crashes the child instead of only printing a DEP0168 warning.
+ *
+ * spawnSync, not execFileSync: a crash then fails the assertion with the
+ * child's exit status and stderr instead of a dump of the script. The 20 s
+ * cap stays under the 30 s test timeout, which cannot fire while this blocks.
+ *
+ * @param script - Script body; `ADDON` holds the path of the addon's `index.js`.
+ * @returns The finished child process.
+ */
+function runStrictNode(script: string): ReturnType<typeof spawnSync> {
+  const addon = createRequire(import.meta.url).resolve('../index.js');
+  return spawnSync(
+    process.execPath,
+    ['--force-node-api-uncaught-exceptions-policy=true', '-e', `const ADDON = ${JSON.stringify(addon)};\n${script}`],
+    { encoding: 'utf8', timeout: 20_000 },
+  );
+}
+
+/** The parts of a finished child that say whether it ran cleanly. */
+function exitOf(child: ReturnType<typeof spawnSync>): { status: number | null; signal: string | null; stderr: unknown } {
+  return { status: child.status, signal: child.signal, stderr: child.stderr };
+}
+
+/** What `exitOf` reports for a child that exited normally and printed no errors. */
+const CLEAN_EXIT = { status: 0, signal: null, stderr: '' };
+
 describe('progress callback', () => {
   /** Let queued thread-safe-function calls reach JS. */
   const drain = () => new Promise<void>((resolve) => setTimeout(resolve, 50));
@@ -163,6 +194,81 @@ describe('progress callback', () => {
       message:
         'cache warming was requested, but the artifact cache is disabled or unavailable; nothing will be cached',
     });
+  });
+
+  it('discards callback errors, sync or async, without crashing the process', () => {
+    // Documented: progress is best-effort, so a failing callback never fails
+    // the call or kills Node. Each case used to crash the process — a sync
+    // throw as an uncaught exception, an async one as an unhandled rejection —
+    // so the scenario runs in a child process that reports what it saw.
+    const child = runStrictNode(`
+      const { Apvm } = require(ADDON);
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      // JS can throw anything, and an async callback rejects instead.
+      const failures = {
+        error: () => { throw new Error('callback boom'); },
+        string: () => { throw 'not an Error'; },
+        symbol: () => { throw Symbol('boom'); },
+        asyncThrow: async () => { throw new Error('async boom'); },
+        rejected: () => Promise.reject(new Error('rejected')),
+      };
+      (async () => {
+        const apvm = await Apvm.create({ cacheEnabled: false });
+        const results = {};
+        for (const [kind, fail] of Object.entries(failures)) {
+          let calls = 0;
+          const outcome = await apvm
+            .warmCache({ project: 'wp-rocket', gitRef: 'release:v1.0.0' }, () => {
+              calls += 1;
+              return fail();
+            })
+            .then(() => 'resolved', (err) => err.code);
+          // Let the queued warning reach the callback, then let any
+          // rejection settle (an unhandled one would kill this process).
+          for (let i = 0; i < 250 && calls === 0; i += 1) await sleep(20);
+          await sleep(50);
+          results[kind] = { outcome, calls };
+        }
+        console.log(JSON.stringify(results));
+      })().catch((err) => {
+        console.error(err);
+        process.exitCode = 1;
+      });
+    `);
+    expect(exitOf(child)).toStrictEqual(CLEAN_EXIT);
+    // Each call still rejects with its own error, after exactly one event.
+    const each = { outcome: 'InvalidArg', calls: 1 };
+    expect(JSON.parse(String(child.stdout))).toStrictEqual({
+      error: each,
+      string: each,
+      symbol: each,
+      asyncThrow: each,
+      rejected: each,
+    });
+  });
+
+  it('never leaves an exception pending, even with a sabotaged Promise.prototype.catch', () => {
+    // Settling an async callback's promise runs its `catch`; when that throws,
+    // the addon must clear the exception rather than leave it pending (fatal
+    // under the strict policy, a DEP0168 warning otherwise).
+    const child = runStrictNode(`
+      const { Apvm } = require(ADDON);
+      Promise.prototype.catch = function () { throw new Error('patched catch'); };
+      (async () => {
+        const apvm = await Apvm.create({ cacheEnabled: false });
+        let calls = 0;
+        const outcome = await apvm
+          .warmCache({ project: 'wp-rocket', gitRef: 'release:v1.0.0' }, async () => {
+            calls += 1;
+          })
+          .then(() => 'resolved', (err) => err.code);
+        for (let i = 0; i < 250 && calls === 0; i += 1) await new Promise((r) => setTimeout(r, 20));
+        await new Promise((r) => setTimeout(r, 50));
+        console.log(JSON.stringify({ outcome, calls }));
+      })();
+    `);
+    expect(exitOf(child)).toStrictEqual(CLEAN_EXIT);
+    expect(JSON.parse(String(child.stdout))).toStrictEqual({ outcome: 'InvalidArg', calls: 1 });
   });
 
   it('reports nothing for a call refused before any work', async () => {

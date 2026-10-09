@@ -2,14 +2,20 @@
 //!
 //! Implements the [`ProgressReporter`] trait using a N-API [`ThreadsafeFunction`],
 //! allowing build events to be delivered to a JavaScript callback function
-//! from any Rust thread without blocking or crashing.
+//! from any Rust thread without blocking.
 //!
 //! The callback is invoked in non-blocking mode, meaning events are queued
 //! on the Node.js event loop and delivered asynchronously. This is safe
 //! to call from the tokio runtime threads that execute build operations.
+//!
+//! The callback is best-effort: whatever it throws, and whatever a promise it
+//! returns rejects with, is discarded — it never fails the build and never
+//! reaches Node's `uncaughtException` / `unhandledRejection` handling.
 
 use apvm_core::build::progress::{BuildEvent, ProgressReporter};
+use napi::bindgen_prelude::{CallbackContext, PromiseRaw, Unknown};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::{Env, JsValue};
 
 use crate::types::JsBuildEvent;
 
@@ -52,17 +58,77 @@ impl ProgressReporter for JsProgressReporter {
     ///
     /// - The call returns immediately without waiting for JS execution
     /// - Events are delivered in order on the next event loop tick
-    /// - If the JS callback throws, the error is swallowed (not propagated)
+    /// - If the JS callback throws, or returns a promise that rejects (an
+    ///   `async` callback), the error is discarded (not propagated)
     ///
     /// This is intentional — build progress is informational, and a
     /// failing callback should never abort the build itself.
     fn report(&self, event: &BuildEvent) {
         let js_event = JsBuildEvent::from(event);
-        // NonBlocking: queue on the event loop, don't wait for JS to process.
-        // Ignoring the result is intentional — progress callbacks are
-        // best-effort and must not abort the build on JS-side errors.
-        let _ = self
-            .callback
-            .call(Ok(js_event), ThreadsafeFunctionCallMode::NonBlocking);
+        // `call_with_return_value`, not `call`: with plain `call`, napi-rs
+        // re-raises a throwing callback through `napi_fatal_exception` — an
+        // uncaught exception, fatal unless the app installed an
+        // `uncaughtException` handler. This variant clears the exception and
+        // hands it to the closure as `Err`, which drops it; a returned value
+        // arrives as `Ok` and is checked for a promise to settle quietly.
+        // The queueing status is ignored for the same reason: progress is
+        // best-effort and must never fail the build. (If converting the event
+        // itself failed — only under OOM or env teardown — napi-rs would call
+        // the callback with an error instead, outside this capture.)
+        let _ = self.callback.call_with_return_value(
+            Ok(js_event),
+            ThreadsafeFunctionCallMode::NonBlocking,
+            |outcome, env| {
+                if let Ok(returned) = outcome {
+                    discard_rejection(&returned, &env);
+                }
+                Ok(())
+            },
+        );
+    }
+}
+
+/// Mark a promise returned by the callback as handled, so its rejection
+/// is discarded instead of crashing Node as an unhandled rejection (the
+/// default since Node 15). A non-promise return value is left alone.
+///
+/// Attaching runs JavaScript (the promise's `catch`), which a patched
+/// `Promise.prototype` could make throw; any exception that leaves pending
+/// is cleared, so this helper itself can never surface one.
+///
+/// # Arguments
+///
+/// * `returned` - What the callback returned
+/// * `env` - The env of the JS thread the callback just ran on
+fn discard_rejection(returned: &Unknown<'_>, env: &Env) {
+    let attached = returned.is_promise().and_then(|is_promise| {
+        if !is_promise {
+            return Ok(());
+        }
+        PromiseRaw::<Unknown<'_>>::new(env.raw(), returned.raw())
+            .catch(|_: CallbackContext<Unknown<'_>>| Ok(()))
+            .map(drop)
+    });
+    if attached.is_err() {
+        clear_pending_exception(env);
+    }
+}
+
+/// Clear the JS exception pending in `env`, if any.
+///
+/// Called only on the JS thread of `env`, inside a threadsafe-function
+/// callback. Leaving an exception pending there would make Node report it
+/// as uncaught once the callback returns.
+///
+/// # Arguments
+///
+/// * `env` - The env of the current JS thread
+fn clear_pending_exception(env: &Env) {
+    let mut exception = std::ptr::null_mut();
+    // SAFETY: `env.raw()` is the live env of the JS thread this callback runs
+    // on, and `exception` is a valid out-pointer for the call's duration.
+    // With nothing pending, the call returns `undefined` and changes nothing.
+    unsafe {
+        napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception);
     }
 }

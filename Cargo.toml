@@ -108,7 +108,11 @@ apvm-storage = { path = "crates/storage" }
 
 # N-API bindings
 # https://docs.rs/napi/3 — SemVer stable since 3.0
-napi = { version = "3", default-features = false, features = ["async", "napi8"] }
+# Floor = the tested version. The progress callback relies on
+# `call_with_return_value` capturing *any* thrown value (3.13+; earlier
+# versions turned a non-Error throw into a fatal exception) and on
+# `PromiseRaw::catch`; `__tests__/contracts.test.ts` covers both.
+napi = { version = "3.14.2", default-features = false, features = ["async", "napi8"] }
 # Floor = the tested version. From 3.6.11 it requires napi-derive-backend
 # 6.1.5+, whose enum members are enumerable like a compiled TS enum;
 # `__tests__/enums.test.ts` and the enum docs rely on it.
