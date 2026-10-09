@@ -73,3 +73,100 @@ fn storage_error_status(err: &apvm_storage::Error) -> Status {
         _ => Status::GenericFailure,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Errors the caller fixes by changing an argument: a JS `InvalidArg`.
+    fn caller_errors() -> Vec<apvm_core::Error> {
+        vec![
+            apvm_core::Error::ProjectNotFound("nope".to_string()),
+            apvm_core::Error::RepositoryNotFound(PathBuf::from("/repo")),
+            apvm_core::Error::PrivateRepoNoToken {
+                repo: "wp-media/backwpup-pro".to_string(),
+            },
+            apvm_core::Error::Config("bad".to_string()),
+            apvm_core::Error::ReleaseNotFound {
+                tag: "v9".to_string(),
+                repo: "wp-media/backwpup-pro".to_string(),
+            },
+            apvm_core::Error::NoMatchingReleaseAssets {
+                tag: "v9".to_string(),
+                repo: "wp-media/backwpup-pro".to_string(),
+                available: "a.zip".to_string(),
+            },
+            apvm_core::Error::ReleasesNotAvailable {
+                project: "wp-rocket".to_string(),
+                tag: "v9".to_string(),
+            },
+            apvm_core::Error::Storage(apvm_storage::Error::InvalidInput {
+                what: "project",
+                value: "Bad/Name".to_string(),
+                reason: "not allowed".to_string(),
+            }),
+            apvm_core::Error::Storage(apvm_storage::Error::SourceFileMissing {
+                path: PathBuf::from("/missing.zip"),
+            }),
+        ]
+    }
+
+    /// Errors only reportable or retryable: a JS `GenericFailure`.
+    /// (`GitHub` and `Json` wrap foreign error types this crate cannot build.)
+    fn environment_errors() -> Vec<apvm_core::Error> {
+        vec![
+            apvm_core::Error::Git("clone failed".to_string()),
+            apvm_core::Error::Build("step failed".to_string()),
+            apvm_core::Error::Project("x".to_string()),
+            apvm_core::Error::PlatformUnsupported {
+                project: "imagify".to_string(),
+                platform: "windows".to_string(),
+                reason: "needs bash".to_string(),
+            },
+            apvm_core::Error::Io(io::Error::other("disk")),
+            apvm_core::Error::Storage(apvm_storage::Error::Data {
+                details: "bad row".to_string(),
+            }),
+            apvm_core::Error::Cache("x".to_string()),
+            apvm_core::Error::Update("x".to_string()),
+            apvm_core::Error::Uninstall("x".to_string()),
+            apvm_core::Error::Skill("x".to_string()),
+        ]
+    }
+
+    #[test]
+    fn caller_fixable_errors_are_invalid_arg() {
+        for err in caller_errors() {
+            assert_eq!(core_error_status(&err), Status::InvalidArg, "{err}");
+        }
+    }
+
+    #[test]
+    fn environment_errors_are_generic_failures() {
+        for err in environment_errors() {
+            assert_eq!(core_error_status(&err), Status::GenericFailure, "{err}");
+        }
+    }
+
+    #[test]
+    fn storage_errors_follow_the_direct_storage_rules() {
+        // A wrapped storage error is classified as the storage call would be,
+        // not blanket-mapped from the `Storage` wrapper.
+        let wrapped = |inner| core_error_status(&apvm_core::Error::Storage(inner));
+        assert_eq!(
+            wrapped(apvm_storage::Error::SourceFileMissing {
+                path: PathBuf::from("/a")
+            }),
+            Status::InvalidArg
+        );
+        assert_eq!(
+            wrapped(apvm_storage::Error::DatabaseInUse {
+                path: PathBuf::from("/c/apvm.db")
+            }),
+            Status::GenericFailure
+        );
+    }
+}

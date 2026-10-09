@@ -788,12 +788,7 @@ impl Apvm {
         variants: Option<Vec<String>>,
         on_progress: Option<ThreadsafeFunction<JsBuildEvent>>,
     ) -> napi::Result<JsBuildOutput> {
-        let keyword = match selector {
-            JsReleaseSelector::LatestStable => "latest-stable",
-            JsReleaseSelector::PreviousStable => "previous-stable",
-            JsReleaseSelector::Latest => "latest",
-            JsReleaseSelector::PreviousLatest => "previous-latest",
-        };
+        let keyword = release_keyword(&selector);
         self.build(
             BuildOptions {
                 project,
@@ -806,5 +801,42 @@ impl Apvm {
             on_progress,
         )
         .await
+    }
+}
+
+/// The `release:` keyword the core resolves for `selector` (see the core's
+/// release-keyword list): pure, so the mapping is unit-tested.
+fn release_keyword(selector: &JsReleaseSelector) -> &'static str {
+    match selector {
+        JsReleaseSelector::LatestStable => "latest-stable",
+        JsReleaseSelector::PreviousStable => "previous-stable",
+        JsReleaseSelector::Latest => "latest",
+        JsReleaseSelector::PreviousLatest => "previous-latest",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_selector_maps_to_a_distinct_core_keyword() {
+        // These exact strings are what the core recognizes; any other text
+        // after `release:` is taken as a literal tag name.
+        let keywords = [
+            release_keyword(&JsReleaseSelector::LatestStable),
+            release_keyword(&JsReleaseSelector::PreviousStable),
+            release_keyword(&JsReleaseSelector::Latest),
+            release_keyword(&JsReleaseSelector::PreviousLatest),
+        ];
+        assert_eq!(
+            keywords,
+            [
+                "latest-stable",
+                "previous-stable",
+                "latest",
+                "previous-latest"
+            ]
+        );
     }
 }

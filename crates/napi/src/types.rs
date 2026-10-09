@@ -871,3 +871,371 @@ pub struct WarmOptions {
     /// - **WP Rocket / Imagify**: Have no variants (this field is ignored)
     pub variants: Option<Vec<String>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use apvm_core::build::progress::OutputStream;
+    use apvm_core::build::{BuildResult, ProducedArtifact};
+    use apvm_core::{
+        ArtifactOrigin, BuildEvent, BuildOutput, BuildPhase, BuildStep, RefSource, ResolvedRef,
+        VersionOverride,
+    };
+
+    use super::*;
+
+    /// A resolved branch ref at commit `abc1234…`.
+    fn branch_ref() -> ResolvedRef {
+        ResolvedRef {
+            input: "branch:develop".to_string(),
+            source: RefSource::Branch("develop".to_string()),
+            git_ref: "develop".to_string(),
+            commit_sha: Some("abc1234def".to_string()),
+        }
+    }
+
+    /// An artifact of `size` bytes with `origin`.
+    fn artifact(variant: Option<&str>, size: u64, origin: ArtifactOrigin) -> ProducedArtifact {
+        ProducedArtifact::new(
+            variant.map(str::to_string),
+            PathBuf::from(format!("/out/{size}.zip")),
+            format!("{size}.zip"),
+            size,
+        )
+        .with_origin(origin)
+    }
+
+    /// A build output for `resolved` holding `artifacts`.
+    fn output(resolved: ResolvedRef, artifacts: Vec<ProducedArtifact>) -> BuildOutput {
+        BuildOutput {
+            result: BuildResult::new(
+                artifacts,
+                PathBuf::from("/out"),
+                "3.17.0".to_string(),
+                vec!["free".to_string()],
+            ),
+            resolved_ref: resolved,
+            commit: "abc1234def".to_string(),
+            commit_short: "abc1234".to_string(),
+            branch: "develop".to_string(),
+            version_override: None,
+        }
+    }
+
+    /// Whether every optional payload field of `event` is unset — the
+    /// fields a JS consumer sees as absent.
+    fn payload_is_empty(event: &JsBuildEvent) -> bool {
+        event.phase.is_none()
+            && event.message.is_none()
+            && event.step.is_none()
+            && event.stream.is_none()
+            && event.line.is_none()
+            && event.artifacts.is_none()
+            && event.reason.is_none()
+            && event.resolved_ref.is_none()
+    }
+
+    #[test]
+    fn every_build_phase_maps_to_its_namesake() {
+        // A swapped arm would hand JS consumers the wrong phase.
+        macro_rules! same {
+            ($($phase:ident),+) => {$(
+                assert!(
+                    matches!(JsBuildPhase::from(BuildPhase::$phase), JsBuildPhase::$phase),
+                    stringify!($phase)
+                );
+            )+};
+        }
+        same!(
+            Preflight,
+            Cache,
+            ReleaseDownload,
+            Clone,
+            Checkout,
+            DependencyCheck,
+            PreBuild,
+            Setup,
+            Build,
+            BuildHook,
+            PostBuild,
+            CollectArtifacts
+        );
+    }
+
+    #[test]
+    fn output_streams_map_to_their_namesakes() {
+        assert!(matches!(
+            JsOutputStream::from(OutputStream::Stdout),
+            JsOutputStream::Stdout
+        ));
+        assert!(matches!(
+            JsOutputStream::from(OutputStream::Stderr),
+            JsOutputStream::Stderr
+        ));
+    }
+
+    #[test]
+    fn ref_sources_use_the_documented_type_strings() {
+        // `type` is a documented discriminant JS code switches on.
+        let cases = [
+            (RefSource::PullRequest(42), "pull_request", "42", "PR #42"),
+            (
+                RefSource::Branch("dev".into()),
+                "branch",
+                "dev",
+                "branch 'dev'",
+            ),
+            (RefSource::Tag("v1".into()), "tag", "v1", "tag 'v1'"),
+            (
+                RefSource::Commit("abcdef123456".into()),
+                "commit",
+                "abcdef123456",
+                "commit abcdef1",
+            ),
+            (
+                RefSource::Release("v2".into()),
+                "release",
+                "v2",
+                "release 'v2'",
+            ),
+        ];
+        for (source, kind, value, description) in cases {
+            let js = JsRefSource::from(&source);
+            assert_eq!(
+                (js.kind.as_str(), js.value.as_str(), js.description.as_str()),
+                (kind, value, description)
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_refs_keep_every_field() {
+        let js = JsResolvedRef::from(&branch_ref());
+        assert_eq!(js.input, "branch:develop");
+        assert_eq!(js.source.kind, "branch");
+        assert_eq!(js.git_ref, "develop");
+        assert_eq!(js.commit_sha.as_deref(), Some("abc1234def"));
+    }
+
+    #[test]
+    fn artifacts_report_origin_strings_and_sizes() {
+        for (origin, name) in [
+            (ArtifactOrigin::Built, "built"),
+            (ArtifactOrigin::Cache, "cache"),
+            (ArtifactOrigin::Downloaded, "downloaded"),
+        ] {
+            let js = JsProducedArtifact::from(&artifact(Some("pro"), 7, origin));
+            assert_eq!(js.origin, name);
+            assert_eq!(js.variant_id.as_deref(), Some("pro"));
+            assert_eq!(js.path, "/out/7.zip");
+            assert_eq!(js.filename, "7.zip");
+            assert_eq!(js.size, 7.0);
+        }
+    }
+
+    #[test]
+    fn build_results_carry_totals_computed_from_the_artifacts() {
+        let result = BuildResult::new(
+            vec![
+                artifact(None, 3, ArtifactOrigin::Built),
+                artifact(None, 4, ArtifactOrigin::Built),
+            ],
+            PathBuf::from("/out"),
+            "1.0".to_string(),
+            vec!["free".to_string(), "pro".to_string()],
+        );
+        let js = JsBuildResult::from(&result);
+        assert_eq!((js.artifact_count, js.total_size), (2, 7.0));
+        assert_eq!(js.artifacts.len(), 2);
+        assert_eq!(js.build_dir, "/out");
+        assert_eq!(js.version, "1.0");
+        assert_eq!(js.variants_built, ["free", "pro"]);
+    }
+
+    #[test]
+    fn build_output_is_from_cache_only_when_every_artifact_is() {
+        let all_cached = output(
+            branch_ref(),
+            vec![
+                artifact(None, 1, ArtifactOrigin::Cache),
+                artifact(None, 2, ArtifactOrigin::Cache),
+            ],
+        );
+        assert!(JsBuildOutput::from(all_cached).from_cache);
+
+        let mixed = output(
+            branch_ref(),
+            vec![
+                artifact(None, 1, ArtifactOrigin::Cache),
+                artifact(None, 2, ArtifactOrigin::Built),
+            ],
+        );
+        assert!(!JsBuildOutput::from(mixed).from_cache);
+
+        // Nothing produced is not a cache hit.
+        assert!(!JsBuildOutput::from(output(branch_ref(), vec![])).from_cache);
+    }
+
+    #[test]
+    fn build_output_describes_the_ref_and_keeps_its_metadata() {
+        let pr = ResolvedRef {
+            input: "pr:12".to_string(),
+            source: RefSource::PullRequest(12),
+            git_ref: "feature/x".to_string(),
+            commit_sha: None,
+        };
+        let mut built = output(pr, vec![artifact(None, 1, ArtifactOrigin::Built)]);
+        built.version_override = Some(VersionOverride {
+            file: "wp-rocket.php".to_string(),
+            from: "3.16".to_string(),
+            to: "3.17.0".to_string(),
+            sites: vec!["header".to_string(), "constant".to_string()],
+        });
+        let js = JsBuildOutput::from(built);
+        assert_eq!(js.description, "PR #12 (branch: feature/x) @ abc1234");
+        assert_eq!(js.commit, "abc1234def");
+        assert_eq!(js.commit_short, "abc1234");
+        assert_eq!(js.branch, "develop");
+        assert_eq!(js.resolved_ref.source.kind, "pull_request");
+        let applied = js.version_override.expect("the override is passed through");
+        assert_eq!(
+            (applied.file, applied.from, applied.to, applied.sites),
+            (
+                "wp-rocket.php".to_string(),
+                "3.16".to_string(),
+                "3.17.0".to_string(),
+                vec!["header".to_string(), "constant".to_string()]
+            )
+        );
+        assert!(
+            JsBuildOutput::from(output(branch_ref(), vec![]))
+                .version_override
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn each_event_sets_its_type_and_only_its_own_payload() {
+        let step = BuildStep::new("Install", "npm ci");
+        let cases: Vec<(BuildEvent, &str)> = vec![
+            (
+                BuildEvent::ReferenceResolved {
+                    resolved: branch_ref(),
+                },
+                "reference_resolved",
+            ),
+            (
+                BuildEvent::PhaseStarted {
+                    phase: BuildPhase::Clone,
+                    message: "Cloning".to_string(),
+                },
+                "phase_started",
+            ),
+            (
+                BuildEvent::PhaseCompleted {
+                    phase: BuildPhase::Clone,
+                },
+                "phase_completed",
+            ),
+            (
+                BuildEvent::StepStarted { step: step.clone() },
+                "step_started",
+            ),
+            (BuildEvent::StepCompleted { step }, "step_completed"),
+            (
+                BuildEvent::CommandOutput {
+                    stream: OutputStream::Stderr,
+                    line: "warn".to_string(),
+                },
+                "command_output",
+            ),
+            (BuildEvent::Warning("w".to_string()), "warning"),
+            (
+                BuildEvent::BuildSucceeded {
+                    artifacts: vec![PathBuf::from("/out/a.zip")],
+                },
+                "build_succeeded",
+            ),
+            (
+                BuildEvent::BuildFailed {
+                    reason: "boom".to_string(),
+                },
+                "build_failed",
+            ),
+        ];
+        for (event, kind) in cases {
+            let js = JsBuildEvent::from(&event);
+            assert_eq!(js.kind, kind);
+            // Clear the fields this kind owns; anything left set leaked in.
+            let rest = match kind {
+                "reference_resolved" => {
+                    assert_eq!(
+                        js.resolved_ref.as_ref().map(|r| r.git_ref.as_str()),
+                        Some("develop")
+                    );
+                    JsBuildEvent {
+                        resolved_ref: None,
+                        ..js
+                    }
+                }
+                "phase_started" => {
+                    assert!(matches!(js.phase, Some(JsBuildPhase::Clone)));
+                    assert_eq!(js.message.as_deref(), Some("Cloning"));
+                    JsBuildEvent {
+                        phase: None,
+                        message: None,
+                        ..js
+                    }
+                }
+                "phase_completed" => {
+                    assert!(matches!(js.phase, Some(JsBuildPhase::Clone)));
+                    JsBuildEvent { phase: None, ..js }
+                }
+                "step_started" | "step_completed" => {
+                    let step = js.step.as_ref().expect("a step event carries its step");
+                    assert_eq!(
+                        (step.label.as_str(), step.command.as_str()),
+                        ("Install", "npm ci")
+                    );
+                    JsBuildEvent { step: None, ..js }
+                }
+                "command_output" => {
+                    assert!(matches!(js.stream, Some(JsOutputStream::Stderr)));
+                    assert_eq!(js.line.as_deref(), Some("warn"));
+                    JsBuildEvent {
+                        stream: None,
+                        line: None,
+                        ..js
+                    }
+                }
+                "warning" => {
+                    assert_eq!(js.message.as_deref(), Some("w"));
+                    JsBuildEvent {
+                        message: None,
+                        ..js
+                    }
+                }
+                "build_succeeded" => {
+                    assert_eq!(
+                        js.artifacts.as_deref(),
+                        Some(&["/out/a.zip".to_string()][..])
+                    );
+                    JsBuildEvent {
+                        artifacts: None,
+                        ..js
+                    }
+                }
+                "build_failed" => {
+                    assert_eq!(js.reason.as_deref(), Some("boom"));
+                    JsBuildEvent { reason: None, ..js }
+                }
+                other => panic!("unexpected kind {other}"),
+            };
+            assert!(
+                payload_is_empty(&rest),
+                "{kind} set a field it does not own"
+            );
+        }
+    }
+}

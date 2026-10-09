@@ -553,6 +553,29 @@ mod tests {
     }
 
     #[test]
+    fn every_js_type_has_a_readable_name() {
+        // These names end up in user-facing "got …" messages.
+        let names = [
+            (ValueType::Undefined, "undefined"),
+            (ValueType::Null, "null"),
+            (ValueType::Boolean, "a boolean"),
+            (ValueType::Number, "a number"),
+            (ValueType::String, "a string"),
+            (ValueType::Symbol, "a symbol"),
+            (ValueType::Object, "an object"),
+            (ValueType::Function, "a function"),
+            (ValueType::External, "an external"),
+        ];
+        for (kind, name) in names {
+            assert_eq!(type_name(kind), name);
+        }
+        assert_eq!(
+            check_object_type(ValueType::Symbol, false, "x"),
+            Err("x must be an object, got a symbol".to_string())
+        );
+    }
+
+    #[test]
     fn checksum_selects_the_depth_and_defaults_to_size() {
         assert_eq!(verify_mode(&Field::Value(true)), VerifyMode::Checksum);
         for other in [Field::Value(false), Field::Empty, Field::Absent] {
