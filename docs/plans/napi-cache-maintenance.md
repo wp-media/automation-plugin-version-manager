@@ -1,6 +1,6 @@
 # NAPI cache maintenance — parity with `apvm cache`
 
-Status: **Phases 1–3.1 implemented** (Phases 1, 2 and 3 audited; cumulative audit of 1–3.1 done, its fixes uncommitted; Phase 4 planned) · Target version: **3.3.0** (from 3.2.0 — also claimed by the site-deployment plan; whichever lands second takes the next minor) · Author: Sandy Figueroa
+Status: **Phases 1–3.1 implemented** (Phases 1, 2 and 3 audited; cumulative audit of 1–3.1 done, its fixes committed in `21f4c13`; Phase 4 planned) · Target version: **3.3.0** (from 3.2.0 — also claimed by the site-deployment plan; whichever lands second takes the next minor) · Author: Sandy Figueroa
 
 ---
 
@@ -355,7 +355,7 @@ As built (the plan below was followed except where noted):
   - Unchanged on purpose: `'Nope' as JsCleanTarget` (an intentionally invalid value) and bare-string comparisons such as `case 'Clone'` (valid against regular string enums). The root README never mentioned the workaround.
   - 111 Node tests (+9) and the full cargo suite are green.
 
-### Cumulative audit of Phases 1–3.1 (2026-10-08) — fixes implemented, uncommitted
+### Cumulative audit of Phases 1–3.1 (2026-10-08) — fixes implemented (`21f4c13`)
 
 Five independent auditors (storage file-system safety, storage SQLite/concurrency, core, CLI + docs, NAPI + tests + CI) on `70efec3`, each reproducing what they reported; every finding below was then reproduced again, fixed, and pinned by a test that fails on `70efec3` (run against a pristine checkout) and passes now. Baseline: 815 Rust + 111 Node tests green.
 
