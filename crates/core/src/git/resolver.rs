@@ -307,7 +307,8 @@ impl<'a> RefResolver<'a> {
     /// 2. PR number (all digits)
     /// 3. Commit SHA (hex, 7-40 chars)
     /// 4. Tag (exists in refs/tags)
-    /// 5. Branch (exists in refs/heads or refs/remotes)
+    /// 5. Branch (exists in refs/heads, or as origin's remote-tracking
+    ///    branch in refs/remotes/origin)
     ///
     /// # Errors
     ///
@@ -498,8 +499,9 @@ impl<'a> RefResolver<'a> {
                 return Err(Error::Git(format!("Tag '{tag}' not found")));
             }
 
-            // Get the commit SHA for the tag
-            let commit_sha = self.get_ref_commit(repo_path, tag).await.ok();
+            // Peel to the commit checkout lands on (an annotated tag's own
+            // object SHA would never match a build's commit).
+            let commit_sha = peeled_commit(repo_path, &format!("refs/tags/{tag}")).await?;
 
             Ok(ResolvedRef {
                 input: input.to_string(),
@@ -541,13 +543,12 @@ impl<'a> RefResolver<'a> {
         tracing::debug!("Resolving branch '{branch}'");
 
         if let Some(repo_path) = self.repo_path {
-            let exists = self.ref_exists_as_branch(branch).await?;
-            if !exists {
+            let Some(branch_ref) = local_branch_ref(repo_path, branch).await? else {
                 return Err(Error::Git(format!("Branch '{branch}' not found")));
-            }
+            };
 
-            // Get the commit SHA for the branch
-            let commit_sha = self.get_ref_commit(repo_path, branch).await.ok();
+            // Fully qualified, so a same-named tag can't answer instead.
+            let commit_sha = peeled_commit(repo_path, &branch_ref).await?;
 
             Ok(ResolvedRef {
                 input: input.to_string(),
@@ -598,6 +599,14 @@ impl<'a> RefResolver<'a> {
         if sha.len() < 7 {
             return Err(Error::Git(format!(
                 "Commit SHA too short (minimum 7 characters): '{sha}'"
+            )));
+        }
+
+        // 64 hex is the longest object name (SHA-256); git aborts on longer
+        // prefixes instead of reporting them missing.
+        if sha.len() > 64 {
+            return Err(Error::Git(format!(
+                "Commit SHA too long (maximum 64 characters): '{sha}'"
             )));
         }
 
@@ -691,92 +700,18 @@ impl<'a> RefResolver<'a> {
             Error::Git("Local repository path required for branch lookup".to_string())
         })?;
 
-        // Check local branches
-        let local = Command::new("git")
-            .args([
-                "show-ref",
-                "--heads",
-                "--verify",
-                &format!("refs/heads/{name}"),
-            ])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to check local branch: {e}")))?;
-
-        if local.status.success() {
-            return Ok(true);
-        }
-
-        // Check remote branches (origin)
-        let remote = Command::new("git")
-            .args([
-                "show-ref",
-                "--verify",
-                &format!("refs/remotes/origin/{name}"),
-            ])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to check remote branch: {e}")))?;
-
-        Ok(remote.status.success())
+        Ok(local_branch_ref(repo_path, name).await?.is_some())
     }
 
-    /// Get the commit SHA for a ref.
-    async fn get_ref_commit(&self, repo_path: &Path, reference: &str) -> Result<String> {
-        let output = Command::new("git")
-            .args(["rev-parse", "--verify", reference])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to get commit for '{reference}': {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::Git(format!(
-                "Failed to resolve '{reference}': {stderr}"
-            )));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    /// Validate and expand a short commit SHA to full SHA.
+    /// Validate that `sha` (full or abbreviated) names exactly one commit
+    /// object, and expand it to the full SHA.
+    ///
+    /// Only objects are considered — never refs — so a branch named like a
+    /// SHA (`deadbeef`) can't pose as a commit: it falls through to the
+    /// branch lookup instead.
     async fn validate_and_expand_commit(&self, repo_path: &Path, sha: &str) -> Result<String> {
-        // Use cat-file to verify it's a commit object
-        let output = Command::new("git")
-            .args(["cat-file", "-t", sha])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to validate commit '{sha}': {e}")))?;
-
-        if !output.status.success() {
-            return Err(Error::Git(format!("Commit '{sha}' not found")));
-        }
-
-        let object_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if object_type != "commit" {
-            return Err(Error::Git(format!(
-                "'{sha}' is a {object_type}, not a commit"
-            )));
-        }
-
-        // Expand to full SHA
-        let output = Command::new("git")
-            .args(["rev-parse", "--verify", sha])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| Error::Git(format!("Failed to expand commit SHA: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::Git(format!("Failed to expand commit SHA: {stderr}")));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let candidates = objects_with_prefix(repo_path, sha).await?;
+        pick_commit(sha, &candidates)
     }
 
     /// Resolve a `tag:` keyword to a concrete tag, or return `None` if the
@@ -886,6 +821,177 @@ impl<'a> RefResolver<'a> {
             .collect();
 
         Ok(tags)
+    }
+}
+
+/// The fully-qualified ref a branch name resolves to in a local clone: the
+/// local branch (`refs/heads/<name>`), else origin's remote-tracking branch
+/// (`refs/remotes/origin/<name>`). Only branch namespaces are searched, so a
+/// same-named tag never answers.
+///
+/// # Arguments
+///
+/// * `repo_path` - The local repository
+/// * `name` - Branch name as the user wrote it
+///
+/// # Returns
+///
+/// The first of those refs that exists, or `None` when neither does.
+///
+/// # Errors
+///
+/// [`Error::Git`] when git cannot be started.
+async fn local_branch_ref(repo_path: &Path, name: &str) -> Result<Option<String>> {
+    for full_ref in [
+        format!("refs/heads/{name}"),
+        format!("refs/remotes/origin/{name}"),
+    ] {
+        let output = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", &full_ref])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| Error::Git(format!("Failed to check branch '{name}': {e}")))?;
+        if output.status.success() {
+            return Ok(Some(full_ref));
+        }
+    }
+    Ok(None)
+}
+
+/// The commit a fully-qualified ref points at, peeling annotated tags
+/// (`<ref>^{commit}`).
+///
+/// # Arguments
+///
+/// * `repo_path` - The local repository
+/// * `full_ref` - A fully-qualified ref such as `refs/tags/v1.0.0`; never a
+///   bare name, which git would resolve tags-first
+///
+/// # Returns
+///
+/// The full commit SHA, or `None` when the ref does not exist or does not
+/// lead to a commit (e.g. a tag on a tree).
+///
+/// # Errors
+///
+/// [`Error::Git`] when git cannot be started.
+async fn peeled_commit(repo_path: &Path, full_ref: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{full_ref}^{{commit}}"),
+        ])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| Error::Git(format!("Failed to resolve '{full_ref}': {e}")))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    ))
+}
+
+/// Every object whose name starts with `prefix`, as `(full SHA, type)`.
+///
+/// `git rev-parse --disambiguate` lists object names only — unlike
+/// `cat-file`/`rev-parse <name>`, which would also resolve a branch or tag
+/// spelled like the prefix. Each full SHA is then typed with `cat-file -t`
+/// (unambiguous for a full-length name).
+///
+/// # Arguments
+///
+/// * `repo_path` - The local repository
+/// * `prefix` - Hex SHA prefix (validated as hex, 7–64 chars, by the caller)
+///
+/// # Returns
+///
+/// Every matching object; empty when nothing matches.
+///
+/// # Errors
+///
+/// [`Error::Git`] when git cannot be started or the lookup fails.
+async fn objects_with_prefix(repo_path: &Path, prefix: &str) -> Result<Vec<(String, String)>> {
+    let listed = Command::new("git")
+        .args(["rev-parse", &format!("--disambiguate={prefix}")])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .map_err(|e| Error::Git(format!("Failed to look up commit '{prefix}': {e}")))?;
+    if !listed.status.success() {
+        let stderr = String::from_utf8_lossy(&listed.stderr);
+        return Err(Error::Git(format!(
+            "Failed to look up commit '{prefix}': {}",
+            stderr.trim()
+        )));
+    }
+
+    let mut objects = Vec::new();
+    for oid in String::from_utf8_lossy(&listed.stdout).split_whitespace() {
+        let typed = Command::new("git")
+            .args(["cat-file", "-t", oid])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| Error::Git(format!("Failed to read object '{oid}': {e}")))?;
+        if typed.status.success() {
+            let kind = String::from_utf8_lossy(&typed.stdout).trim().to_string();
+            objects.push((oid.to_string(), kind));
+        }
+    }
+    Ok(objects)
+}
+
+/// Choose the commit that `prefix` names among the objects sharing it.
+///
+/// Pure (the git queries happen in [`objects_with_prefix`]) so every outcome
+/// is unit-tested.
+///
+/// # Arguments
+///
+/// * `prefix` - The SHA (prefix) the user gave, for error messages
+/// * `objects` - `(full SHA, object type)` of every object with that prefix
+///
+/// # Returns
+///
+/// The full SHA of the single matching commit.
+///
+/// # Errors
+///
+/// [`Error::Git`] when nothing matches, when only non-commit objects match,
+/// or when several commits match (the prefix is too short to be unique).
+fn pick_commit(prefix: &str, objects: &[(String, String)]) -> Result<String> {
+    // Only names that start with the whole input count — git also lists a
+    // shorter object for an over-long input (`<sha>0` in a SHA-1 repo).
+    let wanted = prefix.to_ascii_lowercase();
+    let objects: Vec<&(String, String)> = objects
+        .iter()
+        .filter(|(oid, _)| oid.to_ascii_lowercase().starts_with(&wanted))
+        .collect();
+    let commits: Vec<&str> = objects
+        .iter()
+        .filter(|(_, kind)| kind == "commit")
+        .map(|(oid, _)| oid.as_str())
+        .collect();
+
+    match (commits.as_slice(), objects.as_slice()) {
+        ([commit], _) => Ok((*commit).to_string()),
+        ([], []) => Err(Error::Git(format!("Commit '{prefix}' not found"))),
+        ([], [(_, kind)]) => Err(Error::Git(format!("'{prefix}' is a {kind}, not a commit"))),
+        ([], _) => Err(Error::Git(format!(
+            "'{prefix}' matches no commit (only {} other objects)",
+            objects.len()
+        ))),
+        (many, _) => Err(Error::Git(format!(
+            "Commit SHA '{prefix}' is ambiguous: it matches {} commits. \
+             Use more characters.",
+            many.len()
+        ))),
     }
 }
 
@@ -1594,6 +1700,194 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn local_annotated_tags_resolve_to_the_tagged_commit() {
+        // The SHA must be the commit checkout lands on — never the tag
+        // object — matching what remote mode reports for the same tag.
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let commit = git_stdout(clone.path(), &["rev-parse", "v2.0.0^{commit}"]);
+        let remote = remote_resolver(&file_url(&origin))
+            .resolve("tag:v2.0.0")
+            .await
+            .unwrap();
+
+        for input in ["tag:v2.0.0", "v2.0.0", "tag:latest"] {
+            let local = local_resolver(clone.path()).resolve(input).await.unwrap();
+            assert_eq!(local.source, RefSource::Tag("v2.0.0".into()), "{input}");
+            assert_eq!(
+                local.commit_sha.as_deref(),
+                Some(commit.as_str()),
+                "{input}"
+            );
+        }
+        assert_eq!(remote.commit_sha.as_deref(), Some(commit.as_str()));
+    }
+
+    #[tokio::test]
+    async fn local_origin_only_branches_report_their_commit() {
+        // A fresh clone has `feature/x` only as a remote-tracking ref; its
+        // commit must still be reported (checkout DWIM-creates the branch).
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let tip = git_stdout(clone.path(), &["rev-parse", "origin/feature/x"]);
+
+        let resolved = local_resolver(clone.path())
+            .resolve("branch:feature/x")
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.commit_sha.as_deref(), Some(tip.as_str()));
+    }
+
+    #[tokio::test]
+    async fn local_branch_named_like_a_tag_reports_the_branch_commit() {
+        // `git rev-parse v1.0.0` prefers the tag; `branch:v1.0.0` must report
+        // the branch's own commit.
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        git(
+            clone.path(),
+            &["branch", "v1.0.0", "main"],
+            "2025-01-01T00:00:00",
+        );
+        let main = git_stdout(clone.path(), &["rev-parse", "main"]);
+
+        let resolved = local_resolver(clone.path())
+            .resolve("branch:v1.0.0")
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.source, RefSource::Branch("v1.0.0".into()));
+        assert_eq!(resolved.commit_sha.as_deref(), Some(main.as_str()));
+    }
+
+    #[tokio::test]
+    async fn local_hex_named_branch_is_a_branch_not_a_commit() {
+        // `git cat-file -t deadbeef` resolves the *branch*, which used to make
+        // it pass as a commit. Only real commit objects may match a SHA.
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        assert!(
+            git_stdout(clone.path(), &["rev-parse", "--disambiguate=deadbeef"]).is_empty(),
+            "fixture precondition: no object starts with deadbeef"
+        );
+        git(
+            clone.path(),
+            &["branch", "deadbeef", "main"],
+            "2025-01-01T00:00:00",
+        );
+        let main = git_stdout(clone.path(), &["rev-parse", "main"]);
+        let r = local_resolver(clone.path());
+
+        let resolved = r.resolve("deadbeef").await.unwrap();
+        assert_eq!(resolved.source, RefSource::Branch("deadbeef".into()));
+        assert_eq!(resolved.commit_sha.as_deref(), Some(main.as_str()));
+
+        let err = r.resolve("commit:deadbeef").await.unwrap_err();
+        assert!(
+            err.to_string().contains("Commit 'deadbeef' not found"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_commit_wins_over_a_branch_named_like_its_prefix() {
+        // A real commit object beats a hex-looking branch name: commit
+        // detection runs before the branch lookup.
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let c1 = git_stdout(clone.path(), &["rev-parse", "v1.0.0"]);
+        let prefix = &c1[..8];
+        git(
+            clone.path(),
+            &["branch", prefix, "main"],
+            "2025-01-01T00:00:00",
+        );
+
+        let resolved = local_resolver(clone.path()).resolve(prefix).await.unwrap();
+
+        assert_eq!(resolved.source, RefSource::Commit(c1.clone()));
+    }
+
+    #[tokio::test]
+    async fn commit_shas_longer_than_64_chars_are_rejected_before_git_runs() {
+        // 64 hex is the SHA-256 maximum; longer input made git itself abort
+        // (`--disambiguate` asserts on the length) instead of "not found".
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let too_long = "a".repeat(65);
+        for resolver in [standalone_resolver(), local_resolver(clone.path())] {
+            let err = resolver
+                .resolve(&format!("commit:{too_long}"))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("too long (maximum 64 characters)"),
+                "{err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_sha_with_extra_characters_is_not_found() {
+        // In a SHA-1 repo, `<sha>0` (41 chars) used to resolve to `<sha>`:
+        // only objects whose name starts with the whole input may match.
+        let origin = make_remote_repo();
+        let clone = local_clone(&origin);
+        let full = git_stdout(clone.path(), &["rev-parse", "v1.0.0"]);
+
+        for input in [format!("{full}0"), format!("{full}{}", "0".repeat(24))] {
+            let err = local_resolver(clone.path())
+                .resolve(&format!("commit:{input}"))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not found"), "{input}: {err}");
+        }
+    }
+
+    #[test]
+    fn pick_commit_ignores_objects_that_do_not_start_with_the_prefix() {
+        let objects = [("ffff0000".to_string(), "commit".to_string())];
+        let err = pick_commit("abc1234", &objects).unwrap_err().to_string();
+        assert!(err.contains("Commit 'abc1234' not found"), "{err}");
+        // Case-insensitive, like git: an upper-case prefix still matches.
+        let objects = [("abc1234f".to_string(), "commit".to_string())];
+        assert_eq!(pick_commit("ABC1234", &objects).unwrap(), "abc1234f");
+    }
+
+    #[test]
+    fn pick_commit_requires_exactly_one_commit_among_the_matches() {
+        let object = |oid: &str, kind: &str| (oid.to_string(), kind.to_string());
+
+        assert_eq!(
+            pick_commit("abc1234", &[object("abc1234f", "commit")]).unwrap(),
+            "abc1234f"
+        );
+        // A tree sharing the prefix does not make a lone commit ambiguous.
+        assert_eq!(
+            pick_commit(
+                "abc1234",
+                &[object("abc1234a", "tree"), object("abc1234f", "commit")]
+            )
+            .unwrap(),
+            "abc1234f"
+        );
+
+        let message = |candidates: &[(String, String)]| {
+            pick_commit("abc1234", candidates).unwrap_err().to_string()
+        };
+        assert!(message(&[]).contains("Commit 'abc1234' not found"));
+        assert!(message(&[object("abc1234a", "tree")]).contains("is a tree, not a commit"));
+        let ambiguous = message(&[object("abc1234a", "commit"), object("abc1234b", "commit")]);
+        assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+        assert!(ambiguous.contains("2 commits"), "{ambiguous}");
+        assert!(
+            message(&[object("abc1234a", "tree"), object("abc1234b", "blob")])
+                .contains("matches no commit")
+        );
     }
 
     #[tokio::test]

@@ -32,6 +32,10 @@ branch named `v1.0.0` and want the tag instead).
 | `commit:`   | `commit:abc1234`     | Force commit interpretation        |
 | `release:`  | `release:v5.6.8`     | Download pre-built GitHub Release assets (skip the build) |
 
+The build checks out exactly the kind of ref that was resolved, so
+`branch:v1.0.0` builds the branch even when a tag `v1.0.0` also exists, and
+`tag:v1.0.0` builds the tag.
+
 ## Special keyword refs — tags
 
 Tags are sorted by **creation date** (`git tag --sort=-creatordate`).

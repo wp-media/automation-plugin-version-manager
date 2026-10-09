@@ -363,6 +363,51 @@ async fn prefix_less_refs_are_detected_as_tag_or_branch() {
     assert_eq!(delivered(&branch), "three");
 }
 
+#[tokio::test]
+async fn a_branch_named_like_a_tag_builds_the_branch_and_the_tag_builds_the_tag() {
+    // Regression: the checkout used the bare name, and git prefers the tag
+    // over a branch that exists only on origin — so `branch:v1.0.0` built
+    // the tag's commit while reporting the branch.
+    let repo = tagged_repo();
+    git(
+        repo.path(),
+        &["branch", "v1.0.0", "main"],
+        "2025-01-01T10:00:00",
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let apvm = apvm_for(repo.path(), cache.path(), "src", Box::new(SourceBuilder));
+
+    let out_branch = tempfile::tempdir().unwrap();
+    let branch = apvm
+        .build_from_branch(
+            "src",
+            Some("1.0.0"),
+            "v1.0.0",
+            None,
+            out_branch.path(),
+            &NullReporter,
+        )
+        .await
+        .unwrap();
+    let out_tag = tempfile::tempdir().unwrap();
+    let tag = apvm
+        .build_from_tag(
+            "src",
+            Some("1.0.0"),
+            "v1.0.0",
+            None,
+            out_tag.path(),
+            &NullReporter,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(delivered(&branch), "three");
+    assert_eq!(branch.commit, sha_of(repo.path(), "refs/heads/v1.0.0"));
+    assert_eq!(delivered(&tag), "one");
+    assert_eq!(tag.commit, sha_of(repo.path(), "refs/tags/v1.0.0"));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fail-fast validation (nothing is cloned)
 // ─────────────────────────────────────────────────────────────────────────────

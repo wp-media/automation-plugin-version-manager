@@ -9,7 +9,7 @@ use crate::build::{ArtifactOrigin, BuildResult, BuildRunner, ProducedArtifact};
 use crate::cache_status::CacheStatus;
 use crate::commands::cache;
 use crate::error::{Error, Result};
-use crate::git::{BuildWorkspace, RefResolver, RefSource, RemoteGit, ResolvedRef};
+use crate::git::{BuildWorkspace, RefResolver, RefSource, RemoteGit, Repository, ResolvedRef};
 use crate::github::client::download_asset_owned;
 use crate::github::{GitHubClient, ReleaseAsset};
 use crate::projects::{Project, ProjectRegistry};
@@ -565,6 +565,32 @@ fn ensure_safe_version(project: &str, version: &str) -> Result<()> {
 /// fail the whole cache-warm for the release's assets.
 fn storable_version(version: &str) -> Option<String> {
     is_safe_version(version).then(|| version.to_string())
+}
+
+/// Check out exactly what `resolved` names in a fresh clone.
+///
+/// A bare `git checkout <name>` prefers a tag over a same-named branch that
+/// exists only on origin, so `branch:v1.0` would build tag `v1.0`'s commit.
+/// Branches (including a PR's head branch) and tags are therefore checked
+/// out by their fully qualified refs; commits are full SHAs and need no
+/// disambiguation.
+///
+/// # Arguments
+///
+/// * `repo` - The cloned (and fetched) repository
+/// * `resolved` - The reference resolved before cloning
+///
+/// # Errors
+///
+/// [`Error::Git`] when the ref is missing or the checkout fails.
+async fn checkout_resolved(repo: &Repository, resolved: &ResolvedRef) -> Result<()> {
+    match &resolved.source {
+        RefSource::Branch(_) | RefSource::PullRequest(_) => {
+            repo.checkout_origin_branch(&resolved.git_ref).await
+        }
+        RefSource::Tag(_) => repo.checkout_tag(&resolved.git_ref).await,
+        RefSource::Commit(_) | RefSource::Release(_) => repo.checkout(&resolved.git_ref).await,
+    }
 }
 
 /// Human-readable branch label derived from the resolved source, used for
@@ -1142,8 +1168,8 @@ impl<'a> BuildCommand<'a> {
         repo.reset_hard().await?;
         workspace.pull().await?;
 
-        // Checkout the resolved ref.
-        repo.checkout(&resolved.git_ref).await?;
+        // Checkout the resolved ref (by its exact kind, never a lookalike).
+        checkout_resolved(repo, &resolved).await?;
 
         // Commit SHA after checkout — authoritative record of what was built.
         let (commit, commit_short) = repo.get_head_commit_pair().await?;

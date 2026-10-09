@@ -202,11 +202,64 @@ impl Repository {
     }
 
     /// Checkout a specific ref (branch, tag, or commit).
+    ///
+    /// The name is resolved exactly as `git checkout <name>` resolves it —
+    /// which, for a name shared by a tag and a branch that exists only on
+    /// origin, picks the tag. When the kind is known, prefer
+    /// [`checkout_origin_branch`](Self::checkout_origin_branch) or
+    /// [`checkout_tag`](Self::checkout_tag), which cannot pick the other.
     pub async fn checkout(&self, reference: &str) -> Result<()> {
-        tracing::debug!("Checking out '{}' in {}", reference, self.path.display());
+        self.run_checkout(&[reference]).await
+    }
+
+    /// Check out branch `name` exactly as origin has it: create — or reset —
+    /// the local branch at `refs/remotes/origin/<name>` and switch to it.
+    ///
+    /// Unlike a bare `git checkout <name>`, a tag with the same name can never
+    /// be picked instead, and an existing local branch lands on origin's
+    /// latest fetched tip rather than a stale one.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Branch name on origin (no `origin/` prefix)
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Git`] when origin has no such branch (as last fetched).
+    pub async fn checkout_origin_branch(&self, name: &str) -> Result<()> {
+        let start_point = format!("refs/remotes/origin/{name}");
+        self.run_checkout(&["-B", name, &start_point, "--"]).await
+    }
+
+    /// Check out tag `tag` as a detached HEAD on the commit it points at.
+    ///
+    /// Uses the fully qualified `refs/tags/<tag>`, so a branch with the same
+    /// name can never be picked instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Tag name (no `refs/tags/` prefix)
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Git`] when the repository has no such tag.
+    pub async fn checkout_tag(&self, tag: &str) -> Result<()> {
+        let full_ref = format!("refs/tags/{tag}");
+        self.run_checkout(&["--detach", &full_ref, "--"]).await
+    }
+
+    /// Run `git checkout <args>` in this repository.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Git`] when git cannot be started or the checkout fails
+    /// (its stderr is included).
+    async fn run_checkout(&self, args: &[&str]) -> Result<()> {
+        tracing::debug!("git checkout {} in {}", args.join(" "), self.path.display());
 
         let output = Command::new("git")
-            .args(["checkout", reference])
+            .arg("checkout")
+            .args(args)
             .current_dir(&self.path)
             .output()
             .await
@@ -619,6 +672,68 @@ mod tests {
         // rely on for PR head branches that exist only on origin).
         repo.checkout("feature/x").await.unwrap();
         assert_eq!(repo.current_branch().await.unwrap(), "feature/x");
+    }
+
+    #[tokio::test]
+    async fn exact_checkouts_never_confuse_a_branch_with_a_same_named_tag() {
+        // origin has tag `v1.0.0` (commit c1) AND a branch `v1.0.0` at main's
+        // tip. A bare `git checkout v1.0.0` in a fresh clone lands on the TAG,
+        // so building `branch:v1.0.0` used to build the wrong commit.
+        let origin = make_remote_repo();
+        git(
+            origin.path(),
+            &["branch", "v1.0.0", "main"],
+            "2025-01-01T00:00:00",
+        );
+        let (_holder, repo) = clone_of(&origin).await;
+        let tag_commit = git_stdout(repo.path(), &["rev-parse", "refs/tags/v1.0.0^{commit}"]);
+        let branch_tip = git_stdout(repo.path(), &["rev-parse", "refs/remotes/origin/v1.0.0"]);
+        assert_ne!(tag_commit, branch_tip, "fixture: the two refs must differ");
+
+        repo.checkout_origin_branch("v1.0.0").await.unwrap();
+        assert_eq!(repo.get_head_commit().await.unwrap(), branch_tip);
+        // On the branch itself (git abbreviates it as `heads/v1.0.0` here,
+        // because the short name is ambiguous).
+        assert_eq!(
+            git_stdout(repo.path(), &["symbolic-ref", "HEAD"]),
+            "refs/heads/v1.0.0"
+        );
+
+        repo.checkout_tag("v1.0.0").await.unwrap();
+        assert_eq!(repo.get_head_commit().await.unwrap(), tag_commit);
+        assert_eq!(repo.current_branch().await.unwrap(), "HEAD", "detached");
+    }
+
+    #[tokio::test]
+    async fn checkout_origin_branch_resets_an_existing_local_branch_to_origin() {
+        // The default branch already exists locally after a clone; it must
+        // land on origin's (freshly fetched) tip, not on a stale local one.
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+        let new_tip = commit_change(origin.path(), "four", "2025-02-01T10:00:00");
+        repo.fetch().await.unwrap();
+
+        repo.checkout_origin_branch("main").await.unwrap();
+
+        assert_eq!(repo.get_head_commit().await.unwrap(), new_tip);
+        assert_eq!(repo.current_branch().await.unwrap(), "main");
+    }
+
+    #[tokio::test]
+    async fn exact_checkouts_of_missing_refs_fail_with_git_error() {
+        let origin = make_remote_repo();
+        let (_holder, repo) = clone_of(&origin).await;
+
+        for err in [
+            repo.checkout_origin_branch("no-such-branch")
+                .await
+                .unwrap_err(),
+            repo.checkout_tag("no-such-tag").await.unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("git checkout failed"), "{err}");
+        }
+        // A failed checkout leaves HEAD where it was.
+        assert_eq!(repo.current_branch().await.unwrap(), "main");
     }
 
     #[tokio::test]

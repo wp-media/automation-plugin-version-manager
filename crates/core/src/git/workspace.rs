@@ -5,9 +5,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use tempfile::{Builder, TempDir};
+use tokio::sync::OnceCell;
 
 use crate::error::{Error, Result};
 
@@ -50,8 +50,10 @@ pub struct BuildWorkspace {
     repo_name: String,
     /// GitHub token for private repository access.
     github_token: Option<String>,
-    /// Cached repository handle after cloning.
-    repository: OnceLock<Repository>,
+    /// Cached repository handle after cloning. An async cell, so concurrent
+    /// [`clone_repo`](Self::clone_repo) calls wait for one clone instead of
+    /// racing two `git clone`s into the same directory.
+    repository: OnceCell<Repository>,
 }
 
 impl BuildWorkspace {
@@ -100,35 +102,47 @@ impl BuildWorkspace {
             repo_url: repo_url.to_string(),
             repo_name,
             github_token: github_token.map(String::from),
-            repository: OnceLock::new(),
+            repository: OnceCell::new(),
         })
     }
 
     /// Clone the repository into this workspace.
     ///
+    /// The workspace's token authenticates the clone only for an `https://`
+    /// repository URL; other transports (SSH, `file://`) use the system git's
+    /// own authentication. [`fetch`](Self::fetch) and [`pull`](Self::pull)
+    /// follow the same rule.
+    ///
     /// # Returns
     ///
     /// A [`Repository`] handle for the cloned repository. The repository
-    /// is cached, so calling this multiple times returns the same handle.
+    /// is cached, so calling this multiple times — even concurrently —
+    /// clones once and returns the same handle. A failed clone is not
+    /// cached: the next call tries again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Git`] when the clone fails.
     pub async fn clone_repo(&self) -> Result<&Repository> {
-        if self.repository.get().is_some() {
-            return Ok(self.repository.get().unwrap());
-        }
+        self.repository.get_or_try_init(|| self.clone_now()).await
+    }
 
-        let repo_path = self.temp_dir.path().join(&self.repo_name);
+    /// Clone the repository into [`repo_path`](Self::repo_path), with the
+    /// token only for an HTTPS URL ([`clone_repo`](Self::clone_repo) caches
+    /// the result).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Git`] when the clone fails.
+    async fn clone_now(&self) -> Result<Repository> {
+        let repo_path = self.repo_path();
 
         tracing::debug!("Cloning {} into {}", self.repo_url, repo_path.display());
 
-        let repo = match &self.github_token {
-            Some(token) if self.repo_url.starts_with("https://") => {
-                Repository::clone_with_token(&self.repo_url, token, &repo_path).await?
-            }
-            _ => Repository::clone(&self.repo_url, &repo_path).await?,
-        };
-
-        // Store the repository (ignoring if another thread got there first)
-        let _ = self.repository.set(repo);
-        Ok(self.repository.get().unwrap())
+        match self.https_token() {
+            Some(token) => Repository::clone_with_token(&self.repo_url, token, &repo_path).await,
+            None => Repository::clone(&self.repo_url, &repo_path).await,
+        }
     }
 
     /// Get the cloned repository handle.
@@ -172,19 +186,22 @@ impl BuildWorkspace {
         crate::build::BuildContext::new(self.repo_path(), self.temp_dir.path().to_path_buf())
     }
 
-    /// Fetch updates for the repository using the workspace's token.
+    /// Fetch updates for the repository. The workspace's token is used only
+    /// for an `https://` repository URL, exactly as in
+    /// [`clone_repo`](Self::clone_repo).
     pub async fn fetch(&self) -> Result<()> {
         let repo = self.repository();
-        match &self.github_token {
+        match self.https_token() {
             Some(token) => repo.fetch_with_token(token).await,
             None => repo.fetch().await,
         }
     }
 
-    /// Pull latest changes using the workspace's token.
+    /// Pull latest changes. The workspace's token is used only for an
+    /// `https://` repository URL, exactly as in [`clone_repo`](Self::clone_repo).
     pub async fn pull(&self) -> Result<()> {
         let repo = self.repository();
-        match &self.github_token {
+        match self.https_token() {
             Some(token) => repo.pull_with_token(token).await,
             None => repo.pull().await,
         }
@@ -193,6 +210,19 @@ impl BuildWorkspace {
     /// Get the GitHub token if available.
     pub fn github_token(&self) -> Option<&str> {
         self.github_token.as_deref()
+    }
+
+    /// The token to authenticate git operations with: only for an `https://`
+    /// repository URL. Other transports (SSH, `file://`) use the system git's
+    /// own authentication, so clone, fetch and pull all follow one rule.
+    ///
+    /// # Returns
+    ///
+    /// The token, or `None` without one or for a non-HTTPS URL.
+    fn https_token(&self) -> Option<&str> {
+        self.github_token
+            .as_deref()
+            .filter(|_| self.repo_url.starts_with("https://"))
     }
 
     /// Collect artifacts from the workspace to an output directory.
@@ -529,6 +559,24 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn concurrent_clone_repo_calls_share_one_clone() {
+        // Two racing callers used to run two `git clone`s into the same
+        // directory; the second failed with "already exists".
+        let origin = make_remote_repo();
+        let workspace = BuildWorkspace::new("test", &file_url(&origin), None).unwrap();
+
+        let (first, second) = tokio::join!(workspace.clone_repo(), workspace.clone_repo());
+
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(
+            std::ptr::eq(first, second),
+            "both callers get the one handle"
+        );
+        assert_eq!(first.path(), workspace.repo_path());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn clone_repo_with_token_on_non_https_url_uses_plain_clone() {
         // Tokens only apply to HTTPS; other transports (SSH, file) must
         // clone with the system git's own auth instead of failing.
@@ -540,6 +588,40 @@ mod tests {
             git_stdout(repo.path(), &["remote", "get-url", "origin"]),
             file_url(&origin)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_and_pull_with_token_on_non_https_url_use_plain_git() {
+        // Regression: clone ignored the token for a non-HTTPS URL, but
+        // fetch/pull always took the token path and failed with "requires
+        // HTTPS". All three must follow the same rule.
+        let origin = make_remote_repo();
+        let workspace = BuildWorkspace::new("test", &file_url(&origin), Some("ghp_x")).unwrap();
+        workspace.clone_repo().await.unwrap();
+        let new_tip = commit_change(origin.path(), "four", "2025-02-01T10:00:00");
+
+        workspace.fetch().await.unwrap();
+        workspace.pull().await.unwrap();
+
+        assert_eq!(
+            workspace.repository().get_head_commit().await.unwrap(),
+            new_tip
+        );
+    }
+
+    #[test]
+    fn tokens_apply_only_to_https_urls() {
+        let https = BuildWorkspace::new("test", "https://github.com/o/r.git", Some("t")).unwrap();
+        assert_eq!(https.https_token(), Some("t"));
+        for url in ["git@github.com:o/r.git", "file:///tmp/r", "http://h/r.git"] {
+            let other = BuildWorkspace::new("test", url, Some("t")).unwrap();
+            assert_eq!(other.https_token(), None, "{url}");
+            // The token is still reported as configured.
+            assert_eq!(other.github_token(), Some("t"), "{url}");
+        }
+        let anonymous = BuildWorkspace::new("test", "https://github.com/o/r.git", None).unwrap();
+        assert_eq!(anonymous.https_token(), None);
     }
 
     #[cfg(unix)]
