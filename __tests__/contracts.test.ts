@@ -406,19 +406,16 @@ describe('an environment that goes away mid-build', () => {
     });
     const buildOptions = { project: 'wp-rocket', gitRef: 'branch:develop', outputDir: path.join(dir, 'out') };
     // A worker (eval source) that starts the build; given \`end\`, it runs that
-    // code once its git hangs. Its workerData is \`workerData\` below.
+    // code when the main thread posts it a message — only after checking its
+    // processes, so it can never end before that check. Its workerData is
+    // \`workerData\` below.
     const workerBuild = (end) => [
-      "const fs = require('node:fs');",
-      "const { workerData } = require('node:worker_threads');",
+      "const { parentPort, workerData } = require('node:worker_threads');",
       "const { Apvm } = require(workerData.addon);",
       "Apvm.create({ cacheEnabled: false }).then((apvm) => apvm.build(workerData.options).catch(() => {}));",
-      end
-        ? "const timer = setInterval(() => {" +
-          " const text = fs.existsSync(workerData.helperPidFile) ? fs.readFileSync(workerData.helperPidFile, 'utf8') : '';" +
-          " if (text.endsWith('\\\\n')) { clearInterval(timer); " + end + " } }, 20);"
-        : '',
+      end ? "parentPort.once('message', () => { " + end + " });" : '',
     ].join('\\n');
-    const workerData = { addon: ADDON, options: buildOptions, helperPidFile };
+    const workerData = { addon: ADDON, options: buildOptions };
 
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     // Running = listed by ps and not a zombie (a killed child of this process
@@ -513,12 +510,17 @@ describe('an environment that goes away mid-build', () => {
   const workerEndings = [
     { how: 'being terminated', mainLoads: false, inWorker: '', fromMain: 'await worker.terminate();' },
     { how: 'being terminated', mainLoads: true, inWorker: '', fromMain: 'await worker.terminate();' },
-    { how: 'calling process.exit()', mainLoads: true, inWorker: 'process.exit(0);', fromMain: '' },
+    {
+      how: 'calling process.exit()',
+      mainLoads: true,
+      inWorker: 'process.exit(0);',
+      fromMain: "worker.postMessage('end');",
+    },
     {
       how: 'an uncaught exception',
       mainLoads: true,
       inWorker: "throw new Error('boom');",
-      fromMain: '',
+      fromMain: "worker.postMessage('end');",
     },
   ];
 
