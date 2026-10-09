@@ -299,7 +299,7 @@ Manages a temporary directory for build operations using [`tempfile::TempDir`](h
 
 `resolve_github_token()` implements the 5-source token resolution chain (see above).
 
-`is_valid_token_format()` validates known GitHub token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`).
+`is_valid_token_format()` validates known GitHub token prefixes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`), exported as `KNOWN_TOKEN_PREFIXES`. The same check vets `gh auth token` output (a single whitespace-free token), so a fine-grained `github_pat_` token stored in `gh` is picked up too.
 
 ## GitHub Module
 

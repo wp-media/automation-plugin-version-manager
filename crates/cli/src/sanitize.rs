@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use apvm_config::ConfigKey;
+use apvm_core::git::{KNOWN_TOKEN_PREFIXES, is_valid_token_format};
 
 /// Result of sanitizing a config value.
 #[derive(Debug)]
@@ -59,13 +60,8 @@ fn sanitize_bool(value: &str) -> SanitizeResult {
 /// - Reject empty strings
 /// - Warn on unrecognized prefixes (formats change over time)
 ///
-/// Known GitHub token prefixes:
-/// - `ghp_` — Personal Access Token (classic)
-/// - `gho_` — OAuth Access Token
-/// - `ghu_` — User-to-server Token
-/// - `ghs_` — Server-to-server Token
-/// - `ghr_` — Refresh Token
-/// - `github_pat_` — Fine-grained Personal Access Token
+/// The known prefixes are core's [`KNOWN_TOKEN_PREFIXES`] — the same list
+/// the token lookup uses, so the two can never disagree.
 fn sanitize_token(value: &str) -> SanitizeResult {
     let trimmed = value.trim();
 
@@ -75,12 +71,7 @@ fn sanitize_token(value: &str) -> SanitizeResult {
         );
     }
 
-    // Check for known GitHub token prefixes
-    let known_prefixes = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
-
-    let has_known_prefix = known_prefixes.iter().any(|p| trimmed.starts_with(p));
-
-    if has_known_prefix {
+    if is_valid_token_format(trimmed) {
         SanitizeResult::Ok(trimmed.to_string())
     } else {
         SanitizeResult::Warning {
@@ -88,7 +79,7 @@ fn sanitize_token(value: &str) -> SanitizeResult {
             message: format!(
                 "Token doesn't start with a known GitHub prefix ({}). \
                  It will be stored as-is, but verify it's correct.",
-                known_prefixes.join(", ")
+                KNOWN_TOKEN_PREFIXES.join(", ")
             ),
         }
     }

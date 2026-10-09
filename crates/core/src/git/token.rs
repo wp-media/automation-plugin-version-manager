@@ -189,11 +189,34 @@ async fn try_gh_auth_token() -> Option<String> {
 
 /// Extract a token from successful `gh auth token` stdout.
 ///
-/// Accepts only a trimmed, non-empty value starting with `gh`, so unrelated
-/// output from an old or wrapped `gh` is never mistaken for a credential.
+/// Accepts only a single value in the GitHub token alphabet
+/// ([`has_token_alphabet`]) with a known prefix ([`is_valid_token_format`]) —
+/// including fine-grained `github_pat_` tokens, which `gh auth login
+/// --with-token` stores as-is — so unrelated or decorated output from an old
+/// or wrapped `gh` is never mistaken for a credential.
+///
+/// # Arguments
+///
+/// * `stdout` - Raw stdout of `gh auth token`
+///
+/// # Returns
+///
+/// The trimmed token, or `None` when the output is not exactly one token.
 fn parse_gh_auth_token_stdout(stdout: &[u8]) -> Option<String> {
     let token = String::from_utf8_lossy(stdout).trim().to_string();
-    (!token.is_empty() && token.starts_with("gh")).then_some(token)
+    (has_token_alphabet(&token) && is_valid_token_format(&token)).then_some(token)
+}
+
+/// Whether `token` is non-empty and uses only the GitHub token alphabet
+/// (`[A-Za-z0-9_]`), for tokens apvm discovers on its own (`gh auth token`,
+/// `hosts.yml`).
+///
+/// Such a token is embedded in `https://x-access-token:<token>@…` URLs, so
+/// characters like `@`, `/`, `:` or `#` could redirect the credential to
+/// another host or path; whitespace, control or escape characters only mean
+/// the value is not a bare token.
+fn has_token_alphabet(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Read token from gh CLI config file.
@@ -224,8 +247,10 @@ fn read_gh_config_token() -> Option<String> {
 /// Read and parse a gh `hosts.yml` at `config_path`.
 ///
 /// Returns `None` when the file is missing, unreadable, or has no
-/// `github.com` `oauth_token` — never an error, since this is only a
-/// fallback source.
+/// `github.com` `oauth_token` in the GitHub token alphabet
+/// ([`has_token_alphabet`]) — never an error, since this is only a fallback
+/// source. No prefix is required: tokens issued before GitHub's 2021 format
+/// change have none and still work.
 fn read_gh_hosts_file(config_path: &std::path::Path) -> Option<String> {
     trace!("Reading gh config from: {}", config_path.display());
 
@@ -238,7 +263,7 @@ fn read_gh_hosts_file(config_path: &std::path::Path) -> Option<String> {
 
     // Parse the YAML manually (simple case - avoid adding yaml dependency)
     // We're looking for oauth_token under github.com
-    parse_gh_hosts_yaml(&content)
+    parse_gh_hosts_yaml(&content).filter(|token| has_token_alphabet(token))
 }
 
 /// Get the path to gh CLI hosts config file.
@@ -388,24 +413,27 @@ fn extract_oauth_token(line: &str) -> Option<String> {
     Some(token.to_string())
 }
 
-/// Check if a GitHub token appears to be valid format.
-///
-/// Does NOT validate against GitHub API, just format check.
-///
-/// # Token Formats
+/// Prefixes of every documented GitHub token kind — the single list both the
+/// token lookup and the CLI's `config set token` check use.
 ///
 /// | Prefix | Type |
 /// |--------|------|
 /// | `ghp_` | Personal Access Token (classic) |
-/// | `github_pat_` | Personal Access Token (fine-grained) |
 /// | `gho_` | OAuth token |
 /// | `ghu_` | User-to-server token |
 /// | `ghs_` | Server-to-server token |
 /// | `ghr_` | Refresh token |
-pub fn is_valid_token_format(token: &str) -> bool {
-    let valid_prefixes = ["ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_"];
+/// | `github_pat_` | Personal Access Token (fine-grained) |
+///
+/// Source: <https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#githubs-token-formats>
+pub const KNOWN_TOKEN_PREFIXES: &[&str] = &["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
 
-    valid_prefixes
+/// Check if a GitHub token appears to be valid format: it starts with one of
+/// the [`KNOWN_TOKEN_PREFIXES`].
+///
+/// Does NOT validate against GitHub API, just format check.
+pub fn is_valid_token_format(token: &str) -> bool {
+    KNOWN_TOKEN_PREFIXES
         .iter()
         .any(|prefix| token.starts_with(prefix))
 }
@@ -584,6 +612,101 @@ enterprise.example.com:
     // =========================================================================
     // `gh auth token` output parsing
     // =========================================================================
+
+    #[test]
+    fn gh_auth_token_stdout_accepts_every_known_token_kind() {
+        // `gh auth login --with-token` stores whatever token it is given, so
+        // `gh auth token` can print a fine-grained PAT, not just `gho_`.
+        for token in [
+            "gho_oauth",
+            "ghp_classic",
+            "ghu_user",
+            "ghs_server",
+            "ghr_refresh",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+        ] {
+            let stdout = format!("{token}\n");
+            assert_eq!(
+                parse_gh_auth_token_stdout(stdout.as_bytes()).as_deref(),
+                Some(token)
+            );
+        }
+    }
+
+    #[test]
+    fn gh_auth_token_stdout_rejects_anything_but_a_single_token() {
+        // Extra lines or words mean the output is not (only) a token — e.g. a
+        // wrapper script printing a banner — and must not be sent to GitHub.
+        for stdout in [
+            "gho_abc\nnotice: something else\n",
+            "ghp_abc def",
+            "gh version 2.0.0",
+            "ghost",
+        ] {
+            assert_eq!(
+                parse_gh_auth_token_stdout(stdout.as_bytes()),
+                None,
+                "{stdout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovered_tokens_must_use_the_github_token_alphabet() {
+        // Auto-discovered tokens are embedded in `https://x-access-token:<t>@`
+        // URLs: `@`, `/`, `:` or `#` would move the credential to another
+        // host or path, and escape codes from a wrapped `gh` only cause
+        // confusing 401s. GitHub tokens use `[A-Za-z0-9_]` only.
+        for stdout in [
+            "gho_x@evil.example/",
+            "gho_x:y",
+            "gho_x#frag",
+            "gho_x\u{1b}[0m",
+            "gho_x\0",
+            "gho_\u{fffd}",
+        ] {
+            assert_eq!(
+                parse_gh_auth_token_stdout(stdout.as_bytes()),
+                None,
+                "{stdout:?}"
+            );
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("hosts.yml");
+        std::fs::write(&path, "github.com:\n    oauth_token: ghp_x@evil.example/\n").unwrap();
+        assert_eq!(read_gh_hosts_file(&path), None);
+    }
+
+    #[test]
+    fn hosts_file_keeps_legacy_tokens_without_a_prefix() {
+        // Tokens issued before GitHub's 2021 format change have no prefix but
+        // still work; the hosts.yml fallback has always accepted them.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("hosts.yml");
+        let legacy = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(&path, format!("github.com:\n    oauth_token: {legacy}\n")).unwrap();
+        assert_eq!(read_gh_hosts_file(&path).as_deref(), Some(legacy));
+    }
+
+    #[test]
+    fn known_prefixes_are_listed_in_documentation_order() {
+        // The CLI prints this list in its unknown-prefix warning; keep the
+        // order the READMEs and the skill use.
+        assert_eq!(
+            KNOWN_TOKEN_PREFIXES,
+            ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]
+        );
+    }
+
+    #[test]
+    fn known_prefixes_drive_the_format_check() {
+        for prefix in KNOWN_TOKEN_PREFIXES {
+            assert!(is_valid_token_format(&format!("{prefix}abc")), "{prefix}");
+        }
+        assert!(!is_valid_token_format("gh_abc"));
+        assert!(!is_valid_token_format("token"));
+    }
 
     #[test]
     fn gh_auth_token_stdout_accepts_trimmed_gh_tokens_only() {
