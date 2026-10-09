@@ -1,6 +1,6 @@
 # NAPI cache maintenance — parity with `apvm cache`
 
-Status: **Phases 1–3.1 implemented** (Phases 1, 2 and 3 audited; cumulative audit of 1–3.1 done, its fixes committed in `21f4c13`; Phase 4 planned) · Target version: **3.3.0** (from 3.2.0 — also claimed by the site-deployment plan; whichever lands second takes the next minor) · Author: Sandy Figueroa
+Status: **Phases 1–3.1 implemented** (Phases 1, 2 and 3 audited; cumulative audit of 1–3.1 done, its fixes committed in `21f4c13`; Phase 4 version bump done, awaiting CI) · Target version: **3.3.0** (from 3.2.0; the site-deployment plan moved to 3.4.0) · Author: Sandy Figueroa
 
 ---
 
@@ -414,6 +414,7 @@ Five independent auditors (storage file-system safety, storage SQLite/concurrenc
 
 - Bump the workspace `version` and `package.json` to 3.3.0, and both `3.2.0` mentions in `SKILL.md` (lines 18 and 436; the `CARGO_PKG_VERSION` test in `skill/embedded.rs` only checks that the version appears, so check both by hand).
 - **Exit:** CI green on all three OSes; CI commits the regenerated bindings; the committed `index.d.ts` diff is reviewed against §3.5.
+- **Done (2026-10-08):** `Cargo.toml`, `Cargo.lock` (workspace crates only), `package.json`, the two root fields of `package-lock.json`, and `SKILL.md` lines 18 and 436 now say 3.3.0. The `3.2.0` in `crates/cli/src/update_check.rs` tests is a fixture and stays. Local results: fmt, clippy and doc clean; 845 Rust tests and 130 Node tests pass (1 skipped because file permissions don't apply here), typecheck passes, and `apvm --version` prints 3.3.0. The site-deployment plan was retargeted to 3.4.0.
 
 ---
 

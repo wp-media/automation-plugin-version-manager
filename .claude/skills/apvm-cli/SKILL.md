@@ -15,7 +15,7 @@ SQLite-indexed artifact cache. This skill is the authoritative reference for
 its command surface; treat the source-of-truth as `apvm <command> --help` and
 `crates/cli/src/commands/*.rs`.
 
-Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.2.0**.
+Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.3.0**.
 
 ---
 
@@ -433,7 +433,7 @@ Required for private repos and PR builds. Recommended for public repos
 ## Verification commands
 
 ```sh
-apvm --version              # 3.2.0 (or current)
+apvm --version              # 3.3.0 (or current)
 apvm list                   # registered plugins
 apvm info <plugin>          # version requirement, variants, tool deps
 apvm config path            # config file location
