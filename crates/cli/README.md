@@ -270,7 +270,7 @@ Input values are sanitized before storage:
 
 - **`APVM_CACHE_DIR`** — Overrides the artifact cache directory for the current invocation. Takes precedence over the config `cache-dir` and the default `~/.apvm/cache`, and is honored by both builds and the `cache` command. Useful for CI or local testing: point it at a throwaway directory so a run never reads from or warms your real cache.
 - **`GITHUB_TOKEN`** / **`GH_TOKEN`** — Fallback GitHub token when none is in config.
-- **`RUST_LOG`** — Enables logging (`debug`, `trace`, …); implies verbose diagnostics.
+- **`RUST_LOG`** — Enables logging (`debug`, `trace`, …) on stderr. Independent of `--verbose`, which shows the build commands' own output; while logging, the build spinner is hidden.
 - **`APVM_NO_UPDATE_CHECK`** — Set to any non-empty value to disable the automatic background update check and its notice (see [Update Command](#update-command)).
 
 ```sh

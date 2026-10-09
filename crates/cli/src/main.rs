@@ -2,6 +2,7 @@
 //!
 //! Command-line interface for building and managing WordPress plugin versions.
 
+mod broken_pipe;
 mod color;
 mod commands;
 mod defaults;
@@ -10,6 +11,7 @@ mod sanitize;
 mod status;
 mod update_check;
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -80,16 +82,32 @@ enum Commands {
 // Main Entry Point
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Main entry point with async runtime.
+/// Main entry point: builds the async runtime and runs the command.
 ///
-/// Uses `tokio::main` for async operations (git, GitHub API, etc.).
-/// The `current_thread` flavor is sufficient for CLI tools and has lower overhead.
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+/// A `current_thread` Tokio runtime is enough for a CLI (git, GitHub API,
+/// builds) and has lower overhead. It is built by hand rather than with
+/// `#[tokio::main]` so the whole run sits inside [`broken_pipe::run`]: a
+/// closed output pipe (`apvm list | head -1`) then unwinds — dropping build
+/// workspaces and temp files — and exits quietly with
+/// [`broken_pipe::EXIT_CODE`].
+fn main() -> ExitCode {
+    broken_pipe::install();
+
     // Initialize tracing (only if RUST_LOG is set)
     init_tracing();
 
-    run().await
+    broken_pipe::run(|| {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(run()),
+            Err(e) => {
+                eprintln!("Error: could not start the async runtime: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 /// Run one CLI invocation end to end.
@@ -115,9 +133,11 @@ async fn run() -> ExitCode {
     // Run the requested command.
     let result = dispatch(cli, &paths).await;
 
-    // Report the command's own error first...
+    // Report the command's own error first... Written without panicking:
+    // the command already failed, and that exit status (1) must survive a
+    // closed stderr instead of becoming the broken-pipe status.
     if let Err(e) = &result {
-        eprintln!("Error: {e}");
+        let _ = writeln!(std::io::stderr(), "Error: {e}");
     }
 
     // ...then the update notice, as the last thing printed. Skipped entirely
@@ -216,8 +236,10 @@ async fn dispatch(cli: Cli, paths: &Paths) -> Result<()> {
 
 /// Initialize tracing/logging.
 ///
-/// Enables if `RUST_LOG` environment variable is set OR if `--verbose` flag is used.
-/// This keeps normal CLI output clean while allowing debug output when needed.
+/// Enabled only when the `RUST_LOG` environment variable is set (`--verbose`
+/// is separate: it shows the build commands' own output). Logs go to stderr,
+/// so stdout keeps only the command's output, and are colored only when
+/// stderr is a terminal and `NO_COLOR` is not set to a non-empty value.
 ///
 /// # Examples
 ///
@@ -226,7 +248,7 @@ async fn dispatch(cli: Cli, paths: &Paths) -> Result<()> {
 /// apvm build backwpup 123
 ///
 /// # Verbose (shows commands and output)
-/// apvm -v build backwpup 123
+/// apvm build backwpup 123 --verbose
 ///
 /// # Debug mode (full tracing)
 /// RUST_LOG=debug apvm build backwpup 123
@@ -235,12 +257,27 @@ async fn dispatch(cli: Cli, paths: &Paths) -> Result<()> {
 /// RUST_LOG=trace apvm build backwpup 123
 /// ```
 fn init_tracing() {
-    if std::env::var("RUST_LOG").is_ok() {
+    if tracing_requested() {
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_target(false) // Cleaner output without module paths
+            // Diagnostics are not the command's output: keep them off stdout
+            // (`RUST_LOG=debug apvm list | grep …` must still work), styled
+            // by the same rules as apvm's other stderr text.
+            .with_writer(std::io::stderr)
+            .with_ansi(color::colors_enabled(color::Stream::Stderr))
+            // A failed log write (closed stderr) is dropped: tracing would
+            // otherwise report it with `eprintln!` on that same stream and
+            // panic — possibly while unwinding, which aborts.
+            .log_internal_errors(false)
             .init();
     }
+}
+
+/// Whether `RUST_LOG` diagnostics are enabled for this run (the variable is
+/// set). Other output adapts to it, e.g. the build spinner steps aside.
+pub(crate) fn tracing_requested() -> bool {
+    std::env::var("RUST_LOG").is_ok()
 }
 
 #[cfg(test)]

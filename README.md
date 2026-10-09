@@ -299,7 +299,7 @@ apvm config path
   `~/.apvm/cache`. Honored by both the build commands and `apvm cache`.
 - **`GITHUB_TOKEN`** / **`GH_TOKEN`** — GitHub token used when none is set in
   config (part of token auto-resolution).
-- **`RUST_LOG`** — Enables logging output (`debug`, `trace`, …).
+- **`RUST_LOG`** — Enables logging output (`debug`, `trace`, …), written to stderr.
 - **`APVM_NO_UPDATE_CHECK`** — Set to any non-empty value to disable the
   automatic background update check and its notice (see
   [Automatic update notice](#automatic-update-notice)).

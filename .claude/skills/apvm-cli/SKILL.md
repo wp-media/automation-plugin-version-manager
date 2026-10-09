@@ -29,10 +29,14 @@ Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.3.0**
   stream: stdout output when stdout is not a TTY, stderr status lines
   (`✓`/`info`/`warn`/`error`, prompts) when stderr is not a TTY.
 - Exit codes: `0` success, `1` any error (verify exits 1 when issues found),
-  `2` invalid arguments (e.g. `cache clean --builds --releases`).
+  `2` invalid arguments (e.g. `cache clean --builds --releases`), `141` when
+  the reader of apvm's output went away (`apvm list | head -1`): apvm stops
+  quietly — like a process killed by SIGPIPE — after cleaning up. A command
+  that had already failed keeps `1`; `apvm cache` subcommands write their
+  output best-effort and finish regardless.
 - `RUST_LOG=debug|trace` — enable tracing (`tracing-subscriber` `EnvFilter`).
-  The log lines go to **stdout**, mixed with the command's output, and keep
-  their colors when piped unless `NO_COLOR` is set.
+  Log lines go to **stderr** (stdout keeps only the command's output), and
+  follow the same color rules as other stderr output.
 - **`APVM_CACHE_DIR=<path>`** — override the cache directory for one
   invocation. Takes precedence over the config `cache-dir` and the default
   `~/.apvm/cache`. Honored by both `apvm build` and `apvm cache`.

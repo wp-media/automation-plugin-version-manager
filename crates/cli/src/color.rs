@@ -4,9 +4,9 @@
 //! <https://no-color.org>) or when the stream the text is written to is not a
 //! terminal (piped/redirected). Stdout and stderr are checked separately, so
 //! `apvm … 2>log` keeps colors on the terminal while the log stays plain, and
-//! apvm's own output never puts escape codes into a pipe. (`RUST_LOG`
-//! diagnostics are formatted by `tracing-subscriber`, not here: they go to
-//! stdout and stay colored when piped unless `NO_COLOR` is set.)
+//! apvm's output never puts escape codes into a pipe. (`RUST_LOG`
+//! diagnostics are formatted by `tracing-subscriber`; `main` hands it the
+//! stderr decision from here.)
 
 use std::ffi::OsStr;
 use std::io::IsTerminal;

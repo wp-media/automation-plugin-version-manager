@@ -278,3 +278,101 @@ fn cache_rejects_invalid_flags_even_without_a_cache() {
     assert!(stderr(&out).contains("'bogus'"), "{}", stderr(&out));
     assert!(!sandbox.cache_env_dir().exists());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Diagnostics
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn rust_log_diagnostics_go_to_stderr_without_escape_codes() {
+    // stdout carries only the command's output, so `RUST_LOG=debug apvm list
+    // | grep …` keeps working; the logs go to stderr, plain when piped (even
+    // without NO_COLOR).
+    let sandbox = Sandbox::new().without_env("NO_COLOR");
+    let plain = sandbox.run(&["list"]);
+    assert_exit(&plain, 0);
+
+    let logged = sandbox
+        .command_for(std::path::Path::new(common::APVM))
+        .arg("list")
+        .env("RUST_LOG", "debug")
+        .output()
+        .expect("run apvm");
+    assert_exit(&logged, 0);
+    assert_eq!(stdout(&logged), stdout(&plain), "logs leaked into stdout");
+    let logs = stderr(&logged);
+    assert!(
+        logs.contains("DEBUG"),
+        "expected debug logs on stderr:\n{logs}"
+    );
+    assert!(
+        !logs.contains('\x1b'),
+        "escape codes in piped logs:\n{logs:?}"
+    );
+}
+
+#[test]
+fn a_closed_stdout_ends_the_command_quietly_with_the_sigpipe_status() {
+    // `apvm list | head -0`: the reader is gone before apvm writes. std's
+    // `println!` panics on the broken pipe; apvm must not print a panic
+    // message, and must report the cut-off like a process killed by SIGPIPE
+    // (128 + 13), so `set -o pipefail` scripts still notice it.
+    let sandbox = Sandbox::new();
+    let (reader, writer) = std::io::pipe().expect("create pipe");
+    drop(reader);
+    let out = sandbox
+        .command_for(std::path::Path::new(common::APVM))
+        .arg("list")
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("run apvm");
+    assert_eq!(out.status.code(), Some(141), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "", "no panic message");
+}
+
+/// Run the test's `apvm` with `args` in `sandbox`, its stderr a pipe whose
+/// reader is already gone (stdout still captured); `env` adds variables.
+fn run_with_closed_stderr(
+    sandbox: &Sandbox,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> std::process::Output {
+    let (reader, writer) = std::io::pipe().expect("create pipe");
+    drop(reader);
+    sandbox
+        .command_for(std::path::Path::new(common::APVM))
+        .args(args)
+        .envs(env.iter().copied())
+        .stdout(std::process::Stdio::piped())
+        .stderr(writer)
+        .output()
+        .expect("run apvm")
+}
+
+#[test]
+fn a_failing_command_keeps_its_exit_code_when_stderr_is_closed() {
+    // The `Error:` line cannot be printed, but the command did fail: that
+    // must stay exit 1, not become the broken-pipe status.
+    let out = run_with_closed_stderr(&Sandbox::new(), &["info", "no-such-plugin"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn rust_log_to_a_closed_stderr_never_stops_the_command() {
+    // Log writes that fail are dropped; the command's own stdout output is
+    // complete and it succeeds.
+    let sandbox = Sandbox::new();
+    let expected = stdout(&sandbox.run(&["list"]));
+    let out = run_with_closed_stderr(&sandbox, &["list"], &[("RUST_LOG", "debug")]);
+    assert_exit(&out, 0);
+    assert_eq!(stdout(&out), expected);
+}
+
+#[test]
+fn status_output_to_a_closed_stderr_ends_quietly_with_the_sigpipe_status() {
+    // `skill install` reports on stderr; with the reader gone it stops at
+    // its first status line, like a process killed by SIGPIPE.
+    let out = run_with_closed_stderr(&Sandbox::new(), &["skill", "install"], &[]);
+    assert_eq!(out.status.code(), Some(141));
+}

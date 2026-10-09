@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use apvm_core::build::plugins::VersionRequirement;
 use apvm_core::build::progress::{BuildEvent, ClosureReporter};
@@ -296,8 +296,13 @@ impl BuildArgs {
             )
             .await?
         } else {
-            // Normal mode: spinner with step descriptions
+            // Normal mode: spinner with step descriptions. With `RUST_LOG` set
+            // the log lines are the progress display: a drawn spinner would
+            // share their stderr lines and garble both.
             let spinner = ProgressBar::new_spinner();
+            if crate::tracing_requested() {
+                spinner.set_draw_target(ProgressDrawTarget::hidden());
+            }
             spinner.set_style(
                 ProgressStyle::with_template("{spinner:.cyan} {msg}")
                     .unwrap()

@@ -27,7 +27,7 @@ apvm-storage = { workspace = true }
 # CLI argument parsing
 clap = { workspace = true }
 
-# Async runtime (needed for #[tokio::main])
+# Async runtime (the CLI runs on a current-thread runtime built in `main`)
 tokio = { workspace = true }
 
 # Serialization (config file I/O + the update-notifier state file)
