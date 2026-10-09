@@ -244,8 +244,23 @@ impl Repository {
     ///
     /// [`Error::Git`] when the repository has no such tag.
     pub async fn checkout_tag(&self, tag: &str) -> Result<()> {
-        let full_ref = format!("refs/tags/{tag}");
-        self.run_checkout(&["--detach", &full_ref, "--"]).await
+        self.checkout_detached(&format!("refs/tags/{tag}")).await
+    }
+
+    /// Check out `revision` as a detached HEAD on the commit it names.
+    ///
+    /// Pass something unambiguous — a full commit SHA or a fully qualified
+    /// ref — since git resolves it with its usual revision rules.
+    ///
+    /// # Arguments
+    ///
+    /// * `revision` - A full SHA or a fully qualified ref
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Git`] when the revision does not exist or the checkout fails.
+    pub async fn checkout_detached(&self, revision: &str) -> Result<()> {
+        self.run_checkout(&["--detach", revision, "--"]).await
     }
 
     /// Run `git checkout <args>` in this repository.

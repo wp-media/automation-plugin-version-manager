@@ -9,7 +9,9 @@ use crate::build::{ArtifactOrigin, BuildResult, BuildRunner, ProducedArtifact};
 use crate::cache_status::CacheStatus;
 use crate::commands::cache;
 use crate::error::{Error, Result};
-use crate::git::{BuildWorkspace, RefResolver, RefSource, RemoteGit, Repository, ResolvedRef};
+use crate::git::{
+    BuildWorkspace, RefResolver, RefSource, RemoteGit, Repository, ResolvedRef, expand_commit,
+};
 use crate::github::client::download_asset_owned;
 use crate::github::{GitHubClient, ReleaseAsset};
 use crate::projects::{Project, ProjectRegistry};
@@ -572,8 +574,10 @@ fn storable_version(version: &str) -> Option<String> {
 /// A bare `git checkout <name>` prefers a tag over a same-named branch that
 /// exists only on origin, so `branch:v1.0` would build tag `v1.0`'s commit.
 /// Branches (including a PR's head branch) and tags are therefore checked
-/// out by their fully qualified refs; commits are full SHAs and need no
-/// disambiguation.
+/// out by their fully qualified refs. A commit is first expanded among the
+/// clone's commit objects (never refs): its pre-clone resolution trusts the
+/// input unverified when the GitHub API is unavailable, and `git checkout
+/// deadbeef` would otherwise build a branch or tag of that name.
 ///
 /// # Arguments
 ///
@@ -589,7 +593,12 @@ async fn checkout_resolved(repo: &Repository, resolved: &ResolvedRef) -> Result<
             repo.checkout_origin_branch(&resolved.git_ref).await
         }
         RefSource::Tag(_) => repo.checkout_tag(&resolved.git_ref).await,
-        RefSource::Commit(_) | RefSource::Release(_) => repo.checkout(&resolved.git_ref).await,
+        RefSource::Commit(_) => {
+            let full_sha = expand_commit(repo.path(), &resolved.git_ref).await?;
+            repo.checkout_detached(&full_sha).await
+        }
+        // Releases are downloaded, never cloned; kept total for safety.
+        RefSource::Release(_) => repo.checkout(&resolved.git_ref).await,
     }
 }
 
@@ -3390,5 +3399,73 @@ mod tests {
         assert_eq!(remaining.len(), 1, "{remaining:?}");
         assert_eq!(remaining[0].variant_id.as_deref(), Some("pro"));
         assert_eq!(remaining[0].target_name, "pro.zip");
+    }
+
+    // =========================================================================
+    // Checking out the resolved ref in the clone
+    // =========================================================================
+
+    /// A fresh clone of a fixture origin with a branch named `deadbeef` — a
+    /// SHA-looking name that no object in the repo starts with.
+    async fn clone_with_hex_named_branch() -> (TempDir, TempDir, crate::git::Repository) {
+        use crate::git::testutil::{file_url, git, git_stdout, make_remote_repo};
+        let origin = make_remote_repo();
+        git(
+            origin.path(),
+            &["branch", "deadbeef", "main"],
+            "2025-01-01T00:00:00",
+        );
+        assert!(
+            git_stdout(origin.path(), &["rev-parse", "--disambiguate=deadbeef"]).is_empty(),
+            "fixture precondition: no object starts with deadbeef"
+        );
+        let holder = TempDir::new().unwrap();
+        let repo = crate::git::Repository::clone(&file_url(&origin), &holder.path().join("c"))
+            .await
+            .unwrap();
+        (origin, holder, repo)
+    }
+
+    /// A `Commit` source as pre-clone resolution yields it when the GitHub API
+    /// was unavailable: the user's input, trusted unverified.
+    fn unverified_commit(input: &str) -> ResolvedRef {
+        ResolvedRef {
+            input: format!("commit:{input}"),
+            source: RefSource::Commit(input.to_string()),
+            git_ref: input.to_string(),
+            commit_sha: Some(input.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unverified_commit_never_checks_out_a_same_named_branch() {
+        // `git checkout deadbeef` would happily create and build the branch;
+        // a commit source must match a commit object or fail.
+        let (_origin, _holder, repo) = clone_with_hex_named_branch().await;
+        let head_before = repo.get_head_commit().await.unwrap();
+
+        let err = checkout_resolved(&repo, &unverified_commit("deadbeef"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Commit 'deadbeef' not found"),
+            "{err}"
+        );
+        assert_eq!(repo.get_head_commit().await.unwrap(), head_before);
+    }
+
+    #[tokio::test]
+    async fn an_abbreviated_commit_is_checked_out_detached_at_the_full_sha() {
+        use crate::git::testutil::git_stdout;
+        let (_origin, _holder, repo) = clone_with_hex_named_branch().await;
+        let full = git_stdout(repo.path(), &["rev-parse", "v1.0.0"]);
+
+        checkout_resolved(&repo, &unverified_commit(&full[..8]))
+            .await
+            .unwrap();
+
+        assert_eq!(repo.get_head_commit().await.unwrap(), full);
+        assert_eq!(repo.current_branch().await.unwrap(), "HEAD", "detached");
     }
 }

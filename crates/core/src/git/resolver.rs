@@ -629,7 +629,8 @@ impl<'a> RefResolver<'a> {
                     commit_sha: Some(full_sha),
                 }),
                 Ok(None) => Err(Error::Git(format!(
-                    "Commit '{sha}' not found in {}/{}",
+                    "Commit '{sha}' not found in {}/{} \
+                     (for a branch or tag of that name, use branch:{sha} or tag:{sha})",
                     self.owner, self.repo
                 ))),
                 Err(e) => {
@@ -710,8 +711,7 @@ impl<'a> RefResolver<'a> {
     /// SHA (`deadbeef`) can't pose as a commit: it falls through to the
     /// branch lookup instead.
     async fn validate_and_expand_commit(&self, repo_path: &Path, sha: &str) -> Result<String> {
-        let candidates = objects_with_prefix(repo_path, sha).await?;
-        pick_commit(sha, &candidates)
+        expand_commit(repo_path, sha).await
     }
 
     /// Resolve a `tag:` keyword to a concrete tag, or return `None` if the
@@ -895,6 +895,31 @@ async fn peeled_commit(repo_path: &Path, full_ref: &str) -> Result<Option<String
     Ok(Some(
         String::from_utf8_lossy(&output.stdout).trim().to_string(),
     ))
+}
+
+/// The full SHA of the one commit object `prefix` names in the repository at
+/// `repo_path` — looked up among objects only, never refs, so a branch or tag
+/// spelled like the prefix can't answer instead.
+///
+/// Shared by local-mode resolution and the build's checkout of a commit
+/// source, whose pre-clone resolution may have trusted the input unverified.
+///
+/// # Arguments
+///
+/// * `repo_path` - The local repository
+/// * `prefix` - Hex SHA or abbreviation (7–64 chars, validated by the caller)
+///
+/// # Returns
+///
+/// The full SHA of the single matching commit.
+///
+/// # Errors
+///
+/// [`Error::Git`] when git cannot run, or when no commit, only non-commit
+/// objects, or several commits match (see [`pick_commit`]).
+pub(crate) async fn expand_commit(repo_path: &Path, prefix: &str) -> Result<String> {
+    let candidates = objects_with_prefix(repo_path, prefix).await?;
+    pick_commit(prefix, &candidates)
 }
 
 /// Every object whose name starts with `prefix`, as `(full SHA, type)`.

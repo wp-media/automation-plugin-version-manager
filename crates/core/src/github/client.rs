@@ -77,11 +77,16 @@ impl GitHubClient {
     /// are validated (and short SHAs expanded) through the GitHub commits
     /// API instead.
     ///
+    /// The API also resolves branch and tag names (to their tip commit), so
+    /// its answer only counts when the returned SHA starts with `reference`
+    /// (case-insensitively): a branch named like a SHA (`deadbeef`) is "no
+    /// such commit", never its tip.
+    ///
     /// # Returns
     ///
     /// - `Ok(Some(full_sha))` — the commit exists
-    /// - `Ok(None)` — no such commit (404) or unresolvable/ambiguous
-    ///   reference (422)
+    /// - `Ok(None)` — no such commit (404), an unresolvable/ambiguous
+    ///   reference (422), or a branch/tag name rather than a SHA
     /// - `Err(_)` — transport/auth/rate-limit failure (existence unknown)
     ///
     /// # Sources
@@ -99,7 +104,7 @@ impl GitHubClient {
         let result = self.inner.commits(owner, repo).get(reference).await;
 
         match result {
-            Ok(commit) => Ok(Some(commit.sha)),
+            Ok(commit) => Ok(names_commit(reference, &commit.sha).then_some(commit.sha)),
             Err(octocrab::Error::GitHub { source, .. })
                 if matches!(source.status_code.as_u16(), 404 | 422) =>
             {
@@ -491,9 +496,34 @@ pub async fn download_asset_owned(
     Ok((asset.name, bytes))
 }
 
+/// Whether `sha` (as the commits API returned it) is the commit `reference`
+/// abbreviates: a real match always starts with the (hex) input, compared
+/// case-insensitively — the API answers an upper-case SHA in lower case.
+///
+/// # Arguments
+///
+/// * `reference` - What was looked up
+/// * `sha` - The full SHA the API resolved it to
+fn names_commit(reference: &str, sha: &str) -> bool {
+    sha.to_ascii_lowercase()
+        .starts_with(&reference.to_ascii_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_commit_rejects_a_branch_or_tag_the_api_resolved() {
+        let tip = "0123456789abcdef0123456789abcdef01234567";
+        // `deadbeef` named a branch whose tip is `0123…`: not a commit.
+        assert!(!names_commit("deadbeef", tip));
+        assert!(!names_commit("develop", tip));
+        // A real (case-insensitive) abbreviation or the full SHA is kept.
+        assert!(names_commit("0123456", tip));
+        assert!(names_commit("0123456789ABCDEF", tip));
+        assert!(names_commit(tip, tip));
+    }
 
     /// An octocrab release as GitHub's REST API returns it (fields the model
     /// treats as optional are omitted), with one asset.
