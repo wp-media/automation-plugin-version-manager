@@ -5,7 +5,9 @@
   "main": "index.js",
   "types": "index.d.ts",
   "napi": {
-    "binaryName": "apvm-napi"
+    "binaryName": "apvm-napi",
+    "constEnum": false,
+    "runtimeStringEnum": true
   },
   "scripts": {
     "build": "napi build --release --platform --manifest-path crates/napi/Cargo.toml --output-dir .",
@@ -18,7 +20,7 @@
     "*.rs": "rustfmt"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.6.1",
+    "@napi-rs/cli": "^3.10.8",
     "@types/node": "^25.6.0",
     "husky": "^9.1.7",
     "lint-staged": "^17.0.8",

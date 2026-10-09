@@ -50,7 +50,7 @@ use crate::single_copy::ensure_single_copy;
 ///
 /// ```typescript
 /// const cache = ApvmCache.open({ cacheDir: '/var/lib/apvm/cache' });
-/// await cache.clean({ olderThan: '30d', target: 'Builds' as JsCleanTarget });
+/// await cache.clean({ olderThan: '30d', target: JsCleanTarget.Builds });
 /// let usage;
 /// try {
 ///   usage = await cache.info();

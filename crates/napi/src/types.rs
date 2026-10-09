@@ -28,6 +28,9 @@ use napi_derive::napi;
 /// Each build goes through these phases in order. Use this to track
 /// overall build progress in your UI.
 ///
+/// Members are not enumerable (napi-rs): read them by name —
+/// `Object.values()` returns `[]`.
+///
 /// # TypeScript
 ///
 /// ```typescript
@@ -91,6 +94,9 @@ impl From<apvm_core::BuildPhase> for JsBuildPhase {
 /// Which output stream a command line came from.
 ///
 /// Used in `CommandOutput` events to distinguish between stdout and stderr.
+///
+/// Members are not enumerable (napi-rs): read them by name —
+/// `Object.values()` returns `[]`.
 #[napi(string_enum)]
 pub enum JsOutputStream {
     /// Standard output.
@@ -117,6 +123,9 @@ impl From<apvm_core::build::progress::OutputStream> for JsOutputStream {
 /// Use with [`Apvm.downloadReleaseBySelector()`] to dynamically resolve
 /// the latest or previous release without knowing the exact tag.
 /// Drafts are always excluded.
+///
+/// Members are not enumerable (napi-rs): read them by name —
+/// `Object.values()` returns `[]`.
 ///
 /// | Variant          | Resolves to                                                |
 /// |------------------|------------------------------------------------------------|

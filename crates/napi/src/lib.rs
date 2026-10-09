@@ -46,7 +46,7 @@
 //!
 //! // Maintain the same cache: drop builds unused for 30 days, then check it.
 //! const cache = apvm.cache();
-//! await cache.clean({ olderThan: '30d', target: 'Builds' as JsCleanTarget });
+//! await cache.clean({ olderThan: '30d', target: JsCleanTarget.Builds });
 //! const issues = await cache.verify(); // [] = healthy
 //! ```
 

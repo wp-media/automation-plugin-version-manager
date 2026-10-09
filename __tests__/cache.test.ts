@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { Apvm, ApvmCache, type JsCleanTarget } from '../index.js';
+import { Apvm, ApvmCache, JsCleanTarget } from '../index.js';
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -276,10 +276,8 @@ describe('seeded cache', () => {
 
   it('clean({ target }) selects the record kinds', async () => {
     const cache = await seed();
-    // napi declares `JsCleanTarget` as an ambient `const enum`, which
-    // `isolatedModules` forbids reading (TS2748); its values are these strings.
-    expect((await cache.clean({ target: 'Releases' as JsCleanTarget })).buildsDeleted).toBe(0);
-    expect((await cache.clean({ target: 'Builds' as JsCleanTarget })).buildsDeleted).toBe(2);
+    expect((await cache.clean({ target: JsCleanTarget.Releases })).buildsDeleted).toBe(0);
+    expect((await cache.clean({ target: JsCleanTarget.Builds })).buildsDeleted).toBe(2);
     expect((await cache.info()).buildCount).toBe(0);
   });
 
@@ -420,7 +418,7 @@ describe('seeded cache', () => {
     expect(issue.version).toBeUndefined();
     expect(issue.commit).toBeUndefined();
 
-    const report = await cache.clean({ target: 'Releases' as JsCleanTarget });
+    const report = await cache.clean({ target: JsCleanTarget.Releases });
     expect(report).toMatchObject({ buildsDeleted: 0, releasesDeleted: 1 });
     expect(existsSync(asset)).toBe(false);
     expect((await cache.info()).buildCount).toBe(2);

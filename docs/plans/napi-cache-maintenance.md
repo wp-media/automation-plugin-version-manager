@@ -339,7 +339,7 @@ As built (the plan below was followed except where noted):
   - `cacheStatus()` reports whether the database *opens*: one with unreadable rows is `active` while maintenance rejects `CacheCorrupted`.
   - `createWithTokenResolution()` still reads `GITHUB_TOKEN` / `GH_TOKEN` off the JS thread (core token resolution); a second addon copy loaded only inside a worker thread is not detected; `cacheDir` is not `~`-expanded (as `APVM_CACHE_DIR` in the CLI); a read-only cache directory cannot be inspected (SQLite needs to write); rejections carry no JS stack frames (created on the event loop when work finishes); `apvm.db.corrupt-*` copies are never removed; `exactOptionalPropertyTypes` rejects `{ olderThan: undefined }` (napi typings); a `{ code }` setter that throws on `Error.prototype` breaks every napi-rs rejection.
 
-### Phase 3.1 — Runtime enums (`isolatedModules`-safe typings)
+### Phase 3.1 — Runtime enums (`isolatedModules`-safe typings) — **implemented**
 
 - **Problem (verified with napi-cli 3.10.5):** by default it emits every enum as `export declare const enum`. Under `isolatedModules` (this repo's tsconfig; the default for Vite, Next.js, esbuild and swc users) reading a member — `JsCleanTarget.Builds`, `JsReleaseSelector.Latest` — fails with TS2748, so those consumers must write `'Builds' as JsCleanTarget`. The four enums are `JsBuildPhase`, `JsCleanTarget`, `JsOutputStream` and `JsReleaseSelector`.
 - **Fix:** in `package.json` `"napi"`, set `"constEnum": false` and `"runtimeStringEnum": true`. Both the local `npm run build*` and CI's `npx napi build` (no enum flags) read this config. `runtimeStringEnum` is required: without it, `constEnum: false` turns string enums into type-only unions, which removes `JsReleaseSelector.Latest` from the types (a breaking change).
@@ -347,6 +347,13 @@ As built (the plan below was followed except where noted):
 - **Compatibility:** non-breaking for existing callers. Every expression valid against a `const enum` stays valid against a regular `declare enum`. The difference is that code compiled without `isolatedModules` now reads the member at runtime instead of inlining the string, and the native module already exports it.
 - **Changes:** `package.json`; tests (`cache.test.ts`) and docs (`crates/napi/README.md`, `cache.rs`, `cache_types.rs`, `lib.rs`, root README) switch back from `'Builds' as JsCleanTarget` to `JsCleanTarget.Builds`, and the TS2748 notes are removed. Also add a typecheck-only use of `JsReleaseSelector.Latest` so `npm run typecheck` guards the fix.
 - **Exit:** `npm run build:debug && npm run typecheck && npm test` green. The locally generated `index.d.ts` differs from the committed one only by the four `const` removals plus Phase 3's additions. As with Phase 3, CI commits the regenerated bindings.
+- **Implementation notes (2026-10-08):**
+  - `@napi-rs/cli` floor raised `^3.6.1` → `^3.10.8` (latest): `runtimeStringEnum` first shipped in 3.7.0, so the old range could silently ignore it. With 3.10.8 the output is still exactly the four `const` removals and `index.js` is unchanged.
+  - New `__tests__/enums.test.ts`: every member's runtime value, members non-enumerable (pins the napi-rs limitation — `napi-derive-backend` 6.1.4 hardcodes default property attributes), and a typed `JsReleaseSelector.Latest` read. Verified the guard: typecheck fails against both the old `const enum` typings (TS2748) and a union-only build (TS2693).
+  - Each enum's doc (→ `index.d.ts`) and the napi README say "read members by name; never iterate".
+  - CI: the test job now downloads the `napi-bindings` artifact (committed `index.js`/`index.d.ts` lag until the post-merge bot commit, so PRs adding NAPI API — e.g. Phase 3's `ApvmCache` — would fail against them) and runs `npm run typecheck` once (Linux).
+  - Unchanged on purpose: `'Nope' as JsCleanTarget` (an intentionally invalid value) and bare-string comparisons such as `case 'Clone'` (valid against regular string enums). The root README never mentioned the workaround.
+  - 111 Node tests (+9) and the full cargo suite are green.
 
 ### Phase 4 — Release 3.3.0
 

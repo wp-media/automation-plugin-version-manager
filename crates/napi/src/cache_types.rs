@@ -20,11 +20,11 @@ use napi_derive::napi;
 // Inputs
 // =============================================================================
 
-/// Which record kinds `clean()` removes.
+/// Which record kinds `clean()` removes — pass a member, e.g.
+/// `JsCleanTarget.Builds`.
 ///
-/// Declared to TypeScript as an ambient `const enum`, which `isolatedModules`
-/// cannot read (TS2748); pass its string value there instead
-/// (`'Builds' as JsCleanTarget`).
+/// Members are not enumerable (napi-rs): read them by name —
+/// `Object.values()` returns `[]`.
 #[napi(string_enum)]
 #[derive(Debug)]
 #[allow(
@@ -50,7 +50,7 @@ pub enum JsCleanTarget {
 /// # TypeScript
 ///
 /// ```typescript
-/// await cache.clean({ olderThan: '30d', project: 'backwpup', target: 'Builds' as JsCleanTarget });
+/// await cache.clean({ olderThan: '30d', project: 'backwpup', target: JsCleanTarget.Builds });
 /// const preview = await cache.clean({ dryRun: true }); // reports, deletes nothing
 /// ```
 #[napi(object)]

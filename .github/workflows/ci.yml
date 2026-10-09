@@ -165,7 +165,17 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.settings.napi-artifact }}
+      # The committed index.js / index.d.ts lag behind this change (the bot
+      # regenerates them only after merging), so test against the fresh ones.
+      - name: Download JS bindings
+        uses: actions/download-artifact@v8
+        with:
+          name: napi-bindings
       - run: npm install
+      # Type-checks the tests against the generated index.d.ts (OS-independent).
+      - name: TypeScript typecheck
+        if: runner.os == 'Linux'
+        run: npm run typecheck
       - name: Node tests
         run: npm test
         env:

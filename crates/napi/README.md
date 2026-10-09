@@ -182,13 +182,13 @@ The returned `JsBuildOutput` describes what was cached. Each artifact's `origin`
 `ApvmCache` maintains the artifact cache from Node, at parity with `apvm cache` (one shared implementation in `apvm-core`, so both behave the same).
 
 ```ts
-import { Apvm, ApvmCache, type JsCleanTarget } from 'apvm-napi';
+import { Apvm, ApvmCache, JsCleanTarget } from 'apvm-napi';
 
 const apvm = await Apvm.create({});
 const cache = apvm.cache();                                // the cache this instance builds into
 const other = ApvmCache.open({ cacheDir: '/var/cache/apvm' }); // standalone: no GitHub client needed
 
-await cache.clean({ olderThan: '30d', project: 'backwpup', target: 'Builds' as JsCleanTarget });
+await cache.clean({ olderThan: '30d', project: 'backwpup', target: JsCleanTarget.Builds });
 const issues = await cache.verify({ checksum: true });     // [] = healthy
 if (issues.length > 0) await cache.gc({ checksum: true }); // removes what it can (see gc below)
 ```
@@ -412,8 +412,10 @@ interface JsProducedArtifact {
 
 String enum for selecting which GitHub Release to download. Used with [`downloadReleaseBySelector()`](#apvmdownloadreleaseselectorproject-selector-outputdir-variants-onprogress-promisejsbuildoutput).
 
+> All string enums (`JsBuildPhase`, `JsCleanTarget`, `JsOutputStream`, `JsReleaseSelector`) are runtime enums, so members such as `JsReleaseSelector.Latest` work under TypeScript's `isolatedModules`. Their members are not enumerable — `Object.values(JsReleaseSelector)` returns `[]` — so read them by name; never iterate.
+
 ```ts
-export const enum JsReleaseSelector {
+export declare enum JsReleaseSelector {
   /** Latest non-prerelease, non-draft release (`releases/latest` endpoint). */
   LatestStable    = 'LatestStable',
   /** Second non-prerelease, non-draft release. */
@@ -438,10 +440,10 @@ export const enum JsReleaseSelector {
 interface CleanOptions  { olderThan?: string; project?: string; dryRun?: boolean; target?: JsCleanTarget }
 interface GcOptions     { checksum?: boolean } // also re-hash files (slowest)
 interface VerifyOptions { checksum?: boolean }
-const enum JsCleanTarget { All = 'All', Builds = 'Builds', Releases = 'Releases' }
+declare enum JsCleanTarget { All = 'All', Builds = 'Builds', Releases = 'Releases' }
 ```
 
-`olderThan` is an amount plus a unit: `m` minutes, `h` hours, `d` days, `w` weeks (`30d`, `12h`) — the CLI's `--older-than` grammar. `JsCleanTarget` is an ambient `const enum`; under TypeScript's `isolatedModules` (TS2748) pass its string value instead, e.g. `'Builds' as JsCleanTarget`.
+`olderThan` is an amount plus a unit: `m` minutes, `h` hours, `d` days, `w` weeks (`30d`, `12h`) — the CLI's `--older-than` grammar. Pass a member, e.g. `JsCleanTarget.Builds`.
 
 Byte sizes and counts are `number`s; timestamps are ISO-8601 strings; fields that do not apply are absent.
 
