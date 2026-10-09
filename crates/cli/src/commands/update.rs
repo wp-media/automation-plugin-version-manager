@@ -882,6 +882,34 @@ mod tests {
         path
     }
 
+    /// [`run_skill_refresh`] on a just-written script, retried while Linux
+    /// reports it "busy" (`ETXTBSY`, os error 26): if another test thread
+    /// forks while `write_script` still holds the file open for writing,
+    /// the child inherits that handle until its own `exec`, and executing
+    /// the script fails meanwhile. (Matched on the message: the function
+    /// returns a `String` error.)
+    ///
+    /// # Arguments
+    ///
+    /// * `script` - The executable to run as the "new binary"
+    ///
+    /// # Returns
+    ///
+    /// [`run_skill_refresh`]'s result, after up to 20 attempts while busy.
+    #[cfg(unix)]
+    fn refresh_retrying_busy(script: &std::path::Path) -> std::result::Result<(), String> {
+        let mut attempt = 1;
+        loop {
+            match run_skill_refresh(script) {
+                Err(e) if e.contains("(os error 26)") && attempt < 20 => {
+                    std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_skill_refresh_succeeds_on_zero_exit() {
@@ -893,7 +921,7 @@ mod tests {
 exit 0"#,
         );
 
-        assert_eq!(run_skill_refresh(&script), Ok(()));
+        assert_eq!(refresh_retrying_busy(&script), Ok(()));
     }
 
     #[cfg(unix)]
@@ -902,7 +930,7 @@ exit 0"#,
         let tmp = tempfile::tempdir().unwrap();
         let script = write_script(tmp.path(), "echo 'boom' >&2\nexit 1");
 
-        let err = run_skill_refresh(&script).unwrap_err();
+        let err = refresh_retrying_busy(&script).unwrap_err();
         assert!(err.contains("boom"), "stderr not surfaced: {err}");
     }
 

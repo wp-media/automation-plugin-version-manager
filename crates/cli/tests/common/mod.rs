@@ -22,7 +22,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use tempfile::TempDir;
 
@@ -141,14 +141,15 @@ impl Sandbox {
 
     /// Run `binary` with `args`, feeding `stdin` and then closing it.
     pub fn run_binary(&self, binary: &Path, args: &[&str], stdin: &str) -> Output {
-        let mut child = self
-            .command_for(binary)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("apvm must be spawnable");
+        let mut child = spawn_retrying_busy(|| {
+            self.command_for(binary)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .expect("apvm must be spawnable");
         // Dropping the handle closes stdin, so a prompt sees EOF after `stdin`.
         child
             .stdin
@@ -168,6 +169,37 @@ impl Sandbox {
         let copy = bin_dir.join("apvm");
         std::fs::copy(APVM, &copy).expect("copy apvm binary");
         copy
+    }
+}
+
+/// Run `spawn`, retrying while the executable is "busy" (`ETXTBSY`).
+///
+/// Linux refuses to execute a file that any process holds open for writing.
+/// A freshly written binary (e.g. [`Sandbox::installed_copy`]) can be hit by
+/// that: if another test thread forks while the copy is still open for
+/// writing, its child inherits that handle until its own `exec` closes it.
+/// Retrying after a short, growing pause is the standard remedy; any other
+/// outcome is returned as is.
+///
+/// # Arguments
+///
+/// * `spawn` - Starts the process (called again on each retry)
+///
+/// # Errors
+///
+/// The last spawn error, after up to 20 attempts for a busy executable.
+pub fn spawn_retrying_busy(
+    mut spawn: impl FnMut() -> std::io::Result<Child>,
+) -> std::io::Result<Child> {
+    let mut attempt = 1;
+    loop {
+        match spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+                attempt += 1;
+            }
+            result => return result,
+        }
     }
 }
 
