@@ -17,6 +17,7 @@ use napi::bindgen_prelude::{CallbackContext, PromiseRaw, Unknown};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, JsValue};
 
+use crate::error::clear_pending_exception;
 use crate::types::JsBuildEvent;
 
 /// A progress reporter that forwards events to a JavaScript callback.
@@ -111,24 +112,5 @@ fn discard_rejection(returned: &Unknown<'_>, env: &Env) {
     });
     if attached.is_err() {
         clear_pending_exception(env);
-    }
-}
-
-/// Clear the JS exception pending in `env`, if any.
-///
-/// Called only on the JS thread of `env`, inside a threadsafe-function
-/// callback. Leaving an exception pending there would make Node report it
-/// as uncaught once the callback returns.
-///
-/// # Arguments
-///
-/// * `env` - The env of the current JS thread
-fn clear_pending_exception(env: &Env) {
-    let mut exception = std::ptr::null_mut();
-    // SAFETY: `env.raw()` is the live env of the JS thread this callback runs
-    // on, and `exception` is a valid out-pointer for the call's duration.
-    // With nothing pending, the call returns `undefined` and changes nothing.
-    unsafe {
-        napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception);
     }
 }

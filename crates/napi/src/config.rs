@@ -19,6 +19,8 @@ use napi::bindgen_prelude::{JsObjectValue, JsValue, Object, Unknown};
 use napi::{Env, ValueType};
 use napi_derive::napi;
 
+use crate::error::clear_pending_exception;
+
 /// Configuration options for creating an APVM instance.
 ///
 /// This is a plain JavaScript object (not a class) that you pass
@@ -127,7 +129,13 @@ pub fn resolve_config(env: &Env, config: Option<ApvmConfig>) -> apvm_config::Con
 fn js_cache_dir_override(env: &Env) -> Option<PathBuf> {
     match read_process_env(env, apvm_core::config_io::CACHE_DIR_ENV) {
         Ok(value) => value.filter(|dir| !dir.is_empty()).map(PathBuf::from),
-        Err(_) => apvm_core::config_io::cache_dir_env_override(),
+        Err(_) => {
+            // A throwing `process.env` (e.g. a getter) leaves its exception
+            // pending; the fallback is the answer, so it must not surface
+            // from a call that goes on. (A call starts with none pending.)
+            clear_pending_exception(env);
+            apvm_core::config_io::cache_dir_env_override()
+        }
     }
 }
 

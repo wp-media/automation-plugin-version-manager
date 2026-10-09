@@ -8,7 +8,44 @@
 //! directly. Instead, we provide conversion functions that are used at call sites
 //! via `.map_err()`.
 
-use napi::Status;
+use napi::{Env, Status};
+
+/// Whether a JS exception is pending in `env`.
+///
+/// # Arguments
+///
+/// * `env` - The env of the current JS thread
+///
+/// # Returns
+///
+/// `true` when one is (`false` too if the check itself fails).
+pub(crate) fn exception_pending(env: &Env) -> bool {
+    let mut pending = false;
+    // SAFETY: `env.raw()` is the live env of the JS thread this runs on, and
+    // `pending` is a valid out-pointer for the call's duration.
+    let status = unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut pending) };
+    status == napi::sys::Status::napi_ok && pending
+}
+
+/// Clear the JS exception pending in `env`, if any.
+///
+/// Called only on the JS thread of `env`, after a best-effort JS operation
+/// failed. Left pending, the exception would surface once control returns
+/// to JavaScript: as uncaught after a threadsafe-function callback, or as
+/// thrown by an addon call that itself succeeded.
+///
+/// # Arguments
+///
+/// * `env` - The env of the current JS thread
+pub(crate) fn clear_pending_exception(env: &Env) {
+    let mut exception = std::ptr::null_mut();
+    // SAFETY: `env.raw()` is the live env of the JS thread this runs on, and
+    // `exception` is a valid out-pointer for the call's duration.
+    // With nothing pending, the call returns `undefined` and changes nothing.
+    unsafe {
+        napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception);
+    }
+}
 
 /// Convert an [`apvm_core::Error`] into a [`napi::Error`].
 ///
