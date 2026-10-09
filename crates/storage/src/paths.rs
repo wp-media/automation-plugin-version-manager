@@ -599,4 +599,140 @@ mod tests {
             Ordering::Greater
         );
     }
+
+    /// The `reason` of an [`Error::InvalidInput`] rejection, so a test can
+    /// tell *which* rule fired (a length cap vs. a character rule).
+    fn rejection(result: Result<()>) -> String {
+        match result {
+            Err(Error::InvalidInput { reason, .. }) => reason,
+            other => panic!("expected an InvalidInput rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn length_caps_accept_the_limit_and_reject_one_more() {
+        // Each cap is part of the on-disk / database contract: an off-by-one
+        // either refuses a legitimate value or lets an oversized path
+        // component reach the filesystem.
+        assert!(validate_version(&format!("1{}", "a".repeat(63))).is_ok());
+        assert!(
+            rejection(validate_version(&format!("1{}", "a".repeat(64)))).contains("longer than 64")
+        );
+
+        assert!(validate_tag(&"t".repeat(200)).is_ok());
+        assert!(rejection(validate_tag(&"t".repeat(201))).contains("longer than 200"));
+
+        assert!(validate_reference("branch", &"b".repeat(500)).is_ok());
+        assert!(
+            rejection(validate_reference("branch", &"b".repeat(501))).contains("longer than 500")
+        );
+
+        assert!(validate_variant(&"v".repeat(100)).is_ok());
+        assert!(rejection(validate_variant(&"v".repeat(101))).contains("longer than 100"));
+
+        let name = |len: usize| format!("{}.zip", "f".repeat(len - 4));
+        assert!(validate_filename(&name(200)).is_ok());
+        assert!(rejection(validate_filename(&name(201))).contains("longer than 200"));
+    }
+
+    #[test]
+    fn database_only_values_reject_empty_and_control_characters() {
+        // Tags, source references, branch names and variants never become
+        // path components verbatim, so any printable text — including
+        // non-ASCII — is fine; empty values and control characters (which
+        // would corrupt one-line CLI output and logs) are not.
+        assert!(validate_tag("v5.3.2-ß/release candidate").is_ok());
+        assert!(validate_reference("branch", "feature/ünïcode").is_ok());
+        assert!(validate_variant("pro-de").is_ok());
+
+        assert!(rejection(validate_tag("")).contains("empty"));
+        assert!(rejection(validate_tag("v1\n")).contains("control"));
+        assert!(rejection(validate_tag("v1\u{7f}")).contains("control"));
+
+        assert!(rejection(validate_reference("branch", "")).contains("empty"));
+        assert!(rejection(validate_reference("branch", "dev\telop")).contains("control"));
+
+        assert!(rejection(validate_variant("")).contains("empty"));
+        assert!(rejection(validate_variant("pro\r")).contains("control"));
+    }
+
+    #[test]
+    fn rejections_name_the_field_the_caller_supplied() {
+        // `validate_reference` serves both source references and branch
+        // names; the error must say which one was wrong.
+        let Err(Error::InvalidInput { what, value, .. }) = validate_reference("branch", "") else {
+            panic!("an empty branch must be rejected");
+        };
+        assert_eq!((what, value.as_str()), ("branch", ""));
+        let Err(Error::InvalidInput { what, .. }) = validate_reference("source reference", "a\0")
+        else {
+            panic!("a NUL in a reference must be rejected");
+        };
+        assert_eq!(what, "source reference");
+    }
+
+    #[test]
+    fn long_tags_are_capped_and_stay_distinct() {
+        // A 100-char clean tag is kept verbatim: the cap is inclusive.
+        let exact = format!("v{}", "1".repeat(99));
+        assert_eq!(sanitize_tag_dir(&exact), exact);
+        assert_eq!(sanitize_tag_dir(&format!("{exact}1")).len(), 100 + 1 + 8);
+
+        // Longer tags are cut to 100 chars plus a hash of the *whole* tag, so
+        // two tags sharing their first 100 chars never share a directory.
+        let long = format!("v{}", "1".repeat(149));
+        let a = sanitize_tag_dir(&long);
+        let b = sanitize_tag_dir(&format!("{long}2"));
+        assert_eq!(a.len(), 100 + 1 + 8, "{a}");
+        assert!(a.starts_with(&long[..100]));
+        assert_ne!(a, b);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        );
+    }
+
+    #[test]
+    fn tags_spelled_like_store_internals_are_suffixed() {
+        // An `apvm.`-prefixed directory name is reserved for the store's own
+        // files; a tag spelled that way must not produce one.
+        let dir = sanitize_tag_dir("apvm.db");
+        assert_ne!(dir, "apvm.db");
+        assert!(dir.starts_with("apvm.db-"));
+    }
+
+    #[test]
+    fn version_ordering_is_antisymmetric_and_sorts_lists() {
+        // Sorting needs cmp(a, b) == cmp(b, a).reverse(); each pair drives a
+        // different branch (numeric, lexical, longer numeric continuation,
+        // longer prerelease continuation) from both sides.
+        let pairs = [
+            ("5.10.0", "5.9.0"),
+            ("10.0", "2.0"),
+            ("1.2.1", "1.2"),
+            ("5.6.0", "5.6.0-beta1"),
+            ("5.6.0-rc1", "5.6.0-beta1"),
+        ];
+        for (newer, older) in pairs {
+            assert_eq!(
+                cmp_versions(newer, older),
+                Ordering::Greater,
+                "{newer} > {older}"
+            );
+            assert_eq!(
+                cmp_versions(older, newer),
+                Ordering::Less,
+                "{older} < {newer}"
+            );
+        }
+        // Separators are interchangeable.
+        assert_eq!(cmp_versions("5.6.0-beta1", "5.6.0_beta1"), Ordering::Equal);
+
+        let mut versions = ["5.6.0", "5.10.0", "1.2", "5.6.0-beta1", "5.9.0", "1.2.1"];
+        versions.sort_by(|a, b| cmp_versions(a, b));
+        assert_eq!(
+            versions,
+            ["1.2", "1.2.1", "5.6.0-beta1", "5.6.0", "5.9.0", "5.10.0"]
+        );
+    }
 }

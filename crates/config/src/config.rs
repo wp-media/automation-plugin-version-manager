@@ -526,6 +526,37 @@ mod tests {
     }
 
     #[test]
+    fn config_file_set_cache_is_true_only_for_true_in_any_case() {
+        // Documented contract: anything but "true" (case-insensitive) is
+        // stored as `false`, so a malformed value can never enable caching
+        // by accident.
+        for (value, expected) in [
+            ("TRUE", true),
+            ("True", true),
+            ("false", false),
+            ("yes", false),
+            ("1", false),
+            ("", false),
+        ] {
+            let mut cf = ConfigFile::default();
+            cf.set(ConfigKey::Cache, value.to_string());
+            assert_eq!(cf.cache_enabled, Some(expected), "value {value:?}");
+            assert_eq!(cf.get(ConfigKey::Cache), Some(expected.to_string()));
+        }
+    }
+
+    #[test]
+    fn config_file_tolerates_keys_from_newer_versions() {
+        // A config written by a newer apvm (extra keys) must still load in
+        // an older one instead of failing every command.
+        let json = r#"{"cache_dir": "/cache", "future_setting": {"nested": [1, 2]}}"#;
+        let cf: ConfigFile = serde_json::from_str(json).unwrap();
+        assert_eq!(cf.cache_dir, Some(PathBuf::from("/cache")));
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.cache_dir, PathBuf::from("/cache"));
+    }
+
+    #[test]
     fn config_file_unset_known_keys() {
         let mut cf = ConfigFile {
             github_token: Some("ghp_test".to_string()),
@@ -619,6 +650,19 @@ mod tests {
         let err = "nope".parse::<ConfigKey>().unwrap_err();
         assert!(err.contains("Unknown config key"));
         assert!(err.contains("nope"));
+    }
+
+    #[test]
+    fn config_key_parsing_is_exact_and_lists_valid_keys() {
+        // Keys are matched exactly (no case folding, no `_` for `-`), and
+        // the error lists every valid key so the CLI message is actionable.
+        for wrong in ["Token", "CACHE", "cache_dir", " cache-dir", "builds-dir"] {
+            let err = wrong.parse::<ConfigKey>().unwrap_err();
+            assert!(
+                err.ends_with("Valid keys: token, cache-dir, cache"),
+                "{wrong:?}: {err}"
+            );
+        }
     }
 
     #[test]

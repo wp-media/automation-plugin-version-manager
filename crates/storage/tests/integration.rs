@@ -3640,3 +3640,187 @@ fn repair_adopts_exactly_the_build_directories_gc_keeps() {
     assert_eq!(store.gc().unwrap().orphan_dirs_removed, 0);
     assert!(found.dir.join("a.zip").exists());
 }
+
+// ============================================================================
+// Releases: health, gc reconciliation, case variants
+// ============================================================================
+
+#[test]
+fn a_release_with_a_missing_asset_is_a_miss_until_restored() {
+    let (_root, store, scratch) = make_store();
+    let assets = [
+        artifact(&scratch, "a.zip", b"asset-a", None),
+        artifact(&scratch, "b.zip", b"asset-b", None),
+    ];
+    let meta = ReleaseMetadata::new("backwpup", "v5.3.2");
+    let stored = store.store_release(&meta, &assets).unwrap().release;
+    std::fs::remove_file(stored.dir.join("b.zip")).unwrap();
+    let used_before = store.list_releases("backwpup").unwrap()[0].last_used_at;
+
+    // One missing asset makes the whole release a miss, so the caller
+    // re-downloads instead of delivering a partial release...
+    assert!(store.find_release("backwpup", "v5.3.2").unwrap().is_none());
+    assert!(!store.has_release("backwpup", "v5.3.2").unwrap());
+    // ...while the inventory still lists it, and the miss is not usage.
+    let listed = store.list_releases("backwpup").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].last_used_at, used_before);
+
+    // Re-storing heals: only the missing asset is copied again.
+    let healed = store.store_release(&meta, &assets).unwrap();
+    assert_eq!(healed.newly_stored, ["b.zip"]);
+    assert_eq!(healed.reused, ["a.zip"]);
+    assert!(store.find_release("backwpup", "v5.3.2").unwrap().is_some());
+}
+
+#[test]
+fn gc_drops_a_release_whose_directory_vanished() {
+    let (_root, store, scratch) = make_store();
+    let release = store
+        .store_release(
+            &ReleaseMetadata::new("backwpup", "v5.3.2"),
+            &[artifact(&scratch, "r.zip", b"asset", None)],
+        )
+        .unwrap()
+        .release;
+    std::fs::remove_dir_all(&release.dir).unwrap();
+
+    let report = store.gc().unwrap();
+    assert_eq!((report.stale_release_rows, report.stale_build_rows), (1, 0));
+    assert!(store.list_releases("backwpup").unwrap().is_empty());
+    assert!(store.list_projects().unwrap().is_empty());
+    // Idempotent: nothing left to reconcile.
+    assert_eq!(store.gc().unwrap().stale_release_rows, 0);
+}
+
+#[test]
+fn restoring_a_release_asset_in_another_case_replaces_its_record() {
+    // Release counterpart of the build audit P6: on a case-insensitive
+    // filesystem `asset.zip` and `Asset.zip` are one file, so keeping both
+    // records would leave one pointing at it with a stale size and hash.
+    let (_root, store, scratch) = make_store();
+    let meta = ReleaseMetadata::new("backwpup", "v5.3.2");
+    store
+        .store_release(&meta, &[artifact(&scratch, "asset.zip", b"first", None)])
+        .unwrap();
+    let second = store
+        .store_release(
+            &meta,
+            &[artifact(&scratch, "Asset.zip", b"second-longer", None)],
+        )
+        .unwrap();
+    let names: Vec<&str> = second
+        .release
+        .assets
+        .iter()
+        .map(|a| a.filename.as_str())
+        .collect();
+    assert_eq!(names, ["Asset.zip"]);
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+    assert!(store.find_release("backwpup", "v5.3.2").unwrap().is_some());
+}
+
+// ============================================================================
+// Unreadable rows degrade to misses; repair skips what it cannot adopt
+// ============================================================================
+
+#[test]
+fn unreadable_rows_are_misses_and_left_out_of_listings() {
+    // A row the store cannot represent (here: a directory it never writes)
+    // must turn a cache decision into a miss — so the caller rebuilds or
+    // re-downloads — and be skipped by listings, never fail them.
+    let (_root, store, scratch) = make_store();
+    store
+        .store(
+            &metadata("backwpup", "5.6.0", COMMIT_A),
+            &[artifact(&scratch, "a.zip", b"artifact", None)],
+        )
+        .unwrap();
+    store
+        .store_release(
+            &ReleaseMetadata::new("backwpup", "v5.3.2"),
+            &[artifact(&scratch, "r.zip", b"asset", None)],
+        )
+        .unwrap();
+    {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute("UPDATE builds SET dir_path = 'escape'", [])
+            .unwrap();
+        conn.execute("UPDATE releases SET dir_path = 'escape'", [])
+            .unwrap();
+    }
+
+    let request = LookupRequest::new("backwpup", LookupKey::Commit(COMMIT_A)).version("5.6.0");
+    let result = store.lookup_build(&request).unwrap();
+    assert!(
+        matches!(result, LookupResult::Miss(MissReason::Incomplete)),
+        "{result:?}"
+    );
+    assert!(result.hit().is_none());
+    assert!(
+        store
+            .find_by_commit("backwpup", "5.6.0", COMMIT_A)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.list_builds(None, None).unwrap().is_empty());
+    assert!(store.list_releases("backwpup").unwrap().is_empty());
+}
+
+#[test]
+fn repair_skips_build_directories_with_nothing_adoptable() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("store");
+    let adoptable = "wp-rocket/commits/3.17.4/a1b2c3d/a.zip";
+    // Only OS metadata: adopting it would create a build with no artifact.
+    let junk_only = "wp-rocket/commits/3.17.5/b2c3d4e/.DS_Store";
+    // Not a version the store could have written (no digit).
+    let bad_version = "wp-rocket/commits/beta/c3d4e5f/c.zip";
+    for rel in [adoptable, junk_only, bad_version] {
+        put(&base, rel, "zip");
+    }
+    std::fs::write(base.join("apvm.db"), b"not a sqlite database").unwrap();
+    std::fs::write(base.join(".apvm.lock"), b"").unwrap();
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert_eq!((report.builds_adopted, report.artifacts_adopted), (1, 1));
+    assert_eq!(report.entries_skipped, 2, "{report:?}");
+    assert_eq!(store.list_builds(None, None).unwrap().len(), 1);
+    // Repair never deletes what it skips.
+    for rel in [junk_only, bad_version] {
+        assert!(base.join(rel).exists(), "{rel}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_never_adopts_part_of_a_build_it_cannot_fully_read() {
+    // Adopting only the readable files would index a build that is
+    // silently missing an artifact.
+    if !permissions_enforced() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("store");
+    let build = "wp-rocket/commits/3.17.4/a1b2c3d";
+    put(&base, &format!("{build}/a.zip"), "readable");
+    put(&base, &format!("{build}/b.zip"), "unreadable");
+    let locked = base.join(build).join("b.zip");
+    chmod(&locked, 0o000);
+    std::fs::write(base.join("apvm.db"), b"not a sqlite database").unwrap();
+    std::fs::write(base.join(".apvm.lock"), b"").unwrap();
+
+    let outcome = ArtifactStore::repair(&base);
+    chmod(&locked, 0o644);
+    let (store, report) = outcome.unwrap();
+    assert_eq!(report.builds_adopted, 0);
+    assert_eq!(report.entries_skipped, 1);
+    assert!(
+        store
+            .find_by_commit("wp-rocket", "3.17.4", "a1b2c3d")
+            .unwrap()
+            .is_none()
+    );
+    assert!(base.join(build).join("a.zip").exists());
+    assert!(locked.exists());
+}

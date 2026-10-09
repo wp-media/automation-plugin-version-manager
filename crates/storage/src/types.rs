@@ -349,6 +349,43 @@ mod tests {
     }
 
     #[test]
+    fn build_source_descriptions_are_human_readable() {
+        // Shown verbatim in CLI build summaries and cache listings.
+        assert_eq!(BuildSource::PullRequest(123).to_string(), "PR #123");
+        assert_eq!(
+            BuildSource::Branch("develop".into()).to_string(),
+            "branch 'develop'"
+        );
+        assert_eq!(
+            BuildSource::Tag("v1.0.0".into()).to_string(),
+            "tag 'v1.0.0'"
+        );
+        assert_eq!(
+            BuildSource::Release("v5.3.2".into()).to_string(),
+            "release 'v5.3.2'"
+        );
+        // Commits are abbreviated to 7 characters, like `git log --oneline`.
+        assert_eq!(
+            BuildSource::Commit("a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".into()).to_string(),
+            "commit a1b2c3d"
+        );
+    }
+
+    #[test]
+    fn commit_description_never_splits_a_character() {
+        // A tampered or non-hex reference must not panic on a UTF-8 char
+        // boundary; short values are shown whole.
+        assert_eq!(
+            BuildSource::Commit("abc".into()).description(),
+            "commit abc"
+        );
+        assert_eq!(
+            BuildSource::Commit("ééééééééé".into()).description(),
+            "commit ééééééé"
+        );
+    }
+
+    #[test]
     fn metadata_new_accepts_string_and_option_branch() {
         let with_string = BuildMetadata::new(
             "backwpup",
