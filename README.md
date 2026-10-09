@@ -473,6 +473,23 @@ The project uses GitHub Actions for continuous integration ([ci.yml](.github/wor
 | **Commit Artifacts** | Auto-commits updated `.node` binaries on push to `develop` |
 | **CI (gate)** | Single required status check for branch protection |
 
+## Releasing
+
+Releases are cut by pushing a SemVer tag `vX.Y.Z` (e.g. `v3.3.0`), which runs [release-cli.yml](.github/workflows/release-cli.yml): it builds the CLI for all 5 platforms and publishes a GitHub Release with the binaries and `checksums.txt`.
+
+1. Bump the workspace `version` in `Cargo.toml`, `package.json` / `package-lock.json`, and the version line in `.claude/skills/apvm-cli/SKILL.md`; merge to `develop`.
+2. Wait for CI on `develop` to pass and push its `chore: update NAPI binaries` commit.
+3. Tag **that** commit, so the tag also carries the matching `.node` binaries for packages installed from git:
+
+   ```sh
+   git tag -a v3.3.0 -m "apvm v3.3.0"
+   git push origin v3.3.0
+   ```
+
+The workflow rejects a tag that is not `v` + strict [SemVer](https://semver.org/) or that does not match `Cargo.toml`. A pre-release tag (`v3.4.0-rc.1`) is published as a GitHub pre-release and never marked latest, so `apvm update` and the install scripts ignore it. Releases up to 3.2.0 were tagged `cli/vX.Y.Z`; those tags are kept as history only.
+
+The Node package can be installed straight from a tag, either exactly (`github:wp-media/automation-plugin-version-manager#v3.3.0`) or by range (`github:wp-media/automation-plugin-version-manager#semver:^3.3.0`, see [npm Git URLs](https://docs.npmjs.com/cli/configuring-npm/package-json#git-urls-as-dependencies)).
+
 ## License
 
 MIT — see [package.json](package.json) and crate manifests.

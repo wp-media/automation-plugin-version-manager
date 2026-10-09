@@ -1,20 +1,28 @@
 # Builds CLI binaries for all platforms and publishes them as GitHub Release assets.
 #
-# Triggered by pushing a tag matching `cli/v*` (e.g. `cli/v1.2.1`).
-# The tag should be created from a commit where CI has already passed.
+# Triggered by pushing a SemVer tag `vX.Y.Z` (e.g. `v3.3.0`, `v3.4.0-rc.1`).
+# Tag the commit CI produced for that version — the "chore: update NAPI
+# binaries" commit on `develop` — so the tag also carries the matching `.node`
+# binaries for consumers installing the package from git.
 #
 # Usage:
-#   git tag cli/v1.2.1
-#   git push origin cli/v1.2.1
+#   git tag -a v3.3.0 -m "apvm v3.3.0"
+#   git push origin v3.3.0
 #
-# This creates a GitHub Release named "apvm v1.2.1" with 5 binaries + checksums.
+# This creates a GitHub Release named "apvm v3.3.0" with 5 binaries + checksums.
+# A tag with a pre-release suffix (`-rc.1`, `-beta.2`, …) is published as a
+# pre-release and never marked "latest", so `apvm update` (which reads
+# `/releases/latest`) does not offer it.
 
 name: Release CLI
 
 on:
   push:
     tags:
-      - 'cli/v*'
+      # GitHub filter syntax, not a regex: a coarse pre-filter. The validate
+      # job enforces strict SemVer.
+      # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#filter-pattern-cheat-sheet
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,24 +38,43 @@ env:
 
 jobs:
   # ── Validate ─────────────────────────────────────────────────────────────
-  # Fail fast before any build starts if the tag version doesn't match
-  # the workspace version in Cargo.toml.
-  # e.g. tag `cli/v1.2.1` must match `version = "1.2.1"` in Cargo.toml.
+  # Fail fast before any build starts if the tag is not `v` + strict SemVer,
+  # or if its version doesn't match the workspace version in Cargo.toml.
+  # e.g. tag `v3.3.0` must match `version = "3.3.0"` in Cargo.toml.
   validate:
     name: Validate release tag
     runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v6
-      - name: Check tag version matches Cargo.toml
+      - name: Check tag is SemVer and matches Cargo.toml
+        id: check
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#cli/v}"
-          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          echo "Tag version:   v${TAG_VERSION}"
-          echo "Cargo version: ${CARGO_VERSION}"
-          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
-            echo "::error::Tag version cli/v${TAG_VERSION} does not match Cargo.toml version ${CARGO_VERSION}"
+          TAG="${GITHUB_REF_NAME}"
+          # Official SemVer 2.0.0 regex (https://semver.org/#is-there-a-suggested-regular-expression-regex-to-check-a-semver-string),
+          # prefixed with `v`. Kept in a variable so bash does not re-quote it.
+          SEMVER_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+          if [[ ! "${TAG}" =~ ${SEMVER_RE} ]]; then
+            echo "::error::Tag '${TAG}' is not a valid release tag (expected vX.Y.Z[-prerelease][+build], e.g. v3.3.0)"
             exit 1
           fi
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "Tag version:   ${TAG_VERSION}"
+          echo "Cargo version: ${CARGO_VERSION}"
+          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+            echo "::error::Tag ${TAG} does not match Cargo.toml version ${CARGO_VERSION}"
+            exit 1
+          fi
+          # Capture group 4 is the pre-release part (`-rc.1`); build
+          # metadata (`+…`) alone does not make a pre-release.
+          PRERELEASE=false
+          if [ -n "${BASH_REMATCH[4]}" ]; then PRERELEASE=true; fi
+          echo "Pre-release:   ${PRERELEASE}"
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
 
   # ── Build ────────────────────────────────────────────────────────────────
   # Build the CLI binary for each target platform.
@@ -134,7 +161,7 @@ jobs:
   # Collect all build artifacts, generate checksums, and create a GitHub Release.
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-22.04
     steps:
       - name: Download all CLI artifacts
@@ -148,16 +175,15 @@ jobs:
         working-directory: artifacts
         run: sha256sum apvm-* > checksums.txt
 
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#cli/}" >> "$GITHUB_OUTPUT"
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          name: apvm ${{ steps.version.outputs.version }}
+          name: apvm ${{ needs.validate.outputs.version }}
           generate_release_notes: true
-          make_latest: true
+          # Pre-releases must never become "latest": `apvm update` and the
+          # install scripts follow `/releases/latest`.
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.validate.outputs.prerelease == 'true' && 'false' || 'true' }}
           fail_on_unmatched_files: true
           files: |
             artifacts/apvm-darwin-arm64

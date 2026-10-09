@@ -155,14 +155,12 @@ fn parse_checksum(checksums_text: &str, artifact: &str) -> Result<String> {
 
 /// Extract the SemVer version string from a release tag name.
 ///
-/// APVM release tags follow the pattern `cli/vX.Y.Z`. This strips the
-/// `cli/v` prefix to get a parseable SemVer string.
-///
-/// Falls back to stripping just a `v` prefix for compatibility.
+/// APVM release tags are `vX.Y.Z` (enforced by the `release-cli.yml`
+/// workflow), so this strips one leading `v`. A bare `X.Y.Z` is returned as
+/// is. Any other shape is returned unchanged and fails SemVer parsing in
+/// [`release_version`], surfacing a clear error instead of a wrong version.
 fn extract_version_from_tag(tag: &str) -> &str {
-    tag.strip_prefix("cli/v")
-        .or_else(|| tag.strip_prefix('v'))
-        .unwrap_or(tag)
+    tag.strip_prefix('v').unwrap_or(tag)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -245,7 +243,7 @@ pub(crate) fn current_version() -> Result<semver::Version> {
     })
 }
 
-/// Parse the SemVer version carried by a release's tag (`cli/vX.Y.Z`).
+/// Parse the SemVer version carried by a release's tag (`vX.Y.Z`).
 fn release_version(release: &Release) -> Result<semver::Version> {
     let latest_tag = extract_version_from_tag(&release.tag_name);
     semver::Version::parse(latest_tag).map_err(|e| {
@@ -563,11 +561,6 @@ mod tests {
     // ── extract_version_from_tag ─────────────────────────────────────────
 
     #[test]
-    fn extract_version_strips_cli_v_prefix() {
-        assert_eq!(extract_version_from_tag("cli/v1.2.3"), "1.2.3");
-    }
-
-    #[test]
     fn extract_version_strips_v_prefix() {
         assert_eq!(extract_version_from_tag("v1.2.3"), "1.2.3");
     }
@@ -579,10 +572,28 @@ mod tests {
 
     #[test]
     fn extract_version_preserves_prerelease() {
+        assert_eq!(extract_version_from_tag("v2.0.0-beta.1"), "2.0.0-beta.1");
+    }
+
+    #[test]
+    fn extract_version_preserves_build_metadata() {
         assert_eq!(
-            extract_version_from_tag("cli/v2.0.0-beta.1"),
-            "2.0.0-beta.1"
+            extract_version_from_tag("v2.0.0-rc.1+build.5"),
+            "2.0.0-rc.1+build.5"
         );
+    }
+
+    #[test]
+    fn extract_version_strips_only_one_v() {
+        assert_eq!(extract_version_from_tag("vv1.2.3"), "v1.2.3");
+    }
+
+    #[test]
+    fn extract_version_leaves_other_prefixes_untouched() {
+        // Only `v` is a release-tag prefix; anything else is not stripped,
+        // so `release_version` rejects it rather than guessing.
+        assert_eq!(extract_version_from_tag("cli/v1.2.3"), "cli/v1.2.3");
+        assert_eq!(extract_version_from_tag("release-1.2.3"), "release-1.2.3");
     }
 
     // ── parse_checksum ───────────────────────────────────────────────────
@@ -779,9 +790,9 @@ mod tests {
 
     #[test]
     fn release_version_parses_tag_of_release() {
-        // `release_version` must strip the `cli/v` prefix and parse the rest,
+        // `release_version` must strip the `v` prefix and parse the rest,
         // yielding the same value the update flow compares against.
-        let release = make_test_release(); // tag_name = "cli/v1.3.0"
+        let release = make_test_release(); // tag_name = "v1.3.0"
         let v = release_version(&release).expect("release_version should parse");
         assert_eq!(v, semver::Version::parse("1.3.0").unwrap());
     }
@@ -789,10 +800,30 @@ mod tests {
     #[test]
     fn release_version_errors_on_unparseable_tag() {
         let mut release = make_test_release();
-        release.tag_name = "cli/vnot-a-version".to_string();
+        release.tag_name = "vnot-a-version".to_string();
         let err = release_version(&release).unwrap_err().to_string();
         assert!(
             err.contains("Failed to parse release version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn release_version_parses_prerelease_tag() {
+        let mut release = make_test_release();
+        release.tag_name = "v1.4.0-rc.1".to_string();
+        let v = release_version(&release).expect("release_version should parse");
+        assert_eq!(v, semver::Version::parse("1.4.0-rc.1").unwrap());
+        assert!(!v.pre.is_empty());
+    }
+
+    #[test]
+    fn release_version_rejects_non_v_prefixed_tag() {
+        let mut release = make_test_release();
+        release.tag_name = "cli/v1.3.0".to_string();
+        let err = release_version(&release).unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to parse release version") && err.contains("cli/v1.3.0"),
             "unexpected error: {err}"
         );
     }
@@ -883,7 +914,7 @@ exit 0"#,
     fn make_test_release() -> Release {
         Release {
             id: 100,
-            tag_name: "cli/v1.3.0".to_string(),
+            tag_name: "v1.3.0".to_string(),
             name: "apvm v1.3.0".to_string(),
             prerelease: false,
             draft: false,
@@ -910,7 +941,10 @@ exit 0"#,
                     content_type: "text/plain".to_string(),
                 },
             ],
-            html_url: Some("https://github.com/wp-media/automation-plugin-version-manager/releases/tag/cli/v1.3.0".to_string()),
+            html_url: Some(
+                "https://github.com/wp-media/automation-plugin-version-manager/releases/tag/v1.3.0"
+                    .to_string(),
+            ),
         }
     }
 }
