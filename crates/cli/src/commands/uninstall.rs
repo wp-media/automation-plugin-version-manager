@@ -141,8 +141,15 @@ fn confirm(prompt: &str) -> Result<bool> {
         .read_line(&mut input)
         .map_err(|e| Error::Uninstall(format!("Failed to read user input: {e}")))?;
 
+    Ok(is_affirmative(&input))
+}
+
+/// Whether a raw confirmation answer means "yes": exactly `y` or `yes`,
+/// ignoring surrounding whitespace and case. Anything else — including an
+/// empty line — is a refusal, so a stray Enter never uninstalls.
+fn is_affirmative(input: &str) -> bool {
     let answer = input.trim().to_lowercase();
-    Ok(answer == "y" || answer == "yes")
+    answer == "y" || answer == "yes"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -457,6 +464,16 @@ mod tests {
         let input = "maybe";
         let answer = input.trim().to_lowercase();
         assert!(answer != "y" && answer != "yes");
+    }
+
+    #[test]
+    fn is_affirmative_accepts_only_y_and_yes() {
+        for yes in ["y", "Y", "yes", "YES", "  Yes \n", "y\r\n"] {
+            assert!(is_affirmative(yes), "{yes:?} must confirm");
+        }
+        for no in ["", "\n", "n", "no", "ye", "yess", "y es", "maybe", "1"] {
+            assert!(!is_affirmative(no), "{no:?} must not confirm");
+        }
     }
 
     #[test]

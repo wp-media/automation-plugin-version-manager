@@ -861,6 +861,27 @@ mod tests {
     }
 
     #[test]
+    fn skill_refresh_args_are_a_valid_global_skill_install() {
+        // The refresh spawns the NEW binary with these exact arguments; if the
+        // `skill` command or its `--global` flag is ever renamed, every update
+        // would silently fail to refresh the skill. Parse them with the real
+        // top-level CLI to catch that at test time.
+        let argv = std::iter::once("apvm").chain(SKILL_REFRESH_ARGS);
+        let cli = <crate::Cli as clap::Parser>::try_parse_from(argv)
+            .expect("refresh arguments must parse with the real CLI");
+        assert!(
+            matches!(
+                cli.command,
+                crate::Commands::Skill(crate::commands::SkillArgs {
+                    action: crate::commands::skill::SkillAction::Install { global: true }
+                })
+            ),
+            "refresh must be a *global* skill install, got {:?}",
+            cli.command
+        );
+    }
+
+    #[test]
     fn run_skill_refresh_errors_on_missing_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such-binary");

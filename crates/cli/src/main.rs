@@ -241,3 +241,44 @@ fn init_tracing() {
             .init();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        // clap's own self-check: catches duplicate short/long flags (e.g. a
+        // second `-v` next to `--ver`), invalid defaults, broken
+        // `conflicts_with` targets and similar wiring mistakes that would
+        // otherwise only panic at runtime when the affected command is parsed.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn update_and_uninstall_parse_without_arguments() {
+        // `run` keys the update-notifier opt-out on these exact variants.
+        assert!(matches!(
+            Cli::try_parse_from(["apvm", "update"]).map(|c| c.command),
+            Ok(Commands::Update)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["apvm", "uninstall", "--yes"]).map(|c| c.command),
+            Ok(Commands::Uninstall { yes: true })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["apvm", "uninstall"]).map(|c| c.command),
+            Ok(Commands::Uninstall { yes: false })
+        ));
+    }
+
+    #[test]
+    fn verbose_is_global_and_accepted_after_the_subcommand() {
+        // `apvm build … --verbose` is the documented form, so the flag must
+        // stay `global = true`.
+        let cli = Cli::try_parse_from(["apvm", "list", "--verbose"]).expect("parses");
+        assert!(cli.verbose);
+    }
+}

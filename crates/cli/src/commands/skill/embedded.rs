@@ -191,4 +191,100 @@ mod tests {
              update .claude/skills/apvm-cli/SKILL.md"
         );
     }
+
+    // ── CLI surface ↔ skill parity ───────────────────────────────────────
+    //
+    // CLAUDE.md requires the skill to mirror the CLI surface. These tests walk
+    // the real clap definition, so adding/renaming a subcommand or flag
+    // without documenting it fails here instead of shipping a stale skill.
+
+    /// Every embedded skill file concatenated — a flag may be documented in
+    /// a reference file rather than `SKILL.md` itself.
+    fn skill_text() -> String {
+        SKILL_FILES
+            .iter()
+            .map(|f| f.contents)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Collect `(command path, command)` for `cmd` and every nested
+    /// subcommand, e.g. `"cache gc"`. The root has an empty path.
+    fn walk<'a>(cmd: &'a clap::Command, path: &str, out: &mut Vec<(String, &'a clap::Command)>) {
+        out.push((path.to_string(), cmd));
+        for sub in cmd.get_subcommands() {
+            let sub_path = format!("{path} {}", sub.get_name()).trim().to_string();
+            walk(sub, &sub_path, out);
+        }
+    }
+
+    /// Whether the skill mentions the short flag `-c` as a standalone token
+    /// (`-y`, `[-y]`, `` `-y` ``), not as part of a longer word.
+    fn mentions_short(text: &str, short: char) -> bool {
+        let flag = format!("-{short}");
+        text.match_indices(&flag).any(|(i, _)| {
+            let before = text[..i].chars().next_back();
+            let after = text[i + flag.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '-')
+                && !after.is_some_and(|c| c.is_alphanumeric() || c == '-')
+        })
+    }
+
+    #[test]
+    fn mentions_short_matches_only_standalone_tokens() {
+        assert!(mentions_short("apvm uninstall -y", 'y'));
+        assert!(mentions_short("`apvm cache clear [-y]`", 'y'));
+        assert!(!mentions_short("a pre-yes word", 'y'));
+        assert!(!mentions_short("--yes", 'y'));
+    }
+
+    #[test]
+    fn skill_documents_every_subcommand() {
+        use clap::CommandFactory;
+        let root = crate::Cli::command();
+        let mut commands = Vec::new();
+        walk(&root, "", &mut commands);
+
+        let text = skill_text();
+        let missing: Vec<String> = commands
+            .iter()
+            .filter(|(path, _)| !path.is_empty())
+            .map(|(path, _)| format!("apvm {path}"))
+            .filter(|usage| !text.contains(usage.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the apvm-cli skill never mentions {missing:?} — update .claude/skills/apvm-cli/"
+        );
+    }
+
+    #[test]
+    fn skill_documents_every_flag() {
+        use clap::CommandFactory;
+        let root = crate::Cli::command();
+        let mut commands = Vec::new();
+        walk(&root, "", &mut commands);
+
+        let text = skill_text();
+        let mut missing = Vec::new();
+        for (path, cmd) in &commands {
+            for arg in cmd.get_arguments().filter(|a| !a.is_hide_set()) {
+                // The long form is the canonical spelling; a short-only
+                // mention (`apvm uninstall -y`) still documents the flag.
+                let documented = arg
+                    .get_long()
+                    .is_some_and(|long| text.contains(&format!("--{long}")))
+                    || arg.get_short().is_some_and(|c| mentions_short(&text, c));
+                let named = arg.get_long().is_some() || arg.get_short().is_some();
+                if named && !documented {
+                    missing.push(format!("apvm {path} {}", arg.get_id()));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the apvm-cli skill never mentions these flags: {missing:?} — \
+             update .claude/skills/apvm-cli/"
+        );
+    }
 }
