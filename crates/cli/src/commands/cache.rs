@@ -43,8 +43,8 @@ pub enum CacheAction {
     Info,
     /// Remove cached entries (by age, project, or kind)
     Clean(CleanArgs),
-    /// Remove missing or damaged entries and orphan files (add --checksum to
-    /// re-hash them)
+    /// Remove missing or damaged entries and orphan directories (add
+    /// --checksum to re-hash them)
     Gc {
         /// Also re-hash every file and remove those whose content no longer
         /// matches its recorded checksum (slowest, most thorough). Without
@@ -118,8 +118,15 @@ impl CacheArgs {
     /// Execute the cache command against `cache_dir` (the resolved cache
     /// directory — config override or default) on the real terminal.
     pub fn execute(&self, cache_dir: &Path) -> apvm_core::Result<()> {
-        let mut out = |text: &str| print!("{text}");
-        let mut err = |text: &str| eprint!("{text}");
+        // Best-effort terminal output: `print!` panics when the reader has
+        // gone (`apvm cache info | head -1`), which must not crash the
+        // command; the action's outcome is what decides the exit code.
+        let mut out = |text: &str| {
+            let _ = io::stdout().write_all(text.as_bytes());
+        };
+        let mut err = |text: &str| {
+            let _ = io::stderr().write_all(text.as_bytes());
+        };
         let mut ask = confirm;
         let mut console = Console {
             out: &mut out,
@@ -177,12 +184,13 @@ fn clean(
         return report_empty(cache, console);
     };
     (console.out)(&clean_text(&report));
-    (console.err)(&failures_text(
-        &report.failures,
-        "`apvm cache gc` retries removal failures",
-    ));
+    (console.err)(&failures_text(&report.failures, GC_RETRIES));
     Ok(())
 }
+
+/// The remedy `clean` and `clear` name for what they left on disk; lines
+/// that need something else say so themselves ("remove it by hand").
+const GC_RETRIES: &str = "`apvm cache gc` retries failed removals";
 
 /// `apvm cache gc` — reconcile the database with disk, removing what
 /// `verify` at the same depth reports. What it had to leave in place goes to
@@ -240,10 +248,11 @@ fn repair(cache: &CacheMaintenance, console: &mut Console<'_>) -> apvm_core::Res
 }
 
 /// `apvm cache clear` — remove everything, after confirmation unless `yes`.
-/// The cache is opened (and checked) before asking: no cache is reported,
-/// and a broken one fails, without ever prompting.
+/// The cache is opened (and checked) before asking, without reading its
+/// records: no cache is reported, and a corrupt one fails, without ever
+/// prompting — while one whose rows cannot be read back is still cleared.
 fn clear(cache: &CacheMaintenance, yes: bool, console: &mut Console<'_>) -> apvm_core::Result<()> {
-    if cache.usage().map_err(hint_with_repair)?.is_none() {
+    if !cache.opens().map_err(hint_with_repair)? {
         return report_empty(cache, console);
     }
     let prompt = format!(
@@ -258,10 +267,7 @@ fn clear(cache: &CacheMaintenance, yes: bool, console: &mut Console<'_>) -> apvm
         return report_empty(cache, console);
     };
     (console.out)(&cleared_text(&report));
-    (console.err)(&failures_text(
-        &report.failures,
-        "`apvm cache gc` retries removal failures",
-    ));
+    (console.err)(&failures_text(&report.failures, GC_RETRIES));
     Ok(())
 }
 
@@ -529,25 +535,29 @@ fn hint_without_repair(err: Error) -> Error {
 
 /// Attach the CLI's next step to errors that have one: `apvm cache repair`
 /// for a corrupt, unreadable or lost database (when `offer_repair`), and
-/// where the cache location comes from for someone else's directory. Every
-/// other error passes through unchanged.
+/// where the cache location comes from for someone else's directory. A
+/// storage I/O error gains its cause, which its message leaves out ("…:
+/// Permission denied"). Every other error passes through unchanged.
 fn with_hint(err: Error, offer_repair: bool) -> Error {
     use apvm_storage::Error as Storage;
     let hint = match &err {
         Error::Storage(inner) if offer_repair && inner.is_corruption() => {
-            "The cache database is corrupt — run `apvm cache repair` to recover it."
+            Some("The cache database is corrupt — run `apvm cache repair` to recover it.")
         }
-        Error::Storage(Storage::MissingDatabase { .. }) if offer_repair => {
-            "The cache database is missing or empty — run `apvm cache repair` to re-index the cache from disk."
-        }
-        Error::Storage(Storage::ForeignDirectory { .. }) => {
-            "Check the cache location: APVM_CACHE_DIR if set, else config `cache-dir`, else ~/.apvm/cache."
-        }
-        _ => return err,
+        Error::Storage(Storage::MissingDatabase { .. }) if offer_repair => Some(
+            "The cache database is missing, empty or half-repaired — run `apvm cache repair` to re-index the cache from disk.",
+        ),
+        Error::Storage(Storage::ForeignDirectory { .. }) => Some(
+            "Check the cache location: APVM_CACHE_DIR if set, else config `cache-dir`, else ~/.apvm/cache.",
+        ),
+        _ => None,
     };
-    match err {
-        Error::Storage(inner) => Error::Cache(format!("{inner}\n  {hint}")),
-        other => other,
+    match (err, hint) {
+        (Error::Storage(inner), Some(hint)) => {
+            Error::Cache(format!("{}\n  {hint}", inner.detail()))
+        }
+        (Error::Storage(inner @ Storage::Io { .. }), None) => Error::Cache(inner.detail()),
+        (other, _) => other,
     }
 }
 
@@ -610,6 +620,7 @@ mod tests {
 
     use apvm_storage::{ArtifactStore, BuildMetadata, BuildSource, SourceArtifact};
 
+    /// `apvm cache clean` with no flags.
     fn clean_args() -> CleanArgs {
         CleanArgs {
             older_than: None,
@@ -1131,7 +1142,7 @@ mod tests {
         }
         let text = hint_with_repair(missing()).to_string();
         assert!(
-            text.contains("missing or empty — run `apvm cache repair`"),
+            text.contains("missing, empty or half-repaired — run `apvm cache repair`"),
             "{text}"
         );
         for err in [hint_with_repair(foreign()), hint_without_repair(foreign())] {
@@ -1164,6 +1175,89 @@ mod tests {
     }
 
     #[test]
+    fn a_storage_io_error_keeps_its_cause() {
+        // Audit: the CLI printed "cannot access store database …" without
+        // the reason (e.g. "Permission denied") the Node message carried.
+        use apvm_storage::Error as Storage;
+        let io = || {
+            Error::Storage(Storage::Io {
+                context: "cannot access store database /c/apvm.db".to_string(),
+                source: io::Error::new(io::ErrorKind::PermissionDenied, "Permission denied"),
+            })
+        };
+        for err in [hint_with_repair(io()), hint_without_repair(io())] {
+            assert_eq!(
+                err.to_string(),
+                "Cache error: cannot access store database /c/apvm.db: Permission denied"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_empties_a_cache_whose_rows_cannot_be_read_back() {
+        // Audit: its pre-prompt check read every row, so `clear -y` refused
+        // a cache that an unfiltered `clean` (and Node's `clear()`) emptied.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        seed(&cache);
+        rusqlite::Connection::open(cache.join("apvm.db"))
+            .unwrap()
+            .execute("UPDATE builds SET built_at_ms = ?1", [i64::MAX])
+            .unwrap();
+        let aborted = run(CacheAction::Clear { yes: false }, &cache, &[false]);
+        assert!(aborted.result.is_ok());
+        assert_eq!(aborted.prompts.len(), 1, "it asks first");
+        let run = run(CacheAction::Clear { yes: true }, &cache, &[]);
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert!(run.out.starts_with("Cleared the cache"), "{}", run.out);
+        assert_eq!(
+            ArtifactStore::open(&cache)
+                .unwrap()
+                .usage()
+                .unwrap()
+                .build_count,
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_clean_and_clear_leave_on_disk_goes_to_stderr() {
+        // Audit: nothing tested this output; printing it on stdout, or not
+        // at all, passed every test.
+        use std::os::unix::fs::PermissionsExt;
+        let chmod = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for action in [
+            CacheAction::Clean(clean_args()),
+            CacheAction::Clear { yes: true },
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cache = tmp.path().join("cache");
+            seed(&cache);
+            // The build's directory cannot be unlinked from its parent.
+            let version = cache.join("wp-rocket/commits/3.17.4");
+            chmod(&version, 0o555);
+            let run = run(action, &cache, &[]);
+            chmod(&version, 0o755);
+            if std::fs::read_dir(&version).unwrap().next().is_none() {
+                return; // root: permission bits do not bind, nothing is left
+            }
+            assert!(run.result.is_ok(), "{:?}", run.result);
+            assert!(!run.out.contains("could not be removed"), "{}", run.out);
+            assert!(
+                run.err.starts_with(
+                    "  1 director(ies) could not be removed (`apvm cache gc` retries failed \
+                     removals):\n    - "
+                ),
+                "{}",
+                run.err
+            );
+        }
+    }
+
+    #[test]
     fn a_lost_database_is_reported_and_repair_rebuilds_it() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
@@ -1178,7 +1272,7 @@ mod tests {
             .expect_err("a lost database is not an empty cache");
         assert!(
             err.to_string()
-                .contains("missing or empty — run `apvm cache repair`"),
+                .contains("missing, empty or half-repaired — run `apvm cache repair`"),
             "{err}"
         );
 

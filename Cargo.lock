@@ -82,6 +82,7 @@ dependencies = [
  "directories",
  "indicatif",
  "openssl",
+ "rusqlite",
  "self-replace",
  "semver",
  "serde",

@@ -1056,7 +1056,6 @@ mod tests {
 
     // ---- warm mode (`deliver = false`): reference the cache, write nothing ----
 
-    /// The output directory must be empty (contain no entries).
     #[tokio::test]
     async fn a_failed_cache_write_warns_once_instead_of_passing_silently() {
         // Audit A1: an open cache that refused the write reported nothing,
@@ -1100,6 +1099,7 @@ mod tests {
         assert!(warnings[1].starts_with("this release download could not be stored"));
     }
 
+    /// The output directory must be empty (contain no entries).
     fn assert_output_empty(dir: &std::path::Path) {
         assert!(
             std::fs::read_dir(dir).unwrap().next().is_none(),

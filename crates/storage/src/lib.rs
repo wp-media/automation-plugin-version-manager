@@ -32,17 +32,20 @@
 //! - **Corruption is detected and recoverable.** The database runs in WAL
 //!   mode (crash-safe by design) and is integrity-checked on every open; a
 //!   damaged database fails with [`Error::DatabaseCorrupted`] and
-//!   [`ArtifactStore::repair`] quarantines it, rebuilds a fresh index, and
-//!   re-adopts the artifact files found on disk.
-//! - **Only its own files.** A store is only created in a missing or empty
-//!   directory ([`ArtifactStore::inspect`] / [`StoreState`]); a directory
-//!   holding someone else's data is refused. `gc` and `repair` walk only
-//!   store-produced names and never follow symlinks, so they cannot delete
-//!   or adopt anything the store did not create.
+//!   [`ArtifactStore::repair`] keeps a copy of it, resets it in place
+//!   (never renaming it), and re-adopts the artifact files found on disk.
+//! - **Only its own files.** A store is only created in a missing or
+//!   vacant directory (nothing but OS metadata files), and store-shaped
+//!   content without the store's lock file is someone else's
+//!   ([`ArtifactStore::inspect`] / [`StoreState`]): such directories are
+//!   refused. `gc` and `repair` walk only store-produced names and never
+//!   follow symlinks; repair adopts only build output; paths read back
+//!   from the database are checked before use. So they cannot delete,
+//!   write or adopt anything the store did not create.
 //! - **Concurrency.** The store is `Send + Sync`; in-process access is
 //!   serialized internally. Across processes, SQLite's WAL handles the
 //!   database (concurrent first opens, and opens racing a repair that
-//!   replaces it, included) and an advisory file lock
+//!   resets it, included) and an advisory file lock
 //!   serializes mutations so a clean cannot race a store. (Keep the store on
 //!   a local disk — advisory locks on network filesystems are unreliable.)
 //!

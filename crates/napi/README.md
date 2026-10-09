@@ -210,17 +210,18 @@ if (issues.length > 0) await cache.gc({ checksum: true }); // removes what it ca
 
 - **Independent of `cacheEnabled`:** a disabled cache can still be inspected and cleaned. Creating a handle touches nothing on disk.
 - **No cache yet:** a missing or empty directory resolves every method with an empty report and creates nothing. `info().exists` is `false` then — often a sign of the wrong `cacheDir`.
-- **Strict options**, because `clean()`'s default removes everything: a non-object, an unknown key (`dryrun`), a wrong type, or — for `clean()` — a key set to `undefined` / `null` rejects with `InvalidArg` instead of falling back to a default. Omit a key to leave it unset. `ApvmCache.open()` reads its config the same way (it throws), so `{ cacheDir: process.env.UNSET }` cannot silently open the default cache.
+- **Only its own directories:** a cache is created only in a missing or vacant directory (nothing but `.DS_Store` / `Thumbs.db` / `desktop.ini`) — `Apvm.create()` on a directory holding other files reports `cacheStatus()` `unavailable` and writes nothing there — and store-shaped data without the cache's `.apvm.lock` file is someone else's, whatever its `apvm.db` holds: every method rejects with `GenericFailure` ("not an apvm cache"), changing nothing.
+- **Strict options**, because `clean()`'s default removes everything: a non-object or an object that is not plain (a class instance, a `Map`, `Object.create(defaults)` — options are read from own properties only, so inherited ones would be ignored), an unknown key (`dryrun`), a wrong type, or — for `clean()` — a key set to `undefined` / `null` rejects with `InvalidArg` instead of falling back to a default. Omit a key to leave it unset. `ApvmCache.open()` reads its config the same way (it throws), so `{ cacheDir: process.env.UNSET }` cannot silently open the default cache.
 - **Validation first:** bad options reject with `InvalidArg` whatever the disk state, even on a corrupt cache.
 - **Relative `cacheDir`:** made absolute when the handle (or the `Apvm`) is created, so a later `process.chdir()` changes nothing. `~` is not expanded.
 - **Threading:** each call runs on the blocking pool with its own store, closed before the promise settles. At most one call per CPU runs at a time (the rest wait), so maintenance cannot starve builds. Calls are safe alongside builds on the same cache.
 - **Snapshots:** `verify()` may report as `missing` an entry that a concurrent `clean()` or `clear()` removed meanwhile; `gc()` re-checks before deleting.
 - **Interrupted repair** (the process exited mid-way): the cache is left needing repair — `CacheCorrupted`, and `gc()` refuses — never half-indexed. Run `repair()` again.
-- **Repair never swaps the database file:** it keeps a copy and resets the file in place, so other processes using the cache cannot be crashed by it. A corrupt database that another process (or a running build) holds open is refused with a `GenericFailure` ("in use…"), nothing changed; idle `Apvm` instances of this process let go of it on their own.
-- **One copy of the addon per process:** two copies (a duplicated dependency, a bundler copying the `.node` file) link two SQLite libraries whose file locks cannot see each other, which corrupts or crashes on a shared cache. The second copy's `Apvm.create()`, `Apvm.createWithTokenResolution()` and `ApvmCache.open()` throw `GenericFailure`; deduplicate the dependency. (A copy loaded only inside a worker thread is not detected.)
-- **Self-healing instances:** after a `repair()` from anywhere (this process, the CLI, another process), `Apvm` instances using that cache resume caching on their next build. Nothing needs re-creating. `cacheStatus()` reflects whether the database *opens*: a database that opens but has unreadable rows reports `active` while the maintenance methods reject with `CacheCorrupted`.
+- **Repair never swaps the database file:** it keeps a copy and resets the file in place, so other processes using the cache cannot be crashed by it, and see the repaired index. A database file SQLite can no longer read is only reset once nobody has it open: while a build in this or another process holds it, `repair()` rejects with a `GenericFailure` ("in use…"), nothing changed; idle `Apvm` instances hold no handle.
+- **One copy of the addon per process:** two copies (a duplicated dependency, a bundler copying the `.node` file) link two SQLite libraries whose file locks cannot see each other, which corrupts or crashes on a shared cache. The second copy's `Apvm.create()`, `Apvm.createWithTokenResolution()` and `ApvmCache.open()` throw `GenericFailure`; deduplicate the dependency. (A copy loaded only inside a worker thread is not detected, and where `globalThis` is frozen or sealed the guard cannot record anything and is skipped.)
+- **Self-healing instances:** each build (and `cacheStatus()`) opens the cache afresh and closes it when done, so after a `repair()` from anywhere (this process, the CLI, another process), `Apvm` instances using that cache resume caching on their next build, and damage made meanwhile is reported. Nothing needs re-creating. `cacheStatus()` reflects whether the database *opens*: a database that opens but has unreadable rows reports `active` while the maintenance methods reject with `CacheCorrupted`.
 
-**Error codes.** Every method reports errors by rejecting with an `Error` that has a `message` and a `code` (its `stack` has no JavaScript frames: it is created on the event loop when the work finishes). Only `ApvmCache.open()` is synchronous; it throws `InvalidArg`.
+**Error codes.** Every method reports errors by rejecting with an `Error` that has a `message` and a `code` (its `stack` has no JavaScript frames: it is created on the event loop when the work finishes). Only `ApvmCache.open()` is synchronous; it throws `InvalidArg`. An exception thrown by the options object itself while it is read (a getter, a `Proxy` trap) propagates synchronously, unchanged.
 
 | `err.code` | When | Remedy |
 |---|---|---|
@@ -234,7 +235,7 @@ try {
   usage = await cache.info();
 } catch (e) {
   if ((e as { code?: string }).code !== 'CacheCorrupted') throw e;
-  await cache.repair(); // quarantines the bad database, re-indexes builds on disk
+  await cache.repair(); // keeps a copy, resets the database in place, re-indexes builds on disk
   usage = await cache.info();
 }
 
@@ -340,11 +341,18 @@ interface ApvmConfig {
 
 > The `APVM_CACHE_DIR` environment variable, when set, overrides `cacheDir`
 > (and the default) for every `Apvm` instance in the process. It is read
-> when `create()` / `ApvmCache.open()` is called, and a relative directory
-> is made absolute then, so neither a later env change nor `process.chdir()`
-> moves an existing instance's cache. Handy in tests to
+> from `process.env` when `create()` / `ApvmCache.open()` is called — in a
+> worker thread, from that worker's own `process.env` — and a relative
+> directory is made absolute then, so neither a later env change nor
+> `process.chdir()` moves an existing instance's cache. Handy in tests to
 > isolate the cache from the real `~/.apvm/cache` — this package's own test
 > suite uses it (see `__tests__/setup.ts`).
+>
+> Unlike `ApvmCache.open()`, `Apvm.create()` reads its config leniently (as
+> napi does): an unknown key such as `cachedir` is ignored and
+> `cacheDir: undefined` means the default — so `apvm.cache()` then maintains
+> `~/.apvm/cache`. Check `apvm.cache().dir()` before a destructive call when
+> the config comes from untrusted or hand-written input.
 
 #### `BuildOptions`
 
@@ -530,8 +538,8 @@ try {
 | Project     | Variants             | Version    | Releases |
 |-------------|----------------------|------------|----------|
 | `backwpup`  | free, pro-de, pro-en | Required   | Yes      |
-| `wp-rocket` | (single)             | Embedded   | No       |
-| `imagify`   | (single)             | Embedded   | No       |
+| `wp-rocket` | (single)             | Optional   | No       |
+| `imagify`   | (single)             | Optional   | No       |
 
 ## Full Example
 

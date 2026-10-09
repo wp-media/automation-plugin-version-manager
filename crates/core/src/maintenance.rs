@@ -1,6 +1,7 @@
 //! Artifact-cache maintenance — the single implementation of the
-//! `apvm cache` actions. The CLI is a thin adapter over it, and any other
-//! front end (the Node bindings are next) is meant to wrap it the same way.
+//! `apvm cache` actions. The CLI and the Node bindings (`ApvmCache`) are
+//! thin adapters over it, and any other front end is meant to wrap it the
+//! same way.
 //!
 //! [`CacheMaintenance`] wraps one cache directory and exposes every action:
 //! [`usage`](CacheMaintenance::usage), [`clean`](CacheMaintenance::clean),
@@ -93,9 +94,10 @@ impl CacheMaintenance {
     ///
     /// - [`Error::Config`] — the path is empty (the store would resolve it
     ///   to the current directory).
-    /// - [`Error::Io`] — the path cannot be inspected. On Unix: a component
+    /// - [`Error::Io`] — the path cannot be inspected (on Unix: a component
     ///   is a regular file, or a parent is not searchable; other platforms
-    ///   may report such paths as not found instead.
+    ///   may report such paths as not found instead), or it is a symbolic
+    ///   link to a missing target.
     /// - [`Error::Storage`] — the path is not a directory
     ///   ([`apvm_storage::Error::Io`]), holds someone else's data
     ///   ([`apvm_storage::Error::ForeignDirectory`]), or is a cache whose
@@ -118,6 +120,20 @@ impl CacheMaintenance {
             // Missing, Empty — and any future state: never operate on it.
             _ => Ok(false),
         }
+    }
+
+    /// Whether a cache is here and opens — its database passes the quick
+    /// integrity check every open runs — without reading its records: what
+    /// a front end checks before asking to [`clear`](CacheMaintenance::clear)
+    /// it, since a cache whose rows cannot be read back is still cleared.
+    /// `Ok(false)` when there is no cache; never creates anything.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`CacheMaintenance::exists`], and of opening the store — a
+    /// corrupt database included — as [`Error::Storage`].
+    pub fn opens(&self) -> Result<bool> {
+        Ok(self.with_store(|_| Ok(()))?.is_some())
     }
 
     /// Usage totals and per-project breakdown (`apvm cache info`).
@@ -195,10 +211,9 @@ impl CacheMaintenance {
     /// rebuild a missing, blank or half-repaired one; then re-index the
     /// builds found on disk. A no-op on a healthy database (the report
     /// records nothing done). Crash-safe and never renames the database —
-    /// see [`ArtifactStore::repair`]. [`Apvm`](crate::Apvm) instances of
-    /// this process first let go of the cache (they reopen it on their next
-    /// build), since a corrupt database is only reset once nobody has it
-    /// open.
+    /// see [`ArtifactStore::repair`]. [`Apvm`](crate::Apvm) instances hold
+    /// the cache open only while they build, so an idle one never stands in
+    /// the way of a repair from any process.
     ///
     /// Returns `Ok(None)` when there is no cache — and then creates nothing.
     ///
@@ -207,20 +222,21 @@ impl CacheMaintenance {
     /// Those of [`CacheMaintenance::exists`], except that a lost database is
     /// what repair fixes; [`Error::Storage`] wrapping
     /// [`apvm_storage::Error::DatabaseInUse`] when another process (or a
-    /// build running in this one) holds a corrupt database open — nothing is
-    /// changed; retry once it is done — and otherwise when copying,
-    /// resetting or re-filling fails, or the schema is newer than this build.
+    /// build running in this one) holds open a database file SQLite can no
+    /// longer read — nothing is changed; retry once it is done (a readable
+    /// but damaged database is reset under its users) — and otherwise when
+    /// copying, resetting or re-filling fails, or the schema is newer than
+    /// this build.
     pub fn repair(&self) -> Result<Option<RepairReport>> {
         match self.state()? {
-            StoreState::Missing | StoreState::Empty => Ok(None),
-            // Present or Orphaned; storage itself refuses a foreign directory.
-            _ => {
-                // Idle instances in this process would keep a corrupt
-                // database open, and repair refuses to reset one in use.
-                crate::cache_status::release_stores(&self.dir);
+            // Storage itself refuses a foreign directory.
+            StoreState::Present | StoreState::Orphaned { .. } | StoreState::Foreign { .. } => {
                 let (_store, report) = ArtifactStore::repair(&self.dir)?;
                 Ok(Some(report))
             }
+            // Missing, Empty — and any future state: never operate on it,
+            // as `exists` decides.
+            _ => Ok(None),
         }
     }
 
@@ -242,6 +258,17 @@ impl CacheMaintenance {
             ))
         })?;
         if !exists {
+            // A symlink to nothing would be reported as "no cache", while
+            // every build fails to create the cache there.
+            if std::fs::symlink_metadata(&self.dir).is_ok() {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "the cache directory '{}' is a symbolic link to a missing target",
+                        self.dir.display()
+                    ),
+                )));
+            }
             return Ok(StoreState::Missing);
         }
         Ok(ArtifactStore::inspect(&self.dir)?)
@@ -258,14 +285,39 @@ impl CacheMaintenance {
         &self,
         op: impl FnOnce(&ArtifactStore) -> apvm_storage::Result<T>,
     ) -> Result<Option<T>> {
-        if !self.exists()? {
+        let opened = open_checked(
+            || self.exists(),
+            || Ok(ArtifactStore::open_existing(&self.dir)?),
+        )?;
+        match opened {
+            Some(store) => Ok(Some(op(&store)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Check that a cache exists, then open it — and when it is gone by then,
+/// check again rather than report "no cache": it may have changed in
+/// between (a repair began, leaving its marker; the database was removed),
+/// and a cache needing repair must surface as the error `exists` returns.
+/// Two rounds at most; `Ok(None)` when there is no cache.
+///
+/// # Errors
+///
+/// Those of `exists` and `open`.
+fn open_checked<S>(
+    mut exists: impl FnMut() -> Result<bool>,
+    mut open: impl FnMut() -> Result<Option<S>>,
+) -> Result<Option<S>> {
+    for _round in 0..2 {
+        if !exists()? {
             return Ok(None);
         }
-        let Some(store) = ArtifactStore::open_existing(&self.dir)? else {
-            return Ok(None);
-        };
-        Ok(Some(op(&store)?))
+        if let Some(store) = open()? {
+            return Ok(Some(store));
+        }
     }
+    Ok(None)
 }
 
 // ============================================================================
@@ -941,7 +993,26 @@ mod tests {
     #[test]
     fn repair_adopts_builds_left_on_disk() {
         // The offline seeding path the Node tests rely on: a garbage database
-        // next to a build directory makes repair re-index that build.
+        // next to a build directory, in a directory marked as a cache by its
+        // lock file, makes repair re-index that build.
+        let (_root, dir) = temp_cache();
+        let build_dir = dir.join("wp-rocket/commits/3.17.4/aaaaaaa");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::write(build_dir.join("wp-rocket-3.17.4.zip"), b"zip-bytes").unwrap();
+        corrupt_database(&dir);
+        std::fs::write(dir.join(".apvm.lock"), b"").unwrap();
+        let cache = CacheMaintenance::new(&dir);
+
+        let report = cache.repair().unwrap().unwrap();
+        assert_eq!((report.builds_adopted, report.artifacts_adopted), (1, 1));
+        assert_eq!(counts(&cache), (1, 0));
+    }
+
+    #[test]
+    fn repair_never_adopts_builds_without_the_lock_file() {
+        // Audit: the same layout without `.apvm.lock` is someone else's
+        // directory with a stray `apvm.db`; adopting it let gc delete the
+        // rest of that directory.
         let (_root, dir) = temp_cache();
         let build_dir = dir.join("wp-rocket/commits/3.17.4/aaaaaaa");
         std::fs::create_dir_all(&build_dir).unwrap();
@@ -949,9 +1020,19 @@ mod tests {
         corrupt_database(&dir);
         let cache = CacheMaintenance::new(&dir);
 
-        let report = cache.repair().unwrap().unwrap();
-        assert_eq!((report.builds_adopted, report.artifacts_adopted), (1, 1));
-        assert_eq!(counts(&cache), (1, 0));
+        let err = cache.repair().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Storage(apvm_storage::Error::ForeignDirectory { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(!dir.join(".apvm.lock").exists());
+        assert_eq!(
+            std::fs::read(dir.join("apvm.db")).unwrap(),
+            b"not a sqlite database"
+        );
     }
 
     #[test]
@@ -966,9 +1047,110 @@ mod tests {
         assert_eq!(counts(&cache), (1, 0));
     }
 
+    /// Scripted `exists` / `open` outcomes for [`open_checked`], in order.
+    fn scripted<T>(outcomes: Vec<T>) -> impl FnMut() -> T {
+        let mut outcomes = outcomes.into_iter();
+        move || outcomes.next().expect("called more often than scripted")
+    }
+
+    #[test]
+    fn a_cache_that_changes_before_it_opens_is_checked_again() {
+        // Audit C2: a repair starting between the check and the open (its
+        // marker makes the open find no database) was reported as "no
+        // cache" — `exists: false` to Node — instead of "needs repair".
+        let missing = || {
+            Error::Storage(apvm_storage::Error::MissingDatabase {
+                path: PathBuf::from("/c"),
+                adoptable_builds: 1,
+            })
+        };
+        let opened = open_checked(
+            scripted(vec![Ok(true), Err(missing())]),
+            scripted(vec![Ok(None::<()>)]),
+        );
+        assert!(
+            matches!(
+                opened,
+                Err(Error::Storage(apvm_storage::Error::MissingDatabase { .. }))
+            ),
+            "{opened:?}"
+        );
+        // Opened on the second round, or gone for good.
+        assert_eq!(
+            open_checked(
+                scripted(vec![Ok(true), Ok(true)]),
+                scripted(vec![Ok(None), Ok(Some(7))])
+            )
+            .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            open_checked(
+                scripted(vec![Ok(true), Ok(false)]),
+                scripted(vec![Ok(None::<()>)])
+            )
+            .unwrap(),
+            None
+        );
+        // A cache that keeps vanishing is no cache after two rounds.
+        assert_eq!(
+            open_checked(
+                scripted(vec![Ok(true), Ok(true)]),
+                scripted(vec![Ok(None::<()>), Ok(None)])
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_an_error_not_an_empty_cache() {
+        // Audit N3: it read as "no cache", while every build failed to
+        // create the cache there.
+        let (root, dir) = temp_cache();
+        std::os::unix::fs::symlink(root.path().join("gone"), &dir).unwrap();
+        let cache = CacheMaintenance::new(&dir);
+        for outcome in [cache.exists().map(|_| ()), cache.repair().map(|_| ())] {
+            assert!(
+                matches!(&outcome, Err(Error::Io(err)) if err.kind() == io::ErrorKind::NotFound
+                    && err.to_string().contains("symbolic link to a missing target")),
+                "{outcome:?}"
+            );
+        }
+        assert!(!root.path().join("gone").exists());
+    }
+
+    #[test]
+    fn opens_checks_the_database_without_reading_its_rows() {
+        let (_root, dir) = temp_cache();
+        let cache = CacheMaintenance::new(&dir);
+        assert!(!cache.opens().unwrap(), "no cache");
+        assert!(!dir.exists(), "nothing is created");
+
+        seed_build(&dir, "wp-rocket", COMMIT_A, chrono::Duration::zero());
+        assert!(cache.opens().unwrap());
+        // Rows that cannot be read back (`usage` fails) still open.
+        rusqlite::Connection::open(dir.join("apvm.db"))
+            .unwrap()
+            .execute("UPDATE builds SET built_at_ms = ?1", [i64::MAX])
+            .unwrap();
+        assert!(cache.usage().is_err());
+        assert!(cache.opens().unwrap());
+
+        corrupt_database(&dir);
+        assert!(matches!(
+            cache.opens(),
+            Err(Error::Storage(
+                apvm_storage::Error::DatabaseCorrupted { .. }
+            ))
+        ));
+    }
+
     #[test]
     fn the_handle_is_send_and_sync() {
         // The Node bindings run actions inside `spawn_blocking`.
+        /// Compiles only for `Send + Sync + 'static` types.
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<CacheMaintenance>();
         assert_send_sync::<CleanRequest>();

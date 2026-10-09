@@ -487,6 +487,7 @@ mod tests {
         }
     }
 
+    /// The context of an issue found in a build.
     fn build_context() -> IssueContext {
         IssueContext::Build {
             version: "3.17".to_string(),
@@ -494,10 +495,11 @@ mod tests {
         }
     }
 
+    /// `rfc3339` as a UTC instant; a malformed literal fails the test.
     fn timestamp(rfc3339: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(rfc3339)
-            .map(|t| t.with_timezone(&Utc))
-            .unwrap_or_default()
+            .expect("a valid RFC 3339 test timestamp")
+            .with_timezone(&Utc)
     }
 
     // ---- inputs ---------------------------------------------------------

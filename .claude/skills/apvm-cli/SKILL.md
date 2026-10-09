@@ -26,7 +26,8 @@ Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.2.0**
 - **`--version` / `-V`** — print version, supported on every subcommand.
 - **`NO_COLOR=<anything>`** — disable ANSI colors (`https://no-color.org`).
   Colors are also auto-disabled when stdout is not a TTY.
-- Exit codes: `0` success, `1` any error (verify exits 1 when issues found).
+- Exit codes: `0` success, `1` any error (verify exits 1 when issues found),
+  `2` invalid arguments (e.g. `cache clean --builds --releases`).
 - `RUST_LOG=debug|trace` — enable tracing (`tracing-subscriber` `EnvFilter`).
 - **`APVM_CACHE_DIR=<path>`** — override the cache directory for one
   invocation. Takes precedence over the config `cache-dir` and the default
@@ -191,9 +192,13 @@ off** (`apvm config set cache false`) — operates directly on the cache dir.
 
 A directory is a cache only if it holds the cache database. A missing or empty
 directory prints `Cache is empty — nothing has been cached yet.` and is never
-written to. A directory holding other data is refused (apvm never initializes
-a cache there, and `gc` could otherwise delete it). Invalid flags fail even when
-no cache exists yet.
+written to. apvm only creates a cache in a missing or *vacant* directory
+(nothing but `.DS_Store` / `Thumbs.db` / `desktop.ini`), and a directory with
+store-shaped data but no `.apvm.lock` (the file every cache gets before its
+first build) is someone else's, whatever its `apvm.db` holds: both are
+refused, so `gc` can never delete data apvm did not create. A refused command
+leaves the directory untouched. Invalid flags fail even when no cache exists
+yet.
 
 | Subcommand | Purpose                                                                                |
 |------------|----------------------------------------------------------------------------------------|
@@ -201,8 +206,8 @@ no cache exists yet.
 | `clean`    | Remove entries by age / project / kind (supports `--dry-run`)                          |
 | `gc`       | Remove what `verify` reports at the same depth: records whose files are missing or the wrong size, or whose record is invalid (the bad files deleted; `--checksum` also catches same-size corruption), plus orphan dirs and stale temp files. The next build re-caches what was removed. Files it cannot read are kept and listed on stderr (exit 0). Removes only what apvm created; never follows symlinks |
 | `verify`   | Check integrity (presence + size; `--checksum` re-hashes). **Exits non-zero on issues** so CI can gate on cache health; the hint names the `gc` that removes them (`gc --checksum` for checksum mismatches) |
-| `repair`   | Reset a corrupt DB in place or clear an unreadable one (a copy of either kept as `apvm.db.corrupt-<ts>`), or rebuild a missing / empty / half-repaired one; then re-index builds from disk. Never renames the DB; crash-safe (an interrupted repair leaves the cache "needs repair", never half-indexed — run it again). Refuses, changing nothing, while another process holds a corrupt DB open |
-| `clear`    | Remove everything (prompts unless `-y`; a broken cache errors before prompting)        |
+| `repair`   | Reset a corrupt DB in place (including one that only SQLite's full integrity check finds damaged) or clear an unreadable one (a copy of either kept as `apvm.db.corrupt-<ts>`), or rebuild a missing / empty / half-repaired one; then re-index builds from disk (build output only — never hidden or OS metadata files). Never renames the DB; crash-safe (an interrupted repair leaves the cache "needs repair", never half-indexed — run it again). Refuses, changing nothing, while another process holds open a DB file it can no longer read (only a running build does: idle apvm instances hold no handle) |
+| `clear`    | Remove everything (prompts unless `-y`; a corrupt cache errors before prompting; one whose rows cannot be read back is still cleared) |
 
 #### `apvm cache clean` flags
 
@@ -406,16 +411,17 @@ Required for private repos and PR builds. Recommended for public repos
 
 | Symptom                                                          | Likely cause / fix                                                                |
 |------------------------------------------------------------------|-----------------------------------------------------------------------------------|
-| `The cache database is corrupt — run \`apvm cache repair\` to recover it.` | Follow the hint: `apvm cache repair` keeps a copy of the DB, resets it in place (unreadable rows, `corrupt stored metadata`: clears them) and rebuilds the index. |
-| `… the store database at <path> is in use by another process or store handle; close them and try again` (from `repair`) | Another apvm process (a running build, a Node service) holds the corrupt DB open; resetting it under them could crash them. Nothing was changed. Stop them, then run `apvm cache repair` again. |
+| ``The cache database is corrupt — run `apvm cache repair` to recover it.`` | Follow the hint: `apvm cache repair` keeps a copy of the DB, resets it in place (unreadable rows, `corrupt stored metadata`: clears them) and rebuilds the index. |
+| `… the store database at <path> is in use by another process or store handle; close them and try again` (from `repair`) | Another apvm process (a running build, a Node service) holds the corrupt DB open, and SQLite can only reset a file it can no longer read once nobody has it open. Nothing was changed. Stop them, then run `apvm cache repair` again. |
 | `… is an SQLite database that apvm did not create; refusing to use it` / `… is a symbolic link; refusing to follow it` | The cache dir's `apvm.db` is someone else's database, or a symlink. apvm never writes to either. Re-point the cache dir. |
 | `- [<project>] <file>: invalid record: …` (from `verify`) | The DB row for that file is inconsistent (tampering). `apvm cache gc` removes it; the next build caches the file again. |
-| `… the store database at <dir> is missing or empty but store content remains …` | The DB was deleted or truncated (or a repair was interrupted) while cached files remain. `apvm cache repair` rebuilds it from the builds on disk; `gc` refuses until then. |
+| `… the store database in <dir> is missing, empty or half-repaired (N re-indexable build(s) on disk)` | The DB was deleted or truncated while cached files remain, or a repair was interrupted. `apvm cache repair` rebuilds it from the builds on disk; `gc`, `clean` and builds refuse to write until then. |
 | `⚠ the artifact cache at <dir> needs repair: … This run neither reads nor writes the cache …` (during `build`) | The cache DB is corrupt (or lost while builds remain); the build still succeeds, uncached. Run `apvm cache repair` (the warning also names the Node equivalent, `apvm.cache().repair()`); builds cache again from then on. |
-| `⚠ this build could not be stored in the artifact cache (…); it is not cached` (also `this release download …`) | Writing to the cache failed (disk full, permissions, a replaced database). The output is still delivered; only caching was skipped. Check the reason, then `apvm cache verify` / `apvm cache gc`. |
+| `⚠ this build could not be stored in the artifact cache (…); it is not cached` (also `this release download …`) | Writing to the cache failed (disk full, permissions, a replaced database). The output is still delivered; only caching was skipped. Check the reason, then `apvm cache verify` / `apvm cache gc` — or `apvm cache repair` when the reason says the database is corrupt or malformed. |
 | `⚠ the artifact cache at <dir> is unavailable: …` (during `build`) | The cache dir cannot be used (permissions, a file in the path, someone else's data, a newer apvm's DB). The build still succeeds, uncached. Fix or re-point the cache dir (see the next rows). |
-| `… refusing to use <dir> as an artifact store …`                | The cache dir holds other data — including store-shaped dirs without apvm's `.apvm.lock` file. Point the cache at a new or empty directory (source: `APVM_CACHE_DIR` if set, else config `cache-dir`, else `~/.apvm/cache`). |
-| `Error: IO error: cannot access cache directory '<path>': …`    | `<path>` is the effective cache dir (as above). One of its components is a regular file, or a parent can't be traversed. Fix or re-point it — note `apvm config get cache-dir` shows the config/default only, not `APVM_CACHE_DIR`. On Windows such a path may just print "Cache is empty". |
+| `… refusing to use <dir> as an artifact store: it is not an apvm cache, yet already contains '<entry>' …` | The cache dir holds other data: anything at all when a cache would be created there, or store-shaped dirs without apvm's `.apvm.lock` file (whatever `apvm.db` holds). Nothing was changed. Point the cache at a new or empty directory (source: `APVM_CACHE_DIR` if set, else config `cache-dir`, else `~/.apvm/cache`). |
+| `Error: IO error: cannot access cache directory '<path>': …` / `… is a symbolic link to a missing target` | `<path>` is the effective cache dir (as above). One of its components is a regular file, a parent can't be traversed, or the dir is a dangling symlink. Fix or re-point it — note `apvm config get cache-dir` shows the config/default only, not `APVM_CACHE_DIR`. On Windows such a path may just print "Cache is empty". |
+| `Error: Cache error: cannot list store directory <dir>: …`      | The cache dir exists but can't be read (permissions). apvm refuses rather than mistake it for an empty cache. Fix its permissions. |
 | `Error: failed to determine home directory`                      | `HOME` unset on Unix / `USERPROFILE` unset on Windows. Rare; set the env var.     |
 | `Error: --ver required` (BackWPup)                               | Pass `-v 5.1.0` (or whatever version). See `apvm info backwpup` for the default. |
 | `Warning: --ver ignored for '<plugin>'`                          | Plugin has `Embedded`/`Optional` version handling but you passed `--ver`. Harmless for `Optional` (it rewrites source); for `Embedded` it's rejected. |

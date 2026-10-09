@@ -66,8 +66,8 @@ const WINDOWS_RESERVED: &[&str] = &[
 /// Validate a project identifier (a root-level directory name).
 ///
 /// Rules: 1–64 chars, lowercase `[a-z0-9._-]`, must start with `[a-z0-9]`,
-/// must not end with `.`, and must not start with `apvm.` (reserved for the
-/// database and its WAL siblings).
+/// must not end with `.`, must not start with `apvm.` (reserved for the
+/// database and its WAL siblings), and must not be a Windows device name.
 pub(crate) fn validate_project(project: &str) -> Result<()> {
     if project.is_empty() {
         return Err(Error::invalid("project", project, "must not be empty"));
@@ -108,6 +108,13 @@ pub(crate) fn validate_project(project: &str) -> Result<()> {
             "the 'apvm.' prefix is reserved for store internals",
         ));
     }
+    if is_windows_reserved(project) {
+        return Err(Error::invalid(
+            "project",
+            project,
+            "Windows reserved device names are not allowed",
+        ));
+    }
     Ok(())
 }
 
@@ -115,7 +122,8 @@ pub(crate) fn validate_project(project: &str) -> Result<()> {
 ///
 /// Rules: 1–64 chars from `[0-9A-Za-z._+-]`, at least one digit, no leading
 /// or trailing `.` (Windows silently strips trailing dots, which would
-/// desync the path from the database).
+/// desync the path from the database), and no Windows device name (`COM1`,
+/// `lpt1.2`).
 pub(crate) fn validate_version(version: &str) -> Result<()> {
     if version.is_empty() {
         return Err(Error::invalid("version", version, "must not be empty"));
@@ -149,6 +157,13 @@ pub(crate) fn validate_version(version: &str) -> Result<()> {
             "version",
             version,
             "must not start or end with '.'",
+        ));
+    }
+    if is_windows_reserved(version) {
+        return Err(Error::invalid(
+            "version",
+            version,
+            "Windows reserved device names are not allowed",
         ));
     }
     Ok(())
@@ -238,8 +253,9 @@ pub(crate) fn validate_variant(variant: &str) -> Result<()> {
 /// every supported platform.
 ///
 /// Rules: 1–200 chars; no path separators, control chars, or `< > : " | ? *`;
-/// not `.` or `..`; no leading space; no trailing space or dot; not a
-/// Windows reserved device name (`CON`, `NUL`, `COM1`, ...).
+/// not `.` or `..`; not starting with `.apvm-tmp-` (in-flight copies, which
+/// gc sweeps); no leading space; no trailing space or dot; not a Windows
+/// reserved device name (`CON`, `NUL`, `COM1`, ...).
 pub(crate) fn validate_filename(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::invalid("filename", name, "must not be empty"));
@@ -256,6 +272,14 @@ pub(crate) fn validate_filename(name: &str) -> Result<()> {
             "filename",
             name,
             "'.' and '..' are not allowed",
+        ));
+    }
+    if name.starts_with(TMP_PREFIX) {
+        // gc sweeps such names as crash leftovers.
+        return Err(Error::invalid(
+            "filename",
+            name,
+            "the '.apvm-tmp-' prefix is reserved for in-flight copies",
         ));
     }
     if name.chars().any(|c| {
@@ -370,19 +394,31 @@ pub(crate) fn release_dir_rel(project: &str, tag_dir: &str) -> String {
 /// Join a stored relative path onto the base directory, component by
 /// component, so it works on every platform.
 ///
-/// Splits on both `/` and `\` and drops `.`/`..`/empty components.
-/// Legitimate stored paths never contain `.` or `..` as a component
-/// (project, version, commit and sanitized tags all forbid them), so this
-/// filtering cannot change a valid path — it only ensures the result stays
-/// inside `base_dir` even if the database were tampered with. For reads
-/// only: destructive operations resolve through `layout::owned_dir`, which
-/// also refuses non-store paths and symlinks.
+/// Splits on both `/` and `\` and keeps only plain names: `.`, `..`, empty
+/// components and anything the platform would read as a root or prefix
+/// (`C:` on Windows) are dropped. Legitimate stored paths never contain
+/// them (project, version, commit and sanitized tags all forbid them), so
+/// this filtering cannot change a valid path — it only ensures the result
+/// stays inside `base_dir` even if the database were tampered with. Reads
+/// check record paths too (`layout::is_store_rel`), and destructive
+/// operations resolve through `layout::owned_dir`, which also refuses
+/// symlinks.
 pub(crate) fn rel_to_abs(base_dir: &Path, rel: &str) -> PathBuf {
     rel.split(['/', '\\'])
-        .filter(|component| !component.is_empty() && *component != "." && *component != "..")
+        .filter(|component| is_plain_component(component))
         .fold(base_dir.to_path_buf(), |path, component| {
             path.join(component)
         })
+}
+
+/// Whether `component` is one plain path name on this platform — so
+/// joining it can only descend one level.
+fn is_plain_component(component: &str) -> bool {
+    let mut parts = Path::new(component).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
 }
 
 // ============================================================================

@@ -44,8 +44,8 @@ All tables are `STRICT`; deletes cascade; timestamps are epoch milliseconds
   files — so the next store caches them again; files it cannot read are kept
   and listed in `GcReport::failures` (`gc()` = `gc_with(VerifyMode::Size)`).
 - **Swapped databases are detectable.** `is_current()` tells a long-lived
-  handle that its database file was renamed aside (a repair's quarantine),
-  deleted or replaced; mutations through such a handle fail with
+  handle that its database file was renamed aside (as older apvm versions'
+  repair did), deleted or replaced (repair now resets it in place); mutations through such a handle fail with
   `Error::StaleHandle` instead of updating a database the store no longer
   uses — open the store again.
 - **Deletes stay inside the store.** `clean`, `gc` and `delete_*` remove only
@@ -60,9 +60,11 @@ All tables are `STRICT`; deletes cascade; timestamps are epoch milliseconds
   cleared), and re-adopts the artifact files found on disk (hashes
   recomputed). The file is never renamed or replaced, so connections in
   any process stay bound to it — a rename could make another process's
-  connection take the new file's shared memory for its own (SIGBUS). A
-  corrupt database another connection holds open is refused
-  (`Error::DatabaseInUse`, nothing changed). A *deleted* or blank (0-byte)
+  connection take the new file's shared memory for its own (SIGBUS). A file
+  SQLite can no longer read as a database is only reset once nobody has it
+  open: while another connection holds it, repair is refused
+  (`Error::DatabaseInUse`, nothing changed). A readable but damaged
+  database is reset under its users, who then see the repaired index. A *deleted* or blank (0-byte)
   database with builds left is `StoreState::Orphaned`: `open` refuses
   (`Error::MissingDatabase`) and `repair()` rebuilds it. Repair is
   crash-safe: it hashes first, writes a marker (`apvm.db.repairing`) before
@@ -72,18 +74,27 @@ All tables are `STRICT`; deletes cascade; timestamps are epoch milliseconds
   trust.
 - **Only its own files.** `ArtifactStore::inspect()` classifies a directory
   (`StoreState`: missing, empty, present, orphaned, foreign) without touching
-  it. A store is only created in a missing or empty directory; one holding
-  someone else's data is refused (`Error::ForeignDirectory`) — so is
-  store-shaped data without the store's `.apvm.lock` file, someone else's
-  SQLite file at `apvm.db` (`Error::ForeignDatabase`, never migrated) and a
-  symlinked `apvm.db` (never followed).
-  `open_existing()` never creates anything. `gc` and `repair` walk only
-  store-produced names and never follow symlinks.
+  it. A store is only created in a missing or *vacant* directory — nothing
+  but OS metadata files (`.DS_Store`, `Thumbs.db`, `desktop.ini`) and its own
+  files — so `gc` can never meet store-shaped data someone else puts beside
+  it. Refused with `Error::ForeignDirectory`: any other directory when a
+  store would be created, and store-shaped content without the store's
+  `.apvm.lock` file (created before a store's first build, never removed),
+  whatever `apvm.db` holds. Also refused: someone else's SQLite file at
+  `apvm.db` (`Error::ForeignDatabase`, never written to) and a symlinked
+  `apvm.db`, `.apvm.lock` or repair marker (never followed). A refused
+  repair leaves the directory as it found it. `open_existing()` never
+  creates anything. `gc` and `repair` walk only store-produced names and
+  never follow symlinks; repair adopts only build output (no hidden files,
+  no `Thumbs.db` / `desktop.ini`). Paths read back from the database are
+  checked too: a tampered record is unreadable (`Error::Data`) to lookups,
+  `VerifyProblem::InvalidRecord` to verify and gc, and never written
+  through.
 - **Concurrency.** `ArtifactStore` is `Send + Sync`. Cross-process:
   SQLite/WAL guards the database (concurrent first opens are safe:
   migrations run in an `IMMEDIATE` transaction, and the WAL switch retries
-  within the busy timeout; an open racing repair's replacement of the file
-  reopens on the new one); an advisory lock
+  within the busy timeout; an open that finds the file replaced — as older
+  apvm versions' repair did — reopens on the new one); an advisory lock
   (`.apvm.lock`) serializes mutating operations — database creation
   included — so a clean can't race a store and a create can't race a
   repair. Keep the store on a local disk (advisory locks over NFS/SMB are

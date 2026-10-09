@@ -6,20 +6,29 @@
 //! or `clean('30d')` into a full wipe, and `ApvmCache.open('/dir')` into the
 //! default cache. So these arguments are read field by field:
 //!
-//! - an argument that is not a plain object (or absent) is refused;
+//! - an argument that is not a plain object (or absent) is refused — an
+//!   array, a `Map`, a class instance, `Object.create(defaults)`: options
+//!   are read from own properties only, so inherited ones (a class's
+//!   getters, a prototype's defaults) would otherwise be silently ignored;
 //! - an unknown key is refused (a typo never falls back to a default);
 //! - a field of the wrong type is refused;
 //! - for `clean()` and `open()`, a key that is present but `undefined` or
 //!   `null` is refused too: `{ project: process.env.UNSET }` must not mean
 //!   "every project", nor `{ cacheDir: undefined }` the default cache.
 //!
-//! Reading ([`read_object`], [`read_string`], [`read_bool`]) touches JS values; deciding
-//! ([`check_keys`], [`clean_request`], …) is pure and unit-tested.
+//! An exception the argument itself throws while being read (a getter, a
+//! `Proxy` trap) propagates synchronously, unchanged.
+//!
+//! Reading ([`read_object`], [`read_string`], [`read_bool`]) touches JS
+//! values; deciding ([`check_object_type`], [`check_plain`], [`check_keys`],
+//! [`clean_request`], …) is pure and unit-tested.
 
 use apvm_core::CleanRequest;
 use apvm_core::maintenance::{CleanTarget, VerifyMode};
 use napi::ValueType;
-use napi::bindgen_prelude::{JsObjectValue, JsValue, Object, Unknown};
+use napi::bindgen_prelude::{
+    JsObjectValue, JsValue, KeyCollectionMode, KeyConversion, KeyFilter, Object, Unknown,
+};
 
 /// Keys `clean()` accepts.
 pub const CLEAN_KEYS: &[&str] = &["olderThan", "project", "dryRun", "target"];
@@ -68,8 +77,8 @@ impl Default for CleanFields {
 ///
 /// # Errors
 ///
-/// A message naming `what` when `value` is not an object (or is an array)
-/// or has a key outside `allowed`.
+/// A message naming `what` when `value` is not an object (or is an array),
+/// is not a plain object, or has a key outside `allowed`.
 pub fn read_object<'env>(
     value: Option<Unknown<'env>>,
     what: &str,
@@ -85,9 +94,46 @@ pub fn read_object<'env>(
         return Ok(None);
     }
     let object = value.coerce_to_object().map_err(|e| e.to_string())?;
-    let keys = Object::keys(&object).map_err(|e| e.to_string())?;
+    let (prototype, grandparent) = prototype_kinds(&object).map_err(|e| e.to_string())?;
+    check_plain(prototype, grandparent, what)?;
+    let keys = own_keys(&object).map_err(|e| e.to_string())?;
     check_keys(&keys, allowed, what)?;
     Ok(Some(object))
+}
+
+/// The own enumerable string keys of `object`, the ones options are read
+/// from. Never inherited ones: an enumerable property someone added to
+/// `Object.prototype` is not an option of every call (and `Object::keys`,
+/// which walks the prototype chain, would report it as an unknown one).
+fn own_keys(object: &Object<'_>) -> napi::Result<Vec<String>> {
+    let names = object.get_all_property_names(
+        KeyCollectionMode::OwnOnly,
+        KeyFilter::Enumerable,
+        KeyConversion::NumbersToStrings,
+    )?;
+    let mut keys = Vec::new();
+    for index in 0..names.get_array_length()? {
+        let name: Unknown<'_> = names.get_element(index)?;
+        // Symbol keys are never options.
+        if name.get_type()? == ValueType::String {
+            keys.push(name.coerce_to_string()?.into_utf8()?.into_owned()?);
+        }
+    }
+    Ok(keys)
+}
+
+/// The types of `object`'s prototype and of that prototype's own prototype
+/// (`Null` when the first is `null`), for [`check_plain`].
+fn prototype_kinds(object: &Object<'_>) -> napi::Result<(ValueType, ValueType)> {
+    let prototype = object.get_prototype()?;
+    let kind = prototype.get_type()?;
+    let grandparent = match kind {
+        ValueType::Object | ValueType::Function => {
+            prototype.coerce_to_object()?.get_prototype()?.get_type()?
+        }
+        _ => ValueType::Null,
+    };
+    Ok((kind, grandparent))
 }
 
 /// `key` of `object`: absent, empty (`undefined` / `null`), or its value
@@ -210,6 +256,25 @@ pub fn check_object_type(kind: ValueType, is_array: bool, what: &str) -> Result<
     }
 }
 
+/// Refuse an object that is not plain. A plain object — an object literal,
+/// `JSON.parse` output, `Object.create(null)`, from any realm — has a `null`
+/// prototype or one whose own prototype is `null` (`Object.prototype`).
+/// Anything else (a class instance, a `Map`, `Object.create(defaults)`)
+/// may carry options the own-property reading would silently ignore.
+///
+/// # Errors
+///
+/// A message naming `what` and the fix.
+pub fn check_plain(prototype: ValueType, grandparent: ValueType, what: &str) -> Result<(), String> {
+    if prototype == ValueType::Null || grandparent == ValueType::Null {
+        return Ok(());
+    }
+    Err(format!(
+        "{what} must be a plain object, got one with a prototype of its own (a class \
+         instance, a Map, Object.create(...)); copy its options into an object literal"
+    ))
+}
+
 /// Refuse any key outside `allowed`.
 ///
 /// # Errors
@@ -317,6 +382,7 @@ fn type_name(kind: ValueType) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Owned key names, as read from a JS object.
     fn keys(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_string()).collect()
     }
@@ -358,6 +424,22 @@ mod tests {
                 check_object_type(kind, is_array, "x"),
                 Err(message.to_string())
             );
+        }
+    }
+
+    #[test]
+    fn only_plain_objects_are_read() {
+        use ValueType::{Function, Null, Object};
+        // `{}` (prototype `Object.prototype`, whose prototype is null) and
+        // `Object.create(null)`.
+        assert_eq!(check_plain(Object, Null, "x"), Ok(()));
+        assert_eq!(check_plain(Null, Null, "x"), Ok(()));
+        // A class instance, a Map, `Object.create(defaults)` (prototype with
+        // its own prototype), `Object.create(fn)`.
+        for (prototype, grandparent) in [(Object, Object), (Function, Object)] {
+            let err = check_plain(prototype, grandparent, "x").unwrap_err();
+            assert!(err.starts_with("x must be a plain object"), "{err}");
+            assert!(err.contains("object literal"), "{err}");
         }
     }
 

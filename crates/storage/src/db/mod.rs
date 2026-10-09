@@ -224,9 +224,12 @@ pub(crate) fn open(
 ///
 /// # Errors
 ///
-/// [`Error::DatabaseInUse`] when another connection keeps the file open
-/// past `busy_timeout_ms` (WAL connections hold a shared lock for as long as
-/// they are open); [`Error::Database`] for other SQLite failures.
+/// [`Error::DatabaseInUse`] when the file is not readable as a database and
+/// another connection keeps it open past `busy_timeout_ms`: SQLite then
+/// resets it with rollback-journal locking, which needs exclusive access,
+/// and WAL connections hold a shared lock for as long as they are open. (A
+/// readable WAL database is reset through its WAL, under its readers.)
+/// [`Error::Database`] for other SQLite failures.
 pub(crate) fn reset_in_place(db_path: &Path, busy_timeout_ms: u64) -> Result<()> {
     let flags = OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE);
     let conn = Connection::open_with_flags(db_path, flags)?;
@@ -272,8 +275,9 @@ const CONNECT_ATTEMPTS: usize = 3;
 /// a rename but first reads it just after pairs the old file with the new
 /// database's WAL. So the file's identity is taken before opening and again
 /// after the first read (the pragmas), and a connection whose file changed
-/// in between is discarded and opened again. `before_first_read` runs between the two; tests use it
-/// to replace the file. Returns the connection and that confirmed identity.
+/// in between is discarded and opened again. `before_first_read` runs
+/// between the two; tests use it to replace the file. Returns the connection
+/// and that confirmed identity.
 fn connect(
     db_path: &Path,
     mode: OpenMode,
@@ -399,8 +403,21 @@ fn enable_wal(conn: &Connection, timeout: Duration) -> rusqlite::Result<String> 
 /// Run `PRAGMA quick_check` and fail with [`Error::DatabaseCorrupted`] if
 /// SQLite reports any problem.
 pub(crate) fn quick_check(conn: &Connection, db_path: &Path) -> Result<()> {
+    check(conn, db_path, "PRAGMA quick_check")
+}
+
+/// Run `PRAGMA integrity_check` — [`quick_check`] plus a comparison of
+/// every index with its table, which a damaged index fails while the quick
+/// check passes — and fail with [`Error::DatabaseCorrupted`] if SQLite
+/// reports any problem. Slower: proportional to the database's size.
+pub(crate) fn integrity_check(conn: &Connection, db_path: &Path) -> Result<()> {
+    check(conn, db_path, "PRAGMA integrity_check")
+}
+
+/// Run a check `pragma` that returns `ok`, or one row per problem.
+fn check(conn: &Connection, db_path: &Path, pragma: &str) -> Result<()> {
     let mut stmt = conn
-        .prepare("PRAGMA quick_check")
+        .prepare(pragma)
         .map_err(|err| map_corruption(err, db_path))?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
@@ -454,27 +471,45 @@ fn migrate(conn: &mut Connection, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A database at schema version 0 is new — or someone else's: apvm's
-/// migrations set the version in the transaction that creates the tables,
-/// so a version-0 database holding any schema object was never apvm's.
-/// Runs before anything writes to the file (the WAL switch does), as one
-/// statement so the version and the tables come from the same snapshot even
-/// while a concurrent opener migrates a new database.
+/// The tables every apvm schema version up to [`SCHEMA_VERSION`] has.
+const APVM_TABLES: [&str; 5] = [
+    "builds",
+    "build_artifacts",
+    "build_sources",
+    "releases",
+    "release_assets",
+];
+
+/// Refuse someone else's database. apvm's migrations set the schema version
+/// in the transaction that creates the tables, so a version-0 database
+/// holding any schema object, or a database at a version apvm knows that
+/// lacks one of apvm's tables, was never apvm's. (A newer version is left
+/// to [`supported_version`].) Runs before anything writes to the file (the
+/// WAL switch does), as one statement so the version and the tables come
+/// from the same snapshot even while a concurrent opener migrates a new
+/// database.
 ///
 /// # Errors
 ///
 /// [`Error::ForeignDatabase`] for such a database; [`Error::Database`] when
 /// it cannot be read.
 fn refuse_foreign_database(conn: &Connection, db_path: &Path) -> Result<()> {
-    let (version, objects): (i64, i64) = conn
+    let tables = APVM_TABLES.map(|table| format!("'{table}'")).join(", ");
+    let (version, objects, apvm_tables): (i64, i64, i64) = conn
         .query_row(
-            "SELECT (SELECT user_version FROM pragma_user_version), \
-                    (SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')",
+            &format!(
+                "SELECT (SELECT user_version FROM pragma_user_version), \
+                        (SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'), \
+                        (SELECT count(*) FROM sqlite_master \
+                         WHERE type = 'table' AND name IN ({tables}))"
+            ),
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|err| map_corruption(err, db_path))?;
-    if version == 0 && objects > 0 {
+    let known_version = (1..=SCHEMA_VERSION).contains(&version);
+    let all_tables = usize::try_from(apvm_tables).is_ok_and(|count| count == APVM_TABLES.len());
+    if (version == 0 && objects > 0) || (known_version && !all_tables) {
         return Err(Error::ForeignDatabase {
             path: db_path.to_path_buf(),
         });
@@ -664,8 +699,22 @@ mod tests {
         assert_eq!(err.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
     }
 
-    /// Move `path` and its sidecars aside the way repair's quarantine does,
-    /// then create a different database, with one table `marker`, there.
+    /// Create, at `path`, an apvm database told apart by one extra table,
+    /// `marker`.
+    #[cfg(unix)]
+    fn create_marked_database(path: &Path, marker: &str) {
+        Connection::open(path)
+            .unwrap()
+            .execute_batch(&format!(
+                "PRAGMA journal_mode = WAL; {V1_SCHEMA} CREATE TABLE {marker} (x); \
+                 PRAGMA user_version = {SCHEMA_VERSION};"
+            ))
+            .unwrap();
+    }
+
+    /// Move `path` and its sidecars aside the way older apvm versions'
+    /// repair did, then create a different database, marked `marker`
+    /// ([`create_marked_database`]), there.
     #[cfg(unix)]
     fn replace_database(path: &Path, marker: &str) {
         for suffix in ["", "-wal", "-shm"] {
@@ -674,13 +723,7 @@ mod tests {
                 std::fs::rename(&from, format!("{}.{marker}-old{suffix}", path.display())).unwrap();
             }
         }
-        Connection::open(path)
-            .unwrap()
-            .execute_batch(&format!(
-                "PRAGMA journal_mode = WAL; CREATE TABLE {marker} (x); \
-                 PRAGMA user_version = {SCHEMA_VERSION};"
-            ))
-            .unwrap();
+        create_marked_database(path, marker);
     }
 
     #[cfg(unix)]
@@ -690,13 +733,7 @@ mod tests {
         // through the new database's WAL (a "ghost" after repair).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("apvm.db");
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch(&format!(
-                "PRAGMA journal_mode = WAL; CREATE TABLE old (x); \
-                 PRAGMA user_version = {SCHEMA_VERSION};"
-            ))
-            .unwrap();
+        create_marked_database(&path, "old");
         let mut calls = 0;
         let (conn, file) = connect(&path, OpenMode::ExistingOnly, 1_000, false, &mut || {
             calls += 1;
@@ -707,14 +744,14 @@ mod tests {
         .unwrap();
         assert_eq!(calls, 2);
         assert_eq!(Some(file), file_id(&path), "the identity is the new file's");
-        let tables: String = conn
+        let markers: String = conn
             .query_row(
-                "SELECT group_concat(name) FROM sqlite_master WHERE type = 'table'",
+                "SELECT group_concat(name) FROM sqlite_master WHERE name IN ('old', 'new')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, "new");
+        assert_eq!(markers, "new");
     }
 
     #[cfg(unix)]

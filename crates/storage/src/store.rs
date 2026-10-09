@@ -91,13 +91,17 @@ impl ArtifactStore {
     /// Open (creating if needed) the store at `base_dir` with default
     /// [`StoreOptions`].
     ///
-    /// A store is only ever created in a missing or [`StoreState::Empty`]
-    /// directory — never over content it does not own.
+    /// A store is only ever created in a missing directory or a vacant one —
+    /// holding nothing but operating-system metadata files (`.DS_Store`,
+    /// `Thumbs.db`, `desktop.ini`) and the store's own files — never over or
+    /// beside content it does not own: `gc` could later delete store-shaped
+    /// data someone else puts in a shared directory.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] if the directory cannot be inspected or created,
-    /// [`Error::ForeignDirectory`] if it holds someone else's data,
+    /// [`Error::ForeignDirectory`] if it holds someone else's data — or
+    /// anything at all, when a store would be created there,
     /// [`Error::MissingDatabase`] if its database was lost (see
     /// [`ArtifactStore::repair`]), [`Error::DatabaseCorrupted`] if the
     /// database file is damaged (see [`ArtifactStore::repair`]),
@@ -113,7 +117,7 @@ impl ArtifactStore {
         if let Some(store) = Self::open_present(&base_dir, &options)? {
             return Ok(store);
         }
-        Self::create(base_dir, &options)
+        Self::create(base_dir, &options, &mut || {})
     }
 
     /// Open the store at `base_dir` only if one exists — never creating a
@@ -130,8 +134,8 @@ impl ArtifactStore {
     }
 
     /// Open the database if one is present, never creating it. `Ok(None)`
-    /// when there is none — including one removed (e.g. quarantined by a
-    /// repair) between the check and the open.
+    /// when there is none — including one removed between the check and the
+    /// open.
     fn open_present(base_dir: &Path, options: &StoreOptions) -> Result<Option<Self>> {
         if layout::inspect(base_dir)? != StoreState::Present {
             return Ok(None);
@@ -150,18 +154,34 @@ impl ArtifactStore {
         }
     }
 
-    /// Initialize the store in a missing or empty directory. The database
+    /// Initialize the store in a missing or vacant directory. The database
     /// is only ever created under the store lock, after re-checking there,
     /// so creation races neither another creator nor a repair (which holds
-    /// the lock while it quarantines and rebuilds).
-    fn create(base_dir: PathBuf, options: &StoreOptions) -> Result<Self> {
+    /// the lock while it rebuilds). `before_vacancy_check` runs between the
+    /// first classification and the vacancy check; tests use it to create a
+    /// store there meanwhile.
+    fn create(
+        base_dir: PathBuf,
+        options: &StoreOptions,
+        before_vacancy_check: &mut dyn FnMut(),
+    ) -> Result<Self> {
         // Before touching anything: even the lock file would make someone
         // else's directory look like a store. A lost database (`Orphaned`) is
-        // ours, and may only be a repair between quarantining the old file and
-        // creating the new one: decide that under the lock, which repair holds.
+        // ours, and may only be a repair in progress (its marker, or a lost
+        // database it is about to create): decide that under the lock, which
+        // repair holds.
         match layout::inspect(&base_dir)? {
             StoreState::Orphaned { .. } => {}
-            state => refuse_unowned(&base_dir, state)?,
+            state => {
+                refuse_unowned(&base_dir, state)?;
+                before_vacancy_check();
+                if let Err(occupied) = refuse_occupied(&base_dir) {
+                    // Another process may have created the store — and
+                    // stored a build in it — since the check above: that
+                    // occupant is a store's, so open it.
+                    return Self::open_present(&base_dir, options)?.ok_or(occupied);
+                }
+            }
         }
         std::fs::create_dir_all(&base_dir)
             .io_ctx(|| format!("failed to create store directory {}", base_dir.display()))?;
@@ -217,12 +237,13 @@ impl ArtifactStore {
     /// Whether the database file at [`db_path`](Self::db_path) is still the
     /// one this handle opened.
     ///
-    /// `false` once that file was renamed aside (a [`repair`] quarantining a
-    /// corrupt database), deleted, or replaced: the handle then reads and
-    /// writes a file the store no longer uses, so open the store again.
-    /// Long-lived holders check this before relying on the handle. On
-    /// Windows an open database cannot be renamed or deleted, so there it
-    /// only reports whether the file still exists.
+    /// `false` once that file was renamed aside (as older apvm versions'
+    /// repair did), deleted, or replaced: the handle then reads and writes a
+    /// file the store no longer uses, so open the store again. A
+    /// [`repair`] keeps it `true`: it resets the file in place. Long-lived
+    /// holders check this before relying on the handle. On Windows an open
+    /// database cannot be renamed or deleted, so there it only reports
+    /// whether the file still exists.
     ///
     /// [`repair`]: ArtifactStore::repair
     pub fn is_current(&self) -> bool {
@@ -230,20 +251,30 @@ impl ArtifactStore {
     }
 
     /// Refuse to mutate through a handle that is not
-    /// [current](Self::is_current): its writes would land in a database the
-    /// store no longer uses. Called with the store lock held, under which a
-    /// repair cannot swap the file.
+    /// [current](Self::is_current) — its writes would land in a database the
+    /// store no longer uses — or while an interrupted repair's marker says
+    /// the index is incomplete: repair resets the file in place, so a handle
+    /// opened before it stays current, and its gc would delete every build
+    /// the half-filled index does not list. Called with the store lock held,
+    /// so no repair runs meanwhile.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] when the handle is not current.
+    /// [`Error::StaleHandle`] when the handle is not current;
+    /// [`Error::MissingDatabase`] while a repair marker remains.
     pub(crate) fn ensure_current(&self) -> Result<()> {
-        if self.is_current() {
-            return Ok(());
+        if !self.is_current() {
+            return Err(Error::StaleHandle {
+                path: self.db_path.clone(),
+            });
         }
-        Err(Error::StaleHandle {
-            path: self.db_path.clone(),
-        })
+        if std::fs::symlink_metadata(self.base_dir.join(paths::REPAIR_MARKER_NAME)).is_ok() {
+            return Err(Error::MissingDatabase {
+                path: self.base_dir.clone(),
+                adoptable_builds: layout::count_adoptable_builds(&self.base_dir),
+            });
+        }
+        Ok(())
     }
 
     /// Lock the connection. A poisoned mutex is recovered rather than
@@ -304,7 +335,7 @@ impl ArtifactStore {
                 }
             }
         };
-        let dir_abs = paths::rel_to_abs(&self.base_dir, &dir_rel);
+        let dir_abs = write_dir(&self.base_dir, &dir_rel)?;
 
         // Copy phase — the database stays unlocked while files stream in.
         let (records, newly_stored, reused) =
@@ -555,8 +586,14 @@ impl ArtifactStore {
     /// emptied parents. Only a store-produced directory reached without
     /// symlinks is removed ([`layout::owned_dir`]); a tampered or redirected
     /// one is left on disk (the record is gone either way).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the directory cannot be inspected or removed.
     pub(crate) fn remove_record_dir(&self, dir_rel: &str) -> Result<()> {
-        let Some(dir_abs) = layout::owned_dir(&self.base_dir, dir_rel) else {
+        let owned = layout::owned_dir(&self.base_dir, dir_rel)
+            .io_ctx(|| format!("cannot inspect record directory {dir_rel}"))?;
+        let Some(dir_abs) = owned else {
             tracing::warn!(
                 dir_rel,
                 "record directory is outside the store layout or behind a symlink; left on disk"
@@ -584,15 +621,22 @@ impl ArtifactStore {
 
     /// Convert a database row (plus its artifacts and sources) into the
     /// public [`StoredBuild`] with absolute paths and UTC timestamps.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Data`] for a row the store could not have written — e.g. a
+    /// tampered directory or filename that would lead outside the store —
+    /// and for out-of-range values; [`Error::Database`] for SQLite failures.
     pub(crate) fn build_from_row(
         &self,
         conn: &Connection,
         row: &db::BuildRow,
     ) -> Result<StoredBuild> {
-        let dir = paths::rel_to_abs(&self.base_dir, &row.dir_rel);
+        let dir = record_dir(&self.base_dir, &row.dir_rel)?;
 
         let mut artifacts = Vec::new();
         for artifact in db::builds::artifacts_for(conn, row.id)? {
+            check_record_filename(&artifact.filename)?;
             artifacts.push(StoredArtifact {
                 path: dir.join(&artifact.filename),
                 variant_id: artifact.variant,
@@ -671,6 +715,51 @@ impl Drop for ArtifactStore {
 // Free helpers (also used by release/lookup/maintenance modules)
 // ============================================================================
 
+/// A recorded directory as an absolute path, once checked to be spelled as
+/// the store spells it ([`layout::is_store_rel`]).
+///
+/// # Errors
+///
+/// [`Error::Data`] for any other path: the record was tampered with.
+pub(crate) fn record_dir(base_dir: &Path, dir_rel: &str) -> Result<PathBuf> {
+    if !layout::is_store_rel(dir_rel) {
+        return Err(Error::Data {
+            details: format!("recorded directory '{dir_rel}' is not one the store writes"),
+        });
+    }
+    Ok(paths::rel_to_abs(base_dir, dir_rel))
+}
+
+/// Check a recorded filename the way stored ones are checked, so a
+/// tampered one can never name a file elsewhere.
+///
+/// # Errors
+///
+/// [`Error::Data`] when it is not a valid filename.
+pub(crate) fn check_record_filename(filename: &str) -> Result<()> {
+    paths::validate_filename(filename).map_err(|err| Error::Data {
+        details: format!("recorded filename is not one the store writes: {err}"),
+    })
+}
+
+/// The directory a store writes `dir_rel`'s files into: a store-produced
+/// path reached without symlinks ([`layout::owned_dir`]), so a tampered
+/// record cannot redirect the write.
+///
+/// # Errors
+///
+/// [`Error::Data`] for a path outside the store layout or behind a
+/// symlink; [`Error::Io`] when it cannot be inspected.
+pub(crate) fn write_dir(base_dir: &Path, dir_rel: &str) -> Result<PathBuf> {
+    layout::owned_dir(base_dir, dir_rel)
+        .io_ctx(|| format!("cannot inspect record directory {dir_rel}"))?
+        .ok_or_else(|| Error::Data {
+            details: format!(
+                "recorded directory '{dir_rel}' is outside the store layout or behind a symlink"
+            ),
+        })
+}
+
 /// Whether every recorded artifact exists on disk with its recorded size.
 /// (Checksums are only verified by [`crate::ArtifactStore::verify`] — a
 /// size probe per file keeps cache hits cheap.)
@@ -711,6 +800,23 @@ pub(crate) fn refuse_unowned(base_dir: &Path, state: StoreState) -> Result<()> {
             adoptable_builds,
         }),
         _ => Ok(()),
+    }
+}
+
+/// Refuse to create a store in a directory that is not vacant (see
+/// [`layout::first_occupant`]).
+///
+/// # Errors
+///
+/// [`Error::ForeignDirectory`] naming the first occupant; [`Error::Io`]
+/// when the directory cannot be listed.
+pub(crate) fn refuse_occupied(base_dir: &Path) -> Result<()> {
+    match layout::first_occupant(base_dir)? {
+        Some(entry) => Err(Error::ForeignDirectory {
+            path: base_dir.to_path_buf(),
+            entry,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -897,8 +1003,8 @@ mod tests {
 
     #[test]
     fn a_lost_database_is_rechecked_under_the_lock_repair_holds() {
-        // Audit: an open landing between repair's quarantine and its fresh
-        // database saw `Orphaned` and reported "needs repair" mid-repair.
+        // Audit: an open landing while a repair (re)creates the database
+        // saw `Orphaned` and reported "needs repair" mid-repair.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("store");
         let build = base.join("wp-rocket/commits/3.17.4/a1b2c3d");
@@ -977,9 +1083,39 @@ mod tests {
     }
 
     #[test]
+    fn a_store_created_meanwhile_is_opened_not_refused_as_occupied() {
+        // A concurrent creator made the store, then stored a build, between
+        // this opener's first look (empty) and its vacancy check.
+        let dir = tempfile::tempdir().unwrap();
+        let base = absolute(dir.path().join("store")).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        let mut created = None;
+        let store = ArtifactStore::create(base.clone(), &StoreOptions::default(), &mut || {
+            let rival = ArtifactStore::open(&base).unwrap();
+            std::fs::create_dir_all(base.join("wp-rocket/commits/3.17.4/a1b2c3d")).unwrap();
+            created = Some(rival);
+        })
+        .expect("the store made meanwhile is opened");
+        assert!(created.is_some());
+        assert_eq!(store.base_dir(), base);
+
+        // Someone else's file appearing meanwhile is still refused.
+        let other = absolute(dir.path().join("other")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let refused = ArtifactStore::create(other.clone(), &StoreOptions::default(), &mut || {
+            std::fs::write(other.join("notes.txt"), b"mine").unwrap();
+        });
+        assert!(
+            matches!(&refused, Err(Error::ForeignDirectory { entry, .. }) if entry == "notes.txt"),
+            "{refused:?}"
+        );
+        assert!(!other.join(paths::DB_FILE_NAME).exists());
+    }
+
+    #[test]
     fn creating_a_store_waits_for_the_store_lock() {
         // Creation must not race a repair, which holds this lock while it
-        // quarantines and rebuilds the database.
+        // resets and rebuilds the database.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("store");
         std::fs::create_dir_all(&base).unwrap();

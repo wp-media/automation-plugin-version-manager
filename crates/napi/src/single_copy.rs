@@ -9,7 +9,10 @@
 //!
 //! Each copy is identified by the address of a static in its own image; the
 //! first copy to reach an entry point records it on `globalThis`. A copy
-//! loaded only inside a worker thread (another `globalThis`) is not seen.
+//! loaded only inside a worker thread (another `globalThis`) is not seen,
+//! and where `globalThis` cannot be extended (frozen or sealed, as hardened
+//! JavaScript environments do) nothing can be recorded, so the guard is
+//! skipped rather than making the addon unusable.
 
 use napi::bindgen_prelude::{JsObjectValue, JsValue, Unknown};
 use napi::{Env, Property, PropertyAttributes, Status, ValueType};
@@ -26,11 +29,14 @@ fn copy_id() -> String {
 }
 
 /// Ensure no other copy of the addon is in use in this JS realm: record this
-/// copy on first use, then accept only it.
+/// copy on first use, then accept only it. Recording is best-effort: a
+/// `globalThis` that cannot be extended skips the guard (see the module
+/// docs).
 ///
 /// # Errors
 ///
-/// `GenericFailure` naming the fix when another copy got there first.
+/// `GenericFailure` naming the fix when another copy got there first; the
+/// error of a failed `globalThis` lookup.
 pub fn ensure_single_copy(env: &Env) -> napi::Result<()> {
     let mut global = env.get_global()?;
     let mine = copy_id();
@@ -44,11 +50,14 @@ pub fn ensure_single_copy(env: &Env) -> napi::Result<()> {
             .map_err(|message| napi::Error::new(Status::GenericFailure, message));
     }
     let value = env.create_string(&mine)?;
-    // Read-only, hidden, permanent: nothing can clear the record.
-    global.define_properties(&[Property::new()
+    // Read-only, hidden, permanent: nothing can clear the record. On a
+    // frozen or sealed `globalThis` the definition fails (`InvalidArg`, no
+    // JS exception left pending): proceed unguarded.
+    let _recorded = global.define_properties(&[Property::new()
         .with_utf8_name(GLOBAL_KEY)?
         .with_value(&value)
-        .with_property_attributes(PropertyAttributes::Default)])
+        .with_property_attributes(PropertyAttributes::Default)]);
+    Ok(())
 }
 
 /// Pure decision of [`ensure_single_copy`] (plain `String` errors: a

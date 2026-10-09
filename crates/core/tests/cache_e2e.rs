@@ -688,12 +688,116 @@ async fn a_corrupt_cache_warns_then_resumes_after_repair() {
     );
 }
 
+/// Child-process half of the cross-process test below: does nothing unless
+/// `APVM_E2E_CHILD` names an action — `damage` (checkpoint, then overwrite
+/// the database header in place) or `repair` — for the cache at
+/// `APVM_E2E_DIR`. A process of its own matters: a raw open and close of
+/// `apvm.db` drops every POSIX lock its process holds on the file, so
+/// in-process damage would hide a handle the test process keeps open.
+#[test]
+fn cross_process_child() {
+    let (Ok(action), Ok(dir)) = (
+        std::env::var("APVM_E2E_CHILD"),
+        std::env::var("APVM_E2E_DIR"),
+    ) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    match action.as_str() {
+        "damage" => {
+            let db = dir.join("apvm.db");
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"damaged header, in place").unwrap();
+        }
+        "repair" => {
+            CacheMaintenance::new(&dir)
+                .repair()
+                .expect("a repair from another process succeeds")
+                .expect("there is a cache to repair");
+        }
+        other => panic!("unknown child action {other}"),
+    }
+}
+
+/// Run [`cross_process_child`]'s `action` on the cache at `dir` in a new
+/// process, and require it to succeed.
+fn in_child_process(action: &str, dir: &Path) {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "cross_process_child", "--test-threads=1"])
+        .env("APVM_E2E_CHILD", action)
+        .env("APVM_E2E_DIR", dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "the child process failed to {action}");
+}
+
 #[tokio::test]
-async fn repair_in_process_releases_idle_instances_and_resets_in_place() {
-    // An instance that has built holds its cache open. Damage made in place
-    // is invisible to it, and resetting the database needs it closed:
-    // repair must make the instance let go, reset the very same file, and
-    // the instance must cache again afterwards.
+async fn an_idle_instance_never_hides_damage_or_blocks_a_repair_elsewhere() {
+    // Audit C1: an instance kept the store it opened. After damage made in
+    // place by another process it still said `Active` and built without a
+    // warning, and its open handle made that process's repair fail with
+    // "in use" for as long as the instance lived.
+    use std::sync::{Arc, Mutex};
+    let repo = init_repo();
+    let cache = tempfile::tempdir().unwrap();
+    let store_dir = cache.path().join("store");
+    let apvm = apvm_for(repo.path(), &store_dir, "single", Box::new(SingleBuilder));
+    let request = |out: &Path| {
+        BuildRequest::new("single", "branch:main", out).version(Some("1.0.0".to_string()))
+    };
+    let out = tempfile::tempdir().unwrap();
+    apvm.build(request(out.path()), &NullReporter)
+        .await
+        .expect("build");
+
+    in_child_process("damage", &store_dir);
+    assert!(
+        matches!(apvm.cache_status(), CacheStatus::Corrupted { .. }),
+        "{:?}",
+        apvm.cache_status()
+    );
+    let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let reporter = ClosureReporter::new({
+        let warnings = Arc::clone(&warnings);
+        move |event| {
+            if let BuildEvent::Warning(message) = event {
+                warnings.lock().unwrap().push(message.clone());
+            }
+        }
+    });
+    let out = tempfile::tempdir().unwrap();
+    let uncached = apvm
+        .build(request(out.path()), &reporter)
+        .await
+        .expect("a broken cache must not fail the build");
+    assert_eq!(origin_of(&uncached, None), ArtifactOrigin::Built);
+    {
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("needs repair"), "{}", warnings[0]);
+    }
+
+    in_child_process("repair", &store_dir);
+    assert_eq!(apvm.cache_status(), CacheStatus::Active);
+    let out = tempfile::tempdir().unwrap();
+    let hit = apvm
+        .build(request(out.path()), &NullReporter)
+        .await
+        .expect("build");
+    assert!(hit.from_cache(), "the same instance caches again");
+}
+
+#[tokio::test]
+async fn repair_in_process_resets_in_place_and_the_instance_caches_again() {
+    // An instance that has built holds no handle between builds, so damage
+    // made in place is reported, and repair resets the very same file; the
+    // instance must cache again afterwards.
     let repo = init_repo();
     let cache = tempfile::tempdir().unwrap();
     let store_dir = cache.path().join("store");

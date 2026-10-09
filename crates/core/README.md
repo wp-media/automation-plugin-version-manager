@@ -372,10 +372,11 @@ client) and ignores `cache_enabled`.
   created. Someone else's data (`ForeignDirectory`), a lost database
   (`MissingDatabase`), a regular file, an empty path, or a path that can't be
   inspected are errors — never "empty".
-- **Repair resets in place:** `repair()` first makes the `Apvm` instances of
-  this process let go of the cache, then resets a corrupt database in place
-  (keeping a copy). Another process holding it open makes it fail with
-  `DatabaseInUse`, nothing changed. Crash-safe: an interrupted repair leaves
+- **Repair resets in place:** `repair()` resets a corrupt database in place
+  (keeping a copy). A database file SQLite can no longer read is only reset
+  once nobody has it open: a build running meanwhile, here or in another
+  process, makes repair fail with `DatabaseInUse`, nothing changed (idle
+  `Apvm` instances hold no handle). Crash-safe: an interrupted repair leaves
   the cache "needs repair" (`MissingDatabase`), never half-indexed.
 - **Surfaces errors:** a corrupt database (`DatabaseCorrupted`, or unreadable
   rows: `Data`) comes back inside `Error::Storage` for each front end to
@@ -421,11 +422,11 @@ Builds never fail because of the cache, but they no longer skip it silently.
 | `Corrupted { details }` | The database is corrupt, or lost while cached builds remain — `repair()` fixes it |
 | `Unavailable { details }` | Anything else: the directory can't be created, holds someone else's data, or has a newer apvm's database |
 
-Every `build` / `warm_cache` (and `cache_status` call) checks the cache
-again. If nothing is open, it opens the cache, which picks up a cache that
-another front end or process has since repaired. If a cache is open but its
-database was renamed aside by a repair, deleted or replaced, it opens it
-again. While caching is on but the cache is `Corrupted` or `Unavailable`,
+Every `build` / `warm_cache` (and `cache_status` call) opens the cache afresh
+and closes it when done: an instance holds no handle between builds. So it
+reports a cache damaged meanwhile, picks up one another front end or process
+has since repaired, and never stands in the way of a repair from any process.
+While caching is on but the cache is `Corrupted` or `Unavailable`,
 each build emits exactly one `BuildEvent::Warning` with the reason (and, for
 `Corrupted`, the remedy) and runs uncached. `cache_active()` is
 `cache_status().is_active()`; Node exposes it as `apvm.cacheStatus()`. `cache_status()` is blocking; from async code,

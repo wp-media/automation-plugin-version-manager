@@ -1798,6 +1798,8 @@ fn repair_racing_concurrent_opens_indexes_every_build() {
             );
         }
         std::fs::write(base.join("apvm.db"), b"not a sqlite database").unwrap();
+        // A store: without its lock file, this would be someone else's data.
+        std::fs::write(base.join(".apvm.lock"), b"").unwrap();
 
         let barrier = Arc::new(Barrier::new(4));
         let done = Arc::new(AtomicBool::new(false));
@@ -2431,16 +2433,17 @@ fn restoring_a_filename_in_another_case_replaces_its_record() {
 }
 
 /// Legacy state from before case-insensitive allocation: build `3.17.5`'s
-/// record names `3.17.4`'s directory in another case, and its file lives
-/// there. `3.17.4` was last used 10 days ago. Returns that directory, or
+/// record names `3.17.4-beta`'s directory with the version in another case
+/// (a spelling the store could have written), and its file lives there.
+/// `3.17.4-beta` was last used 10 days ago. Returns that directory, or
 /// `None` on a case-sensitive filesystem, where two spellings are two
 /// directories and nothing can be shared.
 fn shared_directory_store(store: &ArtifactStore, scratch: &Path) -> Option<PathBuf> {
     if !case_insensitive_fs(store.base_dir()) {
         return None;
     }
-    let old =
-        metadata("wp-rocket", "3.17.4", COMMIT_A).with_built_at(Utc::now() - Duration::days(10));
+    let old = metadata("wp-rocket", "3.17.4-beta", COMMIT_A)
+        .with_built_at(Utc::now() - Duration::days(10));
     let a = store
         .store(&old, &[artifact(scratch, "a.zip", b"artifact-a", None)])
         .unwrap()
@@ -2454,7 +2457,8 @@ fn shared_directory_store(store: &ArtifactStore, scratch: &Path) -> Option<PathB
     std::fs::write(a.dir.join("b.zip"), b"artifact-b").unwrap();
     let conn = rusqlite::Connection::open(store.db_path()).unwrap();
     conn.execute(
-        "UPDATE builds SET dir_path = 'WP-ROCKET/commits/3.17.4/a1b2c3d' WHERE version = '3.17.5'",
+        "UPDATE builds SET dir_path = 'wp-rocket/commits/3.17.4-BETA/a1b2c3d' \
+         WHERE version = '3.17.5'",
         [],
     )
     .unwrap();
@@ -2501,7 +2505,7 @@ fn clean_and_delete_keep_a_directory_another_record_still_uses() {
     let shared2 = shared_directory_store(&store2, &scratch2).unwrap();
     assert!(
         store2
-            .delete_build("wp-rocket", "3.17.4", COMMIT_A)
+            .delete_build("wp-rocket", "3.17.4-beta", COMMIT_A)
             .unwrap()
     );
     assert!(shared2.join("b.zip").exists(), "delete_build wiped it");
@@ -2705,6 +2709,100 @@ fn clean_report_saturates_hostile_recorded_sizes() {
     let report = store.clean(&CleanOptions::default().dry_run(true)).unwrap();
     assert_eq!((report.builds_deleted, report.releases_deleted), (2, 1));
     assert_eq!(report.bytes_freed, u64::MAX);
+}
+
+#[test]
+fn reports_and_repair_survive_sizes_summing_past_i64_max() {
+    // Audit: SQLite's SUM fails with "integer overflow" once recorded sizes
+    // add up past i64::MAX (a tampered database). That broke `usage` — and
+    // with it repair's own check, so the documented remedy failed too.
+    let (_root, store, scratch) = make_store();
+    for (version, commit) in [
+        ("3.17.4", COMMIT_A),
+        ("3.17.5", "b1b2c3d4e5f60718293a4b5c6d7e8f9012345678"),
+    ] {
+        store
+            .store(
+                &metadata("wp-rocket", version, commit),
+                &[
+                    artifact(&scratch, "a.zip", b"artifact", None),
+                    artifact(&scratch, "b.zip", b"artifact", None),
+                ],
+            )
+            .unwrap();
+    }
+    for tag in ["v5.3.0", "v5.3.1"] {
+        store
+            .store_release(
+                &ReleaseMetadata::new("backwpup", tag),
+                &[artifact(&scratch, "backwpup.zip", b"release-bytes", None)],
+            )
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute("UPDATE build_artifacts SET size_bytes = ?1", [i64::MAX])
+            .unwrap();
+        conn.execute("UPDATE release_assets SET size_bytes = ?1", [i64::MAX])
+            .unwrap();
+    }
+
+    // Within one build, one project and in total, the sums saturate.
+    let usage = store.usage().unwrap();
+    assert_eq!((usage.build_count, usage.release_count), (2, 2));
+    assert_eq!(
+        (usage.builds_bytes, usage.releases_bytes, usage.total_bytes),
+        (u64::MAX, u64::MAX, u64::MAX)
+    );
+    let report = store
+        .clean(
+            &CleanOptions::default()
+                .target(CleanTarget::Builds)
+                .dry_run(true),
+        )
+        .unwrap();
+    assert_eq!((report.builds_deleted, report.bytes_freed), (2, u64::MAX));
+
+    // The rows read back, so repair has nothing to rebuild…
+    let base = store.base_dir().to_path_buf();
+    drop(store);
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert!(report.quarantined_database.is_none());
+    assert_eq!(report.builds_adopted, 0);
+    // …and gc removes the records whose size no longer matches their file.
+    let gc = store.gc().unwrap();
+    assert_eq!(gc.damaged_artifacts, 6);
+    assert_eq!(recorded(&store), (0, 0));
+    assert_eq!(store.usage().unwrap().total_bytes, 0);
+}
+
+#[test]
+fn a_negative_recorded_size_counts_as_nothing_in_reports() {
+    let (_root, store, scratch) = make_store();
+    for (version, commit) in [
+        ("3.17.4", COMMIT_A),
+        ("3.17.5", "b1b2c3d4e5f60718293a4b5c6d7e8f9012345678"),
+    ] {
+        store
+            .store(
+                &metadata("wp-rocket", version, commit),
+                &[artifact(&scratch, "a.zip", b"artifact", None)],
+            )
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE build_artifacts SET size_bytes = -5 WHERE build_id = \
+             (SELECT id FROM builds WHERE version = '3.17.4')",
+            [],
+        )
+        .unwrap();
+    }
+    // The healthy build's 8 bytes, not 8 − 5.
+    assert_eq!(store.usage().unwrap().builds_bytes, 8);
+    let report = store.clean(&CleanOptions::default().dry_run(true)).unwrap();
+    assert_eq!(report.bytes_freed, 8);
 }
 
 /// A closed store at `<root>/store` holding two builds; returns its base.
@@ -2948,4 +3046,597 @@ fn blank_database_file_with_wal_content_is_present() {
     std::fs::write(base.join("apvm.db"), b"").unwrap();
     std::fs::write(base.join("apvm.db-wal"), b"frames").unwrap();
     assert_eq!(ArtifactStore::inspect(&base).unwrap(), StoreState::Present);
+}
+
+// ============================================================================
+// Audit of phases 1–3.1: ownership, foreign data, tampered records
+// ============================================================================
+
+/// Someone else's directory: release-shaped data, a non-adoptable
+/// commit-shaped tree and a stray `apvm.db`, but no `.apvm.lock`.
+fn foreign_dir_with_database(root: &Path, database: &[u8]) -> PathBuf {
+    let dir = root.join("foreign");
+    put(&dir, "mysite/releases/v1.0/notes.txt", "notes");
+    put(&dir, "tools/commits/2024/deadbeef/nested/keep.txt", "keep");
+    std::fs::write(dir.join("apvm.db"), database).unwrap();
+    dir
+}
+
+#[test]
+fn a_stray_database_never_makes_someone_elses_directory_a_store() {
+    // Audit: a blank or garbage `apvm.db` was `Present`, so read-only `info`
+    // wrote a schema into it, repair re-indexed the data and gc deleted it.
+    let root = tempfile::tempdir().unwrap();
+    for (label, database) in [
+        ("blank", &b""[..]),
+        ("garbage", &b"not a sqlite database"[..]),
+    ] {
+        let dir = foreign_dir_with_database(&root.path().join(label), database);
+        let before = tree(&dir);
+        let bytes = std::fs::read(dir.join("apvm.db")).unwrap();
+        assert!(
+            matches!(
+                ArtifactStore::inspect(&dir).unwrap(),
+                StoreState::Foreign { ref entry } if entry == "mysite"
+            ),
+            "{label}"
+        );
+        for outcome in [
+            ArtifactStore::open(&dir).map(|_| ()),
+            ArtifactStore::repair(&dir).map(|_| ()),
+        ] {
+            assert!(
+                matches!(outcome, Err(Error::ForeignDirectory { .. })),
+                "{label}: {outcome:?}"
+            );
+        }
+        // Read-only access finds no store.
+        assert!(
+            ArtifactStore::open_existing(&dir).unwrap().is_none(),
+            "{label}"
+        );
+        assert_eq!(tree(&dir), before, "{label}: nothing created or deleted");
+        assert_eq!(
+            std::fs::read(dir.join("apvm.db")).unwrap(),
+            bytes,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn a_refused_repair_leaves_no_lock_file_behind() {
+    // Audit: `.apvm.lock` proves a directory is a store; a refused repair
+    // created it, so the directory later counted as one.
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("store");
+    std::fs::create_dir_all(&base).unwrap();
+    {
+        let conn = rusqlite::Connection::open(base.join("apvm.db")).unwrap();
+        conn.execute_batch("CREATE TABLE notes (body TEXT);")
+            .unwrap();
+    }
+    let before = tree(&base);
+    assert!(matches!(
+        ArtifactStore::repair(&base),
+        Err(Error::ForeignDatabase { .. })
+    ));
+    assert_eq!(tree(&base), before);
+}
+
+#[test]
+fn a_foreign_database_at_a_known_schema_version_is_never_written() {
+    // Audit: only version-0 databases were refused; this one was switched
+    // to WAL (written) by a read-only open, then failed on a missing table.
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("store");
+    std::fs::create_dir_all(&base).unwrap();
+    let db = base.join("apvm.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE notes (body TEXT); PRAGMA user_version = 1;")
+            .unwrap();
+    }
+    let before = std::fs::read(&db).unwrap();
+    for outcome in [
+        ArtifactStore::open(&base).map(|_| ()),
+        ArtifactStore::open_existing(&base).map(|_| ()),
+        ArtifactStore::repair(&base).map(|_| ()),
+    ] {
+        assert!(
+            matches!(outcome, Err(Error::ForeignDatabase { .. })),
+            "{outcome:?}"
+        );
+    }
+    assert!(
+        std::fs::read(&db).unwrap() == before,
+        "the file was written"
+    );
+    assert!(!base.join("apvm.db-wal").exists());
+}
+
+#[test]
+fn a_store_is_only_created_in_a_vacant_directory() {
+    // Audit: a store was created among a user's files; gc later deleted
+    // store-shaped data the user put there.
+    let root = tempfile::tempdir().unwrap();
+    for (label, entry) in [
+        ("file", "notes.txt"),
+        ("dir", "Desktop/x"),
+        ("dotdir", ".ssh/config"),
+    ] {
+        let dir = root.path().join(label);
+        put(&dir, entry, "mine");
+        assert_eq!(ArtifactStore::inspect(&dir).unwrap(), StoreState::Empty);
+        let before = tree(&dir);
+        for outcome in [
+            ArtifactStore::open(&dir).map(|_| ()),
+            ArtifactStore::repair(&dir).map(|_| ()),
+        ] {
+            assert!(
+                matches!(&outcome, Err(Error::ForeignDirectory { entry, .. })
+                    if entry.as_str() == entry_root(entry)),
+                "{label}: {outcome:?}"
+            );
+        }
+        assert_eq!(tree(&dir), before, "{label}");
+    }
+
+    // A blank `apvm.db` among user files does not make it a store either.
+    let blank = root.path().join("blank");
+    put(&blank, "notes.txt", "mine");
+    std::fs::write(blank.join("apvm.db"), b"").unwrap();
+    assert_eq!(ArtifactStore::inspect(&blank).unwrap(), StoreState::Empty);
+    assert!(matches!(
+        ArtifactStore::open(&blank),
+        Err(Error::ForeignDirectory { .. })
+    ));
+    assert_eq!(std::fs::metadata(blank.join("apvm.db")).unwrap().len(), 0);
+
+    // Operating-system metadata and the store's own files leave it vacant.
+    let vacant = root.path().join("vacant");
+    for name in [".DS_Store", "Thumbs.db", "desktop.ini", ".apvm.lock"] {
+        put(&vacant, name, "");
+    }
+    ArtifactStore::open(&vacant).unwrap();
+    assert!(vacant.join("apvm.db").exists());
+}
+
+/// The first component of a relative `entry` path.
+fn entry_root(entry: &str) -> &str {
+    entry.split('/').next().unwrap_or(entry)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_that_cannot_be_listed_is_an_error_not_empty() {
+    // Audit: `read_dir` errors were swallowed, so an unlistable store with
+    // a lost database read as `Empty` and got a fresh database — whose gc
+    // then deleted the builds once the directory was readable again.
+    if !permissions_enforced() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_a_build(root.path());
+    delete_database(&base);
+    chmod(&base, 0o333);
+    let inspected = ArtifactStore::inspect(&base);
+    let opened = ArtifactStore::open(&base).map(|_| ());
+    chmod(&base, 0o755);
+    assert!(matches!(inspected, Err(Error::Io { .. })), "{inspected:?}");
+    assert!(matches!(opened, Err(Error::Io { .. })), "{opened:?}");
+    assert!(!base.join("apvm.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn ownership_files_are_never_followed_or_faked_by_links() {
+    // Audit: a dangling `.apvm.lock` / repair-marker symlink made apvm
+    // create its target outside the store; a symlinked or directory lock
+    // file must not prove ownership either.
+    let root = tempfile::tempdir().unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let base = closed_store_with_a_build(root.path());
+    let store = ArtifactStore::open(&base).unwrap();
+    std::fs::remove_file(base.join(".apvm.lock")).unwrap();
+    std::os::unix::fs::symlink(outside.join("lock"), base.join(".apvm.lock")).unwrap();
+    assert!(matches!(store.gc(), Err(Error::Io { .. })));
+    drop(store);
+    assert!(
+        !outside.join("lock").exists(),
+        "the lock target was created"
+    );
+
+    // Not a lock file: the store's data reads as someone else's.
+    delete_database(&base);
+    assert!(matches!(
+        ArtifactStore::inspect(&base).unwrap(),
+        StoreState::Foreign { .. }
+    ));
+    std::fs::remove_file(base.join(".apvm.lock")).unwrap();
+    std::fs::create_dir(base.join(".apvm.lock")).unwrap();
+    assert!(matches!(
+        ArtifactStore::inspect(&base).unwrap(),
+        StoreState::Foreign { .. }
+    ));
+
+    // A marker symlink: the store needs repair, which refuses to follow it.
+    let store = closed_store_with_two_builds(&root.path().join("two"));
+    std::os::unix::fs::symlink(outside.join("marker"), store.join("apvm.db.repairing")).unwrap();
+    assert!(matches!(
+        ArtifactStore::inspect(&store).unwrap(),
+        StoreState::Orphaned { .. }
+    ));
+    assert!(matches!(
+        ArtifactStore::repair(&store),
+        Err(Error::Io { .. })
+    ));
+    assert!(
+        !outside.join("marker").exists(),
+        "the marker target was created"
+    );
+}
+
+#[test]
+fn a_repair_marker_without_the_lock_file_proves_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let user = user_dir(root.path());
+    put(&user, "apvm.db.repairing", "");
+    assert!(matches!(
+        ArtifactStore::inspect(&user).unwrap(),
+        StoreState::Foreign { .. }
+    ));
+}
+
+#[test]
+fn a_marker_repair_cannot_remove_is_refused_before_anything_changes() {
+    // Audit: a directory named like the marker made every repair rebuild
+    // the index, then fail to remove it, forever.
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_two_builds(root.path());
+    std::fs::create_dir(base.join("apvm.db.repairing")).unwrap();
+    let before = std::fs::read(base.join("apvm.db")).unwrap();
+    let err = ArtifactStore::repair(&base).map(|_| ()).unwrap_err();
+    assert!(err.to_string().contains("not a regular file"), "{err}");
+    assert!(std::fs::read(base.join("apvm.db")).unwrap() == before);
+}
+
+#[test]
+fn repair_adopts_build_output_but_never_os_metadata_files() {
+    // Audit: `.DS_Store` was adopted as an artifact and, sorting first,
+    // served as the build's file.
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("store");
+    let build = "wp-rocket/commits/3.17.4/a1b2c3d";
+    put(&base, &format!("{build}/wp-rocket.zip"), "zip");
+    for junk in [".DS_Store", "._wp-rocket.zip", "Thumbs.db", "desktop.ini"] {
+        put(&base, &format!("{build}/{junk}"), "junk");
+    }
+    std::fs::write(base.join("apvm.db"), b"not a sqlite database").unwrap();
+    std::fs::write(base.join(".apvm.lock"), b"").unwrap();
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert_eq!((report.builds_adopted, report.artifacts_adopted), (1, 1));
+    let found = store
+        .find_by_commit("wp-rocket", "3.17.4", "a1b2c3d")
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.artifact(None).unwrap().filename, "wp-rocket.zip");
+}
+
+#[test]
+fn tampered_record_paths_never_reach_outside_the_store() {
+    // Audit: filenames and directories read back from the database were
+    // trusted: an absolute filename made a hit point outside the store, and
+    // a store into a redirected directory wrote outside it.
+    let (root, store, scratch) = make_store();
+    let victim = root.path().join("victim.txt");
+    std::fs::write(&victim, b"precious").unwrap();
+    let build = store
+        .store(
+            &metadata("wp-rocket", "3.17.4", COMMIT_A),
+            &[artifact(&scratch, "a.zip", b"artifact", None)],
+        )
+        .unwrap()
+        .build;
+    {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE build_artifacts SET filename = ?1",
+            [victim.to_string_lossy()],
+        )
+        .unwrap();
+    }
+    // A miss, never a hit on the victim.
+    assert!(
+        store
+            .find_by_commit("wp-rocket", "3.17.4", COMMIT_A)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        store.verify(VerifyMode::Checksum).unwrap()[0].problem,
+        VerifyProblem::InvalidRecord { .. }
+    ));
+    let report = store.gc_with(VerifyMode::Checksum).unwrap();
+    assert_eq!(report.damaged_artifacts, 1);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+    let _ = build;
+
+    // A recorded directory that is not store-shaped is never written into.
+    let (_root2, store2, scratch2) = make_store();
+    store2
+        .store(
+            &metadata("wp-rocket", "3.17.4", COMMIT_A),
+            &[artifact(&scratch2, "a.zip", b"artifact", None)],
+        )
+        .unwrap();
+    {
+        let conn = rusqlite::Connection::open(store2.db_path()).unwrap();
+        conn.execute("UPDATE builds SET dir_path = 'escape'", [])
+            .unwrap();
+    }
+    let err = store2
+        .store(
+            &metadata("wp-rocket", "3.17.4", COMMIT_A),
+            &[artifact(&scratch2, "new.zip", b"new", None)],
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Data { .. }), "{err:?}");
+    assert!(!store2.base_dir().join("escape").exists());
+}
+
+#[test]
+fn a_record_spelled_unlike_the_store_is_invalid_and_gc_stays_consistent() {
+    // Audit: a trailing slash made gc delete a live build's directory while
+    // keeping its record.
+    let (_root, store, scratch) = make_store();
+    store
+        .store(
+            &metadata("wp-rocket", "3.17.4", COMMIT_A),
+            &[artifact(&scratch, "a.zip", b"artifact", None)],
+        )
+        .unwrap();
+    {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute("UPDATE builds SET dir_path = dir_path || '/'", [])
+            .unwrap();
+    }
+    assert!(matches!(
+        store.verify(VerifyMode::Size).unwrap()[0].problem,
+        VerifyProblem::InvalidRecord { .. }
+    ));
+    store.gc().unwrap();
+    // No record survives without its directory, nor the other way round.
+    assert_eq!(recorded(&store), (0, 0));
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+    assert!(
+        store.gc().unwrap().orphan_dirs_removed == 0,
+        "gc is idempotent"
+    );
+}
+
+#[test]
+fn names_gc_or_windows_reserve_are_refused() {
+    let (_root, store, scratch) = make_store();
+    let file = |name: &str| [artifact(&scratch, name, b"x", None)];
+    // gc sweeps `.apvm-tmp-*` files as crash leftovers.
+    assert!(matches!(
+        store.store(
+            &metadata("wp-rocket", "1.0", COMMIT_A),
+            &file(".apvm-tmp-a.zip")
+        ),
+        Err(Error::InvalidInput { .. })
+    ));
+    for (project, version) in [
+        ("nul", "1.0"),
+        ("wp-rocket", "COM1"),
+        ("wp-rocket", "lpt1.2"),
+    ] {
+        assert!(
+            matches!(
+                store.store(&metadata(project, version, COMMIT_A), &file("a.zip")),
+                Err(Error::InvalidInput { .. })
+            ),
+            "{project} {version}"
+        );
+    }
+}
+
+#[test]
+fn a_release_directory_fallback_that_is_taken_is_skipped() {
+    // Audit: the tag `v1.0-29e1a996` takes `V1.0`'s fallback name, so
+    // storing `V1.0` then `v1.0` failed with "collides".
+    let (_root, store, scratch) = make_store();
+    for tag in ["v1.0-29e1a996", "V1.0", "v1.0"] {
+        store
+            .store_release(
+                &ReleaseMetadata::new("backwpup", tag),
+                &[artifact(&scratch, "a.zip", tag.as_bytes(), None)],
+            )
+            .unwrap_or_else(|err| panic!("{tag}: {err}"));
+    }
+    for tag in ["v1.0-29e1a996", "V1.0", "v1.0"] {
+        let release = store.find_release("backwpup", tag).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(&release.assets[0].path).unwrap(),
+            tag.as_bytes()
+        );
+    }
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_reports_a_directory_it_cannot_inspect_as_such() {
+    // Audit: a permission error was reported as "outside the store layout
+    // or behind a symlink … remove it by hand".
+    if !permissions_enforced() {
+        return;
+    }
+    let (_root, store, scratch) = make_store();
+    store
+        .store(
+            &metadata("wp-rocket", "3.17.4", COMMIT_A),
+            &[artifact(&scratch, "a.zip", b"artifact", None)],
+        )
+        .unwrap();
+    let commits = store.base_dir().join("wp-rocket/commits");
+    chmod(&commits, 0o000);
+    let report = store.clean(&CleanOptions::default());
+    chmod(&commits, 0o755);
+    let report = report.unwrap();
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(
+        report.failures[0].starts_with("cannot inspect wp-rocket/commits/3.17.4/"),
+        "{:?}",
+        report.failures
+    );
+    // The orphaned files go with the next gc.
+    assert_eq!(store.gc().unwrap().orphan_dirs_removed, 1);
+}
+
+#[test]
+fn a_handle_opened_before_an_interrupted_repair_never_mutates() {
+    // Audit: repair resets in place, so a handle opened before a repair
+    // that was killed stayed current, and its gc deleted every build the
+    // half-filled index did not list.
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_two_builds(root.path());
+    let holder = ArtifactStore::open(&base).unwrap();
+    // What a repair killed between writing its marker and committing leaves.
+    std::fs::write(base.join("apvm.db.repairing"), b"").unwrap();
+    let before = tree(&base);
+    assert!(matches!(
+        holder.gc(),
+        Err(Error::MissingDatabase {
+            adoptable_builds: 2,
+            ..
+        })
+    ));
+    assert!(matches!(
+        holder.clean(&CleanOptions::default()),
+        Err(Error::MissingDatabase { .. })
+    ));
+    assert_eq!(tree(&base), before, "nothing deleted");
+    drop(holder);
+    let (_, report) = ArtifactStore::repair(&base).unwrap();
+    assert_eq!(report.builds_adopted, 2);
+}
+
+/// Change one byte of the `idx_builds_project` index in place, after
+/// moving the database's content out of its WAL: the index then disagrees
+/// with its table, which only the full integrity check notices.
+fn damage_the_project_index(db: &Path) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let root_page: i64 = conn
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'idx_builds_project'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+    let mut bytes = std::fs::read(db).unwrap();
+    let start = usize::try_from((root_page - 1) * page_size).unwrap();
+    let end = start + usize::try_from(page_size).unwrap();
+    let at = bytes[start..end]
+        .windows(9)
+        .position(|window| window == b"wp-rocket")
+        .expect("the index page holds the project key");
+    bytes[start + at] = b'x';
+    std::fs::write(db, bytes).unwrap();
+}
+
+#[test]
+fn repair_rebuilds_a_database_only_the_full_integrity_check_finds_damaged() {
+    // Audit: a damaged index passes the quick check of every open, so
+    // repair said "healthy" while writes failed as corrupt — and the
+    // documented "corrupt → repair → retry" recipe never converged.
+    let (_root, store, scratch) = make_store();
+    store
+        .store(
+            &metadata("wp-rocket", "3.17.4", COMMIT_A),
+            &[artifact(&scratch, "a.zip", b"artifact", None)],
+        )
+        .unwrap();
+    let base = store.base_dir().to_path_buf();
+    drop(store);
+    damage_the_project_index(&base.join("apvm.db"));
+    let store = ArtifactStore::open(&base).expect("the quick check passes");
+    assert!(matches!(
+        store.integrity_check(),
+        Err(Error::DatabaseCorrupted { .. })
+    ));
+    drop(store);
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert!(report.quarantined_database.is_some(), "it was repaired");
+    assert_eq!(report.builds_adopted, 1);
+    store.integrity_check().unwrap();
+    assert_eq!(recorded(&store), (1, 0));
+    drop(store);
+    let (_, again) = ArtifactStore::repair(&base).unwrap();
+    assert!(again.quarantined_database.is_none(), "now healthy");
+}
+
+#[test]
+fn repair_rebuilds_a_database_with_text_that_is_not_utf8() {
+    // Audit: a bit flip in a text column failed every read with "invalid
+    // utf-8" — repair included, which did not count it as damage.
+    let root = tempfile::tempdir().unwrap();
+    let base = closed_store_with_two_builds(root.path());
+    {
+        let conn = rusqlite::Connection::open(base.join("apvm.db")).unwrap();
+        conn.execute(
+            "UPDATE builds SET version = CAST(x'35c32e36' AS TEXT) WHERE version = '5.6.0'",
+            [],
+        )
+        .unwrap();
+    }
+    let store = ArtifactStore::open(&base).unwrap();
+    let err = store.verify(VerifyMode::Size).map(|_| ()).unwrap_err();
+    assert!(err.is_corruption(), "{err:?}");
+    drop(store);
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert!(report.quarantined_database.is_some());
+    assert_eq!(report.builds_adopted, 2);
+    assert!(store.verify(VerifyMode::Checksum).unwrap().is_empty());
+}
+
+#[test]
+fn repair_adopts_exactly_the_build_directories_gc_keeps() {
+    // Audit: repair skipped the `{7 hex}-{8 hex}` directories the store
+    // creates (gc then deleted them) and adopted upper-case hex ones (which
+    // gc and clean refuse to touch).
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("store");
+    put(
+        &base,
+        "wp-rocket/commits/3.0-beta/a1b2c3d-0f1e2d3c/a.zip",
+        "zip",
+    );
+    put(&base, "wp-rocket/commits/3.0-beta/A1B2C3E/b.zip", "zip");
+    std::fs::write(base.join("apvm.db"), b"not a sqlite database").unwrap();
+    std::fs::write(base.join(".apvm.lock"), b"").unwrap();
+
+    let (store, report) = ArtifactStore::repair(&base).unwrap();
+    assert_eq!(report.builds_adopted, 1);
+    assert_eq!(report.entries_skipped, 1, "the upper-case directory");
+    let found = store
+        .find_by_commit("wp-rocket", "3.0-beta", "a1b2c3d")
+        .unwrap()
+        .expect("the disambiguated build is served");
+    assert!(found.dir.ends_with("a1b2c3d-0f1e2d3c"));
+    assert_eq!(store.gc().unwrap().orphan_dirs_removed, 0);
+    assert!(found.dir.join("a.zip").exists());
 }

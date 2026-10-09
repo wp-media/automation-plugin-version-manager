@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Apvm, ApvmCache, JsCleanTarget } from '../index.js';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { copyFileSync, existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
@@ -9,7 +10,9 @@ import { isAbsolute, join } from 'node:path';
 
 // Cache maintenance — fully offline. A cache is seeded through the public API:
 // build directories on disk plus a garbage `apvm.db`, which `repair()`
-// quarantines and then re-indexes those builds from.
+// resets in place (keeping a copy) and then re-indexes those builds into. The
+// directory carries the store's lock file (`.apvm.lock`), as every real cache
+// does: without it, store-shaped data is someone else's and repair refuses.
 //
 // Isolation: every test points APVM_CACHE_DIR at its own directory and
 // restores the suite's value afterwards. The env var overrides `cacheDir`, so
@@ -60,6 +63,7 @@ async function seed(): Promise<ApvmCache> {
     await mkdir(join(buildFile(build), '..'), { recursive: true });
     await writeFile(buildFile(build), build.content);
   }
+  await writeFile(join(cacheDir, '.apvm.lock'), '');
   await writeFile(join(cacheDir, 'apvm.db'), 'not a database');
   const cache = ApvmCache.open();
   const report = await cache.repair();
@@ -148,6 +152,29 @@ describe('ApvmCache directory', () => {
     } finally {
       process.chdir(cwd);
     }
+  });
+
+  it('APVM_CACHE_DIR set inside a worker thread is honored there', async () => {
+    // Audit: the variable was read from the process environment, which a
+    // worker's own `process.env` copy never reaches — the worker silently
+    // used ~/.apvm/cache.
+    const { Worker } = await import('node:worker_threads');
+    const addon = createRequire(import.meta.url).resolve('../index.js');
+    const workerDir = join(root, 'worker-cache');
+    const worker = new Worker(
+      `const { parentPort, workerData } = require('node:worker_threads');
+       process.env.APVM_CACHE_DIR = workerData.dir;
+       const { ApvmCache } = require(workerData.addon);
+       parentPort.postMessage(ApvmCache.open().dir());`,
+      { eval: true, workerData: { addon, dir: workerDir }, env: { ...process.env } },
+    );
+    const dir = await new Promise((resolve, reject) => {
+      worker.once('message', resolve);
+      worker.once('error', reject);
+    });
+    await worker.terminate();
+    expect(dir).toBe(workerDir);
+    expect(process.env.APVM_CACHE_DIR).toBe(cacheDir);
   });
 
   it('Apvm.create() reads APVM_CACHE_DIR when called, not when it resolves', async () => {
@@ -381,7 +408,9 @@ describe('seeded cache', () => {
     expect((await cache.info()).buildCount).toBe(2);
   });
 
-  it.skipIf(process.platform === 'win32')('an unreadable file is reported and kept by gc', async () => {
+  // Root reads through permission bits; Windows has none to set here.
+  const permissionsBind = process.platform !== 'win32' && process.getuid?.() !== 0;
+  it.skipIf(!permissionsBind)('an unreadable file is reported and kept by gc', async () => {
     const cache = await seed();
     const file = buildFile(BUILDS[0]);
     await chmod(file, 0o000);
@@ -486,7 +515,7 @@ describe('error codes', () => {
     for (const call of [() => cache.info(), () => cache.gc()]) {
       const err = await rejection(call());
       expect(err.code).toBe('CacheCorrupted');
-      expect(err.message).toContain('missing or empty');
+      expect(err.message).toContain('missing, empty or half-repaired');
     }
     // Nothing was deleted or written meanwhile.
     expect(existsSync(buildFile(BUILDS[0]))).toBe(true);
@@ -538,6 +567,24 @@ describe('error codes', () => {
     }
   });
 
+  it('the code is defined on the error, whatever Error.prototype.code does', async () => {
+    // Audit: assigning `code` instead of defining it would let an accessor
+    // on Error.prototype swallow it, and no test noticed.
+    const cache = await seed();
+    await writeFile(join(cacheDir, 'apvm.db'), 'not a database');
+    Object.defineProperty(Error.prototype, 'code', {
+      get: () => undefined,
+      set: () => undefined,
+      configurable: true,
+    });
+    try {
+      const err = await rejection(cache.info());
+      expect(Object.getOwnPropertyDescriptor(err, 'code')?.value).toBe('CacheCorrupted');
+    } finally {
+      delete (Error.prototype as { code?: unknown }).code;
+    }
+  });
+
   it('an unknown target rejects with InvalidArg', async () => {
     const err = await rejection(ApvmCache.open().clean({ target: 'Nope' as JsCleanTarget }));
     expect(err.code).toBe('InvalidArg');
@@ -566,6 +613,39 @@ describe('error codes', () => {
       expect(err.message).toContain('Check the cache location');
     }
     expect(await readdir(cacheDir)).toEqual(['my-plugin']);
+  });
+
+  it('store-shaped data with a stray apvm.db but no lock file is never adopted', async () => {
+    // Audit: a garbage `apvm.db` beside store-shaped data made someone
+    // else's directory a "corrupt cache"; the recipe's repair() adopted it
+    // and gc() then deleted the rest of the directory.
+    for (const build of BUILDS) {
+      await mkdir(join(buildFile(build), '..'), { recursive: true });
+      await writeFile(buildFile(build), build.content);
+    }
+    await mkdir(join(cacheDir, 'mysite', 'releases', 'v1.0'), { recursive: true });
+    await writeFile(join(cacheDir, 'mysite', 'releases', 'v1.0', 'notes.txt'), 'mine');
+    await writeFile(join(cacheDir, 'apvm.db'), 'not a database');
+    const before = (await readdir(cacheDir, { recursive: true })).sort();
+    const cache = ApvmCache.open();
+    for (const call of [() => cache.info(), () => cache.repair(), () => cache.gc()]) {
+      const err = await rejection(call());
+      expect(err.code).toBe('GenericFailure');
+      expect(err.message).toContain('not an apvm cache');
+    }
+    expect((await readdir(cacheDir, { recursive: true })).sort()).toStrictEqual(before);
+  });
+
+  it('Apvm.create() never makes a cache of a directory holding other files', async () => {
+    // Audit: the store was created among a user's files, where gc later
+    // deleted store-shaped data the user put beside it.
+    await mkdir(cacheDir, { recursive: true });
+    await writeFile(join(cacheDir, 'notes.txt'), 'mine');
+    const apvm = await Apvm.create({ cacheDir });
+    const status = await apvm.cacheStatus();
+    expect(status.state).toBe('unavailable');
+    expect(status.reason).toContain("already contains 'notes.txt'");
+    expect(await readdir(cacheDir)).toStrictEqual(['notes.txt']);
   });
 });
 
@@ -635,6 +715,79 @@ describe('strict options', () => {
     expect((await cache.info()).buildCount).toBe(2);
   });
 
+  // Options are read from own properties: an object that is not plain could
+  // carry them through its prototype, where they would be silently ignored.
+  class GetterOptions {
+    get dryRun(): boolean {
+      return true;
+    }
+  }
+  const notPlain: Array<[string, () => unknown]> = [
+    ['Object.create(defaults)', () => Object.create({ dryRun: true })],
+    ['a class instance with getters', () => new GetterOptions()],
+    ['a Map', () => new Map([['dryRun', true]])],
+    ['a Date', () => new Date()],
+  ];
+
+  it.each(notPlain)('clean() rejects %s with InvalidArg and deletes nothing', async (_label, make) => {
+    const cache = await seed();
+    const err = await rejection(cache.clean(make() as never));
+    expect(err.code).toBe('InvalidArg');
+    expect(err.message).toMatch(/must be a plain object/);
+    expect((await cache.info()).buildCount).toBe(2);
+  });
+
+  class GetterConfig {
+    get cacheDir(): string {
+      return '/elsewhere';
+    }
+  }
+  it.each([
+    ['Object.create(defaults)', () => Object.create({ cacheDir: '/elsewhere' })],
+    ['a class instance with getters', () => new GetterConfig()],
+    ['a Map', () => new Map([['cacheDir', '/elsewhere']])],
+  ])('ApvmCache.open() throws InvalidArg for %s, never opening the default cache', (_label, make) => {
+    expect(() => ApvmCache.open(make() as never)).toThrow(expect.objectContaining({ code: 'InvalidArg' }));
+  });
+
+  it('clean() reads plain objects from any realm, and null-prototype ones', async () => {
+    const { runInNewContext } = await import('node:vm');
+    const foreignRealm = runInNewContext('({ dryRun: true })') as { dryRun: boolean };
+    const nullPrototype = Object.assign(Object.create(null) as object, { dryRun: true });
+    for (const options of [foreignRealm, nullPrototype]) {
+      const cache = await seed();
+      const report = await cache.clean(options);
+      expect([report.dryRun, report.buildsDeleted]).toStrictEqual([true, 2]);
+      expect((await cache.info()).buildCount).toBe(2);
+    }
+  });
+
+  it('an exception thrown while reading the options propagates as is', async () => {
+    const cache = await seed();
+    const boom = new Error('boom');
+    const options = {
+      get dryRun(): boolean {
+        throw boom;
+      },
+    };
+    expect(() => cache.clean(options)).toThrow(boom);
+    expect((await cache.info()).buildCount).toBe(2);
+  });
+
+  it('an enumerable addition to Object.prototype is not read as an option', async () => {
+    // Audit: keys were listed with the prototype chain, so a polyfill's
+    // enumerable `Object.prototype` property made every call reject.
+    const cache = await seed();
+    const proto = Object.prototype as Record<string, unknown>;
+    proto.legacyHelper = () => undefined;
+    try {
+      expect((await cache.clean({ dryRun: true })).buildsDeleted).toBe(2);
+      expect(ApvmCache.open({ cacheDir }).dir()).toBe(cacheDir);
+    } finally {
+      delete proto.legacyHelper;
+    }
+  });
+
   it('clean() accepts no options, undefined and null as "no filters"', async () => {
     for (const options of [undefined, null]) {
       const cache = await seed();
@@ -694,10 +847,36 @@ describe('a second copy of the addon', () => {
     copyFileSync(loaded as string, copyPath);
     const copy = require(copyPath) as typeof import('../index.js');
     expect(copy.ApvmCache).not.toBe(ApvmCache);
-    for (const call of [() => copy.ApvmCache.open(), () => copy.Apvm.create({})]) {
+    for (const call of [
+      () => copy.ApvmCache.open(),
+      () => copy.Apvm.create({}),
+      () => copy.Apvm.createWithTokenResolution({}),
+    ]) {
       expect(call).toThrow(/second copy of apvm-napi/);
     }
     // The first copy keeps working.
     expect((await ApvmCache.open().info()).exists).toBe(false);
+  });
+
+  it('does not lock the addon out where globalThis cannot be extended', async () => {
+    // Hardened environments freeze `globalThis`, where the guard cannot
+    // record this copy: it is skipped instead of failing every entry point.
+    const addon = createRequire(import.meta.url).resolve('../index.js');
+    const script = join(root, 'frozen-global.cjs');
+    await writeFile(
+      script,
+      `const { Apvm, ApvmCache } = require(${JSON.stringify(addon)});
+      Object.freeze(globalThis);
+      const cache = ApvmCache.open();
+      Promise.all([cache.info(), Apvm.create({ cacheEnabled: false })]).then(
+        ([usage]) => console.log(JSON.stringify({ dir: cache.dir(), exists: usage.exists })),
+        (err) => { console.error(err); process.exitCode = 1; },
+      );`,
+    );
+    const output = execFileSync(process.execPath, [script], {
+      env: { ...process.env, APVM_CACHE_DIR: cacheDir },
+      encoding: 'utf8',
+    });
+    expect(JSON.parse(output)).toStrictEqual({ dir: cacheDir, exists: false });
   });
 });

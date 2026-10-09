@@ -15,6 +15,8 @@
 
 use std::path::PathBuf;
 
+use napi::bindgen_prelude::{JsObjectValue, JsValue, Object, Unknown};
+use napi::{Env, ValueType};
 use napi_derive::napi;
 
 /// Configuration options for creating an APVM instance.
@@ -111,8 +113,53 @@ impl From<ApvmConfig> for apvm_config::Config {
 /// the current directory, so a later `process.chdir()` cannot point an
 /// instance and its `cache()` handle at different caches. Touches nothing
 /// on disk.
-pub fn resolve_config(config: Option<ApvmConfig>) -> apvm_config::Config {
-    resolve_config_with(config, apvm_core::config_io::cache_dir_env_override())
+///
+/// `APVM_CACHE_DIR` is read from `process.env` as the calling JS thread
+/// sees it: a worker thread's `process.env` is its own copy, which the
+/// process environment never sees.
+pub fn resolve_config(env: &Env, config: Option<ApvmConfig>) -> apvm_config::Config {
+    resolve_config_with(config, js_cache_dir_override(env))
+}
+
+/// `APVM_CACHE_DIR` from the calling thread's `process.env` (`None` when
+/// unset or empty, as in the core); the process environment where there is
+/// no readable `process.env`.
+fn js_cache_dir_override(env: &Env) -> Option<PathBuf> {
+    match read_process_env(env, apvm_core::config_io::CACHE_DIR_ENV) {
+        Ok(value) => value.filter(|dir| !dir.is_empty()).map(PathBuf::from),
+        Err(_) => apvm_core::config_io::cache_dir_env_override(),
+    }
+}
+
+/// `process.env[name]` as a string, `None` when it is not set.
+///
+/// # Errors
+///
+/// When `process` or `process.env` is not an object.
+fn read_process_env(env: &Env, name: &str) -> napi::Result<Option<String>> {
+    let process: Unknown<'_> = env.get_global()?.get_named_property("process")?;
+    let process = object(process, "process")?;
+    let variables = object(process.get_named_property("env")?, "process.env")?;
+    let value: Unknown<'_> = variables.get_named_property(name)?;
+    match value.get_type()? {
+        ValueType::String => Ok(Some(value.coerce_to_string()?.into_utf8()?.into_owned()?)),
+        _ => Ok(None),
+    }
+}
+
+/// `value` as an object; `what` names it in the error.
+///
+/// # Errors
+///
+/// `InvalidArg` when `value` is not an object.
+fn object<'env>(value: Unknown<'env>, what: &str) -> napi::Result<Object<'env>> {
+    if value.get_type()? != ValueType::Object {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            format!("{what} is not an object"),
+        ));
+    }
+    value.coerce_to_object()
 }
 
 /// [`resolve_config`] with the `APVM_CACHE_DIR` value passed in (`None` =
@@ -153,6 +200,7 @@ mod tests {
         assert_eq!(config.github_token.as_deref(), Some("ghp_test"));
     }
 
+    /// A JS config setting every field, with `dir` as `cacheDir`.
     fn explicit(dir: &str) -> Option<ApvmConfig> {
         Some(ApvmConfig {
             cache_dir: Some(dir.to_string()),
@@ -193,16 +241,5 @@ mod tests {
         assert_eq!(from_config.cache_dir, cwd.join("rel/cache"));
         let from_env = resolve_config_with(None, Some(PathBuf::from("rel/env")));
         assert_eq!(from_env.cache_dir, cwd.join("rel/env"));
-    }
-
-    #[test]
-    fn resolve_config_reads_the_environment() {
-        // Whatever APVM_CACHE_DIR holds in this process, resolve_config must
-        // agree with the pure function fed that value.
-        let env = apvm_core::config_io::cache_dir_env_override();
-        assert_eq!(
-            resolve_config(explicit("/explicit/cache")).cache_dir,
-            resolve_config_with(explicit("/explicit/cache"), env).cache_dir
-        );
     }
 }

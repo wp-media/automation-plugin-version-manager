@@ -14,7 +14,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
-use crate::error::{IoContext, Result};
+use crate::error::{Error, IoContext, Result};
 use crate::paths::LOCK_FILE_NAME;
 
 /// Exclusive lock over the store, released on drop.
@@ -28,9 +28,24 @@ impl StoreLock {
     ///
     /// The lock file (`.apvm.lock`) is created on first use and left in
     /// place afterwards — on Windows a locked file cannot be deleted, so a
-    /// persistent lock file is the portable choice.
+    /// persistent lock file is the portable choice. A symlink there is never
+    /// followed (it would create or lock a file outside the store).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the lock file is a symlink, or cannot be opened
+    /// or locked.
     pub(crate) fn acquire(base_dir: &Path) -> Result<Self> {
         let path = base_dir.join(LOCK_FILE_NAME);
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(Error::Io {
+                context: format!(
+                    "store lock file {} is a symbolic link; refusing to follow it",
+                    path.display()
+                ),
+                source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            });
+        }
         let file = OpenOptions::new()
             .create(true)
             .read(true)

@@ -192,13 +192,14 @@ apvm cache verify --checksum
 apvm cache gc
 apvm cache gc --checksum
 
-# Recover the cache database: reset a corrupt one in place or clear an
-# unreadable one (a copy of either is kept), or rebuild a missing, empty or
-# half-repaired one; then re-index the builds. Refuses (changing nothing)
-# while another process holds a corrupt database open.
+# Recover the cache database: reset a corrupt one in place (SQLite's full
+# integrity check decides) or clear an unreadable one (a copy of either is
+# kept), or rebuild a missing, empty or half-repaired one; then re-index the
+# builds. Refuses (changing nothing) while a running build holds open a
+# database file it can no longer read.
 apvm cache repair
 
-# Remove everything (prompts unless -y)
+# Remove everything (prompts unless -y; a corrupt cache errors first)
 apvm cache clear
 apvm cache clear -y
 ```
@@ -210,9 +211,11 @@ are mutually exclusive (omit both to clean everything). Invalid flags fail even
 when nothing has been cached yet.
 
 A directory is a cache only if it holds the cache database: a missing or empty
-one is reported as empty and never written to, and a directory holding other
-data is refused — apvm never initializes a cache there, since `gc` could later
-delete that data.
+one is reported as empty and never written to. apvm creates a cache only in a
+missing or vacant directory (nothing but OS metadata files such as
+`.DS_Store`), and store-shaped data in a directory without the `.apvm.lock`
+file every cache gets is someone else's, whatever its `apvm.db` holds — both
+are refused, unchanged, since `gc` could otherwise delete that data.
 
 Lookups check only presence and size, so a file corrupted without changing size
 is still served from the cache until `apvm cache gc --checksum` removes it. `gc`

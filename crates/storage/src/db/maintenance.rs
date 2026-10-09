@@ -8,7 +8,8 @@ use rusqlite::{Connection, params};
 pub(crate) struct UsageRow {
     pub project: String,
     pub count: i64,
-    pub bytes: i64,
+    /// Recorded bytes; see [`total_bytes`].
+    pub bytes: u64,
     pub oldest_ms: Option<i64>,
     pub newest_ms: Option<i64>,
 }
@@ -18,7 +19,8 @@ pub(crate) struct UsageRow {
 pub(crate) struct Victim {
     pub id: i64,
     pub dir_rel: String,
-    pub bytes: i64,
+    /// Recorded bytes; see [`total_bytes`].
+    pub bytes: u64,
 }
 
 /// Which table a stored file's record lives in.
@@ -47,21 +49,35 @@ pub(crate) struct FileRecord {
     pub sha256: String,
 }
 
+/// A byte sum computed as `TOTAL(MAX(size_bytes, 0))`, as a byte count.
+///
+/// `SUM` over recorded sizes fails with "integer overflow" once they add up
+/// past `i64::MAX` — only a tampered database does, but then every report
+/// and even repair's check failed. `TOTAL` sums in floating point, which
+/// cannot overflow and is exact below 2^53 bytes (8 PiB); `MAX(…, 0)` makes
+/// a corrupt negative size count as nothing. The conversion saturates.
+fn total_bytes(total: f64) -> u64 {
+    // `as` saturates (and maps NaN to 0): the intent here.
+    total as u64
+}
+
+/// Map a `(project, count, bytes, oldest, newest)` aggregate row.
 fn row_to_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
     Ok(UsageRow {
         project: row.get(0)?,
         count: row.get(1)?,
-        bytes: row.get(2)?,
+        bytes: total_bytes(row.get(2)?),
         oldest_ms: row.get(3)?,
         newest_ms: row.get(4)?,
     })
 }
 
+/// Map an `(id, dir_path, bytes)` row selected for deletion.
 fn row_to_victim(row: &rusqlite::Row<'_>) -> rusqlite::Result<Victim> {
     Ok(Victim {
         id: row.get(0)?,
         dir_rel: row.get(1)?,
-        bytes: row.get(2)?,
+        bytes: total_bytes(row.get(2)?),
     })
 }
 
@@ -90,7 +106,7 @@ pub(crate) fn projects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
 /// Build usage grouped by project.
 pub(crate) fn usage_builds(conn: &Connection) -> rusqlite::Result<Vec<UsageRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT b.project, COUNT(DISTINCT b.id), COALESCE(SUM(a.size_bytes), 0),
+        "SELECT b.project, COUNT(DISTINCT b.id), TOTAL(MAX(a.size_bytes, 0)),
                 MIN(b.built_at_ms), MAX(b.built_at_ms)
          FROM builds AS b
          LEFT JOIN build_artifacts AS a ON a.build_id = b.id
@@ -103,7 +119,7 @@ pub(crate) fn usage_builds(conn: &Connection) -> rusqlite::Result<Vec<UsageRow>>
 /// Release usage grouped by project.
 pub(crate) fn usage_releases(conn: &Connection) -> rusqlite::Result<Vec<UsageRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT r.project, COUNT(DISTINCT r.id), COALESCE(SUM(s.size_bytes), 0),
+        "SELECT r.project, COUNT(DISTINCT r.id), TOTAL(MAX(s.size_bytes, 0)),
                 MIN(r.cached_at_ms), MAX(r.cached_at_ms)
          FROM releases AS r
          LEFT JOIN release_assets AS s ON s.release_id = r.id
@@ -130,7 +146,7 @@ pub(crate) fn build_victims(
     older_than_ms: Option<i64>,
 ) -> rusqlite::Result<Vec<Victim>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT b.id, b.dir_path, COALESCE(SUM(a.size_bytes), 0)
+        "SELECT b.id, b.dir_path, TOTAL(MAX(a.size_bytes, 0))
          FROM builds AS b
          LEFT JOIN build_artifacts AS a ON a.build_id = b.id
          WHERE (?1 IS NULL OR b.project = ?1)
@@ -148,7 +164,7 @@ pub(crate) fn release_victims(
     older_than_ms: Option<i64>,
 ) -> rusqlite::Result<Vec<Victim>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT r.id, r.dir_path, COALESCE(SUM(s.size_bytes), 0)
+        "SELECT r.id, r.dir_path, TOTAL(MAX(s.size_bytes, 0))
          FROM releases AS r
          LEFT JOIN release_assets AS s ON s.release_id = r.id
          WHERE (?1 IS NULL OR r.project = ?1)

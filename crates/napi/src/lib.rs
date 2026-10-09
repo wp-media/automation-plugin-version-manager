@@ -26,19 +26,19 @@
 //! # Quick Start (JavaScript/TypeScript)
 //!
 //! ```typescript
-//! import { Apvm, type JsCleanTarget } from 'apvm-napi';
+//! import { Apvm, JsCleanTarget } from 'apvm-napi';
 //!
 //! // All config fields are optional — cacheDir defaults to ~/.apvm/cache
 //! const apvm = await Apvm.create({});
 //!
-//! const output = await apvm.build({
-//!   project: 'wp-rocket',
-//!   gitRef: 'pr:456',
-//!   outputDir: '/tmp/output',
-//!   onProgress: (event) => console.log(event.type, event.message),
-//! });
+//! const output = await apvm.build(
+//!   { project: 'wp-rocket', gitRef: 'pr:456', outputDir: '/tmp/output' },
+//!   (err, event) => {
+//!     if (!err) console.log(event.type, event.message);
+//!   },
+//! );
 //!
-//! console.log(`Built ${output.artifacts.length} artifacts`);
+//! console.log(`Built ${output.result.artifacts.length} artifacts`);
 //!
 //! // Prime the cache without producing output — same pipeline, no outputDir.
 //! // A later build of the same ref is then served from the cache.

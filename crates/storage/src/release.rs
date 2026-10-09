@@ -18,7 +18,10 @@ use crate::error::{Error, IoContext, Result};
 use crate::fsx;
 use crate::lock::StoreLock;
 use crate::paths;
-use crate::store::{ArtifactStore, case_variants, validate_artifact_inputs};
+use crate::store::{
+    ArtifactStore, case_variants, check_record_filename, record_dir, validate_artifact_inputs,
+    write_dir,
+};
 use crate::types::{
     ReleaseMetadata, SourceArtifact, StoreReleaseResult, StoredArtifact, StoredRelease,
 };
@@ -69,7 +72,7 @@ impl ArtifactStore {
                 ),
             }
         };
-        let dir_abs = paths::rel_to_abs(&self.base_dir, &dir_rel);
+        let dir_abs = write_dir(&self.base_dir, &dir_rel)?;
 
         // Copy phase (no database lock held).
         std::fs::create_dir_all(&dir_abs)
@@ -241,15 +244,22 @@ impl ArtifactStore {
     ///
     /// Takes the already-held connection — never locks internally, so it is
     /// safe to call while a [`MutexGuard`](std::sync::MutexGuard) is live.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Data`] for a row the store could not have written (a
+    /// tampered directory or filename) or out-of-range values;
+    /// [`Error::Database`] for SQLite failures.
     pub(crate) fn release_from_row(
         &self,
         conn: &Connection,
         row: &db::ReleaseRow,
     ) -> Result<StoredRelease> {
         let conn_assets = db::releases::assets_for(conn, row.id)?;
-        let dir = paths::rel_to_abs(&self.base_dir, &row.dir_rel);
+        let dir = record_dir(&self.base_dir, &row.dir_rel)?;
         let mut assets = Vec::with_capacity(conn_assets.len());
         for asset in conn_assets {
+            check_record_filename(&asset.filename)?;
             assets.push(StoredArtifact {
                 path: dir.join(&asset.filename),
                 variant_id: None,
@@ -284,20 +294,32 @@ fn assets_healthy(release: &StoredRelease) -> bool {
             .all(|asset| fsx::file_size(&asset.path) == Some(asset.size_bytes))
 }
 
+/// How many hashed alternatives [`pick_release_dir`] tries.
+const RELEASE_DIR_ALTERNATES: u32 = 16;
+
 /// Choose the directory of a newly cached release: the sanitized tag, or —
 /// when another release already has that name up to letter case (`v1.0` vs
-/// `V1.0`, one directory on a case-insensitive filesystem) — its first 100
-/// chars plus a hash of the tag, still a valid release directory name.
+/// `V1.0`, one directory on a case-insensitive filesystem), or a tag whose
+/// own name is such an alternative took it — its first 100 chars plus a
+/// hash of the tag and an attempt number, still a valid release directory
+/// name.
 ///
 /// # Errors
 ///
-/// [`Error::InvalidInput`] in the astronomically unlikely case that both
-/// names are taken; [`Error::Database`] for SQLite failures.
+/// [`Error::InvalidInput`] in the astronomically unlikely case that every
+/// candidate is taken; [`Error::Database`] for SQLite failures.
 fn pick_release_dir(conn: &Connection, project: &str, tag: &str) -> Result<String> {
     let name = paths::sanitize_tag_dir(tag);
     let short: String = name.chars().take(100).collect();
-    let alternate = format!("{short}-{}", paths::hash8(&format!("{tag}\ncase")));
-    for candidate in [name, alternate] {
+    // The first alternative's hash input predates the retries: keep it.
+    let alternates = (0..RELEASE_DIR_ALTERNATES).map(|attempt| {
+        let seed = match attempt {
+            0 => format!("{tag}\ncase"),
+            n => format!("{tag}\ncase{n}"),
+        };
+        format!("{short}-{}", paths::hash8(&seed))
+    });
+    for candidate in std::iter::once(name).chain(alternates) {
         let rel = paths::release_dir_rel(project, &candidate);
         if !db::releases::dir_taken(conn, &rel)? {
             return Ok(rel);
@@ -306,6 +328,6 @@ fn pick_release_dir(conn: &Connection, project: &str, tag: &str) -> Result<Strin
     Err(Error::invalid(
         "tag",
         tag,
-        "its cache directory collides with another release's",
+        "its cache directory collides with other releases'",
     ))
 }

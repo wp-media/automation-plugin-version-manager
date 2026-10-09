@@ -320,7 +320,7 @@ impl ArtifactStore {
         // database and should never overflow for a real cache, but a corrupt
         // or hostile row must not be able to panic a read-only report.
         for row in &build_rows {
-            let bytes = u64::try_from(row.bytes).unwrap_or(0);
+            let bytes = row.bytes;
             let count = u64::try_from(row.count).unwrap_or(0);
             report.builds_bytes = report.builds_bytes.saturating_add(bytes);
             report.build_count = report.build_count.saturating_add(count);
@@ -331,7 +331,7 @@ impl ArtifactStore {
             entry.build_count = count;
         }
         for row in &release_rows {
-            let bytes = u64::try_from(row.bytes).unwrap_or(0);
+            let bytes = row.bytes;
             let count = u64::try_from(row.count).unwrap_or(0);
             report.releases_bytes = report.releases_bytes.saturating_add(bytes);
             report.release_count = report.release_count.saturating_add(count);
@@ -428,24 +428,35 @@ impl ArtifactStore {
         };
 
         for victim in build_victims.iter().chain(release_victims.iter()) {
-            let bytes = u64::try_from(victim.bytes).unwrap_or(0);
+            let bytes = victim.bytes;
             if shared.contains(&victim.dir_rel) {
                 report.bytes_freed = report.bytes_freed.saturating_sub(bytes);
                 continue;
             }
             // A tampered or symlinked `dir_path` is dropped from the index
             // (already done above) but never removed from disk.
-            let Some(dir) = layout::owned_dir(&self.base_dir, &victim.dir_rel) else {
-                tracing::warn!(
-                    dir_rel = %victim.dir_rel,
-                    "record directory is outside the store layout or behind a symlink; left on disk"
-                );
-                report.failures.push(format!(
-                    "{}: outside the store layout or behind a symlink; left on disk (remove it by hand)",
-                    victim.dir_rel
-                ));
-                report.bytes_freed = report.bytes_freed.saturating_sub(bytes);
-                continue;
+            let dir = match layout::owned_dir(&self.base_dir, &victim.dir_rel) {
+                Ok(Some(dir)) => dir,
+                Ok(None) => {
+                    tracing::warn!(
+                        dir_rel = %victim.dir_rel,
+                        "record directory is outside the store layout or behind a symlink; left on disk"
+                    );
+                    report.failures.push(format!(
+                        "{}: outside the store layout or behind a symlink; left on disk (remove it by hand)",
+                        victim.dir_rel
+                    ));
+                    report.bytes_freed = report.bytes_freed.saturating_sub(bytes);
+                    continue;
+                }
+                // Orphaned files until the next gc, which retries.
+                Err(err) => {
+                    report
+                        .failures
+                        .push(format!("cannot inspect {}: {err}", victim.dir_rel));
+                    report.bytes_freed = report.bytes_freed.saturating_sub(bytes);
+                    continue;
+                }
             };
             match fsx::remove_dir_all_if_exists(&dir) {
                 Ok(()) => {
@@ -537,8 +548,8 @@ impl ArtifactStore {
     pub fn verify(&self, mode: VerifyMode) -> Result<Vec<VerifyIssue>> {
         let mut issues = Vec::new();
         for record in self.file_records()? {
-            let path = self.record_path(&record);
-            if let Some(problem) = check_file(mode, &path, record.size_bytes, &record.sha256) {
+            let (path, problem) = self.check_record(mode, &record);
+            if let Some(problem) = problem {
                 issues.push(VerifyIssue {
                     project: record.project.clone(),
                     context: record_context(&record),
@@ -551,14 +562,17 @@ impl ArtifactStore {
         Ok(issues)
     }
 
-    /// Run SQLite's integrity check on the metadata database.
+    /// Run SQLite's full integrity check (`PRAGMA integrity_check`) on the
+    /// metadata database: the quick check every open runs, plus a
+    /// comparison of every index with its table. Proportional to the
+    /// database's size.
     ///
     /// # Errors
     ///
     /// [`crate::Error::DatabaseCorrupted`] when SQLite reports damage.
     pub fn integrity_check(&self) -> Result<()> {
         let conn = self.conn();
-        db::quick_check(&conn, &self.db_path)
+        db::integrity_check(&conn, &self.db_path)
     }
 
     /// Open the store at `base_dir`, recovering whatever can be recovered.
@@ -577,10 +591,11 @@ impl ArtifactStore {
     ///   (`rebuilt_missing_database`).
     ///
     /// **Safe beside other users.** The database file is never renamed or
-    ///   replaced, so open connections — in this process or another — stay
-    ///   bound to it and see the repaired index. A corrupt database that
-    ///   another connection holds open cannot be reset:
-    ///   [`crate::Error::DatabaseInUse`], with nothing changed.
+    /// replaced, so open connections — in this process or another — stay
+    /// bound to it and see the repaired index. Only a file SQLite can no
+    /// longer read as a database needs exclusive access to be reset: while
+    /// another connection holds it open, repair fails with
+    /// [`crate::Error::DatabaseInUse`], with nothing changed.
     ///
     /// **Crash-safe.** Files are hashed before anything changes; a marker
     /// (`apvm.db.repairing`) is written before the database is touched and
@@ -608,9 +623,29 @@ impl ArtifactStore {
         let base_dir = crate::store::absolute(base_dir.into())?;
         // Refuse before creating anything, then classify again under the
         // lock, where the answer is authoritative.
-        refuse_foreign(&base_dir, layout::inspect(&base_dir)?)?;
+        let state = layout::inspect(&base_dir)?;
+        if matches!(state, StoreState::Empty) {
+            // Repair would create a store here.
+            crate::store::refuse_occupied(&base_dir)?;
+        }
+        refuse_foreign(&base_dir, state)?;
         std::fs::create_dir_all(&base_dir)
             .io_ctx(|| format!("failed to create store directory {}", base_dir.display()))?;
+        let lock_existed = fs::symlink_metadata(base_dir.join(paths::LOCK_FILE_NAME)).is_ok();
+        let outcome = Self::repair_locked(base_dir.clone());
+        if outcome.is_err() && !lock_existed {
+            forget_lock_file(&base_dir);
+        }
+        outcome
+    }
+
+    // ========================================================================
+    // Private helpers
+    // ========================================================================
+
+    /// [`ArtifactStore::repair`] once the directory exists: take the store
+    /// lock, classify again there, and repair.
+    fn repair_locked(base_dir: PathBuf) -> Result<(Self, RepairReport)> {
         let _lock = StoreLock::acquire(&base_dir)?;
         match layout::inspect(&base_dir)? {
             StoreState::Orphaned { .. } => Self::rebuild(base_dir, Damage::Lost),
@@ -621,19 +656,26 @@ impl ArtifactStore {
         }
     }
 
-    // ========================================================================
-    // Private helpers
-    // ========================================================================
-
     /// Repair path for a directory with (or without, if empty) a database:
-    /// open it, and rebuild when it is corrupt or its metadata cannot be
-    /// read back. The caller holds the store lock.
+    /// open it, and rebuild when it is corrupt — the full integrity check
+    /// included: a damaged index passes the quick check of an open, yet
+    /// fails writes as corrupt — or its metadata cannot be read back. The
+    /// caller holds the store lock.
     fn repair_database(base_dir: PathBuf) -> Result<(Self, RepairReport)> {
         let store = match Self::open_locked(&base_dir) {
             Ok(store) => store,
             Err(err) if err.is_corruption() => return Self::rebuild(base_dir, Damage::Corrupt),
             Err(other) => return Err(other),
         };
+        match store.integrity_check() {
+            Ok(()) => {}
+            Err(err) if err.is_corruption() => {
+                tracing::warn!(error = %err, "store database fails its integrity check; rebuilding");
+                drop(store);
+                return Self::rebuild(base_dir, Damage::Corrupt);
+            }
+            Err(other) => return Err(other),
+        }
         match store.check_metadata() {
             Ok(()) => Ok((store, RepairReport::default())),
             Err(err) if err.is_corruption() => {
@@ -649,6 +691,17 @@ impl ArtifactStore {
     /// [`ArtifactStore::repair`] for the guarantees). The caller holds the
     /// store lock.
     fn rebuild(base_dir: PathBuf, damage: Damage) -> Result<(Self, RepairReport)> {
+        Self::rebuild_with(base_dir, damage, &mut |_| {})
+    }
+
+    /// [`Self::rebuild`], calling `before_refill` once the database is
+    /// ready to re-fill and the marker is down — the window a crash must
+    /// leave the store [`StoreState::Orphaned`] in (tests check it there).
+    fn rebuild_with(
+        base_dir: PathBuf,
+        damage: Damage,
+        before_refill: &mut dyn FnMut(&Path),
+    ) -> Result<(Self, RepairReport)> {
         let mut report = RepairReport {
             rebuilt_missing_database: damage == Damage::Lost,
             ..RepairReport::default()
@@ -656,16 +709,40 @@ impl ArtifactStore {
         // The slow part, before anything changes.
         let scanned = scan_builds(&base_dir, &mut report);
         let marker = RepairMarker::create(&base_dir)?;
-        let store = match Self::open_locked(&base_dir) {
+        let opened = match Self::open_locked(&base_dir) {
+            // It opens, yet fails its integrity check: reset it all the same.
+            Ok(store) if damage == Damage::Corrupt => {
+                drop(store);
+                Err(Error::DatabaseCorrupted {
+                    path: base_dir.join(paths::DB_FILE_NAME),
+                    details: "it fails its integrity check".to_string(),
+                })
+            }
+            other => other,
+        };
+        let store = match opened {
             Ok(store) => {
                 if damage == Damage::Unreadable {
-                    report.quarantined_database = Some(store.snapshot()?);
+                    // Nothing has changed yet if keeping the copy fails.
+                    match store.snapshot() {
+                        Ok(copy) => report.quarantined_database = Some(copy),
+                        Err(err) => {
+                            marker.abandon();
+                            return Err(err);
+                        }
+                    }
                 }
                 store
             }
             Err(err) if err.is_corruption() => {
                 let db_path = base_dir.join(paths::DB_FILE_NAME);
-                let copy = copy_damaged(&base_dir, &db_path)?;
+                let copy = match copy_damaged(&base_dir, &db_path) {
+                    Ok(copy) => copy,
+                    Err(err) => {
+                        marker.abandon();
+                        return Err(err);
+                    }
+                };
                 if let Err(err) =
                     db::reset_in_place(&db_path, StoreOptions::default().busy_timeout_ms())
                 {
@@ -684,20 +761,34 @@ impl ArtifactStore {
                 return Err(other);
             }
         };
+        before_refill(&base_dir);
         store.refill(&scanned, &mut report)?;
         marker.finish()?;
         count_orphan_release_dirs(&base_dir, &mut report);
         Ok((store, report))
     }
 
-    /// Replace the whole index with `scanned`, in one transaction.
+    /// Replace the whole index with `scanned`, in one transaction committed
+    /// durably — fully synced, with `F_FULLFSYNC` where it exists (macOS) —
+    /// since the repair marker is removed right after: a commit lost to a
+    /// power cut after that would leave an empty index nothing marks as
+    /// incomplete, and gc would delete every build.
     fn refill(&self, scanned: &[ScannedBuild], report: &mut RepairReport) -> Result<()> {
         let mut conn = self.conn();
-        let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        db::maintenance::clear_index(&tx)?;
-        insert_scanned(&mut tx, scanned, report)?;
-        tx.commit()?;
-        Ok(())
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "fullfsync", true)?;
+        let filled = (|| {
+            let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            db::maintenance::clear_index(&tx)?;
+            insert_scanned(&mut tx, scanned, report)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        // Back to the defaults of every store connection (best-effort: the
+        // stricter settings are only slower).
+        let _ = conn.pragma_update(None, "fullfsync", false);
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        filled
     }
 
     /// Keep a consistent copy of this (readable) database beside it, as
@@ -764,9 +855,30 @@ impl ArtifactStore {
         Ok(records)
     }
 
-    /// Where a record's file is read from (verify and gc agree on it).
-    fn record_path(&self, record: &db::maintenance::FileRecord) -> PathBuf {
-        paths::rel_to_abs(&self.base_dir, &record.dir_rel).join(&record.filename)
+    /// Check one record's file at `mode`, the way verify and gc agree on:
+    /// returns where the file is and what is wrong with it, if anything. A
+    /// record whose path the store could not have written — a tampered
+    /// directory or filename, e.g. one naming a file outside the store — is
+    /// [`VerifyProblem::InvalidRecord`], and that file is never touched.
+    fn check_record(
+        &self,
+        mode: VerifyMode,
+        record: &db::maintenance::FileRecord,
+    ) -> (PathBuf, Option<VerifyProblem>) {
+        // Plain components only, so even a tampered record's path stays
+        // inside the store.
+        let rel = format!("{}/{}", record.dir_rel, record.filename);
+        let path = paths::rel_to_abs(&self.base_dir, &rel);
+        if !layout::is_store_rel(&record.dir_rel)
+            || paths::validate_filename(&record.filename).is_err()
+        {
+            let problem = VerifyProblem::InvalidRecord {
+                details: format!("the recorded path '{rel}' is not one the store writes"),
+            };
+            return (path, Some(problem));
+        }
+        let problem = check_file(mode, &path, record.size_bytes, &record.sha256);
+        (path, problem)
     }
 
     /// The records a checksum pass flags, found without the store lock:
@@ -775,16 +887,7 @@ impl ArtifactStore {
         Ok(self
             .file_records()?
             .iter()
-            .filter(|record| {
-                let path = self.record_path(record);
-                check_file(
-                    VerifyMode::Checksum,
-                    &path,
-                    record.size_bytes,
-                    &record.sha256,
-                )
-                .is_some()
-            })
+            .filter(|record| self.check_record(VerifyMode::Checksum, record).1.is_some())
             .map(|record| (record.kind, record.id))
             .collect())
     }
@@ -840,6 +943,7 @@ impl ArtifactStore {
                 Ok(meta) if meta.is_dir() => {
                     rows.live.insert(dir_rel);
                 }
+                // Neither live nor stale: its records stay, unjudged.
                 Err(err)
                     if !matches!(
                         err.kind(),
@@ -849,7 +953,6 @@ impl ArtifactStore {
                     report
                         .failures
                         .push(format!("cannot inspect {}: {err}", path.display()));
-                    rows.blocked.insert(dir_rel);
                 }
                 _ if is_build => rows.builds.push(id),
                 _ => rows.releases.push(id),
@@ -880,8 +983,7 @@ impl ArtifactStore {
                 }
                 other => other,
             };
-            let path = self.record_path(&record);
-            match gc_verdict(depth, &path, &record) {
+            match gc_verdict(self.check_record(depth, &record).1) {
                 GcVerdict::Keep => {
                     kept.insert(file_identity(&record));
                 }
@@ -891,7 +993,12 @@ impl ArtifactStore {
                     report.failures.push(details);
                 }
                 GcVerdict::Drop { delete_file } => {
-                    damaged.push(self.damaged_file(&record, delete_file, report));
+                    match self.damaged_file(&record, delete_file, report) {
+                        Some(file) => damaged.push(file),
+                        None => {
+                            kept.insert(file_identity(&record));
+                        }
+                    }
                 }
             }
         }
@@ -907,16 +1014,26 @@ impl ArtifactStore {
 
     /// A record to drop; its file is deleted only when `delete_file` and the
     /// record names a file in a store-produced directory reached without
-    /// symlinks ([`layout::owned_dir`]).
+    /// symlinks ([`layout::owned_dir`]). `None` — keep the record — when that
+    /// directory cannot be inspected (listed in `report.failures`).
     fn damaged_file(
         &self,
         record: &db::maintenance::FileRecord,
         delete_file: bool,
         report: &mut GcReport,
-    ) -> DamagedFile {
+    ) -> Option<DamagedFile> {
         let mut delete = None;
         if delete_file {
-            delete = layout::owned_dir(&self.base_dir, &record.dir_rel)
+            let dir = match layout::owned_dir(&self.base_dir, &record.dir_rel) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    report
+                        .failures
+                        .push(format!("cannot inspect {}: {err}", record.dir_rel));
+                    return None;
+                }
+            };
+            delete = dir
                 .filter(|_| paths::validate_filename(&record.filename).is_ok())
                 .map(|dir| dir.join(&record.filename));
             if delete.is_none() {
@@ -927,11 +1044,11 @@ impl ArtifactStore {
                 ));
             }
         }
-        DamagedFile {
+        Some(DamagedFile {
             key: (record.kind, record.id),
             identity: file_identity(record),
             delete,
-        }
+        })
     }
 
     /// Drop stale rows and the `dropped` file records, then every build or
@@ -1183,14 +1300,14 @@ fn count_orphan_release_dirs(base_dir: &Path, report: &mut RepairReport) {
 /// Identity of a file record: its table and row id.
 type FileKey = (db::maintenance::FileKind, i64);
 
-/// Records whose directory is gone, those still present (`live`), and
-/// those whose directory cannot be inspected (`blocked`: kept, not judged).
+/// Records whose directory is gone (`builds`, `releases`: row ids) and the
+/// directories still present (`live`). Records whose directory cannot be
+/// inspected are in neither: kept, not judged.
 #[derive(Default)]
 struct StaleRows {
     builds: Vec<i64>,
     releases: Vec<i64>,
     live: HashSet<String>,
-    blocked: HashSet<String>,
 }
 
 /// A damaged file record gc drops, and the file to delete with it (`None`
@@ -1219,11 +1336,12 @@ enum GcVerdict {
     Unreadable(String),
 }
 
-/// Judge one record at `depth` the way `verify` does. A record whose size
-/// cannot be read back is dropped, its file with it; a file that cannot be
-/// read is kept.
-fn gc_verdict(depth: VerifyMode, path: &Path, record: &db::maintenance::FileRecord) -> GcVerdict {
-    match check_file(depth, path, record.size_bytes, &record.sha256) {
+/// What gc does about a record, given what `verify` at the same depth found
+/// wrong with it. A record that cannot be read back is dropped, its file
+/// with it when the store owns that file; a file that cannot be read is
+/// kept.
+fn gc_verdict(problem: Option<VerifyProblem>) -> GcVerdict {
+    match problem {
         None => GcVerdict::Keep,
         Some(VerifyProblem::Missing) => GcVerdict::Drop { delete_file: false },
         Some(
@@ -1263,6 +1381,19 @@ fn gc_delete_damaged(file: &DamagedFile, report: &mut GcReport) -> bool {
     }
 }
 
+/// Remove the lock file a failed repair created, unless the failure left a
+/// repair marker (the store must then stay [`StoreState::Orphaned`], which
+/// the lock file proves). A refused repair — someone else's database, a
+/// newer schema, a database in use — thus leaves the directory as it found
+/// it: a lock file would make it look like a store that owns whatever
+/// store-shaped data later appears there. Best-effort.
+fn forget_lock_file(base_dir: &Path) {
+    if fs::symlink_metadata(base_dir.join(paths::REPAIR_MARKER_NAME)).is_ok() {
+        return;
+    }
+    let _ = fs::remove_file(base_dir.join(paths::LOCK_FILE_NAME));
+}
+
 /// Refuse a directory that holds someone else's data — see
 /// [`StoreState::Foreign`].
 fn refuse_foreign(base_dir: &Path, state: StoreState) -> Result<()> {
@@ -1288,12 +1419,12 @@ fn project_entry<'a>(projects: &'a mut Vec<ProjectUsage>, project: &str) -> &'a 
     &mut projects[last]
 }
 
-/// Sum recorded bytes of victims, saturating at zero for corrupt negatives
-/// and saturating the total so a hostile row cannot overflow the report.
+/// Sum recorded bytes of victims, saturating the total so a hostile row
+/// cannot overflow the report.
 fn sum_bytes(victims: &[db::maintenance::Victim]) -> u64 {
-    victims.iter().fold(0u64, |acc, victim| {
-        acc.saturating_add(u64::try_from(victim.bytes).unwrap_or(0))
-    })
+    victims
+        .iter()
+        .fold(0u64, |acc, victim| acc.saturating_add(victim.bytes))
 }
 
 /// Fold helper: earliest of an optional running value and an optional row.
@@ -1438,16 +1569,34 @@ struct RepairMarker {
 
 impl RepairMarker {
     /// Write the marker durably (unless an interrupted repair left one).
+    /// Never through a symlink: it is created exclusively, and an existing
+    /// marker that is not a regular file is refused before anything
+    /// changes (repair could never remove it, so it would never complete).
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] when it cannot be written: repair must not change the
-    /// database without it.
+    /// [`Error::Io`] when it cannot be written, or an existing one is not a
+    /// regular file: repair must not change the database without it.
     fn create(base_dir: &Path) -> Result<Self> {
         let path = base_dir.join(paths::REPAIR_MARKER_NAME);
-        let inherited = path.exists();
+        let inherited = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => true,
+            Ok(_) => {
+                return Err(Error::Io {
+                    context: format!(
+                        "the repair marker {} is not a regular file; remove it, then repair again",
+                        path.display()
+                    ),
+                    source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+                });
+            }
+            Err(_) => false,
+        };
         if !inherited {
-            let file = fs::File::create(&path)
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
                 .and_then(|file| file.sync_all().map(|()| file))
                 .io_ctx(|| format!("failed to write the repair marker {}", path.display()))?;
             drop(file);
@@ -1499,6 +1648,7 @@ fn sync_dir(dir: &Path) {
 mod tests {
     use super::*;
 
+    /// Where the repair marker of the store at `dir` lives.
     fn marker_path(dir: &Path) -> PathBuf {
         dir.join(paths::REPAIR_MARKER_NAME)
     }
@@ -1526,6 +1676,37 @@ mod tests {
         assert!(marker_path(dir.path()).exists());
         RepairMarker::create(dir.path()).unwrap().finish().unwrap();
         assert!(!marker_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_crash_before_the_refill_commits_leaves_the_store_orphaned() {
+        // Audit: nothing pinned the marker's crash protection — deleting it
+        // right after it is written passed every suite.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let build = base.join("wp-rocket/commits/3.17.4/a1b2c3d");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("wp-rocket.zip"), b"zip").unwrap();
+        fs::write(base.join(paths::DB_FILE_NAME), b"not a sqlite database").unwrap();
+        let _lock = StoreLock::acquire(&base).unwrap();
+
+        let mut mid_repair = None;
+        let (store, report) =
+            ArtifactStore::rebuild_with(base.clone(), Damage::Corrupt, &mut |dir| {
+                mid_repair = Some(layout::inspect(dir).unwrap());
+            })
+            .unwrap();
+        assert_eq!(
+            mid_repair,
+            Some(StoreState::Orphaned {
+                adoptable_builds: 1
+            }),
+            "a crash here must leave the store needing repair"
+        );
+        assert_eq!(report.builds_adopted, 1);
+        assert!(!marker_path(&base).exists());
+        drop(store);
+        assert_eq!(layout::inspect(&base).unwrap(), StoreState::Present);
     }
 
     #[test]

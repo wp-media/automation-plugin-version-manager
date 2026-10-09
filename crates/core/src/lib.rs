@@ -80,23 +80,19 @@ pub use maintenance::{CacheMaintenance, CleanRequest};
 
 use std::path::Path;
 
-use cache_status::StoreSlot;
 use github::GitHubClient;
 use projects::ProjectRegistry;
 
-/// Open the artifact cache for a new instance, best-effort.
+/// Initialize the artifact cache of a new instance, best-effort: opening it
+/// once creates the cache directory at construction, as consumers expect,
+/// and closes it again — an instance holds no handle between builds (see
+/// [`Apvm::cache_status`]). A cache problem must never prevent APVM from
+/// building, so a failure is only logged: every build, warm and status
+/// check opens the cache again and reports it.
 ///
-/// Opening up front initializes the cache directory at construction, as
-/// consumers expect. A cache problem must never prevent APVM from building,
-/// so a failure only leaves the slot empty (and is logged): every build,
-/// warm and status call checks the cache again — see [`Apvm::cache_status`].
-///
-/// I/O note: a quick SQLite open + directory create, also run from the async
-/// constructor; per-build checks run on `spawn_blocking`.
-fn open_cache_store(config: &Config) -> StoreSlot {
-    let slot = StoreSlot::default();
-    slot.refresh(config);
-    slot
+/// Blocking: a SQLite open, which waits for a repair running meanwhile.
+fn init_cache(config: &Config) {
+    drop(cache_status::open_cache(config));
 }
 
 /// Selects which GitHub Release to download.
@@ -177,9 +173,6 @@ pub struct Apvm {
     pub registry: ProjectRegistry,
     /// Source of the resolved token (for diagnostics).
     pub token_source: Option<git::TokenSource>,
-    /// The shared artifact cache, re-checked before each build (see
-    /// [`Apvm::cache_status`]); empty while caching is off or unusable.
-    store: StoreSlot,
 }
 
 impl Apvm {
@@ -199,14 +192,13 @@ impl Apvm {
             .as_ref()
             .map(|_| git::TokenSource::Config);
         let registry = ProjectRegistry::with_known_projects();
-        let store = open_cache_store(&config);
+        init_cache(&config);
 
         Ok(Self {
             config,
             github,
             registry,
             token_source,
-            store,
         })
     }
 
@@ -251,14 +243,15 @@ impl Apvm {
         }
 
         let registry = ProjectRegistry::with_known_projects();
-        let store = open_cache_store(&config);
+        // Off the async runtime: the open may wait for a running repair.
+        let opened = cache_status::open_cache_async(&config).await;
+        cache_status::close_async(opened.0).await;
 
         Ok(Self {
             config,
             github,
             registry,
             token_source,
-            store,
         })
     }
 
@@ -284,14 +277,13 @@ impl Apvm {
             .as_ref()
             .map(|_| git::TokenSource::Config);
         let registry = ProjectRegistry::new(); // Empty registry
-        let store = open_cache_store(&config);
+        init_cache(&config);
 
         Ok(Self {
             config,
             github,
             registry,
             token_source,
-            store,
         })
     }
 
@@ -333,16 +325,16 @@ impl Apvm {
     /// Whether builds on this instance use the artifact cache right now, and
     /// if not, why.
     ///
-    /// Checks the cache again, exactly as each build does: it opens the
-    /// cache when none is open — picking up a cache repaired meanwhile, by
-    /// any front end or process — and replaces an open one whose database
-    /// was deleted or replaced.
-    /// Builds still work whatever the status; they only run uncached.
+    /// Opens the cache afresh, exactly as each build does, and closes it
+    /// again: it reports a cache damaged meanwhile and picks up one repaired
+    /// meanwhile, by any front end or process. Builds still work whatever
+    /// the status; they only run uncached.
     ///
-    /// Blocking (a stat, plus a SQLite open when nothing usable is open):
-    /// from async code, call it inside `tokio::task::spawn_blocking`.
+    /// Blocking — a SQLite open with its integrity check, which also waits
+    /// for a repair running meanwhile: from async code, call it inside
+    /// `tokio::task::spawn_blocking`.
     pub fn cache_status(&self) -> CacheStatus {
-        self.store.refresh(&self.config).1
+        cache_status::open_cache(&self.config).1
     }
 
     /// Whether the artifact cache is active for this instance: shorthand for
@@ -353,7 +345,8 @@ impl Apvm {
 
     /// The configured artifact cache directory (regardless of whether the
     /// store opened successfully), made absolute at construction
-    /// ([`config_io::pin_cache_dir`]).
+    /// ([`config_io::pin_cache_dir`]) — keep it absolute if you change
+    /// [`Apvm::config`] afterwards, or it follows the current directory.
     pub fn cache_dir(&self) -> &Path {
         &self.config.cache_dir
     }
@@ -373,7 +366,7 @@ impl Apvm {
         reporter: &dyn build::progress::ProgressReporter,
     ) -> Result<commands::BuildOutput> {
         // `false` = deliver artifacts to the output directory (a normal build).
-        self.command().await.execute(request, reporter, false).await
+        self.run(request, reporter, false).await
     }
 
     /// Warm the artifact cache for a project without producing any output.
@@ -420,19 +413,27 @@ impl Apvm {
         // `true` = warm-only: run the whole pipeline but deliver nothing to an
         // output directory. `WarmRequest::into_build_request` supplies the
         // fixed `output_dir = ""`, `no_cache = false`.
-        self.command()
-            .await
-            .execute(request.into_build_request(), reporter, true)
-            .await
+        self.run(request.into_build_request(), reporter, true).await
     }
 
-    /// A build command over the cache as it is now: re-checked (see
-    /// [`Apvm::cache_status`]), with its status, so an unusable cache is
-    /// reported as a warning by the build.
-    async fn command(&self) -> commands::BuildCommand<'_> {
-        let (store, status) = self.store.refresh_async(&self.config).await;
-        commands::BuildCommand::new(&self.github, &self.registry, &self.config, store)
-            .with_cache_status(status)
+    /// Run a build command (`warm_cache` = deliver nothing) over the cache
+    /// as it is now: opened afresh (see [`Apvm::cache_status`]), with its
+    /// status, so an unusable cache is reported as a warning by the build —
+    /// then let go of it, so the instance holds no handle between builds.
+    async fn run(
+        &self,
+        request: BuildRequest,
+        reporter: &dyn build::progress::ProgressReporter,
+        warm_cache: bool,
+    ) -> Result<commands::BuildOutput> {
+        let (store, status) = cache_status::open_cache_async(&self.config).await;
+        let outcome =
+            commands::BuildCommand::new(&self.github, &self.registry, &self.config, store.clone())
+                .with_cache_status(status)
+                .execute(request, reporter, warm_cache)
+                .await;
+        cache_status::close_async(store).await;
+        outcome
     }
 
     /// Shared helper for the `build_from_*` conveniences: assemble a
@@ -689,33 +690,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relative_cache_dir_is_pinned_and_its_store_kept() {
+    async fn every_constructor_pins_a_relative_cache_dir() {
+        // Audit C6: only `Apvm::new` was tested; the CLI goes through
+        // `new_with_token_resolution`.
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("cache");
         let Some(relative) = relative_to_cwd(&dir) else {
             return;
         };
         assert!(relative.is_relative());
-        let apvm = Apvm::new(Config::new(relative)).unwrap();
-
-        // Pinned at construction: a later `chdir` cannot move the cache.
-        assert!(
-            apvm.cache_dir().is_absolute(),
-            "{}",
-            apvm.cache_dir().display()
-        );
-        assert_eq!(
-            std::fs::canonicalize(apvm.cache_dir()).unwrap(),
-            std::fs::canonicalize(&dir).unwrap()
-        );
-        // Re-checks keep the open store instead of reopening it each time.
-        let first = apvm.store.current().expect("store open");
-        assert!(apvm.cache_status().is_active());
-        let second = apvm.store.current().expect("store open");
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
-            "store was reopened"
-        );
+        let instances = [
+            Apvm::new(Config::new(relative.clone())).unwrap(),
+            Apvm::new_with_token_resolution(Config::new(relative.clone()))
+                .await
+                .unwrap(),
+            Apvm::new_empty(Config::new(relative)).unwrap(),
+        ];
+        for apvm in instances {
+            // Pinned at construction: a later `chdir` cannot move the cache.
+            assert!(
+                apvm.cache_dir().is_absolute(),
+                "{}",
+                apvm.cache_dir().display()
+            );
+            assert_eq!(
+                std::fs::canonicalize(apvm.cache_dir()).unwrap(),
+                std::fs::canonicalize(&dir).unwrap()
+            );
+            assert!(apvm.cache_status().is_active());
+        }
     }
 
     #[tokio::test]

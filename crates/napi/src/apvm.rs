@@ -122,11 +122,21 @@ impl Apvm {
         // Resolved now, on the calling thread: `APVM_CACHE_DIR` counts as it
         // is when `create()` is called (not when the promise runs), and the
         // environment is never read off the JS thread while JS may write it.
-        let rust_config = resolve_config(config);
+        let rust_config = resolve_config(env, config);
         // Octocrab (HTTP client) requires a Tokio runtime during
-        // initialization, which is why creation is async.
+        // initialization, which is why creation is async. It runs on the
+        // blocking pool (still inside the runtime): opening the cache may
+        // wait for a repair running meanwhile.
         env.spawn_future(async move {
-            let inner = apvm_core::Apvm::new(rust_config).map_err(core_error_to_napi)?;
+            let inner = tokio::task::spawn_blocking(move || apvm_core::Apvm::new(rust_config))
+                .await
+                .map_err(|join| {
+                    napi::Error::new(
+                        napi::Status::GenericFailure,
+                        format!("creating the instance did not complete: {join}"),
+                    )
+                })?
+                .map_err(core_error_to_napi)?;
             Ok(Self {
                 inner: Arc::new(inner),
             })
@@ -181,7 +191,7 @@ impl Apvm {
         ensure_single_copy(env)?;
         // `APVM_CACHE_DIR` is read now, as in `create()`. (Token resolution
         // still reads `GITHUB_TOKEN` / `GH_TOKEN` when the promise runs.)
-        let rust_config = resolve_config(config);
+        let rust_config = resolve_config(env, config);
         env.spawn_future(async move {
             let inner = apvm_core::Apvm::new_with_token_resolution(rust_config)
                 .await
@@ -249,10 +259,11 @@ impl Apvm {
     /// `active`, `disabled` (`cacheEnabled: false`), `corrupted` (call
     /// `cache().repair()`) or `unavailable`, with a `reason` for the last two.
     ///
-    /// Re-checks the cache exactly as each build does, so after a
-    /// `repair()` — from this process, the CLI or anywhere else — it reports
-    /// `active` again and builds resume caching, with no new instance.
-    /// Builds work whatever the status; they only run uncached.
+    /// Opens the cache afresh, exactly as each build does (an instance holds
+    /// no handle between builds), so it reports a cache damaged meanwhile,
+    /// and after a `repair()` — from this process, the CLI or anywhere else —
+    /// it reports `active` again and builds resume caching, with no new
+    /// instance. Builds work whatever the status; they only run uncached.
     ///
     /// # TypeScript
     ///
@@ -265,7 +276,7 @@ impl Apvm {
     #[napi]
     pub async fn cache_status(&self) -> napi::Result<JsCacheStatus> {
         let apvm = Arc::clone(&self.inner);
-        // A stat, plus a SQLite open when nothing usable is open: blocking.
+        // A SQLite open, which may wait for a running repair: blocking.
         let status = tokio::task::spawn_blocking(move || apvm.cache_status())
             .await
             .map_err(|join| {

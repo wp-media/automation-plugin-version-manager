@@ -13,7 +13,9 @@
 //! | `GenericFailure` | anything else (I/O, foreign data, a newer schema, a failed task) | report it |
 //!
 //! Every method returns a promise and reports every error by rejecting it;
-//! only `ApvmCache.open()`, which is synchronous, throws (`InvalidArg`).
+//! only `ApvmCache.open()`, which is synchronous, throws (`InvalidArg`). An
+//! exception the options object itself throws while being read (a getter,
+//! a `Proxy` trap) propagates synchronously, unchanged.
 //!
 //! Each call opens its own store on the blocking thread pool and closes it
 //! before the promise settles, so no handle outlives a call and the event
@@ -80,7 +82,7 @@ impl ApvmCache {
     ///
     /// # Throws
     ///
-    /// `InvalidArg` when `config` is not an object, has an unknown key, or
+    /// `InvalidArg` when `config` is not a plain object, has an unknown key, or
     /// has a `cacheDir` that is not a string — including `undefined` /
     /// `null`: omit the key to mean the default cache. `GenericFailure` when
     /// another copy of this addon is already in use in the process.
@@ -89,10 +91,13 @@ impl ApvmCache {
         ensure_single_copy(env)?;
         let cache_dir = cache_input::read_cache_dir(config)
             .map_err(|message| napi::Error::new(Status::InvalidArg, message))?;
-        let config = resolve_config(Some(ApvmConfig {
-            cache_dir,
-            ..ApvmConfig::default()
-        }));
+        let config = resolve_config(
+            env,
+            Some(ApvmConfig {
+                cache_dir,
+                ..ApvmConfig::default()
+            }),
+        );
         Ok(Self::new(CacheMaintenance::new(config.cache_dir)))
     }
 
@@ -120,7 +125,7 @@ impl ApvmCache {
     ///
     /// # Throws
     ///
-    /// `InvalidArg` for bad options — not an object, an unknown key, a wrong
+    /// `InvalidArg` for bad options — not a plain object, an unknown key, a wrong
     /// type, a key set to `undefined` / `null` (omit it instead), a bad
     /// `olderThan`, `project` or `target` — or an empty path;
     /// `CacheCorrupted`; `GenericFailure`.
@@ -212,15 +217,15 @@ impl ApvmCache {
     /// no-op on a healthy cache. Never renames the database, so other
     /// processes using it cannot be crashed. Interrupted (e.g. the process
     /// exited), it leaves the cache needing repair — never half-indexed — so
-    /// running it again completes it. `Apvm` instances of this process let go
-    /// of the cache first and resume caching on their next build.
+    /// running it again completes it. `Apvm` instances hold the cache open
+    /// only while they build, and resume caching on their next build.
     ///
     /// # Throws
     ///
     /// `InvalidArg` (empty path); `GenericFailure` — never `CacheCorrupted`,
     /// since repair is that remedy — including when another process (or a
-    /// build running here) holds a corrupt database open: nothing is
-    /// changed; retry once it is done.
+    /// build running here) holds open a database file SQLite can no longer
+    /// read: nothing is changed; retry once it is done.
     #[napi(ts_return_type = "Promise<JsRepairReport>")]
     pub fn repair<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, JsRepairReport>> {
         run(env, &self.inner, Action::Repair, |cache| {
@@ -281,11 +286,7 @@ where
     F: FnOnce(&CacheMaintenance) -> apvm_core::Result<V> + Send + 'static,
 {
     let cache = cache.clone();
-    let task = async move {
-        // The semaphore is never closed, so acquiring cannot fail.
-        let _permit = slots().acquire().await.ok();
-        Ok(tokio::task::spawn_blocking(move || op(&cache)).await)
-    };
+    let task = async move { Ok(limited(slots(), move || op(&cache)).await) };
     env.spawn_future_with_callback(task, move |env, joined| match joined {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(js_error(
@@ -299,6 +300,23 @@ where
             format!("the cache task did not complete: {join}"),
         )),
     })
+}
+
+/// Run `work` on the blocking thread pool once `slots` grants a permit,
+/// holding it until `work` is done — so at most as many run at once as
+/// `slots` has permits.
+///
+/// # Errors
+///
+/// The [`JoinError`](tokio::task::JoinError) of a task that panicked or was
+/// cancelled.
+async fn limited<T: Send + 'static>(
+    slots: &Semaphore,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    // The semaphore is never closed, so acquiring cannot fail.
+    let _permit = slots.acquire().await.ok();
+    tokio::task::spawn_blocking(work).await
 }
 
 /// A JS `Error` with `message` and a custom `code`, as a `napi::Error` that
@@ -354,7 +372,7 @@ fn error_message(err: &apvm_core::Error, action: Action) -> String {
     };
     let hint = match err {
         apvm_core::Error::Storage(Storage::MissingDatabase { .. }) if action.offers_repair() => {
-            "The cache database is missing or empty — call repair() to re-index the cache from disk."
+            "The cache database is missing, empty or half-repaired — call repair() to re-index the cache from disk."
         }
         _ if action.offers_repair() && needs_repair(err) => {
             "The cache database is corrupt — call repair() to recover it."
@@ -376,10 +394,12 @@ mod tests {
 
     const ACTIONS: [Action; 3] = [Action::Inspect, Action::Modify, Action::Repair];
 
+    /// `err` as the core wraps it.
     fn storage(err: apvm_storage::Error) -> apvm_core::Error {
         apvm_core::Error::Storage(err)
     }
 
+    /// A database that is not SQLite (`DatabaseCorrupted`).
     fn corrupted() -> apvm_core::Error {
         storage(apvm_storage::Error::DatabaseCorrupted {
             path: PathBuf::from("/c/apvm.db"),
@@ -387,12 +407,14 @@ mod tests {
         })
     }
 
+    /// Rows that cannot be read back (`Data`).
     fn data() -> apvm_core::Error {
         storage(apvm_storage::Error::Data {
             details: "bad timestamp".to_string(),
         })
     }
 
+    /// A lost database beside cached builds (`MissingDatabase`).
     fn missing_db() -> apvm_core::Error {
         storage(apvm_storage::Error::MissingDatabase {
             path: PathBuf::from("/c"),
@@ -400,6 +422,7 @@ mod tests {
         })
     }
 
+    /// Someone else's directory (`ForeignDirectory`).
     fn foreign() -> apvm_core::Error {
         storage(apvm_storage::Error::ForeignDirectory {
             path: PathBuf::from("/c"),
@@ -407,6 +430,7 @@ mod tests {
         })
     }
 
+    /// A storage I/O failure whose cause is not in its message.
     fn storage_io() -> apvm_core::Error {
         storage(apvm_storage::Error::Io {
             context: "failed to open /c".to_string(),
@@ -414,6 +438,7 @@ mod tests {
         })
     }
 
+    /// A rejected `project` filter (`InvalidInput`).
     fn invalid_project() -> apvm_core::Error {
         storage(apvm_storage::Error::InvalidInput {
             what: "project",
@@ -432,8 +457,37 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_slots_allow_at_least_one_call() {
-        assert!(slots().available_permits() >= 1);
+    fn maintenance_slots_allow_one_call_per_cpu() {
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        assert_eq!(slots().available_permits(), cpus);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limited_work_never_exceeds_the_permits() {
+        // Audit: removing the limiter went unnoticed by every test.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slots = Arc::new(Semaphore::new(2));
+        let (running, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let tasks: Vec<_> = (0..12)
+            .map(|_| {
+                let (slots, running, peak) = (slots.clone(), running.clone(), peak.clone());
+                tokio::spawn(async move {
+                    limited(&slots, move || {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        running.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 2, "two permits, two at a time");
+        assert_eq!(slots.available_permits(), 2, "every permit came back");
     }
 
     // ---- error codes ----------------------------------------------------

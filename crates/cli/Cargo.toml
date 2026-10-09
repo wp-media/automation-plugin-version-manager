@@ -69,3 +69,5 @@ openssl = { workspace = true, optional = true }
 # dev-dependency so it is never compiled into the shipped binary — with resolver
 # v3, dev-only features do not leak into normal or release builds.
 tokio = { workspace = true, features = ["test-util"] }
+# Lets cache tests write rows the store cannot read back (tampered metadata).
+rusqlite = { workspace = true }

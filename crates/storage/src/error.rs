@@ -52,8 +52,8 @@ pub enum Error {
     Database(#[from] rusqlite::Error),
 
     /// The database file is not a valid SQLite database or failed the
-    /// integrity check. Use [`crate::ArtifactStore::repair`] to quarantine
-    /// the corrupt file and rebuild a fresh index. The message names no
+    /// integrity check. [`crate::ArtifactStore::repair`] keeps a copy of it,
+    /// resets it in place and rebuilds the index. The message names no
     /// remedy: each front end adds its own (`apvm cache repair`, …).
     #[error("storage database corrupted at {}: {details}", path.display())]
     DatabaseCorrupted {
@@ -80,20 +80,22 @@ pub enum Error {
 
     /// Stored metadata is internally inconsistent (e.g. a negative file size
     /// or an out-of-range timestamp). Indicates external tampering with the
-    /// database; [`crate::ArtifactStore::repair`] quarantines it and rebuilds
-    /// a clean index.
+    /// database; [`crate::ArtifactStore::repair`] keeps a copy of it, then
+    /// clears and re-fills the index in place.
     #[error("corrupt stored metadata: {details}")]
     Data {
         /// Description of the inconsistency.
         details: String,
     },
 
-    /// The directory has no store database and no sign of ever having held
-    /// a store, yet contains `entry`, a subdirectory named like a store
-    /// project. The store refuses to initialize there: its garbage
-    /// collection could later delete that data.
+    /// The directory is not a store, yet contains `entry`: a subdirectory
+    /// named like a store project in a directory without the store's lock
+    /// file (`.apvm.lock`, created before a store's first build and never
+    /// removed), whatever its `apvm.db` holds — or, where a new store would
+    /// be created, anything but operating-system metadata files. The store
+    /// refuses: its garbage collection could later delete that data.
     #[error(
-        "refusing to use {} as an artifact store: it has no apvm database but already \
+        "refusing to use {} as an artifact store: it is not an apvm cache, yet already \
          contains '{entry}' (use a new or empty directory)",
         path.display()
     )]
@@ -111,8 +113,8 @@ pub enum Error {
     /// rebuilds the index. The message names no remedy: each front end adds
     /// its own.
     #[error(
-        "the store database at {} is missing or empty but store content remains \
-         ({adoptable_builds} re-indexable build(s))",
+        "the store database in {} is missing, empty or half-repaired \
+         ({adoptable_builds} re-indexable build(s) on disk)",
         path.display()
     )]
     MissingDatabase {
@@ -123,9 +125,10 @@ pub enum Error {
     },
 
     /// The database is held open by another process or store handle, so it
-    /// cannot be reset in place. Repair refuses rather than swap the file
-    /// out from under them (which can crash them or mix their files): close
-    /// the other users and run repair again.
+    /// cannot be reset in place: SQLite needs exclusive access to reset a
+    /// file it cannot read as a database, and repair never renames the file
+    /// instead (that can crash the other users or mix their files). Nothing
+    /// is changed: close the other users and run repair again.
     #[error(
         "the store database at {} is in use by another process or store handle; \
          close them and try again",
@@ -137,8 +140,8 @@ pub enum Error {
     },
 
     /// The file at the database path is an SQLite database the store did not
-    /// create (no schema version, yet tables). It is never migrated or
-    /// written to.
+    /// create: no schema version, yet tables — or a schema version apvm
+    /// knows without apvm's tables. It is never migrated or written to.
     #[error(
         "{} is an SQLite database that apvm did not create; refusing to use it",
         path.display()
@@ -149,9 +152,9 @@ pub enum Error {
     },
 
     /// This handle's database file is no longer the store's: it was renamed
-    /// aside (a repair quarantining it), deleted or replaced after the handle
-    /// opened it. Mutations refuse, since they would update a database the
-    /// store no longer uses; open the store again.
+    /// aside (as older apvm versions' repair did), deleted or replaced after
+    /// the handle opened it. Mutations refuse, since they would update a
+    /// database the store no longer uses; open the store again.
     #[error(
         "the store database at {} was replaced, moved or deleted after this handle opened it; \
          open the store again",
@@ -176,10 +179,12 @@ impl Error {
 
     /// Whether the store database is damaged in a way
     /// [`crate::ArtifactStore::repair`] fixes: [`Error::DatabaseCorrupted`],
-    /// unreadable rows ([`Error::Data`]), or an SQLite "corrupt" / "not a
-    /// database" failure met after opening ([`Error::Database`]).
-    /// [`Error::MissingDatabase`] is not included: it is a lost database,
-    /// which repair also rebuilds.
+    /// unreadable rows ([`Error::Data`], or a value that does not convert
+    /// to its column's type — invalid UTF-8, a wrong type, an out-of-range
+    /// integer: the tables are `STRICT`, so only damage puts one there), or
+    /// an SQLite "corrupt" / "not a database" failure met after opening
+    /// ([`Error::Database`]). [`Error::MissingDatabase`] is not included: it
+    /// is a lost database, which repair also rebuilds.
     pub fn is_corruption(&self) -> bool {
         use rusqlite::ErrorCode;
         match self {
@@ -188,6 +193,12 @@ impl Error {
                 err.code,
                 ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
             ),
+            Self::Database(
+                rusqlite::Error::Utf8Error(..)
+                | rusqlite::Error::FromSqlConversionFailure(..)
+                | rusqlite::Error::InvalidColumnType(..)
+                | rusqlite::Error::IntegralValueOutOfRange(..),
+            ) => true,
             _ => false,
         }
     }

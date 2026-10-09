@@ -723,15 +723,17 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
 ///   outputDir: '/tmp/output',
 /// });
 ///
-/// // Full options (BackWPup, version required)
-/// await apvm.build({
-///   project: 'backwpup',
-///   gitRef: 'pr:123',
-///   version: '5.1.0',
-///   variants: ['pro', 'free'],
-///   outputDir: '/tmp/output',
-///   onProgress: (event) => console.log(event),
-/// });
+/// // Full options (BackWPup, version required), with progress events
+/// await apvm.build(
+///   {
+///     project: 'backwpup',
+///     gitRef: 'pr:123',
+///     version: '5.1.0',
+///     variants: ['pro', 'free'],
+///     outputDir: '/tmp/output',
+///   },
+///   (err, event) => console.log(err ?? event),
+/// );
 /// ```
 #[napi(object)]
 pub struct BuildOptions {
