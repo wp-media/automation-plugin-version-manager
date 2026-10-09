@@ -260,10 +260,13 @@ fn read_gh_hosts_file(config_path: &std::path::Path) -> Option<String> {
     }
 
     let content = std::fs::read_to_string(config_path).ok()?;
+    // A leading BOM (Windows editors) is not whitespace to `trim`, so it
+    // would hide the first section.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
 
     // Parse the YAML manually (simple case - avoid adding yaml dependency)
     // We're looking for oauth_token under github.com
-    parse_gh_hosts_yaml(&content).filter(|token| has_token_alphabet(token))
+    parse_gh_hosts_yaml(content).filter(|token| has_token_alphabet(token))
 }
 
 /// Get the path to gh CLI hosts config file.
@@ -676,6 +679,16 @@ enterprise.example.com:
         let path = dir.path().join("hosts.yml");
         std::fs::write(&path, "github.com:\n    oauth_token: ghp_x@evil.example/\n").unwrap();
         assert_eq!(read_gh_hosts_file(&path), None);
+    }
+
+    #[test]
+    fn hosts_file_with_a_byte_order_mark_still_yields_its_token() {
+        // A leading BOM (from a Windows editor) is not whitespace to `trim`,
+        // so the `github.com:` section was never found.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("hosts.yml");
+        std::fs::write(&path, "\u{feff}github.com:\n    oauth_token: gho_bom\n").unwrap();
+        assert_eq!(read_gh_hosts_file(&path).as_deref(), Some("gho_bom"));
     }
 
     #[test]

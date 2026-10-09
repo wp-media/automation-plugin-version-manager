@@ -113,7 +113,7 @@ pub fn load_config_or_default<P: AsRef<Path>>(path: P, default_config: Config) -
 pub fn load_config_file<P: AsRef<Path>>(path: P, defaults: &Config) -> Result<Config> {
     let path = path.as_ref();
 
-    match fs::read_to_string(path) {
+    match read_config_text(path) {
         Ok(content) => {
             if content.trim().is_empty() {
                 tracing::debug!("Config file is empty, using defaults");
@@ -129,10 +129,7 @@ pub fn load_config_file<P: AsRef<Path>>(path: P, defaults: &Config) -> Result<Co
             tracing::debug!("Config file not found, using defaults");
             Ok(defaults.clone())
         }
-        Err(e) => Err(Error::Io(io::Error::new(
-            e.kind(),
-            format!("Failed to read config file '{}': {}", path.display(), e),
-        ))),
+        Err(e) => Err(read_failure(path, e)),
     }
 }
 
@@ -225,7 +222,7 @@ pub fn override_cache_dir(mut config: Config, cache_dir: Option<PathBuf>) -> Con
 pub fn load_config_file_raw<P: AsRef<Path>>(path: P) -> Result<ConfigFile> {
     let path = path.as_ref();
 
-    match fs::read_to_string(path) {
+    match read_config_text(path) {
         Ok(content) => {
             if content.trim().is_empty() {
                 return Ok(ConfigFile::default());
@@ -234,10 +231,7 @@ pub fn load_config_file_raw<P: AsRef<Path>>(path: P) -> Result<ConfigFile> {
             parse_config(path, &content)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(ConfigFile::default()),
-        Err(e) => Err(Error::Io(io::Error::new(
-            e.kind(),
-            format!("Failed to read config file '{}': {}", path.display(), e),
-        ))),
+        Err(e) => Err(read_failure(path, e)),
     }
 }
 
@@ -259,6 +253,50 @@ pub fn save_config_file<P: AsRef<Path>>(config_file: &ConfigFile, path: P) -> Re
     let config_path = path.as_ref().to_path_buf();
     save_to_path_impl(config_file, &config_path)?;
     Ok(config_path)
+}
+
+/// The error for a config file that exists but cannot be read as text.
+///
+/// Text that is not UTF-8 (typically UTF-16, which Windows PowerShell 5.1
+/// writes by default) gets an actionable [`Error::Config`]; anything else
+/// (permissions, a directory in the way, ...) stays an [`Error::Io`].
+///
+/// # Arguments
+///
+/// * `path` - The config file
+/// * `e` - The read failure
+fn read_failure(path: &Path, e: io::Error) -> Error {
+    if e.kind() == ErrorKind::InvalidData {
+        return Error::Config(format!(
+            "Config file '{}' is not UTF-8 text (it may have been saved as UTF-16). \
+             Re-save it as UTF-8, or delete it to reset to defaults.",
+            path.display()
+        ));
+    }
+    Error::Io(io::Error::new(
+        e.kind(),
+        format!("Failed to read config file '{}': {e}", path.display()),
+    ))
+}
+
+/// Read a config file as text, dropping a leading UTF-8 byte-order mark.
+///
+/// Some Windows editors (e.g. Notepad) save JSON with a BOM, which is not
+/// part of the content and which serde_json would reject as invalid JSON.
+///
+/// # Arguments
+///
+/// * `path` - The config file
+///
+/// # Errors
+///
+/// Whatever [`fs::read_to_string`] reports (missing file, not UTF-8, ...).
+fn read_config_text(path: &Path) -> io::Result<String> {
+    let mut content = fs::read_to_string(path)?;
+    if content.starts_with('\u{feff}') {
+        content.drain(..'\u{feff}'.len_utf8());
+    }
+    Ok(content)
 }
 
 /// Parse config-file JSON, mapping a failure to an actionable
@@ -298,7 +336,7 @@ fn parse_config<T: DeserializeOwned>(path: &Path, content: &str) -> Result<T> {
 ///
 /// Internal implementation that handles all edge cases.
 fn load_config_from_path(path: &Path) -> Result<Config> {
-    match fs::read_to_string(path) {
+    match read_config_text(path) {
         Ok(content) => {
             // File exists, try to parse it
             if content.trim().is_empty() {
@@ -312,17 +350,14 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
         }
         Err(e) => {
             // File doesn't exist or I/O error
-            Err(Error::Io(io::Error::new(
-                e.kind(),
-                format!("Failed to read config file '{}': {}", path.display(), e),
-            )))
+            Err(read_failure(path, e))
         }
     }
 }
 
 /// Load configuration from a specific path with default fallback.
 fn load_config_from_path_with_default(path: &Path, default_config: Config) -> Result<Config> {
-    match fs::read_to_string(path) {
+    match read_config_text(path) {
         Ok(content) => {
             // File exists, try to parse it
             if content.trim().is_empty() {
@@ -340,10 +375,7 @@ fn load_config_from_path_with_default(path: &Path, default_config: Config) -> Re
         }
         Err(e) => {
             // Other I/O error (permissions, etc.)
-            Err(Error::Io(io::Error::new(
-                e.kind(),
-                format!("Failed to read config file '{}': {}", path.display(), e),
-            )))
+            Err(read_failure(path, e))
         }
     }
 }
@@ -882,6 +914,78 @@ mod tests {
             assert!(message.ends_with("or fix that setting."), "{message}");
             assert!(!message.contains("syntax"), "{message}");
         }
+    }
+
+    #[test]
+    fn a_utf8_byte_order_mark_is_ignored_by_every_loader() {
+        // Windows editors (e.g. Notepad) may save JSON with a BOM, which
+        // serde_json rejects as "expected value at line 1 column 1".
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(
+            &path,
+            "\u{feff}{\"cache_dir\": \"/bom\", \"cache_enabled\": false}",
+        )
+        .unwrap();
+        let defaults = test_config(PathBuf::from("/default/cache"));
+
+        assert_eq!(load_config(&path).unwrap().cache_dir, PathBuf::from("/bom"));
+        assert_eq!(
+            load_config_or_default(&path, defaults.clone())
+                .unwrap()
+                .cache_dir,
+            PathBuf::from("/bom")
+        );
+        assert!(!load_config_file(&path, &defaults).unwrap().cache_enabled);
+        assert_eq!(
+            load_config_file_raw(&path).unwrap().cache_dir,
+            Some(PathBuf::from("/bom"))
+        );
+    }
+
+    #[test]
+    fn a_config_that_is_not_utf8_gets_an_actionable_config_error() {
+        // Windows PowerShell 5.1 writes UTF-16 by default (`>`, `Out-File`).
+        // Every loader must say how to recover, not just "invalid UTF-8".
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain("{}".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        fs::write(&path, utf16).unwrap();
+        let defaults = test_config(PathBuf::from("/default/cache"));
+
+        for message in [
+            config_message(load_config(&path)),
+            config_message(load_config_or_default(&path, defaults.clone())),
+            config_message(load_config_file(&path, &defaults)),
+            config_message(load_config_file_raw(&path)),
+        ] {
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(message.contains("not UTF-8 text"), "{message}");
+            assert!(
+                message.ends_with("Re-save it as UTF-8, or delete it to reset to defaults."),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_holding_only_a_byte_order_mark_counts_as_blank() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, "\u{feff}\n").unwrap();
+        let defaults = test_config(PathBuf::from("/default/cache"));
+
+        assert_eq!(
+            load_config_file(&path, &defaults).unwrap().cache_dir,
+            defaults.cache_dir
+        );
+        assert!(load_config_file_raw(&path).unwrap().is_empty());
+        assert!(
+            config_message(load_config(&path)).ends_with("is empty. Delete it or add valid JSON.")
+        );
     }
 
     #[test]
