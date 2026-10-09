@@ -160,6 +160,40 @@ export declare class Apvm {
    */
   tokenSource(): string | null
   /**
+   * A maintenance handle for the cache this instance builds into (its
+   * `cacheDir` after `APVM_CACHE_DIR`, fixed at `create()`). Works whether
+   * caching is enabled or not; touches nothing on disk.
+   *
+   * # TypeScript
+   *
+   * ```typescript
+   * const usage = await apvm.cache().info();
+   * console.log(`${usage.buildCount} builds, ${usage.totalBytes} bytes`);
+   * ```
+   */
+  cache(): ApvmCache
+  /**
+   * Whether builds on this instance use the artifact cache right now:
+   * `active`, `disabled` (`cacheEnabled: false`), `corrupted` (call
+   * `cache().repair()`) or `unavailable`, with a `reason` for the last two.
+   *
+   * Opens the cache afresh, exactly as each build does (an instance holds
+   * no handle between builds), so it reports a cache damaged meanwhile,
+   * and after a `repair()` — from this process, the CLI or anywhere else —
+   * it reports `active` again and builds resume caching, with no new
+   * instance. Builds work whatever the status; they only run uncached.
+   *
+   * # TypeScript
+   *
+   * ```typescript
+   * const status = await apvm.cacheStatus();
+   * if (status.state === 'corrupted') {
+   *   await apvm.cache().repair();
+   * }
+   * ```
+   */
+  cacheStatus(): Promise<JsCacheStatus>
+  /**
    * List all registered project names.
    *
    * Returns the names of projects that can be built (e.g., `["backwpup", "wp-rocket"]`).
@@ -474,6 +508,125 @@ export declare class Apvm {
 }
 
 /**
+ * Maintenance handle for one artifact cache directory.
+ *
+ * Get one from an instance — `apvm.cache()`, the cache that instance builds
+ * into — or standalone with `ApvmCache.open(config?)`, which needs no
+ * GitHub client. Creating a handle touches nothing on disk, and every
+ * method works whether caching is enabled or not.
+ *
+ * A missing (or empty) cache directory is not an error: every method
+ * resolves with an empty report and creates nothing; `info().exists`
+ * tells "never created" apart from "empty".
+ *
+ * # TypeScript
+ *
+ * ```typescript
+ * const cache = ApvmCache.open({ cacheDir: '/var/lib/apvm/cache' });
+ * await cache.clean({ olderThan: '30d', target: JsCleanTarget.Builds });
+ * let usage;
+ * try {
+ *   usage = await cache.info();
+ * } catch (e) {
+ *   if ((e as { code?: string }).code !== 'CacheCorrupted') throw e;
+ *   await cache.repair();
+ *   usage = await cache.info();
+ * }
+ * ```
+ */
+export declare class ApvmCache {
+  /**
+   * Open the cache that `Apvm.create(config)` would build into: `cacheDir`
+   * (default `~/.apvm/cache`), overridden by `APVM_CACHE_DIR` when set,
+   * and made absolute. Reads only `cacheDir`; touches nothing on disk.
+   *
+   * # Throws
+   *
+   * `InvalidArg` when `config` is not a plain object, has an unknown key, or
+   * has a `cacheDir` that is not a string — including `undefined` /
+   * `null`: omit the key to mean the default cache. `GenericFailure` when
+   * another copy of this addon is already in use in the process.
+   */
+  static open(config?: ApvmConfig | undefined | null): ApvmCache
+  /** The cache directory this handle operates on. */
+  dir(): string
+  /**
+   * Usage totals and a per-project breakdown (`apvm cache info`).
+   *
+   * # Throws
+   *
+   * `CacheCorrupted`; `InvalidArg` (empty path); `GenericFailure`.
+   */
+  info(): Promise<JsCacheUsage>
+  /**
+   * Remove the entries `options` selects (`apvm cache clean`); with no
+   * options, everything. With `dryRun`, only reports them. Options are
+   * validated before the disk is touched, whatever its state.
+   *
+   * # Throws
+   *
+   * `InvalidArg` for bad options — not a plain object, an unknown key, a wrong
+   * type, a key set to `undefined` / `null` (omit it instead), a bad
+   * `olderThan`, `project` or `target` — or an empty path;
+   * `CacheCorrupted`; `GenericFailure`.
+   */
+  clean(options?: CleanOptions | undefined | null): Promise<JsCleanReport>
+  /**
+   * Remove every build and cached release (`apvm cache clear`). There is
+   * no prompt: the call is the consent.
+   *
+   * # Throws
+   *
+   * `CacheCorrupted`; `InvalidArg` (empty path); `GenericFailure`.
+   */
+  clear(): Promise<JsCleanReport>
+  /**
+   * Reconcile the database with disk (`apvm cache gc [--checksum]`):
+   * remove records whose files are missing or damaged (as `verify()` at
+   * the same depth finds them) with those files, plus orphan directories
+   * and stale temp files. Files it cannot read are kept and listed in
+   * `failures`. The next build caches a removed entry again.
+   *
+   * # Throws
+   *
+   * `InvalidArg` for bad options or an empty path; `CacheCorrupted`;
+   * `GenericFailure`.
+   */
+  gc(options?: GcOptions | undefined | null): Promise<JsGcReport>
+  /**
+   * Check stored files (`apvm cache verify [--checksum]`). Resolves with
+   * the problems found — `[]` means healthy; it does not reject for them.
+   * Reports only: `gc()` at the same depth removes what it finds. A
+   * snapshot: an entry removed meanwhile (by `clean()` or a build) may
+   * still be reported as `missing`.
+   *
+   * # Throws
+   *
+   * `InvalidArg` for bad options or an empty path; `CacheCorrupted`;
+   * `GenericFailure`.
+   */
+  verify(options?: VerifyOptions | undefined | null): Promise<JsVerifyIssue[]>
+  /**
+   * Recover the cache (`apvm cache repair`): reset a corrupt database in
+   * place or clear an unreadable one (keeping a copy of either), or
+   * rebuild a missing or blank one; then re-index the builds on disk. A
+   * no-op on a healthy cache. Never renames the database, so other
+   * processes using it cannot be crashed. Interrupted (e.g. the process
+   * exited), it leaves the cache needing repair — never half-indexed — so
+   * running it again completes it. `Apvm` instances hold the cache open
+   * only while they build, and resume caching on their next build.
+   *
+   * # Throws
+   *
+   * `InvalidArg` (empty path); `GenericFailure` — never `CacheCorrupted`,
+   * since repair is that remedy — including when another process (or a
+   * build running here) holds open a database file SQLite can no longer
+   * read: nothing is changed; retry once it is done.
+   */
+  repair(): Promise<JsRepairReport>
+}
+
+/**
  * Configuration options for creating an APVM instance.
  *
  * This is a plain JavaScript object (not a class) that you pass
@@ -503,7 +656,10 @@ export interface ApvmConfig {
   /**
    * Base directory of the artifact cache (the `apvm-storage` store).
    *
-   * When omitted (`null` or `undefined`), defaults to `~/.apvm/cache`.
+   * When omitted, defaults to `~/.apvm/cache`; `APVM_CACHE_DIR`, when set,
+   * overrides either. `Apvm.create` also takes `undefined` as omitted (but
+   * throws `StringExpected` for `null`); `ApvmCache.open` refuses both, so
+   * an unset variable cannot silently select the default cache.
    * This is where cached build artifacts and release assets live; it is
    * distinct from a build's per-invocation `outputDir`.
    *
@@ -550,15 +706,17 @@ export interface ApvmConfig {
  *   outputDir: '/tmp/output',
  * });
  *
- * // Full options (BackWPup, version required)
- * await apvm.build({
- *   project: 'backwpup',
- *   gitRef: 'pr:123',
- *   version: '5.1.0',
- *   variants: ['pro', 'free'],
- *   outputDir: '/tmp/output',
- *   onProgress: (event) => console.log(event),
- * });
+ * // Full options (BackWPup, version required), with progress events
+ * await apvm.build(
+ *   {
+ *     project: 'backwpup',
+ *     gitRef: 'pr:123',
+ *     version: '5.1.0',
+ *     variants: ['pro', 'free'],
+ *     outputDir: '/tmp/output',
+ *   },
+ *   (err, event) => console.log(err ?? event),
+ * );
  * ```
  */
 export interface BuildOptions {
@@ -625,6 +783,51 @@ export interface BuildOptions {
    * level (`cacheEnabled: false`), still warms the cache.
    */
   noCache?: boolean
+}
+
+/**
+ * Options for `ApvmCache.clean()` — the `apvm cache clean` flags, one field
+ * each. With no options, `clean()` removes everything, as in the CLI.
+ *
+ * Read strictly, since the default is destructive: an unknown key, a
+ * wrong type, or a key set to `undefined` / `null` rejects with
+ * `code: 'InvalidArg'` — omit a key to leave it unset.
+ *
+ * # TypeScript
+ *
+ * ```typescript
+ * await cache.clean({ olderThan: '30d', project: 'backwpup', target: JsCleanTarget.Builds });
+ * const preview = await cache.clean({ dryRun: true }); // reports, deletes nothing
+ * ```
+ */
+export interface CleanOptions {
+  /**
+   * Only entries not used within this window: an amount plus a unit —
+   * `m` minutes, `h` hours, `d` days, `w` weeks (e.g. `30d`, `12h`).
+   * Omitted = any age.
+   */
+  olderThan?: string
+  /**
+   * Only this project's entries (e.g. `wp-rocket`). Omitted = every
+   * project.
+   */
+  project?: string
+  /** Report what would be removed without deleting anything. Default `false`. */
+  dryRun?: boolean
+  /** Which record kinds to remove. Default `All`. */
+  target?: JsCleanTarget
+}
+
+/**
+ * Options for `ApvmCache.gc()`. An unknown key or a wrong type rejects
+ * with `code: 'InvalidArg'`.
+ */
+export interface GcOptions {
+  /**
+   * Also re-hash every file and remove those whose content no longer
+   * matches (slowest, most thorough). Default `false`: size check only.
+   */
+  checksum?: boolean
 }
 
 /**
@@ -775,6 +978,9 @@ export interface JsBuildOutput {
  * Each build goes through these phases in order. Use this to track
  * overall build progress in your UI.
  *
+ * Members are plain enumerable properties, like a compiled TypeScript
+ * enum: `Object.values()` lists every value in declaration order.
+ *
  * # TypeScript
  *
  * ```typescript
@@ -785,7 +991,7 @@ export interface JsBuildOutput {
  * }
  * ```
  */
-export declare const enum JsBuildPhase {
+export declare enum JsBuildPhase {
   /** Pre-clone verification of GitHub references (PR existence, etc.). */
   Preflight = 'Preflight',
   /** Consulting the artifact cache for a prior build of the resolved commit. */
@@ -867,11 +1073,134 @@ export interface JsBuildStep {
 }
 
 /**
+ * Whether an `Apvm` instance's builds use the artifact cache right now.
+ *
+ * | `state` | meaning | `reason` |
+ * |---|---|---|
+ * | `active` | builds read and write the cache | absent |
+ * | `disabled` | `cacheEnabled: false` | absent |
+ * | `corrupted` | the database needs `repair()`; builds run uncached | set |
+ * | `unavailable` | the cache cannot be used (permissions, foreign data, newer schema); builds run uncached | set |
+ */
+export interface JsCacheStatus {
+  /** The cache state. */
+  state: 'active' | 'disabled' | 'corrupted' | 'unavailable'
+  /** What is wrong (`corrupted`, `unavailable`). */
+  reason?: string
+}
+
+/** What `ApvmCache.info()` reports (`apvm cache info`). */
+export interface JsCacheUsage {
+  /** The cache directory inspected. */
+  cacheDir: string
+  /**
+   * `false` when no cache exists there yet (the directory is missing or
+   * empty — often a sign of the wrong `cacheDir`); every count is then 0.
+   */
+  exists: boolean
+  /** Bytes of all cached files (builds + releases). */
+  totalBytes: number
+  /** Bytes of build artifacts. */
+  buildsBytes: number
+  /** Bytes of release assets. */
+  releasesBytes: number
+  /** Number of cached builds. */
+  buildCount: number
+  /** Number of cached releases. */
+  releaseCount: number
+  /** Number of cached files (artifacts + assets). */
+  fileCount: number
+  /** Size of the cache database itself. */
+  databaseBytes: number
+  /**
+   * When the oldest cached build was built (ISO-8601). Not its last use:
+   * `clean({ olderThan })` goes by last use.
+   */
+  oldestBuild?: string
+  /** When the newest cached build was built (ISO-8601). */
+  newestBuild?: string
+  /** Per-project breakdown. */
+  projects: Array<JsProjectUsage>
+}
+
+/**
+ * What `ApvmCache.clean()` and `clear()` removed (or, with `dryRun`,
+ * would remove).
+ */
+export interface JsCleanReport {
+  /** Builds removed. */
+  buildsDeleted: number
+  /** Cached releases removed. */
+  releasesDeleted: number
+  /** Bytes freed. */
+  bytesFreed: number
+  /** Whether this was a dry run (nothing deleted). */
+  dryRun: boolean
+  /**
+   * Directories whose removal failed, one line each, with what to do.
+   * Their records are already gone; the next `gc()` retries those inside
+   * the cache layout, and the line says when one must be removed by hand.
+   */
+  failures: Array<string>
+}
+
+/**
+ * Which record kinds `clean()` removes — pass a member, e.g.
+ * `JsCleanTarget.Builds`.
+ *
+ * Members are plain enumerable properties, like a compiled TypeScript
+ * enum: `Object.values()` lists every value in declaration order.
+ */
+export declare enum JsCleanTarget {
+  /** Builds and cached releases (the default). */
+  All = 'All',
+  /** Only builds. */
+  Builds = 'Builds',
+  /** Only cached releases. */
+  Releases = 'Releases',
+}
+
+/** What `ApvmCache.gc()` removed. */
+export interface JsGcReport {
+  /**
+   * Build records dropped: their directory is gone, or none of their
+   * files survived.
+   */
+  staleBuildRows: number
+  /** Release records dropped for the same reasons. */
+  staleReleaseRows: number
+  /**
+   * Directories without a record removed (including those of builds and
+   * releases dropped by this run).
+   */
+  orphanDirsRemoved: number
+  /** Bytes reclaimed from those directories. */
+  orphanBytesRemoved: number
+  /** Stale temporary files swept. */
+  staleTempFilesRemoved: number
+  /**
+   * File records dropped as damaged: missing, wrong size, or — with
+   * `checksum` — wrong content. The next build caches them again.
+   */
+  damagedArtifacts: number
+  /** Bytes of damaged files deleted. */
+  damagedBytesRemoved: number
+  /**
+   * What gc left in place, one line each (unreadable files, failed
+   * deletes, records outside the cache layout).
+   */
+  failures: Array<string>
+}
+
+/**
  * Which output stream a command line came from.
  *
  * Used in `CommandOutput` events to distinguish between stdout and stderr.
+ *
+ * Members are plain enumerable properties, like a compiled TypeScript
+ * enum: `Object.values()` lists every value in declaration order.
  */
-export declare const enum JsOutputStream {
+export declare enum JsOutputStream {
   /** Standard output. */
   Stdout = 'Stdout',
   /** Standard error. */
@@ -923,6 +1252,20 @@ export interface JsProducedArtifact {
   origin: string
 }
 
+/** Per-project share of a [`JsCacheUsage`]. */
+export interface JsProjectUsage {
+  /** Project name (e.g. `wp-rocket`). */
+  project: string
+  /** Number of cached builds. */
+  buildCount: number
+  /** Number of cached releases. */
+  releaseCount: number
+  /** Bytes of build artifacts. */
+  buildsBytes: number
+  /** Bytes of release assets. */
+  releasesBytes: number
+}
+
 /**
  * The type of git reference that was resolved.
  *
@@ -965,6 +1308,9 @@ export interface JsRefSource {
  * the latest or previous release without knowing the exact tag.
  * Drafts are always excluded.
  *
+ * Members are plain enumerable properties, like a compiled TypeScript
+ * enum: `Object.values()` lists every value in declaration order.
+ *
  * | Variant          | Resolves to                                                |
  * |------------------|------------------------------------------------------------|
  * | `LatestStable`   | Latest non-prerelease, non-draft release                   |
@@ -988,7 +1334,7 @@ export interface JsRefSource {
  * );
  * ```
  */
-export declare const enum JsReleaseSelector {
+export declare enum JsReleaseSelector {
   /** Latest stable release (non-prerelease, non-draft). */
   LatestStable = 'LatestStable',
   /** Previous stable release. */
@@ -997,6 +1343,36 @@ export declare const enum JsReleaseSelector {
   Latest = 'Latest',
   /** Previous non-draft release. */
   PreviousLatest = 'PreviousLatest',
+}
+
+/**
+ * What `ApvmCache.repair()` did. All zero / absent / `false` = the cache
+ * was healthy (or absent) and nothing was done.
+ */
+export interface JsRepairReport {
+  /**
+   * Where a copy of the damaged database was kept, for inspection only —
+   * the database itself is reset (corrupt) or cleared (unreadable rows)
+   * in place. Absent when it was healthy, or missing / blank /
+   * half-repaired (see `rebuiltMissingDatabase`).
+   */
+  quarantinedDatabase?: string
+  /**
+   * The database was missing, blank or left half-repaired, and the index
+   * was built again from the files on disk.
+   */
+  rebuiltMissingDatabase: boolean
+  /** Builds re-indexed from disk. */
+  buildsAdopted: number
+  /** Artifact files re-indexed (hashes recomputed). */
+  artifactsAdopted: number
+  /** Directories or files skipped as not adoptable. */
+  entriesSkipped: number
+  /**
+   * Release directories left on disk without records (release metadata
+   * cannot be rebuilt from files); download again or `gc()` them.
+   */
+  orphanReleaseDirs: number
 }
 
 /**
@@ -1013,6 +1389,52 @@ export interface JsResolvedRef {
   gitRef: string
   /** Full commit SHA, if resolved. */
   commitSha?: string
+}
+
+/**
+ * One problem `ApvmCache.verify()` found — a flattened union: `kind` says
+ * which context fields are set, `problem` which detail fields are.
+ *
+ * | `kind` | set |
+ * |---|---|
+ * | `build` | `version`, `commit` |
+ * | `release` | `tag` |
+ *
+ * | `problem` | set |
+ * |---|---|
+ * | `missing` | — |
+ * | `size_mismatch` | `expectedSize`, `actualSize` |
+ * | `checksum_mismatch` | `expectedSha256`, `actualSha256` |
+ * | `unreadable` | `details` — the file cannot be read; `gc()` keeps it |
+ * | `invalid_record` | `details` — the record is corrupt; `gc()` removes it |
+ */
+export interface JsVerifyIssue {
+  /** Project the file belongs to. */
+  project: string
+  /** Whether the file is a build artifact or a release asset. */
+  kind: 'build' | 'release'
+  /** Build version (`kind: 'build'`). */
+  version?: string
+  /** Build commit SHA (`kind: 'build'`). */
+  commit?: string
+  /** Release tag (`kind: 'release'`). */
+  tag?: string
+  /** The affected filename. */
+  filename: string
+  /** Absolute path of the affected file. */
+  path: string
+  /** What is wrong. */
+  problem: 'missing' | 'size_mismatch' | 'checksum_mismatch' | 'unreadable' | 'invalid_record'
+  /** Recorded size (`size_mismatch`). */
+  expectedSize?: number
+  /** Size on disk (`size_mismatch`). */
+  actualSize?: number
+  /** Recorded SHA-256 (`checksum_mismatch`). */
+  expectedSha256?: string
+  /** SHA-256 of the file on disk (`checksum_mismatch`). */
+  actualSha256?: string
+  /** What is wrong (`unreadable`, `invalid_record`). */
+  details?: string
 }
 
 /**
@@ -1044,6 +1466,18 @@ export interface JsVersionOverride {
    * e.g. `["Version: header", "WP_ROCKET_VERSION"]`.
    */
   sites: Array<string>
+}
+
+/**
+ * Options for `ApvmCache.verify()`. An unknown key or a wrong type rejects
+ * with `code: 'InvalidArg'`.
+ */
+export interface VerifyOptions {
+  /**
+   * Re-hash every file and compare to its recorded checksum (slowest,
+   * most thorough). Default `false`: presence and size only.
+   */
+  checksum?: boolean
 }
 
 /**
