@@ -72,13 +72,6 @@ pub(crate) fn validate_project(project: &str) -> Result<()> {
     if project.is_empty() {
         return Err(Error::invalid("project", project, "must not be empty"));
     }
-    if project.len() > 64 {
-        return Err(Error::invalid(
-            "project",
-            project,
-            "longer than 64 characters",
-        ));
-    }
     let mut chars = project.chars();
     let first = chars.next().unwrap_or(' ');
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
@@ -96,6 +89,14 @@ pub(crate) fn validate_project(project: &str) -> Result<()> {
             "project",
             project,
             "only lowercase letters, digits, '.', '_' and '-' are allowed",
+        ));
+    }
+    // Checked after the ASCII-only rules, so bytes == characters here.
+    if project.len() > 64 {
+        return Err(Error::invalid(
+            "project",
+            project,
+            "longer than 64 characters",
         ));
     }
     if project.ends_with('.') {
@@ -128,13 +129,6 @@ pub(crate) fn validate_version(version: &str) -> Result<()> {
     if version.is_empty() {
         return Err(Error::invalid("version", version, "must not be empty"));
     }
-    if version.len() > 64 {
-        return Err(Error::invalid(
-            "version",
-            version,
-            "longer than 64 characters",
-        ));
-    }
     if !version
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
@@ -143,6 +137,14 @@ pub(crate) fn validate_version(version: &str) -> Result<()> {
             "version",
             version,
             "only letters, digits, '.', '_', '+' and '-' are allowed",
+        ));
+    }
+    // Checked after the ASCII-only rule, so bytes == characters here.
+    if version.len() > 64 {
+        return Err(Error::invalid(
+            "version",
+            version,
+            "longer than 64 characters",
         ));
     }
     if !version.chars().any(|c| c.is_ascii_digit()) {
@@ -189,14 +191,14 @@ pub(crate) fn validate_commit(commit: &str) -> Result<String> {
 }
 
 /// Validate a release tag. Tags live in the database (the directory name is
-/// a sanitized derivation), so only sanity limits apply: 1–200 chars, no
-/// control characters.
+/// a sanitized derivation), so only sanity limits apply: 1–200 bytes of
+/// UTF-8, no control characters.
 pub(crate) fn validate_tag(tag: &str) -> Result<()> {
     if tag.is_empty() {
         return Err(Error::invalid("tag", tag, "must not be empty"));
     }
     if tag.len() > 200 {
-        return Err(Error::invalid("tag", tag, "longer than 200 characters"));
+        return Err(Error::invalid("tag", tag, "longer than 200 bytes"));
     }
     if tag.chars().any(char::is_control) {
         return Err(Error::invalid(
@@ -209,13 +211,13 @@ pub(crate) fn validate_tag(tag: &str) -> Result<()> {
 }
 
 /// Validate a source reference or branch name (database-only values):
-/// 1–500 chars, no control characters.
+/// 1–500 bytes of UTF-8, no control characters.
 pub(crate) fn validate_reference(what: &'static str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(Error::invalid(what, value, "must not be empty"));
     }
     if value.len() > 500 {
-        return Err(Error::invalid(what, value, "longer than 500 characters"));
+        return Err(Error::invalid(what, value, "longer than 500 bytes"));
     }
     if value.chars().any(char::is_control) {
         return Err(Error::invalid(
@@ -227,17 +229,14 @@ pub(crate) fn validate_reference(what: &'static str, value: &str) -> Result<()> 
     Ok(())
 }
 
-/// Validate a variant identifier: 1–100 chars, no control characters.
+/// Validate a variant identifier: 1–100 bytes of UTF-8, no control
+/// characters.
 pub(crate) fn validate_variant(variant: &str) -> Result<()> {
     if variant.is_empty() {
         return Err(Error::invalid("variant", variant, "must not be empty"));
     }
     if variant.len() > 100 {
-        return Err(Error::invalid(
-            "variant",
-            variant,
-            "longer than 100 characters",
-        ));
+        return Err(Error::invalid("variant", variant, "longer than 100 bytes"));
     }
     if variant.chars().any(char::is_control) {
         return Err(Error::invalid(
@@ -252,7 +251,8 @@ pub(crate) fn validate_variant(variant: &str) -> Result<()> {
 /// Validate an artifact filename so it is safe as a single path component on
 /// every supported platform.
 ///
-/// Rules: 1–200 chars; no path separators, control chars, or `< > : " | ? *`;
+/// Rules: 1–200 bytes of UTF-8 (filesystems cap name *bytes*); no path
+/// separators, control chars, or `< > : " | ? *`;
 /// not `.` or `..`; not starting with `.apvm-tmp-` (in-flight copies, which
 /// gc sweeps); no leading space; no trailing space or dot; not a Windows
 /// reserved device name (`CON`, `NUL`, `COM1`, ...).
@@ -261,11 +261,7 @@ pub(crate) fn validate_filename(name: &str) -> Result<()> {
         return Err(Error::invalid("filename", name, "must not be empty"));
     }
     if name.len() > 200 {
-        return Err(Error::invalid(
-            "filename",
-            name,
-            "longer than 200 characters",
-        ));
+        return Err(Error::invalid("filename", name, "longer than 200 bytes"));
     }
     if name == "." || name == ".." {
         return Err(Error::invalid(
@@ -633,6 +629,40 @@ mod tests {
         let name = |len: usize| format!("{}.zip", "f".repeat(len - 4));
         assert!(validate_filename(&name(200)).is_ok());
         assert!(rejection(validate_filename(&name(201))).contains("longer than 200"));
+    }
+
+    #[test]
+    fn ascii_only_fields_report_the_character_rule_before_the_length() {
+        // 40 × "é" is 40 characters but 80 bytes: the real problem is the
+        // character set, and only then does "64 characters" hold true.
+        let wide = "é".repeat(40);
+        assert!(rejection(validate_version(&wide)).starts_with("only letters, digits"));
+        assert!(rejection(validate_project(&wide)).starts_with("must start with a lowercase"));
+        assert!(
+            rejection(validate_project(&format!("a{wide}"))).starts_with("only lowercase letters")
+        );
+    }
+
+    #[test]
+    fn non_ascii_limits_count_bytes_and_say_so() {
+        // 101 × "é" is 101 characters but 202 bytes (UTF-8). The caps are
+        // byte caps (filesystems limit name bytes), and the message must not
+        // claim "characters" for a value well under 200 characters.
+        let wide = |count: usize| "é".repeat(count);
+        assert!(validate_tag(&wide(100)).is_ok());
+        assert_eq!(rejection(validate_tag(&wide(101))), "longer than 200 bytes");
+        assert_eq!(
+            rejection(validate_reference("branch", &wide(251))),
+            "longer than 500 bytes"
+        );
+        assert_eq!(
+            rejection(validate_variant(&wide(51))),
+            "longer than 100 bytes"
+        );
+        assert_eq!(
+            rejection(validate_filename(&format!("{}.zip", wide(99)))),
+            "longer than 200 bytes"
+        );
     }
 
     #[test]
