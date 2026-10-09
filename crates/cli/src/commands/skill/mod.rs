@@ -19,6 +19,8 @@ use clap::{Args, Subcommand};
 
 use apvm_core::error::{Error, Result};
 
+use crate::status::{info, success, warn};
+
 mod embedded;
 mod fs_ops;
 
@@ -34,25 +36,6 @@ pub(crate) use fs_ops::UninstallOutcome;
 ///
 /// Source: <https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-crates>
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ANSI color helpers (same style as update.rs / uninstall.rs)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Green check mark for success messages.
-fn success(msg: &str) {
-    eprintln!("  \x1b[32m✓\x1b[0m  {msg}");
-}
-
-/// Blue info prefix.
-fn info(msg: &str) {
-    eprintln!("\x1b[34minfo\x1b[0m  {msg}");
-}
-
-/// Yellow warn prefix.
-fn warn(msg: &str) {
-    eprintln!("\x1b[33mwarn\x1b[0m  {msg}");
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI definition

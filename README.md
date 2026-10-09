@@ -368,7 +368,7 @@ Every command other than `update` and `uninstall` performs a **non-blocking, bac
 - **Throttled** — the network check runs at most **once per hour**, tracked in `~/.apvm/update-check.json`. Repeated invocations within the hour reuse the cached result, so nearly every run does no network work and stays instant.
 - **Report-only** — it never downloads or replaces anything; upgrading is always an explicit `apvm update`.
 - **Safe** — the check runs concurrently with your command and is bounded by a short timeout, so a slow or unreachable GitHub never stalls the CLI, and it **never changes the exit code** (only `apvm update` itself can fail).
-- **Quiet by default where it should be** — suppressed when stderr is not a TTY (pipes, CI), rendered without color when `NO_COLOR` is set, and disabled entirely by `APVM_NO_UPDATE_CHECK=1`.
+- **Quiet by default where it should be** — suppressed when stderr is not a TTY (pipes, CI), rendered without color when `NO_COLOR` is set (to any non-empty value), and disabled entirely by `APVM_NO_UPDATE_CHECK=1`.
 
 Running `apvm update` also refreshes this state, so the notice stays in sync and does not immediately re-report.
 

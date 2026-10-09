@@ -7,6 +7,7 @@ mod commands;
 mod defaults;
 mod paths;
 mod sanitize;
+mod status;
 mod update_check;
 
 use std::process::ExitCode;

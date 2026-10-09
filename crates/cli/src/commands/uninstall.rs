@@ -32,6 +32,8 @@ use std::path::PathBuf;
 
 use apvm_core::error::{Error, Result};
 
+use crate::status::{bold, dim, info, success, warn, yellow};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,40 +42,6 @@ use apvm_core::error::{Error, Result};
 ///
 /// Source: <https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-crates>
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ANSI color helpers (same style as update.rs)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Green check mark for success messages.
-fn success(msg: &str) {
-    eprintln!("  \x1b[32m✓\x1b[0m  {msg}");
-}
-
-/// Blue info prefix.
-fn info(msg: &str) {
-    eprintln!("\x1b[34minfo\x1b[0m  {msg}");
-}
-
-/// Dim text.
-fn dim(msg: &str) -> String {
-    format!("\x1b[2m{msg}\x1b[0m")
-}
-
-/// Bold text.
-fn bold(msg: &str) -> String {
-    format!("\x1b[1m{msg}\x1b[0m")
-}
-
-/// Yellow text.
-fn yellow(msg: &str) -> String {
-    format!("\x1b[33m{msg}\x1b[0m")
-}
-
-/// Yellow warn prefix.
-fn warn(msg: &str) {
-    eprintln!("\x1b[33mwarn\x1b[0m  {msg}");
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Binary location

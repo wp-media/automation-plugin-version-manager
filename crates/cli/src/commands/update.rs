@@ -30,6 +30,7 @@ use apvm_core::error::{Error, Result};
 use apvm_core::github::{GitHubClient, Release, ReleaseAsset};
 
 use crate::paths::Paths;
+use crate::status::{self, info, success, warn};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -51,30 +52,6 @@ const CHECKSUMS_FILENAME: &str = "checksums.txt";
 ///
 /// Source: <https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-crates>
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ANSI color helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Green check mark for success messages.
-fn success(msg: &str) {
-    eprintln!("  \x1b[32m✓\x1b[0m  {msg}");
-}
-
-/// Blue info prefix.
-fn info(msg: &str) {
-    eprintln!("\x1b[34minfo\x1b[0m  {msg}");
-}
-
-/// Red error prefix.
-fn error_msg(msg: &str) {
-    eprintln!("\x1b[31merror\x1b[0m {msg}");
-}
-
-/// Yellow warn prefix.
-fn warn(msg: &str) {
-    eprintln!("\x1b[33mwarn\x1b[0m  {msg}");
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Platform detection
@@ -390,9 +367,9 @@ pub async fn execute(paths: &Paths) -> Result<()> {
     let actual_hash: String = hash_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     if actual_hash != expected_hash {
-        error_msg("Checksum verification failed!");
-        error_msg(&format!("  Expected: {expected_hash}"));
-        error_msg(&format!("  Actual:   {actual_hash}"));
+        status::error("Checksum verification failed!");
+        status::error(&format!("  Expected: {expected_hash}"));
+        status::error(&format!("  Actual:   {actual_hash}"));
         return Err(Error::Update(
             "SHA-256 checksum mismatch — the download may be corrupted.\n\
              Please try again. If the problem persists, report it at:\n\

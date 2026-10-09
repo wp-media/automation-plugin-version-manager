@@ -221,13 +221,134 @@ mod tests {
     /// Whether the skill mentions the short flag `-c` as a standalone token
     /// (`-y`, `[-y]`, `` `-y` ``), not as part of a longer word.
     fn mentions_short(text: &str, short: char) -> bool {
-        let flag = format!("-{short}");
-        text.match_indices(&flag).any(|(i, _)| {
+        mentions_token(text, &format!("-{short}"))
+    }
+
+    /// Whether the skill mentions the long flag `--name` as a whole token, so
+    /// `--verbose` never counts as documenting `--ver`.
+    fn mentions_long(text: &str, long: &str) -> bool {
+        mentions_token(text, &format!("--{long}"))
+    }
+
+    /// Whether `flag` occurs in `text` with no word character or `-` directly
+    /// before or after it.
+    fn mentions_token(text: &str, flag: &str) -> bool {
+        let is_word = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+        text.match_indices(flag).any(|(i, _)| {
             let before = text[..i].chars().next_back();
             let after = text[i + flag.len()..].chars().next();
-            !before.is_some_and(|c| c.is_alphanumeric() || c == '-')
-                && !after.is_some_and(|c| c.is_alphanumeric() || c == '-')
+            !before.is_some_and(is_word) && !after.is_some_and(is_word)
         })
+    }
+
+    /// One line of a skill file with the markdown headings it sits under.
+    struct ScopedLine<'a> {
+        /// Headings enclosing the line, outermost first.
+        headings: Vec<&'a str>,
+        /// The line itself.
+        text: &'a str,
+    }
+
+    /// Split every embedded skill file into lines tagged with their enclosing
+    /// headings. `#` lines inside fenced code blocks are shell comments, not
+    /// headings; each file starts with no headings.
+    fn scoped_lines() -> Vec<ScopedLine<'static>> {
+        SKILL_FILES
+            .iter()
+            .flat_map(|file| scope_lines(file.contents))
+            .collect()
+    }
+
+    /// [`scoped_lines`] for one markdown document.
+    fn scope_lines(markdown: &str) -> Vec<ScopedLine<'_>> {
+        let mut stack: Vec<(usize, &str)> = Vec::new();
+        let mut in_fence = false;
+        let mut lines = Vec::new();
+        for text in markdown.lines() {
+            if text.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+            }
+            let level = text.chars().take_while(|&c| c == '#').count();
+            if !in_fence && level > 0 && text[level..].starts_with(' ') {
+                stack.retain(|&(outer, _)| outer < level);
+                stack.push((level, text));
+            }
+            lines.push(ScopedLine {
+                headings: stack.iter().map(|&(_, heading)| heading).collect(),
+                text,
+            });
+        }
+        lines
+    }
+
+    /// Whether a flag of `apvm <path>` — found in a line by `mentions` — is
+    /// documented where that command is: on a line naming the command itself,
+    /// or anywhere in a section whose heading names the command or one of its
+    /// parents (`### apvm cache` covers `cache clear`). Global flags (`path`
+    /// empty) may appear anywhere.
+    fn documents_flag(
+        lines: &[ScopedLine<'_>],
+        path: &str,
+        mentions: impl Fn(&str) -> bool,
+    ) -> bool {
+        let words: Vec<&str> = path.split_whitespace().collect();
+        let scopes: Vec<String> = (1..=words.len())
+            .map(|n| format!("apvm {}", words[..n].join(" ")))
+            .collect();
+        let own = format!("apvm {path}");
+        lines.iter().any(|line| {
+            mentions(line.text)
+                && (path.is_empty()
+                    || mentions_token(line.text, &own)
+                    || line
+                        .headings
+                        .iter()
+                        .any(|heading| scopes.iter().any(|scope| mentions_token(heading, scope))))
+        })
+    }
+
+    #[test]
+    fn scope_lines_tracks_nested_headings_but_not_code_comments() {
+        let doc = "# Top\n## `apvm cache`\n### flags\n```sh\n# a comment\nx\n```\n## Other\ny";
+        let lines = scope_lines(doc);
+        let headings_of = |text: &str| {
+            lines
+                .iter()
+                .find(|l| l.text == text)
+                .map(|l| l.headings.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(headings_of("x"), ["# Top", "## `apvm cache`", "### flags"]);
+        assert_eq!(headings_of("y"), ["# Top", "## Other"]);
+    }
+
+    #[test]
+    fn documents_flag_only_counts_the_flags_own_command() {
+        let doc = "\
+## `apvm info`
+  gulp (auto-install: npm install --global gulp-cli)
+## `apvm cache <SUBCMD>`
+| `clear` | prompts unless `-y`/`--yes` |
+## Examples
+apvm cache verify --checksum
+apvm build x --verbose
+";
+        let lines = scope_lines(doc);
+        let long = |name: &'static str| move |line: &str| mentions_long(line, name);
+        // Another command's section, even one quoting `--global`, is no proof.
+        assert!(!documents_flag(&lines, "skill install", long("global")));
+        // A parent command's section covers its subcommands...
+        assert!(documents_flag(&lines, "cache clear", long("yes")));
+        assert!(documents_flag(&lines, "cache clear", |line: &str| {
+            mentions_short(line, 'y')
+        }));
+        // ...but not unrelated commands sharing the flag.
+        assert!(!documents_flag(&lines, "uninstall", long("yes")));
+        // A line naming the exact command documents it anywhere.
+        assert!(documents_flag(&lines, "cache verify", long("checksum")));
+        assert!(!documents_flag(&lines, "cache gc", long("checksum")));
+        // Global flags may be documented anywhere.
+        assert!(documents_flag(&lines, "", long("verbose")));
     }
 
     #[test]
@@ -236,6 +357,15 @@ mod tests {
         assert!(mentions_short("`apvm cache clear [-y]`", 'y'));
         assert!(!mentions_short("a pre-yes word", 'y'));
         assert!(!mentions_short("--yes", 'y'));
+    }
+
+    #[test]
+    fn mentions_long_matches_only_whole_flags() {
+        assert!(mentions_long("apvm build x --ver 5.1.0", "ver"));
+        assert!(mentions_long("`--yes`", "yes"));
+        assert!(mentions_long("[--global]", "global"));
+        assert!(!mentions_long("apvm build x --verbose", "ver"));
+        assert!(!mentions_long("--no-cache", "no"));
     }
 
     #[test]
@@ -265,18 +395,24 @@ mod tests {
         let mut commands = Vec::new();
         walk(&root, "", &mut commands);
 
-        let text = skill_text();
+        let lines = scoped_lines();
         let mut missing = Vec::new();
         for (path, cmd) in &commands {
             for arg in cmd.get_arguments().filter(|a| !a.is_hide_set()) {
-                // The long form is the canonical spelling; a short-only
-                // mention (`apvm uninstall -y`) still documents the flag.
-                let documented = arg
-                    .get_long()
-                    .is_some_and(|long| text.contains(&format!("--{long}")))
-                    || arg.get_short().is_some_and(|c| mentions_short(&text, c));
-                let named = arg.get_long().is_some() || arg.get_short().is_some();
-                if named && !documented {
+                // The long form is the canonical spelling, so it must be
+                // documented whenever it exists (a short `-y` alone hides
+                // `--yes` from readers); a short-only flag needs its short
+                // form. Positionals have neither and are covered by usage.
+                let documented = match (arg.get_long(), arg.get_short()) {
+                    (Some(long), _) => {
+                        documents_flag(&lines, path, |line| mentions_long(line, long))
+                    }
+                    (None, Some(short)) => {
+                        documents_flag(&lines, path, |line| mentions_short(line, short))
+                    }
+                    (None, None) => true,
+                };
+                if !documented {
                     missing.push(format!("apvm {path} {}", arg.get_id()));
                 }
             }

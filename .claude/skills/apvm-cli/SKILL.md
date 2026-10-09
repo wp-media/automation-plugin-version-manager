@@ -24,11 +24,15 @@ Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.3.0**
 - **`--verbose`** (also `--verbose` after the subcommand) — show full command
   output instead of the spinner. Applies to every subcommand.
 - **`--version` / `-V`** — print version, supported on every subcommand.
-- **`NO_COLOR=<anything>`** — disable ANSI colors (`https://no-color.org`).
-  Colors are also auto-disabled when stdout is not a TTY.
+- **`NO_COLOR=<non-empty>`** — disable ANSI colors (`https://no-color.org`;
+  an empty `NO_COLOR=` does not count). Colors are also auto-disabled per
+  stream: stdout output when stdout is not a TTY, stderr status lines
+  (`✓`/`info`/`warn`/`error`, prompts) when stderr is not a TTY.
 - Exit codes: `0` success, `1` any error (verify exits 1 when issues found),
   `2` invalid arguments (e.g. `cache clean --builds --releases`).
 - `RUST_LOG=debug|trace` — enable tracing (`tracing-subscriber` `EnvFilter`).
+  The log lines go to **stdout**, mixed with the command's output, and keep
+  their colors when piped unless `NO_COLOR` is set.
 - **`APVM_CACHE_DIR=<path>`** — override the cache directory for one
   invocation. Takes precedence over the config `cache-dir` and the default
   `~/.apvm/cache`. Honored by both `apvm build` and `apvm cache`.
@@ -207,7 +211,7 @@ yet.
 | `gc`       | Remove what `verify` reports at the same depth: records whose files are missing or the wrong size, or whose record is invalid (the bad files deleted; `--checksum` also catches same-size corruption), plus orphan dirs and stale temp files. The next build re-caches what was removed. Files it cannot read are kept and listed on stderr (exit 0). Removes only what apvm created; never follows symlinks |
 | `verify`   | Check integrity (presence + size; `--checksum` re-hashes). **Exits non-zero on issues** so CI can gate on cache health; the hint names the `gc` that removes them (`gc --checksum` for checksum mismatches) |
 | `repair`   | Reset a corrupt DB in place (including one that only SQLite's full integrity check finds damaged) or clear an unreadable one (a copy of either kept as `apvm.db.corrupt-<ts>`), or rebuild a missing / empty / half-repaired one; then re-index builds from disk (build output only — never hidden or OS metadata files). Never renames the DB; crash-safe (an interrupted repair leaves the cache "needs repair", never half-indexed — run it again). Refuses, changing nothing, while another process holds open a DB file it can no longer read (only a running build does: idle apvm instances hold no handle) |
-| `clear`    | Remove everything (prompts unless `-y`; a corrupt cache errors before prompting; one whose rows cannot be read back is still cleared) |
+| `clear`    | Remove everything (prompts unless `-y`/`--yes`; a corrupt cache errors before prompting; one whose rows cannot be read back is still cleared) |
 
 #### `apvm cache clean` flags
 
@@ -361,7 +365,7 @@ it never self-updates.
 
 ---
 
-### `apvm uninstall [-y]`
+### `apvm uninstall [-y|--yes]`
 
 Removes the `apvm` binary and its containing `bin/` directory
 (`~/.apvm/bin/`), plus the **global** Claude Code skill
@@ -377,7 +381,7 @@ with `apvm skill uninstall` *before* uninstalling the binary.
 
 ```sh
 apvm uninstall          # prompts for confirmation
-apvm uninstall -y       # skip confirmation
+apvm uninstall -y       # skip confirmation (same as --yes)
 ```
 
 ---

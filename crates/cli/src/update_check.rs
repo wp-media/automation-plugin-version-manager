@@ -329,7 +329,7 @@ pub fn maybe_start(paths: &Paths, command_eligible: bool) -> Option<Checker> {
 
     // `should_check` already guaranteed stderr is a TTY, so color depends only
     // on NO_COLOR here.
-    let color = std::env::var_os("NO_COLOR").is_none();
+    let color = !crate::color::no_color_requested();
 
     Some(Checker {
         handle,

@@ -249,3 +249,32 @@ fn update_check_never_runs_when_stderr_is_not_a_terminal() {
     assert!(stderr(&out).is_empty(), "{}", stderr(&out));
     assert!(!sandbox.home().join(".apvm/update-check.json").exists());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plain output in pipes
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn stderr_messages_carry_no_escape_codes_when_piped() {
+    // Status lines (✓/info/warn), the uninstall plan and its prompt must stay
+    // plain in pipes and logs — whether or not NO_COLOR is set — since
+    // stderr is not a terminal here.
+    for sandbox in [Sandbox::new(), Sandbox::new().without_env("NO_COLOR")] {
+        let binary = sandbox.installed_copy();
+        let outputs = [
+            sandbox.run(&["skill", "install"]),
+            sandbox.run(&["skill", "install", "-g"]),
+            sandbox.run(&["skill", "uninstall"]),
+            sandbox.run_binary(&binary, &["uninstall"], "n\n"),
+        ];
+        for out in &outputs {
+            assert_exit(out, 0);
+            let err = stderr(out);
+            assert!(!err.is_empty(), "expected status output");
+            assert!(
+                !err.contains('\x1b'),
+                "escape codes in piped stderr:\n{err:?}"
+            );
+        }
+    }
+}

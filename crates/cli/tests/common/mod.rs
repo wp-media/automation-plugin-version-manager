@@ -40,6 +40,8 @@ pub struct Sandbox {
     /// When `true`, `APVM_CACHE_DIR` is not exported (exercises the config
     /// file / default cache location instead).
     without_cache_env: bool,
+    /// Allow-listed variables to drop again (see [`Sandbox::without_env`]).
+    removed_env: Vec<&'static str>,
 }
 
 impl Sandbox {
@@ -51,6 +53,7 @@ impl Sandbox {
             cwd: TempDir::new().expect("temp cwd"),
             scratch: TempDir::new().expect("temp scratch"),
             without_cache_env: false,
+            removed_env: Vec::new(),
         }
     }
 
@@ -62,6 +65,13 @@ impl Sandbox {
             without_cache_env: true,
             ..Self::new()
         }
+    }
+
+    /// Do not export `key` (one of the allow-listed defaults, e.g.
+    /// `NO_COLOR`) to commands from this sandbox.
+    pub fn without_env(mut self, key: &'static str) -> Self {
+        self.removed_env.push(key);
+        self
     }
 
     /// The fake home directory.
@@ -117,6 +127,9 @@ impl Sandbox {
         }
         if !self.without_cache_env {
             cmd.env("APVM_CACHE_DIR", self.cache_env_dir());
+        }
+        for key in &self.removed_env {
+            cmd.env_remove(key);
         }
         cmd
     }
