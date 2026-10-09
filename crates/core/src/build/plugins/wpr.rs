@@ -107,8 +107,8 @@ const RSYNC_EXCLUDES: &[&str] = &[
 ///
 /// Single source of truth: the Unix build renders these into `zip -x` flags via
 /// [`zip_exclude_flags`], while the Windows build hands the same slice to
-/// [`create_zip_archive`]. Both platforms therefore produce identical archives
-/// by construction.
+/// [`fs::create_zip_archive`](crate::build::fs::create_zip_archive). Both
+/// platforms therefore produce identical archives by construction.
 ///
 /// These catch dev/tooling files that survive the rsync step, which drops only
 /// the names listed in [`RSYNC_EXCLUDES`] (matched at any depth, whole subtree):

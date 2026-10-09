@@ -48,7 +48,7 @@
 //! That toolchain (`bash`, `rsync`, `zip`) is not available on Windows, so
 //! **Imagify is Unix-only**. [`ensure_platform_supported`](Builder::ensure_platform_supported)
 //! rejects a Windows build up front with an actionable
-//! [`Error::PlatformUnsupported`](crate::error::Error::PlatformUnsupported)
+//! [`Error::PlatformUnsupported`]
 //! rather than failing partway through the script. Build on macOS or Linux, or
 //! use WSL (Windows Subsystem for Linux). This mirrors the Rust
 //! `imagify_build_e2e` integration test, which is itself `#![cfg(unix)]`.

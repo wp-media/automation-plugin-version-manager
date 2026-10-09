@@ -120,7 +120,7 @@ impl From<apvm_core::build::progress::OutputStream> for JsOutputStream {
 
 /// Selects which GitHub Release to download.
 ///
-/// Use with [`Apvm.downloadReleaseBySelector()`] to dynamically resolve
+/// Use with `Apvm.downloadReleaseBySelector()` to dynamically resolve
 /// the latest or previous release without knowing the exact tag.
 /// Drafts are always excluded.
 ///

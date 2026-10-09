@@ -22,7 +22,7 @@ use napi_derive::napi;
 /// Configuration options for creating an APVM instance.
 ///
 /// This is a plain JavaScript object (not a class) that you pass
-/// to [`Apvm.create()`] or [`Apvm.createWithTokenResolution()`].
+/// to `Apvm.create()` or `Apvm.createWithTokenResolution()`.
 ///
 /// All fields are optional — when `cacheDir` is omitted, the cache defaults
 /// to `~/.apvm/cache`.
