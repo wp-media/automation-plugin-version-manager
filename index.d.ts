@@ -630,7 +630,7 @@ export declare class ApvmCache {
  * Configuration options for creating an APVM instance.
  *
  * This is a plain JavaScript object (not a class) that you pass
- * to [`Apvm.create()`] or [`Apvm.createWithTokenResolution()`].
+ * to `Apvm.create()` or `Apvm.createWithTokenResolution()`.
  *
  * All fields are optional — when `cacheDir` is omitted, the cache defaults
  * to `~/.apvm/cache`.
@@ -1304,7 +1304,7 @@ export interface JsRefSource {
 /**
  * Selects which GitHub Release to download.
  *
- * Use with [`Apvm.downloadReleaseBySelector()`] to dynamically resolve
+ * Use with `Apvm.downloadReleaseBySelector()` to dynamically resolve
  * the latest or previous release without knowing the exact tag.
  * Drafts are always excluded.
  *
