@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { Apvm } from '../index.js';
-import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { removeBestEffort } from './cleanup.js';
 
 // =============================================================================
 // Apvm.create() — Async factory
@@ -45,7 +46,11 @@ describe('Apvm.create()', () => {
 // Apvm.createWithTokenResolution() — Async factory
 // =============================================================================
 
-describe('Apvm.createWithTokenResolution()', () => {
+// Resolving a token runs `gh auth token` when none is configured (as on CI).
+// On a cold, busy Windows runner the suite's first call took 13–21 s in CI,
+// close to the 30 s default — most likely that first `gh` start, the one step
+// `create()` (under 1 s there) does not take: allow more.
+describe('Apvm.createWithTokenResolution()', { timeout: 90_000 }, () => {
   it('creates an instance with empty config', async () => {
     const apvm = await Apvm.createWithTokenResolution({});
     expect(apvm).toBeInstanceOf(Apvm);
@@ -167,7 +172,7 @@ describe('build() basic functionality', () => {
       }
     } finally {
       if (tempRoot) {
-        await rm(tempRoot, { recursive: true, force: true });
+        await removeBestEffort(tempRoot, 'apvm.test');
       }
     }
   }, 10 * 60_000);
@@ -220,7 +225,7 @@ describe('build() basic functionality', () => {
       expect(fileStat.size).toBeGreaterThan(0);
     } finally {
       if (tempRoot) {
-        await rm(tempRoot, { recursive: true, force: true });
+        await removeBestEffort(tempRoot, 'apvm.test');
       }
     }
   }, 10 * 60_000);
@@ -489,7 +494,7 @@ describe('warmCache() basic functionality', () => {
       expect(usage.projects.map((p) => p.project)).toContain('wp-rocket');
     } finally {
       if (tempRoot) {
-        await rm(tempRoot, { recursive: true, force: true });
+        await removeBestEffort(tempRoot, 'apvm.test');
       }
     }
   }, 10 * 60_000);

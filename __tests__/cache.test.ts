@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { removeBestEffort } from './cleanup.js';
 
 // Cache maintenance — fully offline. A cache is seeded through the public API:
 // build directories on disk plus a garbage `apvm.db`, which `repair()`
@@ -38,12 +39,10 @@ afterEach(async () => {
     process.env.APVM_CACHE_DIR = suiteCacheDir;
   }
   // Best-effort, like setup.ts: on Windows an `Apvm` the GC has not freed yet
-  // still holds the database open, and deleting it fails with EBUSY/EPERM.
-  try {
-    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-  } catch (err) {
-    console.warn(`[cache.test] could not remove ${root}: ${String(err)}`);
-  }
+  // still holds the database open (and a `.node` copy a child just loaded
+  // may stay locked), so deleting can fail or take long; it must never fail
+  // the test.
+  await removeBestEffort(root, 'cache.test');
 });
 
 /** Seeded builds: project, version, commit dir, file, content. */
