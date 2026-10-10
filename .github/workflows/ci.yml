@@ -24,6 +24,10 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-22.04
+    # Job timeouts: several times the usual run time (check ~2 min, builds
+    # 3-7 min, tests 5-9 min), so a hung step fails instead of burning
+    # GitHub's 6-hour default.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -64,6 +68,7 @@ jobs:
             os: windows-latest
             artifact: apvm-napi.win32-x64-msvc.node
     runs-on: ${{ matrix.settings.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -77,7 +82,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-      - run: npm install
+      # `npm ci`: exactly the committed lockfile (which lists every
+      # platform's native packages), failing if it drifts from package.json.
+      - run: npm ci
       - name: Build NAPI
         run: >
           npx napi build --release --platform
@@ -121,6 +128,9 @@ jobs:
             os: windows-latest
             napi-artifact: napi-x86_64-pc-windows-msvc
     runs-on: ${{ matrix.settings.os }}
+    # Includes real builds of wp-rocket and imagify from GitHub, each test
+    # allowed 10 min: more room than the other jobs.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -158,7 +168,7 @@ jobs:
 
       # Rust tests
       - name: Rust tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # Node tests
       - name: Download NAPI binary
@@ -171,7 +181,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: napi-bindings
-      - run: npm install
+      - run: npm ci
       # Type-checks the tests against the generated index.d.ts (OS-independent).
       - name: TypeScript typecheck
         if: runner.os == 'Linux'
@@ -189,6 +199,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     needs: [build-napi, test]
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Download all NAPI artifacts
@@ -200,7 +211,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add *.node index.js index.d.ts
+          git add -- *.node index.js index.d.ts
           git diff --staged --quiet && exit 0
           git commit -m "chore: update NAPI binaries"
           git pull --rebase
