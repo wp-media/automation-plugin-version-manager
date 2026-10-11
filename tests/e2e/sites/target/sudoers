@@ -1,0 +1,27 @@
+# APVM E2E harness sudoers (installed as /etc/sudoers.d/apvm-e2e; checked by visudo at build).
+# Users and their purpose: ../README.md.
+
+# A file log, so checks can see what sudo records about refused probes (no syslog here).
+Defaults logfile=/var/log/apvm-e2e-sudo.log
+
+# deploy: the least-privilege setup the plan documents (§6.2), with the plain (ftpuser)
+# Runas form, which also allows `-g www-data` because ftpuser belongs to www-data.
+deploy ALL=(www-data) NOPASSWD: ALL
+deploy ALL=(ftpuser) NOPASSWD: ALL
+deploy ALL=(root) NOPASSWD: /usr/bin/chown, /usr/bin/stat
+
+# Users with unusual login shells or dotfiles can act as the www-data sites' identity.
+User_Alias APVM_SHELL_USERS = dashy, fishy, noisy, tcshy, zshy
+APVM_SHELL_USERS ALL=(www-data) NOPASSWD: ALL
+
+# pwsudo: sudo wants a password, so `sudo -n` must fail.
+pwsudo ALL=(ALL:ALL) ALL
+
+# mixed: the plan's explicit (ftpuser : www-data) form without a password, plus a
+# password rule for www-data, so `sudo -n -l` succeeds where the real command cannot.
+mixed ALL=(ftpuser : www-data) NOPASSWD: ALL
+mixed ALL=(www-data) ALL
+
+# ttyreq: no password, but requiretty, so `sudo -n` over a tty-less SSH channel must fail.
+Defaults:ttyreq requiretty
+ttyreq ALL=(www-data) NOPASSWD: ALL

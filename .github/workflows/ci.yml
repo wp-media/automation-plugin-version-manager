@@ -184,6 +184,42 @@ jobs:
           # https://getcomposer.org/doc/articles/troubleshooting.md#memory-limit-errors
           COMPOSER_MEMORY_LIMIT: "-1"
 
+  # Site-deployment E2E harness: WordPress + WP-CLI behind OpenSSH and sudo in
+  # Docker (tests/e2e/sites). verify.sh re-checks the ground truth the plan's
+  # remote design relies on (docs/plans/site-deployment.md §3.5).
+  e2e-sites:
+    name: E2E sites harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Lint harness scripts
+        run: shellcheck -x tests/e2e/sites/*.sh tests/e2e/sites/lib/*.sh tests/e2e/sites/checks/*.sh tests/e2e/sites/target/*.sh
+      - name: Start harness
+        run: tests/e2e/sites/harness.sh up
+      - name: Verify ground truth
+        run: tests/e2e/sites/verify.sh
+        env:
+          # Outside the repo's dot-dirs: upload-artifact skips hidden paths.
+          APVM_E2E_RESULTS_DIR: ${{ runner.temp }}/e2e-sites-results
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-sites-results
+          path: ${{ runner.temp }}/e2e-sites-results
+          if-no-files-found: warn
+      - name: Harness logs
+        if: failure()
+        run: tests/e2e/sites/harness.sh logs
+      - name: Stop harness
+        if: always()
+        run: tests/e2e/sites/harness.sh down
+
   commit-artifacts:
     name: Commit Artifacts
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
@@ -214,7 +250,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [check, build-napi, test, commit-artifacts]
+    needs: [check, build-napi, test, e2e-sites, commit-artifacts]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
@@ -223,6 +259,7 @@ jobs:
           needs.check.result != 'success' ||
           needs.build-napi.result != 'success' ||
           needs.test.result != 'success' ||
+          needs.e2e-sites.result != 'success' ||
           (needs.commit-artifacts.result != 'success' &&
            needs.commit-artifacts.result != 'skipped')
         run: exit 1

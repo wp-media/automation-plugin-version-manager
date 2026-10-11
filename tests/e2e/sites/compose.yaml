@@ -1,0 +1,61 @@
+# APVM site-deployment E2E harness (docs/plans/site-deployment.md, P0).
+#
+# Drive it with ./harness.sh rather than `docker compose` directly: `harness.sh up`
+# creates the SSH key the target trusts and writes the matching ssh_config and
+# known_hosts under .state/. harness.sh names the project per checkout
+# (apvm-e2e-<checksum of the path>), so worktrees never share containers or images.
+# Both services are ephemeral (no named volumes). Needs Compose >= 2.23.1
+# (configs.content).
+
+services:
+  db:
+    # MariaDB 12.3.3, the current LTS, pinned by digest.
+    image: mariadb:12.3.3@sha256:2bdff1534a7e569fecaf4b10b66ad0d410806e382d9db29ba305448addda97c4
+    environment:
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+      # Must match DB_USER / DB_PASSWORD in target/apvm-e2e.sh.
+      MARIADB_USER: wp
+      MARIADB_PASSWORD: wp
+    configs:
+      - source: db-init
+        target: /docker-entrypoint-initdb.d/apvm-e2e.sql
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      start_interval: 1s
+      retries: 3
+
+  target:
+    build:
+      context: target
+    hostname: apvm-e2e-target
+    # Reaps the processes SSH sessions leave behind.
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+        # A restarted db has lost its tmpfs data: restarting the target restores the
+        # sites from their snapshots (apvm-e2e start).
+        restart: true
+    environment:
+      # The public key every login user trusts. Required, so a bare `docker compose up`
+      # fails here instead of recreating the target without a key.
+      APVM_E2E_AUTHORIZED_KEY: ${APVM_E2E_AUTHORIZED_KEY:?run tests/e2e/sites/harness.sh instead of docker compose}
+    ports:
+      # Loopback only: the harness accepts root logins with the harness key.
+      - "127.0.0.1:${APVM_E2E_SSH_PORT:-2722}:22"
+      - "127.0.0.1:${APVM_E2E_HTTP_PORT:-8722}:80"
+
+configs:
+  db-init:
+    content: |
+      CREATE DATABASE wp_single;
+      CREATE DATABASE wp_multi;
+      CREATE DATABASE wp_ftpsite;
+      GRANT ALL PRIVILEGES ON wp_single.* TO 'wp'@'%';
+      GRANT ALL PRIVILEGES ON wp_multi.* TO 'wp'@'%';
+      GRANT ALL PRIVILEGES ON wp_ftpsite.* TO 'wp'@'%';

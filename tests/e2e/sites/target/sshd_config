@@ -1,0 +1,16 @@
+# APVM E2E harness sshd settings (installed in /etc/ssh/sshd_config.d/; first value wins).
+
+# Key-only logins. root may log in with a key, to exercise the `runuser` identity path.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+
+# Tests open many connections at once, all from the Docker gateway address. Failed-auth
+# samples must not trigger OpenSSH's per-source penalties and lock every user out.
+MaxStartups 64:30:128
+PerSourcePenalties no
+
+# The plan relies on this OpenSSH default (§3.4); stated so the harness keeps it.
+MaxSessions 10
+
+UseDNS no
