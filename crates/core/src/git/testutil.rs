@@ -4,14 +4,12 @@
 //! URLs — exercising the same transport code paths as a network remote,
 //! with zero network access.
 
-use std::process::Command;
-
 use tempfile::TempDir;
 
 /// Run a git command in `dir` with deterministic identity/dates and
 /// signing disabled; panics with stderr on failure.
 pub(crate) fn git(dir: &std::path::Path, args: &[&str], date: &str) {
-    let out = Command::new("git")
+    let out = crate::git::command()
         .args([
             "-c",
             "user.email=test@test",
@@ -89,7 +87,7 @@ pub(crate) fn file_url(dir: &TempDir) -> String {
 /// stderr on failure. For reading state (`rev-parse`, `remote get-url`)
 /// that tests assert against.
 pub(crate) fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = crate::git::command()
         .args(args)
         .current_dir(dir)
         .output()

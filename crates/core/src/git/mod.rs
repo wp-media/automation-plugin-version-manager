@@ -1,5 +1,6 @@
 //! Git operations.
 
+mod command;
 mod remote;
 mod repository;
 mod resolver;
@@ -8,6 +9,8 @@ pub(crate) mod testutil;
 pub mod token;
 mod workspace;
 
+pub(crate) use command::tokio_command;
+pub use command::{REPOSITORY_ENV_VARS, command, isolate};
 pub use remote::{RemoteGit, RemoteRefs};
 pub use repository::Repository;
 pub(crate) use resolver::expand_commit;

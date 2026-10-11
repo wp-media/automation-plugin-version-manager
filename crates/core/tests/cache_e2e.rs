@@ -190,7 +190,7 @@ impl Builder for OverrideBuilder {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = apvm_core::git::command()
         .current_dir(dir)
         .args(args)
         .status()

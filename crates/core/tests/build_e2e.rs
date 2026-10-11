@@ -23,7 +23,6 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::Mutex;
 
 use apvm_core::build::plugins::{BuildArtifact, Builder, VersionRequirement};
@@ -150,7 +149,7 @@ impl Recorder {
 /// Run git in `dir` with a fixed identity and `date`, so tag creation dates —
 /// which order the tag keywords — are deterministic.
 fn git(dir: &Path, args: &[&str], date: &str) -> String {
-    let out = Command::new("git")
+    let out = apvm_core::git::command()
         .args([
             "-c",
             "user.email=test@apvm.dev",

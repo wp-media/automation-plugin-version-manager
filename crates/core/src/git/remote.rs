@@ -293,7 +293,7 @@ impl RemoteGit {
     /// rejected credential must fail immediately, not hang a CI pipeline
     /// waiting for terminal input.
     fn git_command(&self) -> Command {
-        let mut cmd = Command::new("git");
+        let mut cmd = super::tokio_command();
         cmd.env("GIT_TERMINAL_PROMPT", "0");
         cmd
     }
@@ -323,7 +323,6 @@ impl RemoteGit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
     // =========================================================================
@@ -433,7 +432,7 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/pull/12/head
     #[tokio::test]
     async fn tags_by_creatordate_empty_repo() {
         let dir = TempDir::new().unwrap();
-        let out = StdCommand::new("git")
+        let out = crate::git::command()
             .args(["init", "--quiet"])
             .current_dir(dir.path())
             .output()

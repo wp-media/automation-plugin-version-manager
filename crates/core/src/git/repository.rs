@@ -5,8 +5,6 @@
 
 use std::path::{Path, PathBuf};
 
-use tokio::process::Command;
-
 use crate::error::{Error, Result};
 
 /// A Git repository wrapper.
@@ -57,7 +55,7 @@ impl Repository {
     pub async fn clone(url: &str, path: &Path) -> Result<Self> {
         tracing::info!("Cloning {} into {}", url, path.display());
 
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["clone", url])
             .arg(path)
             .output()
@@ -118,7 +116,7 @@ impl Repository {
         let authenticated_url =
             url.replacen("https://", &format!("https://x-access-token:{token}@"), 1);
 
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["clone", &authenticated_url])
             .arg(path)
             .output()
@@ -155,7 +153,7 @@ impl Repository {
     pub async fn fetch(&self) -> Result<()> {
         tracing::debug!("Fetching updates in {}", self.path.display());
 
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["fetch", "--all", "--prune"])
             .current_dir(&self.path)
             .output()
@@ -272,7 +270,7 @@ impl Repository {
     async fn run_checkout(&self, args: &[&str]) -> Result<()> {
         tracing::debug!("git checkout {} in {}", args.join(" "), self.path.display());
 
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .arg("checkout")
             .args(args)
             .current_dir(&self.path)
@@ -290,7 +288,7 @@ impl Repository {
 
     /// Get the current branch name.
     pub async fn current_branch(&self) -> Result<String> {
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(&self.path)
             .output()
@@ -309,7 +307,7 @@ impl Repository {
     pub async fn pull(&self) -> Result<()> {
         tracing::debug!("Pulling latest changes in {}", self.path.display());
 
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["pull", "--ff-only"])
             .current_dir(&self.path)
             .output()
@@ -359,7 +357,7 @@ impl Repository {
     pub async fn reset_hard(&self) -> Result<()> {
         tracing::debug!("Resetting repository in {}", self.path.display());
 
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["reset", "--hard", "HEAD"])
             .current_dir(&self.path)
             .output()
@@ -372,7 +370,7 @@ impl Repository {
         }
 
         // Also clean untracked files
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["clean", "-fdx"])
             .current_dir(&self.path)
             .output()
@@ -389,7 +387,7 @@ impl Repository {
 
     /// Set the URL for a remote.
     async fn set_remote_url(&self, remote: &str, url: &str) -> Result<()> {
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["remote", "set-url", remote, url])
             .current_dir(&self.path)
             .output()
@@ -406,7 +404,7 @@ impl Repository {
 
     /// Get the URL for a remote.
     async fn get_remote_url(&self, remote: &str) -> Result<String> {
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["remote", "get-url", remote])
             .current_dir(&self.path)
             .output()
@@ -440,7 +438,7 @@ impl Repository {
     ///
     /// - [git-rev-parse(1)](https://git-scm.com/docs/git-rev-parse)
     pub async fn get_head_commit(&self) -> Result<String> {
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["rev-parse", "HEAD"])
             .current_dir(&self.path)
             .output()

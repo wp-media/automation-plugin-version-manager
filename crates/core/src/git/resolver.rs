@@ -27,7 +27,6 @@
 use std::path::Path;
 
 use apvm_storage::BuildSource;
-use tokio::process::Command;
 use tokio::sync::OnceCell;
 
 use crate::error::{Error, Result};
@@ -680,7 +679,7 @@ impl<'a> RefResolver<'a> {
             Error::Git("Local repository path required for tag lookup".to_string())
         })?;
 
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args([
                 "show-ref",
                 "--tags",
@@ -802,7 +801,7 @@ impl<'a> RefResolver<'a> {
             Error::Git("Local repository path required for tag lookup".to_string())
         })?;
 
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["tag", "--sort=-creatordate"])
             .current_dir(repo_path)
             .output()
@@ -846,7 +845,7 @@ async fn local_branch_ref(repo_path: &Path, name: &str) -> Result<Option<String>
         format!("refs/heads/{name}"),
         format!("refs/remotes/origin/{name}"),
     ] {
-        let output = Command::new("git")
+        let output = super::tokio_command()
             .args(["show-ref", "--verify", "--quiet", &full_ref])
             .current_dir(repo_path)
             .output()
@@ -877,7 +876,7 @@ async fn local_branch_ref(repo_path: &Path, name: &str) -> Result<Option<String>
 ///
 /// [`Error::Git`] when git cannot be started.
 async fn peeled_commit(repo_path: &Path, full_ref: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
+    let output = super::tokio_command()
         .args([
             "rev-parse",
             "--verify",
@@ -942,7 +941,7 @@ pub(crate) async fn expand_commit(repo_path: &Path, prefix: &str) -> Result<Stri
 ///
 /// [`Error::Git`] when git cannot be started or the lookup fails.
 async fn objects_with_prefix(repo_path: &Path, prefix: &str) -> Result<Vec<(String, String)>> {
-    let listed = Command::new("git")
+    let listed = super::tokio_command()
         .args(["rev-parse", &format!("--disambiguate={prefix}")])
         .current_dir(repo_path)
         .output()
@@ -958,7 +957,7 @@ async fn objects_with_prefix(repo_path: &Path, prefix: &str) -> Result<Vec<(Stri
 
     let mut objects = Vec::new();
     for oid in String::from_utf8_lossy(&listed.stdout).split_whitespace() {
-        let typed = Command::new("git")
+        let typed = super::tokio_command()
             .args(["cat-file", "-t", oid])
             .current_dir(repo_path)
             .output()
