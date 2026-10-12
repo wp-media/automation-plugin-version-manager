@@ -1,6 +1,6 @@
 # Site deployment — manage WordPress plugins on remote sites
 
-Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1.1 done (2026-10-11, audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1) and 8 (P1.1 audit). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
+Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.5 (implemented and audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5) and 10 (P1.2–P1.5 audit). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
 
 ---
 
@@ -23,6 +23,29 @@ Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, 
 ---
 
 ## 0. Change log
+
+### Revision 10 (adversarial audit of P1.2–P1.5, 2026-10-12)
+
+| Topic | Change |
+|---|---|
+| Inventory writes | `update` refuses a newer (read-only) inventory even when the change replaces the document whole (it was rewritten as version 1). Documents over 16 MiB are refused on write as on read, so apvm never writes a file it would refuse to load. Paths that name no file (empty, `/`, `..`, a trailing `/` or `/.`) are refused by `load` and `save` alike (§7) |
+| Same WordPress | Hosts are compared exactly, not case-folded: `ssh -G` (OpenSSH 10.x) matches `Host` patterns case-sensitively, so `Prod` and `prod` can reach different machines (verified). The key also holds `proxy_jump` and `ssh_config_file`: one internal address behind two bastions, or one alias in two ssh_config files, can be two machines (§4.2) |
+| Zip readers | WordPress unzips with libzip (`ZipArchive::CHECKCONS`) and falls back to PclZip when libzip refuses a zip; PclZip uses the *first* end record, ignores Unicode path fields and treats DOS-folder-attribute files as folders. Verified with WordPress 7.1.3's code: a crafted zip inspected as `good` installed `evil/evil.php`. Inspection now refuses any zip the readers could read differently: one end record whose comment ends the file, a central directory that ends at it and holds exactly the declared records, consistent ZIP64 records, no renaming Unicode path field, no DOS folder attribute on files, no duplicate names (libzip refuses them; zip 8.6 merges them, which also bypassed the limits) (§6.10) |
+| Zip limits | The entry count comes from the end record, before the zip crate parses entries (1 M entries took 663 MB before; now refused in 71 ms) (§6.10) |
+| Headers | `Network: 0` falls back to `Site Wide Only`, as in WordPress (0 differences on 40 002 random headers against WordPress's own regexes under PHP); one-pass parsing (a 99 000-file zip took 12 s). Names stored as UTF-8 without the UTF-8 flag (macOS `zip`/`ditto`) are decoded as libzip does |
+| Core hints | One helper feeds both `plugin_hints` and `project_for_slug`, so they cannot drift apart. Every value re-checked against all 43 cached artifacts (§3.1) |
+| Later phases | Obligations noted in P2.1, P2.4, P8.1, P8.5 and P10.1 |
+
+### Revision 9 (P1.2–P1.5 implementation, 2026-10-12)
+
+| Topic | Change |
+|---|---|
+| Inventory file | `io::{load, save, update, env_override}`. `load` takes no lock (a save is one rename). `update` writes only when the change succeeds and changes something. The lock file is created `0600` and never removed. Parents are created `0700`. Directory fsync is best effort: once renamed, the save has landed. Reads are capped at 16 MiB. Symlink refusal covers the file and its lock file (not the directories above: macOS's `/tmp` is a link); directories and special files are refused too (§7) |
+| Settings | Every resolved value carries its source (`built-in`, `defaults`, `server`, `site`). SSH merges field by field: server, `defaults.ssh`, built-in (connect timeout 15 s, multiplex on, program `ssh`); a field none sets is left to ssh_config. Site settings: the site's value, else the built-in one. `command_timeout_secs` stays optional (operations own their defaults) (§4.2) |
+| Targets | Union in inventory order, each site once; unknown ids reported first, with a hint when only case or spaces differ; a selection that matches no site is an error like an empty one; a selected group or server that adds no site is a warning (`NoSites`) (§4.2) |
+| Core hints | `Apvm::plugin_hints` and `ProjectRegistry::plugin_hints` return `Result<PluginHints>`: a registered custom builder can declare invalid hints. `Error::Sites` and its napi mapping land here, not in P8.5. `Project::plugin_slugs` and `BackWPupBuilder::SLUG_FREE`/`SLUG_PRO` added; `apvm info` also shows a `Family:` section (§8.1) |
+| Package | Two extra files, `package/archive.rs` (all zip I/O) and `package/layout.rs` (raw directory checks, revision 10). The file must be named `*.zip`. Only Stored and Deflated entries (what every WordPress unzip path handles). Every entry is decompressed and its size and CRC-32 checked, under a read budget (4× the file size + 1 MiB) that stops shared-data entries and fake end records (zip 8.6 retries each candidate). A top-level `.DS_Store` is refused, not ignored: WordPress's `dirlist` counts hidden files, so `install_package` would see two items. `enclosed_name()` alone accepts absolute paths in zip 8.6, so apvm applies its own path rules (§6.10) |
+| Codes | New `inventory_io` (the inventory file, its lock or its directory cannot be read, written, locked or created, or is not a regular file) (§4.5) |
 
 ### Revision 8 (adversarial audit of P1.1, 2026-10-12)
 
@@ -177,8 +200,8 @@ Zip roots (`zipinfo -1`, real artifacts in `~/.apvm/cache`):
 | backwpup | `free` | `backwpup` | `backwpup.php` | `BackWPup` |
 | backwpup | `pro-de` | `backwpup-pro` | `backwpup.php` | `BackWPup Pro` |
 | backwpup | `pro-en` | `backwpup-pro` | `backwpup.php` | `BackWPup Pro` |
-| wp-rocket | — | `wp-rocket` | `wp-rocket.php` | — |
-| imagify | — | `imagify` | `imagify.php` | — |
+| wp-rocket | — | `wp-rocket` | `wp-rocket.php` | `WP Rocket` |
+| imagify | — | `imagify` | `imagify.php` | `Imagify` |
 
 - **pro-de vs pro-en:** a full-tree diff of both builds at commit `1dceea8` (9.99.99) differs only in `inc/Pro/License/License.php`, `WC_API_URL = 'https://backwpup.de/'` vs `'https://backwpup.com/'` (plus a POT timestamp). Headers are identical, so the variant can only be told apart by that file. The build uses `gulp pro --language=de|en`.
 - **Both variants are network-only:** `Network: true` in free and pro.
@@ -348,7 +371,7 @@ Effective SSH settings = built-in → `defaults.ssh` → `server.ssh` (field by 
 
 ### 4.2 Targets
 
-`--site a,b` · `--group qa` · `--server eu-1` · `--all-sites`. Flags are repeatable (union), kept in inventory order and de-duplicated. The same `host:port:user` + `path` under two ids → warning. An empty selection is an error, never "everything".
+`--site a,b` · `--group qa` · `--server eu-1` · `--all-sites`. Flags are repeatable (union), kept in inventory order and de-duplicated. Sites with the same `path` on the same ssh destination (`host`, `port`, `user`, `proxy_jump`, `ssh_config_file`, compared exactly as apvm passes them to ssh; unset ≠ a value) → warning (revision 10); P6.4's probe-time realpath key covers the rest. An empty selection, or one that matches no site, is an error, never "everything"; a selected group or server that adds no site → warning. Settings resolve with their source: SSH field by field (server → `defaults.ssh` → built-in: connect timeout 15 s, multiplex on, program `ssh`; otherwise left to ssh_config), site settings from the site, else built-in (§7).
 
 ### 4.3 Plugin selection
 
@@ -400,7 +423,7 @@ Stable codes (CLI `--json`, NAPI `code`):
 | WordPress | `wp_cli_missing`, `not_wordpress`, `wp_not_installed`, `plugins_dir_not_writable`, `multisite_unsupported` |
 | Execution | `site_locked`, `insufficient_space`, `upload_corrupted`, `wp_command_failed`, `verification_failed`, `state_drifted`, `outcome_unknown`, `health_check_failed`, `timeout`, `file_mods_disallowed` |
 | Ownership / variants | `ownership_unfixable`, `variant_conflict` (two variants of one slug, or two siblings activated together without `--keep-siblings`) |
-| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory) |
+| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory), `inventory_io` (the inventory file, its lock or its directory cannot be read, written, locked or created, or is not a regular file) |
 | Status | `expectation_not_met`, `undetermined` |
 
 ---
@@ -825,13 +848,15 @@ Family "backwpup"
 
 | Rule | Detail |
 |---|---|
-| File | Regular `.zip`, ≤ 256 MiB, opens |
-| Bomb limits | ≤ 100 000 entries; uncompressed total (central directory, `by_index_raw`) ≤ 1 GiB |
-| Paths | `enclosed_name()` (no absolute, `..`, NUL); backslashes rejected; symlink entries warned |
-| Structure | Exactly one top-level dir (ignoring `__MACOSX/`, `.DS_Store`); its name passes the slug allowlist |
+| File | Regular file named `*.zip`, ≤ 256 MiB, read into memory once (hash and inspection see the same bytes; nothing is extracted) |
+| Directory | One reading for libzip, PclZip and the zip crate (revision 10): exactly one end record in the last 64 KiB, its comment ending the file; a central directory ending at it with exactly the declared records; consistent ZIP64 records; no multi-disk archive; no renaming Unicode path field; no DOS folder attribute on a file; no duplicate names → else `Ambiguous` / `DuplicateEntry` |
+| Bomb limits | ≤ 100 000 entries (from the end record, before entries are parsed); declared uncompressed total ≤ 1 GiB; every entry decompressed with its exact declared size and CRC-32; total reads ≤ 4× file size + 1 MiB |
+| Compression | Stored or Deflated only; encrypted entries refused |
+| Paths | apvm's own rules (zip 8.6's `enclosed_name()` accepts absolute paths): no `..`, `.` or empty component, no leading `/`, no NUL, no backslash; also checked under `__MACOSX/`; symlink entries warned |
+| Structure | Exactly one top-level dir (ignoring `__MACOSX/` only: a top-level `.DS_Store` or any other file is refused, since WordPress counts hidden files); its name passes the slug allowlist |
 | Plugin | A `<root>/*.php` with `Plugin Name:` in its first 8 KiB; main = `<root>/<root>.php` if headered, else the first headered (sorted); several → warning |
-| Headers | WordPress `get_file_data` semantics on bytes: Name, Version, Requires at least, Requires PHP, Network, Requires Plugins, Text Domain |
-| Variant | `PluginHints` markers checked inside the zip |
+| Headers | WordPress 7.1.3 `get_file_data`/`get_plugin_data` semantics on bytes (short `<?` tags, `''`/`'0'` empty, `Network` falling back to `Site Wide Only`, `Requires Plugins` cleanup): Name, Version, Requires at least, Requires PHP, Network, Requires Plugins, Text Domain. Names are decoded as libzip does (UTF-8 guessed without the flag). Note: WordPress's own `check_package()` reads requirements from the first headered file in `glob` order, which can differ from the main file when several are headered (already a warning) |
+| Variant | `PluginHints` markers searched while streaming each entry: exactly one match → that variant; a single-variant slug without marker → that variant; none → `Undetermined`; several → `Undetermined` + warning |
 | Identity | SHA-256 + size |
 
 ### 6.11 Multisite (P10)
@@ -943,8 +968,9 @@ Family "backwpup"
 
 File handling:
 - **Load:** a missing file is an empty inventory. Parsing uses `deny_unknown_fields`, requires `version`, accepts records only as JSON objects, reads `null` as unset and ignores a leading UTF-8 BOM. Then full validation runs, reporting every problem with its location (`sites[1].server: unknown server 'eu-2'`). A newer `version` (read from the JSON object) is read-only when this build can read it fully (every field and value known, every rule passed). Otherwise it is refused with `inventory_unsupported`, and its problems stay listable.
-- **Save:** lock (`inventory.json.lock`, `std::fs::File::lock`) → temp file `0600` → fsync → rename → fsync dir. Edits are read-modify-write under the lock.
-- **Refused:** a symlinked path.
+- **Save:** lock (`inventory.json.lock`, `std::fs::File::lock`, created `0600`, never removed) → temp file created `0600` with `create_new` → fsync → rename → fsync dir (best effort: once renamed, the save has landed). Missing parents are created `0700`. Edits are read-modify-write under the lock (`io::update`), which writes only when the change succeeds and changes something; `load` takes no lock (a save is one rename).
+- **Limits:** documents over 16 MiB are refused on read and write. A newer (read-only) inventory is never written, even when a change replaces it whole.
+- **Refused:** a symlinked path (the file or its lock file, even dangling; the directories above may be links, e.g. macOS's `/tmp`), a directory or special file at either path, and a path that names no file. Errors carry the path (`inventory_io`). Lock waits are unbounded (a bounded wait is an open decision).
 
 ---
 
@@ -963,12 +989,12 @@ crates/sites/src/
   lib.rs, error.rs (Error + stable code()), problem.rs (located problems), allowlist/{mod, net, paths}.rs (value rules),
   hints.rs, layout.rs (file/dir *names* only)
   inventory/{mod, model, validate, io, resolve}.rs
-  package/{mod, headers, rules}.rs
+  package/{mod, headers, rules, archive, layout}.rs
   remote/{mod, quote, script, identity, transport, capture, local, ssh, classify, mux}.rs
   wp/{mod, command, parse, state, snippets, probe, classify}.rs
   ops/{model, plan, order, apply, verify, ownership, variants, staging, install, list, status, lock, run, runner, report}.rs
   progress.rs (SiteEvent, SiteReporter, Null/Closure/LogFileReporter) · session.rs · manager.rs
-crates/core/src/deploy.rs  ·  crates/core/src/build/plugins/*.rs (slugs, markers)  ·  projects/registry.rs (plugin_hints)
+crates/core/src/deploy.rs  ·  crates/core/src/build/plugins/*.rs (slugs, markers)  ·  projects/{registry, hints}.rs (plugin_hints)
 crates/cli/src/commands/{server, site, group}.rs · commands/wp/{mod, args, render, list, status, install, activate,
   deactivate, uninstall, reset, delete, ownership, run}.rs · prompt.rs
 crates/napi/src/{sites_inventory, sites, sites_types, sites_progress}.rs
@@ -1012,7 +1038,7 @@ pub struct Expectations { pub state: Option<ExpectedState>, pub version: Option<
 pub fn classify(args: &[String]) -> WpClassification; // ReadOnly | MayWrite | Refused(reason)
 // core
 impl Apvm {
-    pub fn plugin_hints(&self) -> PluginHints;
+    pub fn plugin_hints(&self) -> Result<PluginHints>;   // fallible: custom builders can declare invalid hints
     pub fn declared_packages(&self, project: &str, variants: &[String]) -> Result<Vec<PackageSource>>;
     pub async fn build_package(&self, req: BuildPackageRequest, r: &dyn ProgressReporter) -> Result<BuiltPackages>;
     pub async fn install_build(&self, sites: &SiteManager, req: InstallBuildRequest,
@@ -1218,7 +1244,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Result:** 43 asserted checks pass on macOS and Ubuntu clients, plus the optional real-BackWPup check locally; 2 INFO checks record versions and a network-dependent timeout. The deviations are marked ⚠ in §3.5 and resolved in revisions 4 and 5. CI (run 38189801662) passes every job, `e2e-sites` included, with the same 43 checks; its first run caught two bugs, both fixed (revision 6).
 - **Depends:** — · **Parallel:** P1.x, P2.x, P3.1
 
-### P1 — Foundations (lib)
+### P1 — Foundations (lib) ✅ (2026-10-12)
 
 #### P1.1 — Crate, inventory model, validation, hint types ✅ (implemented 2026-10-11, audited 2026-10-12)
 - **Goal:** the pure data layer.
@@ -1228,19 +1254,21 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Result:** `crates/sites` with `Inventory` (strict parse, located validation, version handling, CRUD that keeps it valid), `PluginHints`, `layout` names, `Error` + `Code`, and the value rules in `allowlist/` and located problems in `problem.rs`. The refinements are in revisions 7 and 8 (audit). Tests: 105 unit tests, including a randomized property test of the always-valid invariant; 4 integration tests on the §7 example; 2 doctests. Unit tests also guard against any `apvm-*` dependency. Line coverage is 99.7%; the rest is an unreachable serialization error.
 - **Depends:** — · **Parallel:** P0
 
-#### P1.2 — Inventory persistence
+#### P1.2 — Inventory persistence ✅ (implemented and audited 2026-10-12)
 - **Goal:** safe load/save/update.
 - **Changes:** `inventory/io.rs` (lock, atomic `0600` write, `update`, symlink refusal, `env_override`).
 - **Tests:** missing file = empty; located errors; `0600`; no partial file; two concurrent `update`s both land; symlink refused; env override.
+- **Result:** `io::{load, save, update, env_override}` with std only (`File::lock`), new errors `InventoryIo`/`InventoryNotAFile`/`InventoryFile` and the `inventory_io` code; details in §7 and revisions 9 and 10. Tests: 51 unit, 4 integration (concurrent updates from 4 processes, `APVM_INVENTORY` from a child environment), 1 doctest; the 3 concurrency tests fail with the lock disabled. Windows: clippy-clean for `x86_64-pc-windows-msvc`. Known limits (low): a FIFO swapped in between the check and the open can block a `load` (only the same user can, in `~/.apvm`; fixing needs `libc`); a crash mid-save can leave a hidden `0600` temp file; lock waits are unbounded.
 - **Depends:** P1.1 · **Parallel:** P1.3–P1.5, P3.1
 
-#### P1.3 — Settings merge and targets
+#### P1.3 — Settings merge and targets ✅ (implemented and audited 2026-10-12)
 - **Goal:** `ResolvedSite` + `Targets` resolution.
 - **Changes:** `inventory/resolve.rs`.
 - **Tests:** precedence table; union/order/dedupe; empty selection error; same-WordPress warning.
+- **Result:** `Inventory::{resolve_server, resolve_site, resolve_targets}`, `Targets`, `ResolvedTargets` (+ `TargetWarning::{NoSites, SameWordPress}`), `Setting<T>` + `SettingSource`, `ResolvedServer`/`ResolvedSsh`/`ResolvedSite` (`Serialize`, `#[non_exhaustive]`, built only in the crate) and the `BUILTIN_*` constants; rules in §4.2 and revisions 9 and 10. Errors reuse `invalid_input`, located like `groups[1]`. Tests: 27 unit (every field at every level; all 8192 selections of a sample inventory against an independent model, warnings and first error included) and 3 integration tests on the §7 example. Open: whether a site's `command_timeout_secs` overrides the 900 s install timeout (decide in P8.2); warnings have no stable code yet (add with P5's `--json`).
 - **Depends:** P1.1 · **Parallel:** P1.2, P1.4, P1.5, P3.1
 
-#### P1.4 — Core: slugs, variant markers, families → `PluginHints`
+#### P1.4 — Core: slugs, variant markers, families → `PluginHints` ✅ (implemented and audited 2026-10-12)
 - **Goal:** core describes its plugins to `apvm-sites`.
 - **Changes:**
   - `crates/core/Cargo.toml` (`apvm-sites`);
@@ -1248,16 +1276,18 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
   - `ProjectRegistry::{plugin_hints, project_for_slug}` and `Apvm::plugin_hints`;
   - `apvm info` shows slug + marker per variant; `SKILL.md`.
 - **Tests:** declared values equal §3.1; hints validate; `info` output.
+- **Result:** the three `Builder` methods (default `None`), declared for BackWPup/WP Rocket/Imagify and checked against all 43 cached artifacts (pro-de/pro-en markers match exactly one variant in each of the 19 pro zips); `ProjectRegistry::{plugin_hints, project_for_slug}`, `Apvm::plugin_hints` (both `Result`, §8.1), `Project::plugin_slugs`, new `projects/hints.rs`, `Error::Sites` + napi `GenericFailure` mapping; `apvm info` shows slugs, markers and a `Family:` section; SKILL.md and READMEs match the real output. Tests: §3.1 table as independent literals, hint validation, invalid custom declarations, `info` helpers and 2 end-to-end `info` tests. Adding `Error::Sites` to core's (not `#[non_exhaustive]`) `Error` breaks exhaustive matches downstream, as `Skill` did in a minor release.
 - **Depends:** P1.1 · **Parallel:** P1.2, P1.3, P1.5, P2.x, P3.x
 
-#### P1.5 — Package inspection
+#### P1.5 — Package inspection ✅ (implemented and audited 2026-10-12)
 - **Goal:** `PluginPackage::inspect(path, &hints)` per §6.10.
-- **Changes:** `package/{mod,headers,rules}.rs`.
+- **Changes:** `package/{mod,headers,rules,archive,layout}.rs`.
 - **Tests:**
   - generated zips covering every rule (single root ✓, files at root ✗, two roots ✗, `__MACOSX`, `..`/absolute/backslash ✗, symlink ⚠);
   - headers: missing `Plugin Name` ✗, several headered ⚠, beyond 8 KiB ignored, CRLF, multibyte at the boundary (no panic);
   - bomb caps; unsupported compression → clear error; SHA-256;
   - variant detection from markers.
+- **Result:** `PluginPackage` (`path`, `size`, `sha256`, `uncompressed_size`, `slug`, `main_file`, `headers`, `variant`, `warnings`), `PluginHeaders`, `VariantDetection`, `PackageWarning`, `PackageDefect`, the limits as constants, and `Error::PackageInvalid` (`package_invalid`); rules in §6.10 and revisions 9 and 10. Uses the workspace's `zip` 8.6.0 (deflate only) and `sha2` 0.11.0. Tests: every rule and defect on generated zips, the libzip/PclZip differential shapes, ZIP64, headers, marker boundaries, a 9 000-zip fuzz test, a public-API test; all 43 cached artifacts inspect as §3.1 says (~80 ms each, release). `inspect` is synchronous CPU + I/O: async callers use `spawn_blocking`. Residual (low): a non-UTF-8 name without the UTF-8 flag is written differently by libzip and PclZip; it never affects the folder structure or the slug.
 - **Depends:** P1.1 · **Parallel:** P1.2–P1.4, P2.x, P3.x, P4.x
 
 ### P2 — Inventory front ends
@@ -1269,6 +1299,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
   - `commands/{mod,server}.rs`; `prompt.rs` (shared `confirm`; `uninstall.rs` moves onto it, its tests unchanged);
   - `.claude/skills/apvm-cli/{SKILL.md, references/sites.md}`; `skill/embedded.rs` (`SKILL_FILES`); `tests/cli_inventory.rs`.
 - **Tests:** add/edit/show/list/remove; defaults set/unset; invalid input → exit 1; `--json`; `--cascade`; `APVM_INVENTORY`; `0600`.
+- **Audit notes (rev 10):** every edit goes through `io::update` (lock → load → change → save), never `load` then `save`, which can lose a concurrent edit. Map error locations like `sites[1]` / `all_sites` to the flags the user typed (`--site`, `--all-sites`).
 - **Depends:** P1.2, P1.3 · **Parallel:** P1.4, P1.5, P2.4, P3.x
 
 #### P2.2 — cli: `apvm site`
@@ -1287,6 +1318,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** the inventory from Node.
 - **Changes:** `crates/napi/Cargo.toml`; `sites_inventory.rs`, `sites_types.rs`; `lib.rs` docs; `__tests__/sites-inventory.test.ts`; `crates/napi/README.md`.
 - **Tests:** round-trip; validation errors with `err.code`; `APVM_INVENTORY` from `process.env`; `save` → `0600`.
+- **Audit notes (rev 10):** `io::save` replaces whatever is on disk. `SiteInventory.load()` … `save()` must not lose another process's edit made in between: either `save` runs `io::update` and refuses when the file changed since `load`, or mutations apply through `io::update` directly. Decide here and test it with two processes. Map `inventory_io` to a rejection code.
 - **Depends:** P1.2, P1.3 · **Parallel:** P2.1–P2.3, P3.x
 
 ### P3 — Remote execution (lib)
@@ -1477,6 +1509,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Changes:** `ops/staging.rs`.
 - **Tests:** goldens; path validation (only `<tmp>/apvm.XXXXXXXXXX`); space check; checksum-tool selection; fake mismatch → `upload_corrupted`; stale sweep pattern; E2E: 20 MB upload hash-matches, dir `0700` owned by the identity (incl. `ftpuser:www-data`), removed after success and after failure.
 - **Audit notes (rev 8):** find staging dirs by a literal prefix of `remote_tmp_dir` (it may hold `.` and `+`), never by a regex built from it.
+- **Audit notes (rev 10):** `PluginPackage::main_file()` and header values may hold any character, control characters included: treat them as data (quote, escape before printing), never splice them into a command. Call `inspect` through `spawn_blocking`.
 - **Depends:** P4.2 · **Parallel:** P6.x, P7.x
 
 #### P8.2 — lib: install execution
@@ -1507,7 +1540,8 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** build → package → install as a reusable core API.
 - **Changes:**
   - `crates/core/src/deploy.rs`, `lib.rs` re-exports;
-  - `Error::Sites(#[from] apvm_sites::Error)` + `crates/napi/src/error.rs` mapping (the match is exhaustive).
+  - ~~`Error::Sites(#[from] apvm_sites::Error)` + `crates/napi/src/error.rs` mapping~~: done in P1.4 (napi maps it to `GenericFailure`; refine per code here).
+- **Audit notes (rev 10):** a builder with one variant records no variant in its builds (`variants_built = []`); map such builds through that sole variant, as `plugin_hints` does.
 - **Tests:** variant selection rules (multi-variant needs `--variants`; same-slug pairs rejected); slug mismatch; `install_build` over a `SiteManager` with fake transport and an injected built package (the build path is covered by existing pipeline tests + P8.6's gated E2E); napi status mapping.
 - **Depends:** P8.2, P1.4 · **Parallel:** P8.3, P8.4, P7.x
 
@@ -1552,6 +1586,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** §6.11 in probe + planner.
 - **Changes:** snippets (headers, subsite activations), probe/plan rules.
 - **Tests:** multisite planner tables; snippet parsing; `--network` on a single site → input error.
+- **Audit notes (rev 10):** subsites added as separate sites with the same `path` raise the same-WordPress warning (§4.2). That is correct (one plugins directory); document it in the multisite docs.
 - **Depends:** P6.1, P4.2 · **Parallel:** P7.x, P8.x, P9.x
 
 #### P10.2 — Enable multisite mutations (lib + cli + napi tests)
