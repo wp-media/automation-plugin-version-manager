@@ -1,6 +1,6 @@
 # Site deployment — manage WordPress plugins on remote sites
 
-Status: **in progress**: P0 implemented and verified locally (macOS and Ubuntu clients); its first CI run is pending. Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results) and 5 (adversarial audit, 2026-10-11). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
+Status: **in progress**: P0 implemented and verified locally (macOS and Ubuntu clients); its first CI run is pending. Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11) and 6 (CI on the branch). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
 
 ---
 
@@ -18,11 +18,17 @@ Status: **in progress**: P0 implemented and verified locally (macOS and Ubuntu c
 - **Ownership respects owner *and* group:** WP-CLI runs as the plugins directory's owner **and group** (`sudo -n -u <owner> -g <group>`), so `ftpuser:www-data` sites stay `ftpuser:www-data` with the group bits the web server needs. Mismatches are repaired without root (`chgrp`, `chmod g+`); a root `chown` runs only on sites that opt in, under strict preconditions.
 - **Uploads:** each zip is inspected locally, streamed over SSH into a private **staging dir** (`/tmp/apvm.XXXXXXXXXX`, owned by the identity, `0700`), checksum-verified, installed from there, and always cleaned up.
 - **Transport:** system OpenSSH (your `~/.ssh/config`, agent, ProxyJump), multiplexed on Unix. Scripts travel over SSH's stdin, so the remote login shell (bash, zsh, fish, …) never parses them.
-- **Phases:** 43 small ones; libraries first, then the CLI and NAPI front ends in parallel tracks. No new crates.io dependencies.
+- **Phases:** 44 small ones; libraries first, then the CLI and NAPI front ends in parallel tracks. No new crates.io dependencies.
 
 ---
 
 ## 0. Change log
+
+### Revision 6 (CI on the branch, 2026-10-11)
+
+| Topic | Change |
+|---|---|
+| CI | `ci.yml` temporarily runs on pushes to `feat/site-deployment` (P0); new last phase P12 removes the trigger after the merge |
 
 ### Revision 5 (adversarial audit of P0 and revision 4, 2026-10-11)
 
@@ -1174,6 +1180,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
     - `target/{Dockerfile, entrypoint.sh, apvm-e2e.sh, sudoers, sshd_config, vhosts.conf}`;
     - `fixtures/{plugins,variants}/…`;
   - `.github/workflows/ci.yml` job `e2e-sites` (`harness.sh up` + `verify.sh`, results uploaded; gates `CI`);
+  - a **temporary** `push` trigger for `feat/site-deployment` in `ci.yml`, so CI runs on this branch before its PR exists (`commit-artifacts` stays develop-only); P12 removes it;
   - §3.5 results recorded in this plan, which is adjusted in revisions 4 and 5.
 - **Done when:** the harness is healthy locally and in CI; `verify.sh` passes, or each deviation is recorded and the plan adjusted.
 - **Result:** 43 asserted checks pass on macOS and Ubuntu clients, plus the optional real-BackWPup check locally; 2 INFO checks record versions and a network-dependent timeout. The deviations are marked ⚠ in §3.5 and resolved in revisions 4 and 5. P0 is done once the CI job passes.
@@ -1522,6 +1529,14 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
   - tag `v3.4.0` after CI is green.
 - **Depends:** P0–P10 · **Parallel:** —
 
+### P12 — Remove the temporary CI trigger
+- **Goal:** CI triggers go back to `develop` pushes and PRs to `develop` only.
+- **When:** right after `feat/site-deployment` is merged into `develop`, as a one-file PR to `develop`. Until then, once a PR to `develop` is open, every push runs CI twice (`push` + `pull_request`); that is expected.
+- **Changes:** `.github/workflows/ci.yml`: drop the `feat/site-deployment` entry and its comment from `on.push.branches` (back to `branches: [develop]`); mark P12 done here.
+- **Tests:** none (workflow config only).
+- **Done when:** `grep -n 'feat/site-deployment' .github/workflows/ci.yml` finds nothing, and the next CI run on `develop` passes.
+- **Depends:** P11 (branch merged) · **Parallel:** —
+
 ### Dependency overview
 
 ```
@@ -1542,7 +1557,7 @@ P8.1+P6.3+P6.4 ─ P8.2 ┬ P8.3(+P7.1) ─ P8.6(+P8.5)
                       └ P8.5(+P1.4)
 P6.4 ─ P9.1 ┬ P9.2(+P7.1) ;  P9.1+P5.4 ─ P9.3
 P6.1+P4.2 ─ P10.1 ─ P10.2(+P7.3, P8.3, P7.5)
-all ─ P11
+all ─ P11 ─ P12
 ```
 
 **Critical path:** P1.1 → P3.1 → P3.2 → P3.3 → P4.2 → P5.1 → P6.2 → P6.3 → P8.2 → P8.3 → P10.2 → P11. NAPI phases never sit on it.
