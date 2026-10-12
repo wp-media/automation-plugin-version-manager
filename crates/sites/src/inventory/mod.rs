@@ -17,11 +17,17 @@
 
 pub mod io;
 mod model;
+mod resolve;
 mod validate;
 
 pub use model::{
     Defaults, EntityKind, Group, INVENTORY_VERSION, Owner, OwnershipPolicy, RunAs, Server, Site,
     SshSettings,
+};
+pub use resolve::{
+    BUILTIN_CONNECT_TIMEOUT_SECS, BUILTIN_MULTIPLEX, BUILTIN_REMOTE_TMP_DIR, BUILTIN_SSH_BINARY,
+    BUILTIN_WP_CLI, ResolvedServer, ResolvedSite, ResolvedSsh, ResolvedTargets,
+    STANDARD_PLUGINS_SUBDIR, Setting, SettingSource, TargetWarning, Targets,
 };
 
 use std::collections::HashSet;

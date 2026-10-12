@@ -5,9 +5,11 @@ behind `apvm server|site|group` and `apvm wp`, the Node bindings, and
 apvm-core's build-and-install path. The design and the phase plan are in
 [`docs/plans/site-deployment.md`](../../docs/plans/site-deployment.md).
 
-**Status:** the data layer (phase P1.1, audited) and inventory persistence
-(P1.2). It has the inventory model, its validation, safe reading and writing
-of the inventory file, the plugin hint types and the shared file names.
+**Status:** the data layer (phase P1.1, audited), inventory persistence
+(P1.2) and settings and targets (P1.3). It has the inventory model, its
+validation, safe reading and writing of the inventory file, settings
+resolution and target selection, the plugin hint types and the shared file
+names.
 SSH, WP-CLI and the plugin operations arrive in later phases.
 
 ## Design rules
@@ -100,6 +102,33 @@ The caller passes the path: front ends use `~/.apvm/inventory.json`, or
   (even dangling ones), so apvm never reads, locks or replaces a file
   elsewhere. Directories above the file may be links.
 
+## Settings and targets
+
+Resolution is pure: it reads an `Inventory`, never the disk or the network.
+
+- **Effective settings.** `Inventory::resolve_site` returns a `ResolvedSite`;
+  `resolve_server` returns a server with its effective SSH settings. Each
+  value says where it came from (`built-in`, `defaults`, `server`, `site`).
+  - SSH, field by field: the server's `ssh`, then `defaults.ssh`, then the
+    built-in value (connect timeout 15 s, multiplexing on, program `ssh`).
+    A field none of them sets is left to ssh and your ssh_config. `binary`
+    comes from `defaults.ssh` only.
+  - The site's own settings, else the built-in ones: `wp_cli` `["wp"]`,
+    `run_as` and `owner` `auto`, `ownership` `mirror`, `plugins_dir`
+    `<path>/wp-content/plugins`, `allow_root` `false`, `remote_tmp_dir`
+    `/tmp`.
+- **Targets.** `Targets` names sites, groups, servers, or all sites.
+  `Inventory::resolve_targets` returns their union in inventory order, each
+  site once.
+  - Errors (`invalid_input`, located like `groups[1]`): an unknown id, with
+    a hint when only letter case or spaces differ; a selection that names
+    nothing or matches no site. An empty selection never means "everything".
+  - Warnings: a selected group or server without sites, and sites that are
+    the same WordPress install: the same path on the same ssh destination
+    (host, port, login user, jump hosts and ssh_config file, compared
+    exactly as apvm passes them to ssh, since ssh matches `Host` patterns
+    case-sensitively and resolves anything left unset through ssh_config).
+
 ## Plugin hints
 
 `PluginHints` describe each apvm project's plugins:
@@ -150,8 +179,12 @@ cargo test -p apvm-sites
   file after a failed write or a panicking change, concurrent updates from
   threads, refused symbolic links (including one swapped in while the file
   is opened), a newer inventory never overwritten, the size cap on reads
-  and writes.
+  and writes;
+- settings precedence (every field at every level) and target selection
+  (union, order, de-duplication, errors, warnings), including an exhaustive
+  check of every selection on a sample inventory.
 
 `tests/inventory.rs` loads the example document of the plan through the
-public API. `tests/inventory_io.rs` runs concurrent updates from several
-processes and checks `APVM_INVENTORY`.
+public API; `tests/targets.rs` resolves targets and settings on it.
+`tests/inventory_io.rs` runs concurrent updates from several processes and
+checks `APVM_INVENTORY`.

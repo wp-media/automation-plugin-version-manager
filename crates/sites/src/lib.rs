@@ -15,6 +15,9 @@
 //! - [`inventory::io`]: loads, saves and updates the inventory file safely
 //!   (an exclusive lock, atomic `0600` writes, symbolic links refused), and
 //!   reads the `APVM_INVENTORY` override for front ends.
+//! - [`Targets`] and [`ResolvedSite`]: which sites a command works on (a
+//!   union of sites, groups and servers, in inventory order, never empty),
+//!   with each site's effective settings and where each came from.
 //! - [`PluginHints`]: what apvm's builders know about their plugins (the
 //!   slug each variant installs to, the markers that tell same-slug
 //!   variants apart, family traits), with no plugin-specific code here.
@@ -73,6 +76,10 @@ pub use hints::{FamilyTraits, PluginHint, PluginHints, ProjectHints, VariantHint
 pub use inventory::{
     Defaults, EntityKind, Group, INVENTORY_VERSION, Inventory, Owner, OwnershipPolicy, RunAs,
     Server, ServerRemoval, Site, SiteRemoval, SshSettings,
+};
+pub use inventory::{
+    ResolvedServer, ResolvedSite, ResolvedSsh, ResolvedTargets, Setting, SettingSource,
+    TargetWarning, Targets,
 };
 pub use problem::Problem;
 
