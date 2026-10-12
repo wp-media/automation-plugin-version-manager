@@ -1,6 +1,6 @@
 # Site deployment — manage WordPress plugins on remote sites
 
-Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.5 (implemented and audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5), 10 (P1.2–P1.5 audit), 11 (decisions after P1) and 12 (no lost edits from Node). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
+Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.6 (implemented and audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5), 10 (P1.2–P1.5 audit), 11 (decisions after P1), 12 (no lost edits from Node) and 13 (P1.6 and its audit). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
 
 ---
 
@@ -23,6 +23,15 @@ Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, 
 ---
 
 ## 0. Change log
+
+### Revision 13 (P1.6 implementation and audit, 2026-10-12)
+
+| Topic | Change |
+|---|---|
+| API | `io::Fingerprint` (SHA-256 of the exact bytes, or missing; opaque, `missing()`, `is_missing()`), `io::load_tracked`, `io::save_if_unchanged` and code `inventory_changed`, as revision 12 says. From the audit: `io::save` now returns the fingerprint of what it wrote, and `io::update_tracked` returns `TrackedUpdate { value, inventory, fingerprint }`. Reloading after a forced save or an `update` to get a fingerprint could pair the object's inventory with another process's later edit, and the next tracked save would then lose that edit (reproduced) |
+| Refusals | `save_if_unchanged` compares the file once before taking the lock (a mismatch then is final: every writer replaces the file in one rename) and again under it, so a refused save usually creates no lock file and never re-creates a deleted directory. A file grown past 16 MiB is `inventory_changed`, not `inventory_invalid` |
+| Read-only | A tracked save of a newer (read-only) inventory is refused with `inventory_read_only`, even when nothing changed; one replacing a newer file whole is refused too (checked under the lock, as in `update`) |
+| Known limit | Deleting `inventory.json.lock` while a writer holds it lets the next writer in (it locks a new file), so two edits can race. apvm never deletes it; the crate README says not to. A post-lock inode check would not help: the second writer's lock file is genuine |
 
 ### Revision 12 (no lost edits from Node, 2026-10-12)
 
@@ -988,7 +997,7 @@ File handling:
 - **Limits:** documents over 16 MiB are refused on read and write. A newer (read-only) inventory is never written, even when a change replaces it whole.
 - **Refused:** a symlinked path (the file or its lock file, even dangling; the directories above may be links, e.g. macOS's `/tmp`), a directory or special file at either path, and a path that names no file. Errors carry the path (`inventory_io`).
 - **Lock wait:** a busy lock is retried for at most 10 s (`io::LOCK_WAIT`), then the write fails with `inventory_locked` and nothing is written (revision 11).
-- **No lost edits (revision 12):** callers that keep an inventory in memory between load and save use `io::load_tracked` + `io::save_if_unchanged`: under the lock the file must still match the fingerprint of the bytes loaded (or still be missing), else `inventory_changed` and nothing is written. `io::save` (blind overwrite) is only for a deliberate "force".
+- **No lost edits (revisions 12, 13):** callers that keep an inventory in memory between load and save use `io::load_tracked` + `io::save_if_unchanged`: under the lock the file must still match the fingerprint of the bytes loaded (or still be missing), else `inventory_changed` and nothing is written (the file is also compared before the lock, so a refusal usually creates nothing). `io::save` (blind overwrite) is only for a deliberate "force". `io::save`, `io::save_if_unchanged` and `io::update_tracked` return the fingerprint of the file afterwards; a caller never reloads just to get one.
 
 ---
 
@@ -1023,7 +1032,7 @@ tests/e2e/sites/…  ·  tests/support/fake-remote/{fake-ssh, fake-sudo, fake-wp
 
 1. **Every capability is an `apvm-sites` API.** It covers `Inventory` (+ io), `SiteManager` (`probe`, `list`, `status`, `plan`/`apply`, `run_wp`, `unlock`), `PluginPackage::inspect`, `wp::classify`, `PluginHints`, and the reporters (including `LogFileReporter`).
 2. **Front ends add only** argument parsing, confirmation, rendering, and default locations (`~/.apvm` + `layout` names). The env override helper `inventory::io::env_override()` (`APVM_INVENTORY`) lives in the library, mirroring `config_io::cache_dir_env_override`.
-   Inventory edits go through `io::update` (CLI, `SiteInventory.update`) or `io::load_tracked` + `io::save_if_unchanged` (`SiteInventory.load` … `save`); a front end never writes back a whole document blindly unless the user forces it.
+   Inventory edits go through `io::update` (CLI), `io::update_tracked` (`SiteInventory.update`) or `io::load_tracked` + `io::save_if_unchanged` (`SiteInventory.load` … `save`); a front end never writes back a whole document blindly unless the user forces it.
 3. **Core uses it now** for two things:
    - `ProjectRegistry::plugin_hints()` (family/variant knowledge comes from builders);
    - `Apvm::build_package` + `Apvm::install_build` (plan → build → bind → apply, no prompts), used by NAPI `installBuild` and by any future core feature. The CLI uses the stepwise API so it can confirm before building.
@@ -1313,10 +1322,11 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Result:** `PluginPackage` (`path`, `size`, `sha256`, `uncompressed_size`, `slug`, `main_file`, `headers`, `variant`, `warnings`), `PluginHeaders`, `VariantDetection`, `PackageWarning`, `PackageDefect`, the limits as constants, and `Error::PackageInvalid` (`package_invalid`); rules in §6.10 and revisions 9 and 10. Uses the workspace's `zip` 8.6.0 (deflate only) and `sha2` 0.11.0. Tests: every rule and defect on generated zips, the libzip/PclZip differential shapes, ZIP64, headers, marker boundaries, a 9 000-zip fuzz test, a public-API test; all 43 cached artifacts inspect as §3.1 says (~80 ms each, release). `inspect` is synchronous CPU + I/O: async callers use `spawn_blocking`. Residual (low): a non-UTF-8 name without the UTF-8 flag is written differently by libzip and PclZip; it never affects the folder structure or the slug.
 - **Depends:** P1.1 · **Parallel:** P1.2–P1.4, P2.x, P3.x, P4.x
 
-#### P1.6 — Inventory conflict detection (lib)
+#### P1.6 — Inventory conflict detection (lib) ✅ (implemented and audited 2026-10-12)
 - **Goal:** a save that cannot lose another process's edit, for callers that keep an inventory in memory (revision 12).
 - **Changes:** `inventory/io.rs` (+ tests): `Fingerprint` (opaque: SHA-256 of the exact bytes read, or missing; `sha2` is already a dependency), `load_tracked(path) -> Result<(Inventory, Fingerprint)>` (one read: the inventory and the fingerprint come from the same bytes), `save_if_unchanged(path, &Inventory, &Fingerprint) -> Result<Fingerprint>` (under the lock: re-read safely, compare, write, return the new fingerprint); `Error::InventoryChanged { path }` + code `inventory_changed`; README.
 - **Tests:** unchanged → saved, new fingerprint returned and usable for the next save; changed by another writer → `inventory_changed`, file untouched; deleted since load, or created when it was missing → refused; a byte-identical rewrite is not a conflict; read-only (newer) inventory refused; busy lock → `inventory_locked`; the conflict reproduced across two processes.
+- **Result:** `io::{Fingerprint, load_tracked, save_if_unchanged, update_tracked, TrackedUpdate}`; `io::save` returns a `Fingerprint`; `Error::InventoryChanged` (`inventory_changed`); README. Audit changes in revision 13. Tests: 25 new unit tests (every case above, plus a deleted directory, a file grown past the cap, a no-op `update` in between, forced-save and `update_tracked` chaining, a failed write retried with the same fingerprint, a symlinked path, and 6 threads that reload on conflict until every edit lands, with conflicts asserted to happen), 2 cross-process tests (a child's edits between load and save, `Fingerprint::missing()` over a file a child created), 1 doctest. Each guard (the comparison, the comparison under the lock, the read-only check, the pre-lock look, the size-cap mapping, the returned fingerprints) was removed in turn and a test failed every time. The threaded test passed 40 of 40 runs. Windows: clippy-clean for `x86_64-pc-windows-msvc`. Workspace: 1 533 tests green.
 - **Depends:** P1.2 · **Parallel:** P1.3–P1.5, P2.1–P2.3, P3.x
 
 ### P2 — Inventory front ends
@@ -1348,8 +1358,8 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Changes:** `crates/napi/Cargo.toml`; `sites_inventory.rs`, `sites_types.rs`; `lib.rs` docs; `__tests__/sites-inventory.test.ts`; `crates/napi/README.md`.
 - **Behavior (revision 12):**
   - `load(path?)` uses `io::load_tracked` and remembers the path and fingerprint; `empty()` remembers none.
-  - `save(path?, { force? })`: the target is `path`, else the loaded path, else the default (`APVM_INVENTORY`, else `~/.apvm/inventory.json`). The expected state is the remembered fingerprint when the target is the loaded path (compared as absolute paths), else "missing", so `empty().save()` never wipes an existing inventory. Without `force` it calls `io::save_if_unchanged`; with `force`, `io::save`. On success the object tracks the target and the new fingerprint and returns the path. On `InventoryChanged` nothing is written and the object keeps its changes.
-  - `static update(fn, path?)`: `io::update`; `fn` gets a `SiteInventory` over the locked copy and must be synchronous. A throw in `fn` writes nothing and is rethrown as is (beware napi's pending-exception pitfalls). It returns the saved inventory, tracked. Calling `save`/`update` on the same path inside `fn` fails with `InventoryLocked` after 10 s (documented, tested), never deadlocks.
+  - `save(path?, { force? })`: the target is `path`, else the loaded path, else the default (`APVM_INVENTORY`, else `~/.apvm/inventory.json`). The expected state is the remembered fingerprint when the target is the loaded path (compared as absolute paths), else "missing", so `empty().save()` never wipes an existing inventory. Without `force` it calls `io::save_if_unchanged`; with `force`, `io::save`. On success the object tracks the target and the fingerprint the call returned (never one from a reload, which could hold another process's later edit) and returns the path. On `InventoryChanged` nothing is written and the object keeps its changes. A loaded read-only (newer) inventory always rejects `save` with `InventoryReadOnly`. Comparing absolute (not canonical) paths can report a false `InventoryChanged` (`/tmp/x` vs `/private/tmp/x` on macOS): safe, documented.
+  - `static update(fn, path?)`: `io::update_tracked`; `fn` gets a `SiteInventory` over the locked copy and must be synchronous. A throw in `fn` writes nothing and is rethrown as is (beware napi's pending-exception pitfalls). It returns the saved inventory, tracked with the `TrackedUpdate` fingerprint. Calling `save`/`update` on the same path inside `fn` fails with `InventoryLocked` after 10 s (documented, tested), never deadlocks.
   - Rejection codes: `InventoryChanged`, `InventoryLocked`, `InventoryIo`, plus the existing inventory codes.
 - **Tests:** round-trip; validation errors with `err.code`; `APVM_INVENTORY` from `process.env`; `save` → `0600`; a second process edits between `load` and `save` → `InventoryChanged`, the file keeps that edit, the object keeps its own, reload + reapply + save succeeds; `force` overwrites; `empty().save()` over an existing file refused; chained saves on one object; `update` from parallel workers all land; a throwing `fn` writes nothing.
 - **Depends:** P1.3, P1.6 · **Parallel:** P2.1–P2.3, P3.x
