@@ -1,6 +1,6 @@
 # Site deployment — manage WordPress plugins on remote sites
 
-Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.5 (implemented and audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5) and 10 (P1.2–P1.5 audit). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
+Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.5 (implemented and audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5), 10 (P1.2–P1.5 audit) and 11 (decisions after P1). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
 
 ---
 
@@ -23,6 +23,14 @@ Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, 
 ---
 
 ## 0. Change log
+
+### Revision 11 (decisions after P1, 2026-10-12)
+
+| Topic | Change |
+|---|---|
+| Inventory lock | Writers wait at most 10 s (`io::LOCK_WAIT`) for a busy lock, polling `File::try_lock` (5 ms doubling to 100 ms), then fail with the new code `inventory_locked`; nothing is written. Before, a stuck holder blocked every writer forever (§4.5, §7) |
+| `apvm info` | The `Family:` section added in P1.4 stays |
+| Same WordPress | The revision 10 key stays (exact host, port, user, `proxy_jump`, `ssh_config_file`, path); P6.4's realpath key covers the rest |
 
 ### Revision 10 (adversarial audit of P1.2–P1.5, 2026-10-12)
 
@@ -423,7 +431,7 @@ Stable codes (CLI `--json`, NAPI `code`):
 | WordPress | `wp_cli_missing`, `not_wordpress`, `wp_not_installed`, `plugins_dir_not_writable`, `multisite_unsupported` |
 | Execution | `site_locked`, `insufficient_space`, `upload_corrupted`, `wp_command_failed`, `verification_failed`, `state_drifted`, `outcome_unknown`, `health_check_failed`, `timeout`, `file_mods_disallowed` |
 | Ownership / variants | `ownership_unfixable`, `variant_conflict` (two variants of one slug, or two siblings activated together without `--keep-siblings`) |
-| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory), `inventory_io` (the inventory file, its lock or its directory cannot be read, written, locked or created, or is not a regular file) |
+| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory), `inventory_io` (the inventory file, its lock or its directory cannot be read, written, locked or created, or is not a regular file), `inventory_locked` (another process held the inventory lock for the whole 10 s wait) |
 | Status | `expectation_not_met`, `undetermined` |
 
 ---
@@ -970,7 +978,8 @@ File handling:
 - **Load:** a missing file is an empty inventory. Parsing uses `deny_unknown_fields`, requires `version`, accepts records only as JSON objects, reads `null` as unset and ignores a leading UTF-8 BOM. Then full validation runs, reporting every problem with its location (`sites[1].server: unknown server 'eu-2'`). A newer `version` (read from the JSON object) is read-only when this build can read it fully (every field and value known, every rule passed). Otherwise it is refused with `inventory_unsupported`, and its problems stay listable.
 - **Save:** lock (`inventory.json.lock`, `std::fs::File::lock`, created `0600`, never removed) → temp file created `0600` with `create_new` → fsync → rename → fsync dir (best effort: once renamed, the save has landed). Missing parents are created `0700`. Edits are read-modify-write under the lock (`io::update`), which writes only when the change succeeds and changes something; `load` takes no lock (a save is one rename).
 - **Limits:** documents over 16 MiB are refused on read and write. A newer (read-only) inventory is never written, even when a change replaces it whole.
-- **Refused:** a symlinked path (the file or its lock file, even dangling; the directories above may be links, e.g. macOS's `/tmp`), a directory or special file at either path, and a path that names no file. Errors carry the path (`inventory_io`). Lock waits are unbounded (a bounded wait is an open decision).
+- **Refused:** a symlinked path (the file or its lock file, even dangling; the directories above may be links, e.g. macOS's `/tmp`), a directory or special file at either path, and a path that names no file. Errors carry the path (`inventory_io`).
+- **Lock wait:** a busy lock is retried for at most 10 s (`io::LOCK_WAIT`), then the write fails with `inventory_locked` and nothing is written (revision 11).
 
 ---
 
@@ -1258,7 +1267,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** safe load/save/update.
 - **Changes:** `inventory/io.rs` (lock, atomic `0600` write, `update`, symlink refusal, `env_override`).
 - **Tests:** missing file = empty; located errors; `0600`; no partial file; two concurrent `update`s both land; symlink refused; env override.
-- **Result:** `io::{load, save, update, env_override}` with std only (`File::lock`), new errors `InventoryIo`/`InventoryNotAFile`/`InventoryFile` and the `inventory_io` code; details in §7 and revisions 9 and 10. Tests: 51 unit, 4 integration (concurrent updates from 4 processes, `APVM_INVENTORY` from a child environment), 1 doctest; the 3 concurrency tests fail with the lock disabled. Windows: clippy-clean for `x86_64-pc-windows-msvc`. Known limits (low): a FIFO swapped in between the check and the open can block a `load` (only the same user can, in `~/.apvm`; fixing needs `libc`); a crash mid-save can leave a hidden `0600` temp file; lock waits are unbounded.
+- **Result:** `io::{load, save, update, env_override}` with std only (`File::lock`), new errors `InventoryIo`/`InventoryNotAFile`/`InventoryFile` and the `inventory_io` code; details in §7 and revisions 9 and 10. Tests: 51 unit, 4 integration (concurrent updates from 4 processes, `APVM_INVENTORY` from a child environment), 1 doctest; the 3 concurrency tests fail with the lock disabled. Windows: clippy-clean for `x86_64-pc-windows-msvc`. Known limits (low): a FIFO swapped in between the check and the open can block a `load` (only the same user can, in `~/.apvm`; fixing needs `libc`); a crash mid-save can leave a hidden `0600` temp file. Revision 11 bounds the lock wait (10 s, `inventory_locked`).
 - **Depends:** P1.1 · **Parallel:** P1.3–P1.5, P3.1
 
 #### P1.3 — Settings merge and targets ✅ (implemented and audited 2026-10-12)
