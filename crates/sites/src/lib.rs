@@ -22,6 +22,9 @@
 //!   slug each variant installs to, the markers that tell same-slug
 //!   variants apart, family traits), with no plugin-specific code here.
 //! - [`layout`]: names of the files front ends keep for this crate.
+//! - [`PluginPackage`]: a plugin zip inspected locally before an install
+//!   (single plugin folder, safe paths, size limits, headers read as
+//!   WordPress reads them, variant markers, SHA-256).
 //! - [`Error`] with stable [`Code`]s for the CLI's `--json` and the Node
 //!   bindings.
 //!
@@ -69,6 +72,7 @@ mod error;
 mod hints;
 pub mod inventory;
 pub mod layout;
+pub mod package;
 mod problem;
 
 pub use error::{Code, Error, Result};
@@ -81,6 +85,7 @@ pub use inventory::{
     ResolvedServer, ResolvedSite, ResolvedSsh, ResolvedTargets, Setting, SettingSource,
     TargetWarning, Targets,
 };
+pub use package::{PackageDefect, PackageWarning, PluginHeaders, PluginPackage, VariantDetection};
 pub use problem::Problem;
 
 #[cfg(test)]

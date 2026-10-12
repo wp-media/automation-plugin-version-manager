@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::inventory::EntityKind;
 use crate::inventory::io::FileKind;
+use crate::package::PackageDefect;
 use crate::problem::{Problem, printable, quoted};
 
 /// Convenient result alias used across the crate.
@@ -34,6 +35,8 @@ pub enum Code {
     /// written, locked or created, or is not a regular file
     /// (`inventory_io`).
     InventoryIo,
+    /// A plugin zip breaks an inspection rule (`package_invalid`).
+    PackageInvalid,
 }
 
 impl Code {
@@ -45,6 +48,7 @@ impl Code {
             Self::InventoryUnsupported => "inventory_unsupported",
             Self::InventoryReadOnly => "inventory_read_only",
             Self::InventoryIo => "inventory_io",
+            Self::PackageInvalid => "package_invalid",
         }
     }
 }
@@ -202,6 +206,16 @@ pub enum Error {
         /// `projects[0].plugins[1].slug`.
         problems: Vec<Problem>,
     },
+
+    /// A plugin zip breaks a rule of package inspection (plan §6.10).
+    #[error("invalid plugin package {}: {defect}", quoted(path))]
+    PackageInvalid {
+        /// The zip file, as given.
+        path: String,
+        /// The rule it breaks.
+        #[source]
+        defect: PackageDefect,
+    },
 }
 
 impl Error {
@@ -218,6 +232,7 @@ impl Error {
             | Self::NotFound { .. }
             | Self::ServerInUse { .. }
             | Self::InvalidHints { .. } => Code::InvalidInput,
+            Self::PackageInvalid { .. } => Code::PackageInvalid,
         }
     }
 

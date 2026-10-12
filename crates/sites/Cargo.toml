@@ -15,3 +15,11 @@ serde_json = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
+
+# Plugin zip inspection (package/): read archives in memory, hash them
+zip = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# Temporary zip files for the package tests
+tempfile = { workspace = true }

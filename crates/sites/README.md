@@ -5,12 +5,13 @@ behind `apvm server|site|group` and `apvm wp`, the Node bindings, and
 apvm-core's build-and-install path. The design and the phase plan are in
 [`docs/plans/site-deployment.md`](../../docs/plans/site-deployment.md).
 
-**Status:** the data layer (phase P1.1, audited), inventory persistence
-(P1.2) and settings and targets (P1.3). It has the inventory model, its
-validation, safe reading and writing of the inventory file, settings
-resolution and target selection, the plugin hint types and the shared file
-names.
-SSH, WP-CLI and the plugin operations arrive in later phases.
+**Status:** phase P1 (foundations): the data layer (P1.1), inventory
+persistence (P1.2), settings and targets (P1.3), the plugin hint types that
+apvm-core fills (P1.4) and local package inspection (P1.5). It has the
+inventory model and its validation, safe reading and writing of the
+inventory file, settings resolution and target selection, plugin hints,
+plugin zip inspection and the shared file names. SSH, WP-CLI and the plugin
+operations arrive in later phases.
 
 ## Design rules
 
@@ -143,6 +144,28 @@ apvm-core builds them from its builders, so this crate holds no
 plugin-specific code. A project has variants on every slug or on none.
 Same-slug variants need markers that cannot overlap.
 
+## Package inspection
+
+`PluginPackage::inspect(path, &hints)` reads a plugin zip in memory (never
+extracting it) and returns its slug, main file, headers, variant, SHA-256,
+sizes and warnings, or refuses it with `package_invalid` and the rule it
+breaks (`PackageDefect`):
+
+| Rule | Detail |
+|---|---|
+| File | a regular `*.zip` file of at most 256 MiB |
+| Limits | at most 100 000 entries and 1 GiB uncompressed; every entry is decompressed once, so its declared size and CRC-32 are checked on the bytes actually read; reading the zip may take at most 4 times its size plus 1 MiB, which refuses entries that share their data and files full of fake directory records (zip-bomb shapes that make a reader go over the same bytes again and again) |
+| Directory | read the same way by every zip reader WordPress may use (libzip, then PclZip when libzip refuses a zip): one end record, closing the file; a central directory that ends at it and holds exactly the records it declares; no two entries with the same name; no Unicode path field that renames an entry; no file with the DOS folder attribute. The entry count is checked from the end record, before any entry is parsed |
+| Entries | Stored or Deflated, not encrypted |
+| Paths | relative and canonical: no `..` (nor `../` inside a name), `.` or empty component, leading `/`, NUL or backslash. Symbolic links only give a warning (WordPress writes them as plain files) |
+| Structure | exactly one top-level folder, named like a slug; `__MACOSX/` is ignored, as WordPress ignores it. Any top-level file, `.DS_Store` included, is refused: WordPress would then install into a folder named after the uploaded zip |
+| Plugin | a `<slug>/*.php` (not starting with `.`) with `Plugin Name` in its first 8 KiB; the main file is `<slug>/<slug>.php` when it has one, else the first in byte order; several give a warning |
+| Headers | read like WordPress 7.1.3's `get_file_data()`: first matching line, any letter case, CR and CRLF line endings, values cut at `*/` or `?>`; `Network`, `Requires Plugins` and the others as `get_plugin_data()` reads them |
+| Variant | the hints' markers are looked for inside the zip: exactly one match names the variant; none or several leave it undetermined |
+
+Inspection hashes and decompresses: run it on a blocking thread in async
+code.
+
 ## Errors
 
 `Error::code()` returns a stable `Code`:
@@ -154,7 +177,8 @@ Same-slug variants need markers that cannot overlap.
   be read, written, locked or created, or is not a regular file (a symbolic
   link, a directory);
 - `invalid_input`: a refused record, a taken or unknown id, a server in use,
-  or invalid hints.
+  or invalid hints;
+- `package_invalid`: a plugin zip that breaks an inspection rule.
 
 `Error::problems()` lists the located problems, so a front end can print
 them one per line.
@@ -182,9 +206,16 @@ cargo test -p apvm-sites
   and writes;
 - settings precedence (every field at every level) and target selection
   (union, order, de-duplication, errors, warnings), including an exhaustive
-  check of every selection on a sample inventory.
+  check of every selection on a sample inventory;
+- package inspection, on zips the tests generate: every structure, path,
+  directory and limit rule (including zips that libzip, PclZip and the zip
+  crate would read differently, and ZIP64 end records), damaged and
+  encrypted entries, other compression methods, WordPress header parsing
+  (8 KiB window, CRLF, a multibyte character cut at the boundary) and
+  variant markers, plus a small fuzz test (mutated zips never panic).
 
 `tests/inventory.rs` loads the example document of the plan through the
 public API; `tests/targets.rs` resolves targets and settings on it.
 `tests/inventory_io.rs` runs concurrent updates from several processes and
-checks `APVM_INVENTORY`.
+checks `APVM_INVENTORY`. `tests/package.rs` inspects a BackWPup Pro zip
+through the public API.
