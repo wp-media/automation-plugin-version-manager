@@ -71,7 +71,7 @@ pub(crate) fn tokio_command() -> tokio::process::Command {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     /// Initializes an empty repository in a fresh temp dir.
@@ -91,8 +91,10 @@ mod tests {
     }
 
     /// Runs `git rev-parse --absolute-git-dir` in `dir` with `GIT_DIR` set to
-    /// `decoy` on the command, isolated or not; returns the reported git dir.
-    fn git_dir_seen(dir: &Path, decoy: &Path, isolated: bool) -> String {
+    /// `decoy` on the command, isolated or not; returns the reported git dir,
+    /// canonicalized so it compares equal to [`std::fs::canonicalize`] output
+    /// (git on Windows prints `C:/…/.git`, canonicalize yields `\\?\C:\…\.git`).
+    fn git_dir_seen(dir: &Path, decoy: &Path, isolated: bool) -> PathBuf {
         let mut cmd = std::process::Command::new("git");
         cmd.env("GIT_DIR", decoy.join(".git"))
             .env("GIT_INDEX_FILE", decoy.join(".git/index"))
@@ -107,7 +109,8 @@ mod tests {
             "rev-parse failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        let reported = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        std::fs::canonicalize(&reported).expect("git reports an existing git dir")
     }
 
     #[test]
@@ -140,12 +143,12 @@ mod tests {
         // Control: without isolation, the foreign GIT_DIR wins (the bug).
         assert_eq!(
             git_dir_seen(target.path(), decoy.path(), false),
-            decoy_git_dir.to_string_lossy()
+            decoy_git_dir
         );
         // With isolation, git uses the repository of its working directory.
         assert_eq!(
             git_dir_seen(target.path(), decoy.path(), true),
-            target_git_dir.to_string_lossy()
+            target_git_dir
         );
     }
 
