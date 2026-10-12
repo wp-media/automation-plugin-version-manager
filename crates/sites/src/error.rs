@@ -5,7 +5,10 @@
 //! wildcard arm. Messages name no front-end remedy (no CLI flag, no Node
 //! option); each front end adds its own.
 
+use std::path::{Path, PathBuf};
+
 use crate::inventory::EntityKind;
+use crate::inventory::io::FileKind;
 use crate::problem::{Problem, printable, quoted};
 
 /// Convenient result alias used across the crate.
@@ -27,6 +30,10 @@ pub enum Code {
     /// The inventory was written by a newer apvm: this one may read it but
     /// never change it (`inventory_read_only`).
     InventoryReadOnly,
+    /// The inventory file, its lock file or its directory cannot be read,
+    /// written, locked or created, or is not a regular file
+    /// (`inventory_io`).
+    InventoryIo,
 }
 
 impl Code {
@@ -37,6 +44,7 @@ impl Code {
             Self::InventoryInvalid => "inventory_invalid",
             Self::InventoryUnsupported => "inventory_unsupported",
             Self::InventoryReadOnly => "inventory_read_only",
+            Self::InventoryIo => "inventory_io",
         }
     }
 }
@@ -149,6 +157,44 @@ pub enum Error {
         sites: Vec<String>,
     },
 
+    /// Reading or writing the inventory file failed: the file, its lock
+    /// file or its directory could not be read, written, locked or created.
+    #[error("{context} {}: {source}", shown(path))]
+    InventoryIo {
+        /// What was being done (`"cannot read the inventory"`, …).
+        context: &'static str,
+        /// The file or directory involved (the inventory, its lock file or
+        /// its directory).
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The inventory path, or its lock file, is not a regular file. A
+    /// symbolic link is never followed: it could make apvm read or replace
+    /// a file elsewhere.
+    #[error("refusing {}: it is {found}, not a regular file", shown(path))]
+    InventoryNotAFile {
+        /// The refused path.
+        path: PathBuf,
+        /// What is there instead.
+        found: FileKind,
+    },
+
+    /// The inventory file's content could not be read: `source` says why
+    /// ([`Error::InventoryJson`], [`Error::InventoryInvalid`] or
+    /// [`Error::InventoryUnsupported`]), and [`Error::code`] and
+    /// [`Error::problems`] are those of `source`.
+    #[error("{}: {source}", shown(path))]
+    InventoryFile {
+        /// The inventory file.
+        path: PathBuf,
+        /// Why its content was refused.
+        #[source]
+        source: Box<Error>,
+    },
+
     /// Plugin hints break one or more rules.
     #[error("invalid plugin hints: {}", Problem::join(problems))]
     InvalidHints {
@@ -165,6 +211,8 @@ impl Error {
             Self::InventoryJson { .. } | Self::InventoryInvalid { .. } => Code::InventoryInvalid,
             Self::InventoryUnsupported { .. } => Code::InventoryUnsupported,
             Self::InventoryReadOnly { .. } => Code::InventoryReadOnly,
+            Self::InventoryIo { .. } | Self::InventoryNotAFile { .. } => Code::InventoryIo,
+            Self::InventoryFile { source, .. } => source.code(),
             Self::InvalidInput { .. }
             | Self::AlreadyExists { .. }
             | Self::NotFound { .. }
@@ -181,10 +229,19 @@ impl Error {
             Self::InventoryInvalid { problems }
             | Self::InvalidInput { problems, .. }
             | Self::InvalidHints { problems } => problems,
-            Self::InventoryUnsupported { source, .. } => source.problems(),
+            Self::InventoryUnsupported { source, .. } | Self::InventoryFile { source, .. } => {
+                source.problems()
+            }
             _ => &[],
         }
     }
+}
+
+/// A path as shown in messages: as the platform displays it, with control
+/// and invisible formatting characters escaped. Not quoted, so Windows
+/// paths keep single backslashes.
+fn shown(path: &Path) -> String {
+    printable(&path.display().to_string())
 }
 
 #[cfg(test)]
@@ -219,6 +276,65 @@ mod tests {
         assert_eq!(Code::InventoryUnsupported.as_str(), "inventory_unsupported");
         assert_eq!(Code::InventoryReadOnly.as_str(), "inventory_read_only");
         assert_eq!(Code::InventoryReadOnly.to_string(), "inventory_read_only");
+        assert_eq!(Code::InventoryIo.as_str(), "inventory_io");
+    }
+
+    #[test]
+    fn file_errors_name_their_path_and_map_to_their_codes() {
+        let path = PathBuf::from("/home/me/.apvm/inventory.json");
+        let error = Error::InventoryIo {
+            context: "cannot read the inventory",
+            path: path.clone(),
+            source: std::io::Error::other("boom"),
+        };
+        assert_eq!(error.code(), Code::InventoryIo);
+        assert_eq!(
+            error.to_string(),
+            "cannot read the inventory /home/me/.apvm/inventory.json: boom"
+        );
+        assert!(error.problems().is_empty());
+
+        let error = Error::InventoryNotAFile {
+            path: path.clone(),
+            found: FileKind::Symlink,
+        };
+        assert_eq!(error.code(), Code::InventoryIo);
+        assert_eq!(
+            error.to_string(),
+            "refusing /home/me/.apvm/inventory.json: it is a symbolic link, not a regular file"
+        );
+
+        // A content error keeps the code and problems of its source.
+        let error = Error::InventoryFile {
+            path,
+            source: Box::new(Error::InventoryUnsupported {
+                found: 2,
+                supported: 1,
+                source: Box::new(Error::InventoryInvalid {
+                    problems: problems(),
+                }),
+            }),
+        };
+        assert_eq!(error.code(), Code::InventoryUnsupported);
+        assert_eq!(error.problems(), problems().as_slice());
+        assert!(
+            error
+                .to_string()
+                .starts_with("/home/me/.apvm/inventory.json: the inventory has format version 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn paths_in_messages_escape_control_characters() {
+        let error = Error::InventoryNotAFile {
+            path: PathBuf::from("/tmp/a\u{1b}[2Jb"),
+            found: FileKind::Directory,
+        };
+        assert_eq!(
+            error.to_string(),
+            "refusing /tmp/a\\u{1b}[2Jb: it is a directory, not a regular file"
+        );
     }
 
     #[test]

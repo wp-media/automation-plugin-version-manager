@@ -4,8 +4,8 @@
 //! An [`Inventory`] is **always valid**: it is built empty, parsed from a
 //! document that passes every rule, or changed through methods that check
 //! the record first and change nothing when it is refused. It works on the
-//! document's text; reading and writing the file (locking, atomic saves)
-//! is a separate layer.
+//! document's text; [`io`] reads and writes the file (locking, atomic
+//! saves, no symbolic links).
 //!
 //! # Versions
 //!
@@ -15,6 +15,7 @@
 //! refused ([`Error::InventoryUnsupported`]) rather than read with parts
 //! ignored, which could drop a setting that restricts what apvm does.
 
+pub mod io;
 mod model;
 mod validate;
 

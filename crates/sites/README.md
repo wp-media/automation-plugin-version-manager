@@ -5,9 +5,10 @@ behind `apvm server|site|group` and `apvm wp`, the Node bindings, and
 apvm-core's build-and-install path. The design and the phase plan are in
 [`docs/plans/site-deployment.md`](../../docs/plans/site-deployment.md).
 
-**Status:** the data layer (phase P1.1, audited). It has the inventory
-model, its validation, the plugin hint types and the shared file names.
-Persistence, SSH, WP-CLI and the plugin operations arrive in later phases.
+**Status:** the data layer (phase P1.1, audited) and inventory persistence
+(P1.2). It has the inventory model, its validation, safe reading and writing
+of the inventory file, the plugin hint types and the shared file names.
+SSH, WP-CLI and the plugin operations arrive in later phases.
 
 ## Design rules
 
@@ -74,6 +75,31 @@ The rules, in short (plan §7 has the full table and the reasons):
 | `identity_file`, `known_hosts_file`, `ssh_config_file`, `binary` | `[A-Za-z0-9._/\:+-]`, `~` only as a leading `~/`, no `.` or `..` component; `known_hosts_file` not `none`, `NUL` or `/dev/…`; `binary` only in `defaults.ssh` |
 | `name` / `notes` | 1–128 / 1–1024 characters, no control or invisible formatting character |
 
+## The inventory file (`inventory::io`)
+
+The caller passes the path: front ends use `~/.apvm/inventory.json`, or
+`APVM_INVENTORY` when it is set and not empty (`io::env_override()`).
+
+- **`load`**: a missing file is an empty inventory. Errors carry the path,
+  and content problems their locations. Files over 16 MiB, and content that
+  is not UTF-8, are refused.
+- **`save`**: replaces the file under an exclusive lock
+  (`inventory.json.lock`, `std::fs::File::lock`). The document is written
+  to a temp file created `0600`, synced, renamed over the inventory, and the
+  directory is synced, so a crash or a failed write never leaves a partial
+  file. Missing directories are created `0700`.
+- **`update`**: load, change and save under the lock, so concurrent edits
+  from threads or processes all land. The file is not written when the
+  change fails or changes nothing (the lock file and missing directories
+  are still created). A change to a newer, read-only inventory is refused,
+  even one that replaces it whole.
+- Documents over 16 MiB are never written (`load` would refuse them), and
+  paths that name no file (empty, `/`, `..`, or ending with a separator or
+  `/.`) are refused.
+- **Symbolic links are refused** for the inventory file and its lock file
+  (even dangling ones), so apvm never reads, locks or replaces a file
+  elsewhere. Directories above the file may be links.
+
 ## Plugin hints
 
 `PluginHints` describe each apvm project's plugins:
@@ -95,6 +121,9 @@ Same-slug variants need markers that cannot overlap.
 - `inventory_invalid`: parse or validation failure;
 - `inventory_unsupported`: a newer document this build cannot read;
 - `inventory_read_only`: a change to a newer document;
+- `inventory_io`: the inventory file, its lock file or its directory cannot
+  be read, written, locked or created, or is not a regular file (a symbolic
+  link, a directory);
 - `invalid_input`: a refused record, a taken or unknown id, a server in use,
   or invalid hints.
 
@@ -116,7 +145,13 @@ cargo test -p apvm-sites
   accepted change keeps the inventory valid, every refused change leaves it
   untouched, and every result reloads unchanged;
 - versions;
-- the hint rules.
+- the hint rules;
+- the inventory file: missing = empty, located errors, `0600`, no partial
+  file after a failed write or a panicking change, concurrent updates from
+  threads, refused symbolic links (including one swapped in while the file
+  is opened), a newer inventory never overwritten, the size cap on reads
+  and writes.
 
 `tests/inventory.rs` loads the example document of the plan through the
-public API.
+public API. `tests/inventory_io.rs` runs concurrent updates from several
+processes and checks `APVM_INVENTORY`.

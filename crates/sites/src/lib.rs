@@ -12,6 +12,9 @@
 //!   checked when parsed, and a refused change leaves it untouched. Every
 //!   problem is reported with its location (`sites[1].server: unknown
 //!   server 'eu-2'`).
+//! - [`inventory::io`]: loads, saves and updates the inventory file safely
+//!   (an exclusive lock, atomic `0600` writes, symbolic links refused), and
+//!   reads the `APVM_INVENTORY` override for front ends.
 //! - [`PluginHints`]: what apvm's builders know about their plugins (the
 //!   slug each variant installs to, the markers that tell same-slug
 //!   variants apart, family traits), with no plugin-specific code here.
