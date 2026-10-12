@@ -244,8 +244,11 @@ pub enum Error {
         problems: Vec<Problem>,
     },
 
-    /// A plugin zip breaks a rule of package inspection (plan §6.10).
-    #[error("invalid plugin package {}: {defect}", quoted(path))]
+    /// A plugin zip breaks a rule of package inspection (plan §6.10). The
+    /// path is shown as the platform displays it (control characters
+    /// escaped), not escaped like an id, which would double Windows
+    /// backslashes.
+    #[error("invalid plugin package '{}': {defect}", printable(path))]
     PackageInvalid {
         /// The zip file, as given.
         path: String,
@@ -343,6 +346,20 @@ mod tests {
         assert_eq!(Code::InventoryIo.as_str(), "inventory_io");
         assert_eq!(Code::InventoryLocked.as_str(), "inventory_locked");
         assert_eq!(Code::InventoryChanged.as_str(), "inventory_changed");
+    }
+
+    #[test]
+    fn package_paths_keep_windows_backslashes_and_escape_control_characters() {
+        let error = Error::PackageInvalid {
+            path: "C:\\Users\\me\\a\u{1b}b.zip".into(),
+            defect: PackageDefect::NotAFile,
+        };
+        let message = error.to_string();
+        assert!(
+            message.starts_with("invalid plugin package 'C:\\Users\\me\\a\\u{1b}b.zip': "),
+            "{message}"
+        );
+        assert_eq!(error.code(), Code::PackageInvalid);
     }
 
     #[test]
