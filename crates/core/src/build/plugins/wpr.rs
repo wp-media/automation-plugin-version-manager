@@ -407,6 +407,16 @@ impl Builder for WpRocketBuilder {
             target_name: name,
         }])
     }
+
+    // =========================================================================
+    // WordPress Plugin Identity
+    // =========================================================================
+
+    /// Every build installs to `wp-rocket`, the zip's root directory
+    /// (`PLUGIN_DIR_NAME`); there are no variants, so `variant` is ignored.
+    fn plugin_slug(&self, _variant: Option<&str>) -> Option<&'static str> {
+        Some(PLUGIN_DIR_NAME)
+    }
 }
 
 // =============================================================================
@@ -831,6 +841,24 @@ mod tests {
     #[test]
     fn test_no_default_variants() {
         assert!(builder().default_variants().is_empty());
+    }
+
+    // =========================================================================
+    // WordPress Plugin Identity (plan §3.1)
+    // =========================================================================
+
+    #[test]
+    fn test_plugin_slug_is_the_zip_root_whatever_the_variant() {
+        let b = builder();
+        assert_eq!(b.plugin_slug(None), Some("wp-rocket"));
+        assert_eq!(b.plugin_slug(Some("anything")), Some("wp-rocket"));
+        assert_eq!(b.plugin_slug(None), Some(PLUGIN_DIR_NAME));
+    }
+
+    #[test]
+    fn test_no_marker_and_no_family() {
+        assert_eq!(builder().variant_marker("anything"), None);
+        assert_eq!(builder().family_traits(), None);
     }
 
     // =========================================================================

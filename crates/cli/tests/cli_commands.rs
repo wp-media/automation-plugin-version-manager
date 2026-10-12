@@ -169,6 +169,57 @@ fn info_single_variant_plugin_reports_no_variants() {
 }
 
 #[test]
+fn info_backwpup_shows_slugs_markers_and_family() {
+    // Plan §3.1: free → backwpup; pro-de and pro-en → backwpup-pro, told
+    // apart by the license-server URL in License.php.
+    let out = Sandbox::new().run(&["info", "backwpup"]);
+    assert_exit(&out, 0);
+    let text = stdout(&out);
+    assert!(
+        text.contains(
+            "  Private:     yes (requires GITHUB_TOKEN)\n  Slugs:       backwpup, backwpup-pro\n"
+        ),
+        "{text}"
+    );
+    let license = "inc/Pro/License/License.php";
+    let variants = format!(
+        "Variants:\n\
+         \x20 free         Free           BackWPup Free version\n\
+         \x20              Slug:    backwpup\n\
+         \x20 pro-de       Pro (German)   BackWPup Pro German version\n\
+         \x20              Slug:    backwpup-pro\n\
+         \x20              Marker:  {license} contains \"https://backwpup.de/\"\n\
+         \x20 pro-en       Pro (English)  BackWPup Pro English version\n\
+         \x20              Slug:    backwpup-pro\n\
+         \x20              Marker:  {license} contains \"https://backwpup.com/\"\n\
+         \x20 Default:     free, pro-en\n\
+         \n\
+         Family:\n\
+         \x20 Conflicts:   yes (when several are active, only one runs per request)\n\
+         \x20 Shared data: yes (each one's uninstall removes data the others use)\n\
+         \n\
+         Tool dependencies:\n"
+    );
+    assert!(text.contains(&variants), "{text}");
+}
+
+#[test]
+fn info_single_output_plugins_show_their_slug_and_no_family() {
+    for (name, slug) in [("wp-rocket", "wp-rocket"), ("imagify", "imagify")] {
+        let out = Sandbox::new().run(&["info", name]);
+        assert_exit(&out, 0);
+        let text = stdout(&out);
+        assert!(
+            text.contains(&format!("  Private:     no\n  Slug:        {slug}\n")),
+            "{text}"
+        );
+        for absent in ["Slugs:", "Marker:", "Family:"] {
+            assert!(!text.contains(absent), "`info {name}` shows {absent:?}");
+        }
+    }
+}
+
+#[test]
 fn info_unknown_plugin_fails_with_exit_1() {
     let out = Sandbox::new().run(&["info", "no-such-plugin"]);
     assert_exit(&out, 1);

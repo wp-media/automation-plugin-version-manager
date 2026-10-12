@@ -69,7 +69,8 @@ apvm-core/src/
 │   ├── models.rs       PullRequest, Release, ReleaseAsset
 │   └── mod.rs          Re-exports
 └── projects/       Project management
-    ├── registry.rs     ProjectRegistry, Project definitions
+    ├── registry.rs     ProjectRegistry, Project definitions, plugin_hints, project_for_slug
+    ├── hints.rs        Builder declarations → apvm-sites ProjectHints
     └── mod.rs          Re-exports
 ```
 
@@ -225,11 +226,11 @@ Built-in implementations:
 
 The `VersionRequirement` enum controls how each plugin handles versions:
 
-| Variant    | Behavior                                                         | Example        |
-|------------|------------------------------------------------------------------|----------------|
-| `Required` | Version **must** be provided via parameter                       | BackWPup       |
-| `Embedded` | Version is auto-detected from source code; parameter is ignored  | WP Rocket      |
-| `Optional` | Version can be provided to override, or auto-detected if omitted | (future use)   |
+| Variant    | Behavior                                                         | Example            |
+|------------|------------------------------------------------------------------|--------------------|
+| `Required` | Version **must** be provided via parameter                       | BackWPup           |
+| `Embedded` | Version is auto-detected from source code; parameter is ignored  | —                  |
+| `Optional` | Version can be provided to override, or auto-detected if omitted | WP Rocket, Imagify |
 
 Version detection helpers:
 
@@ -247,6 +248,10 @@ pub trait Builder: Send + Sync {
     fn has_variants(&self) -> bool;
     fn variants(&self) -> Vec<Variant>;
     fn default_variants(&self) -> Vec<String>;
+    // WordPress plugin identity (defaults declare nothing):
+    fn plugin_slug(&self, variant: Option<&str>) -> Option<&'static str>;
+    fn variant_marker(&self, variant: &str) -> Option<VariantMarker>;
+    fn family_traits(&self) -> Option<FamilyTraits>;
     // ... build hooks, dependency checks, etc.
 }
 ```
@@ -254,7 +259,24 @@ pub trait Builder: Send + Sync {
 Current implementations:
 
 - **`BackWPupBuilder`** (`bwu.rs`) — multi-variant (free, pro-de, pro-en), version required, supports GitHub Releases
-- **`WpRocketBuilder`** (`wpr.rs`) — single output, version embedded (auto-detected from PHP header)
+- **`WpRocketBuilder`** (`wpr.rs`) — single output, version optional (detected from or rewritten into `wp-rocket.php`)
+- **`ImagifyBuilder`** (`imagify.rs`) — single output, version optional (detected from or rewritten into `imagify.php`)
+
+### Plugin hints (site deployment)
+
+Builders also declare what their zips install on a WordPress site: the plugin
+slug per variant (`free` → `backwpup`, `pro-de`/`pro-en` → `backwpup-pro`,
+`wp-rocket`, `imagify`), the marker file that tells same-slug variants apart
+(`inc/Pro/License/License.php` containing `https://backwpup.de/` or
+`https://backwpup.com/`), and the family traits of a multi-slug project
+(BackWPup: conflicts when both are active, shared data).
+
+`ProjectRegistry::plugin_hints()` (and `Apvm::plugin_hints()`) turns these
+into a validated `apvm_sites::PluginHints`, projects in name order; builders
+that keep the defaults are left out. `ProjectRegistry::project_for_slug(slug)`
+finds the project that installs a slug (`backwpup-pro` → `backwpup`), and
+`Project::plugin_slugs()` lists a project's slugs. The hint types are
+re-exported from the crate root.
 
 ## Git Module
 
@@ -461,6 +483,7 @@ All errors use the `Error` enum derived with [thiserror](https://docs.rs/thiserr
 | `NoMatchingReleaseAssets`  | No variant-matching assets in release          |
 | `Io(io::Error)`            | Filesystem errors                              |
 | `Json(serde_json::Error)`  | JSON parse errors                              |
+| `Sites(apvm_sites::Error)` | Site-management errors (invalid plugin hints)  |
 | `Update(String)`           | Self-update errors                             |
 | `Uninstall(String)`        | Self-uninstall errors                          |
 
@@ -485,6 +508,7 @@ All library code returns `Result<T>` (alias for `Result<T, Error>`). **No panics
 | [tempfile](https://docs.rs/tempfile/3)           | 3       | Temporary build directories       |
 | [directories](https://docs.rs/directories/6)    | 6       | Platform directory resolution     |
 | [apvm-config](../config/)                        | workspace | Configuration types             |
+| [apvm-sites](../sites/)                          | workspace | Plugin hints for site deployment |
 | [apvm-storage](../storage/)                      | workspace | Artifact storage                |
 
 ## Running Tests

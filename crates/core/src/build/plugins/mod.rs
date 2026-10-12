@@ -13,6 +13,10 @@ pub use bwu::BackWPupBuilder;
 pub use imagify::ImagifyBuilder;
 pub use wpr::WpRocketBuilder;
 
+// The plugin-identity types `Builder` declares, re-exported so custom builders
+// need no direct apvm-sites dependency.
+pub use apvm_sites::{FamilyTraits, VariantMarker};
+
 use crate::Result;
 use crate::error::Error;
 
@@ -643,6 +647,92 @@ pub trait Builder: Send + Sync {
     /// Check if this project has multiple variants.
     fn has_variants(&self) -> bool {
         self.variants().len() > 1
+    }
+
+    // =========================================================================
+    // WordPress Plugin Identity (site deployment)
+    // =========================================================================
+    //
+    // What the built zips install to on a WordPress site. The registry turns
+    // these declarations into `apvm_sites::PluginHints`
+    // (`ProjectRegistry::plugin_hints`), so apvm-sites holds no
+    // plugin-specific code. Every default declares nothing: a builder that
+    // keeps them is simply absent from the hints.
+
+    /// The WordPress plugin slug (the zip's top-level directory, and the
+    /// directory under `wp-content/plugins`) that a build installs to.
+    ///
+    /// # Arguments
+    ///
+    /// * `variant` - A variant id from [`variants`](Self::variants), or
+    ///   `None` when `variants()` is empty. A builder with a single variant
+    ///   is asked with that variant's id, although
+    ///   [`has_variants`](Self::has_variants) is false for it and its builds
+    ///   record no variant. Builders without variants may ignore it, as
+    ///   [`validate_variants`](Self::validate_variants) ignores requested
+    ///   variants for them.
+    ///
+    /// # Returns
+    ///
+    /// The slug, or `None` when it is not declared (an unknown variant, or a
+    /// builder that keeps the default). For a builder with variants, declare
+    /// a slug for every variant or for none.
+    ///
+    /// # Default
+    ///
+    /// Returns `None`: no slug declared.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn plugin_slug(&self, variant: Option<&str>) -> Option<&'static str> {
+    ///     match variant? {
+    ///         "free" => Some("my-plugin"),
+    ///         "pro" => Some("my-plugin-pro"),
+    ///         _ => None,
+    ///     }
+    /// }
+    /// ```
+    fn plugin_slug(&self, _variant: Option<&str>) -> Option<&'static str> {
+        None
+    }
+
+    /// The marker that tells this variant apart from the other variants
+    /// installing to the same slug: a file inside the plugin that contains a
+    /// fixed text only this variant has.
+    ///
+    /// Required for every variant whose slug is shared with another variant
+    /// (BackWPup's `pro-de` and `pro-en` both install to `backwpup-pro`);
+    /// optional otherwise.
+    ///
+    /// # Arguments
+    ///
+    /// * `variant` - A variant id from [`variants`](Self::variants)
+    ///
+    /// # Returns
+    ///
+    /// The marker, or `None` when the variant needs none or is unknown.
+    ///
+    /// # Default
+    ///
+    /// Returns `None`: no marker declared.
+    fn variant_marker(&self, _variant: &str) -> Option<VariantMarker> {
+        None
+    }
+
+    /// How this project's plugins behave together on one site, for a
+    /// project whose variants install to several slugs (a plugin family,
+    /// such as BackWPup's `backwpup` and `backwpup-pro`).
+    ///
+    /// # Returns
+    ///
+    /// The family traits, or `None` for a project with a single slug.
+    ///
+    /// # Default
+    ///
+    /// Returns `None`: not a family.
+    fn family_traits(&self) -> Option<FamilyTraits> {
+        None
     }
 
     // =========================================================================
@@ -1452,6 +1542,33 @@ mod tests {
         // gate is a no-op on every platform.
         assert!(WpRocketBuilder.ensure_platform_supported().is_ok());
         assert!(BackWPupBuilder.ensure_platform_supported().is_ok());
+    }
+
+    /// A builder that implements only the required methods, as a custom
+    /// builder written before the plugin-identity methods existed does.
+    struct BareBuilder;
+
+    impl Builder for BareBuilder {
+        fn setup_commands(&self) -> Vec<BuildStep> {
+            Vec::new()
+        }
+
+        fn build_commands(&self, _: &BuildContext, _: &str, _: &[&str]) -> Vec<BuildStep> {
+            Vec::new()
+        }
+
+        fn artifacts(&self, _: &BuildContext, _: &str, _: &[&str]) -> Result<Vec<BuildArtifact>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn plugin_identity_defaults_declare_nothing() {
+        // Custom builders keep compiling and simply stay out of the hints.
+        assert_eq!(BareBuilder.plugin_slug(None), None);
+        assert_eq!(BareBuilder.plugin_slug(Some("free")), None);
+        assert_eq!(BareBuilder.variant_marker("free"), None);
+        assert_eq!(BareBuilder.family_traits(), None);
     }
 
     // =========================================================================

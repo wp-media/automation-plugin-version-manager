@@ -10,7 +10,7 @@ This crate produces the `apvm` binary. All heavy logic is delegated to [`apvm-co
 |-------------|-----------------------------------------------------------------------------|
 | `build`     | Build a plugin from a git reference (PR, branch, tag, commit, release)      |
 | `list`      | List all registered plugins                                                 |
-| `info`      | Show detailed information about a plugin (repo, variants, version, tools)   |
+| `info`      | Show details about a plugin (repo, slugs, variants, version, tools)         |
 | `cache`     | Inspect and maintain the artifact cache                                     |
 | `config`    | View or change configuration settings                                       |
 | `skill`     | Install or remove the Claude Code skill for apvm (project-local or global)  |
@@ -149,9 +149,12 @@ Shows detailed information about a plugin:
 - Repository URL and GitHub owner/repo
 - Default branch
 - Whether it requires authentication (private)
+- WordPress plugin slug(s) its builds install to (`Slug:` / `Slugs:`)
 - Version requirement (`Required`, `Embedded`, or `Optional`)
 - Default version (if any)
-- Available variants with descriptions
+- Available variants with descriptions, each with its slug and, when variants
+  share a slug, the marker that tells them apart (BackWPup `pro-de` / `pro-en`)
+- Plugin family traits, for projects with several slugs (BackWPup free + pro)
 - Required build tools (e.g., npm, composer, gulp, rsync, zip)
 
 Example:

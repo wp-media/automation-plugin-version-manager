@@ -16,12 +16,19 @@
 //!
 //! BackWPup produces three variants:
 //! - `free` - Free version for WordPress.org
-//! - `pro-de` - Pro version with German translations
-//! - `pro-en` - Pro version with English translations
+//! - `pro-de` - Pro version for the German store (license server `backwpup.de`)
+//! - `pro-en` - Pro version for the English store (license server `backwpup.com`)
+//!
+//! `free` installs to the `backwpup` plugin slug and both pro variants to
+//! `backwpup-pro`, told apart on a site by a marker file. Free and pro form a
+//! plugin family (see [`Builder::family_traits`]).
 
 use super::super::BuildContext;
 use super::super::progress::{BuildEvent, BuildStep, ProgressReporter};
-use super::{BuildArtifact, BuildVariant, Builder, ToolDependency, VersionRequirement};
+use super::{
+    BuildArtifact, BuildVariant, Builder, FamilyTraits, ToolDependency, VariantMarker,
+    VersionRequirement,
+};
 use crate::Result;
 use std::path::Path;
 
@@ -35,7 +42,21 @@ impl BackWPupBuilder {
     pub const VARIANT_PRO_DE: &'static str = "pro-de";
     /// Variant ID for Pro English version.
     pub const VARIANT_PRO_EN: &'static str = "pro-en";
+    /// WordPress plugin slug (zip root directory) of the free variant.
+    pub const SLUG_FREE: &'static str = "backwpup";
+    /// WordPress plugin slug (zip root directory) shared by both pro variants.
+    pub const SLUG_PRO: &'static str = "backwpup-pro";
 }
+
+/// The only file that differs between the pro-de and pro-en builds (plan
+/// §3.1: a full-tree diff, POT timestamp aside), so it tells them apart.
+const PRO_MARKER_PATH: &str = "inc/Pro/License/License.php";
+
+/// The license-server URL (`WC_API_URL`) only the pro-de build contains.
+const PRO_DE_NEEDLE: &str = "https://backwpup.de/";
+
+/// The license-server URL (`WC_API_URL`) only the pro-en build contains.
+const PRO_EN_NEEDLE: &str = "https://backwpup.com/";
 
 impl Builder for BackWPupBuilder {
     // =========================================================================
@@ -345,6 +366,46 @@ impl Builder for BackWPupBuilder {
         } else {
             None
         }
+    }
+
+    // =========================================================================
+    // WordPress Plugin Identity
+    // =========================================================================
+
+    /// `free` installs to `backwpup`; `pro-de` and `pro-en` both install to
+    /// `backwpup-pro` (plan §3.1). `None` (no variant) or an unknown variant
+    /// has no slug.
+    fn plugin_slug(&self, variant: Option<&str>) -> Option<&'static str> {
+        match variant? {
+            Self::VARIANT_FREE => Some(Self::SLUG_FREE),
+            Self::VARIANT_PRO_DE | Self::VARIANT_PRO_EN => Some(Self::SLUG_PRO),
+            _ => None,
+        }
+    }
+
+    /// The pro variants share a slug and differ only in the license-server
+    /// URL in `inc/Pro/License/License.php`; `free` has its slug to itself
+    /// and needs no marker.
+    fn variant_marker(&self, variant: &str) -> Option<VariantMarker> {
+        let needle = match variant {
+            Self::VARIANT_PRO_DE => PRO_DE_NEEDLE,
+            Self::VARIANT_PRO_EN => PRO_EN_NEEDLE,
+            _ => return None,
+        };
+        Some(VariantMarker {
+            path: PRO_MARKER_PATH.to_string(),
+            needle: needle.to_string(),
+        })
+    }
+
+    /// Free and pro are a family: both main files return early once one
+    /// edition is loaded (only one runs per request), and each edition's
+    /// uninstall routine drops the tables and options both use (plan §3.1).
+    fn family_traits(&self) -> Option<FamilyTraits> {
+        Some(FamilyTraits {
+            conflicts_when_active: true,
+            shared_data: true,
+        })
     }
 }
 
@@ -706,5 +767,61 @@ mod tests {
         let b = builder();
         assert_eq!(b.variant_from_release_asset("unrelated.zip"), None);
         assert_eq!(b.variant_from_release_asset(""), None);
+    }
+
+    // =========================================================================
+    // WordPress Plugin Identity (plan §3.1)
+    // =========================================================================
+
+    #[test]
+    fn test_plugin_slug_per_variant() {
+        let b = builder();
+        assert_eq!(b.plugin_slug(Some("free")), Some("backwpup"));
+        assert_eq!(b.plugin_slug(Some("pro-de")), Some("backwpup-pro"));
+        assert_eq!(b.plugin_slug(Some("pro-en")), Some("backwpup-pro"));
+    }
+
+    #[test]
+    fn test_plugin_slug_needs_a_known_variant() {
+        let b = builder();
+        assert_eq!(b.plugin_slug(None), None);
+        for unknown in ["", "pro", "Free", "pro-fr"] {
+            assert_eq!(b.plugin_slug(Some(unknown)), None, "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn test_variant_marker_tells_the_pro_variants_apart() {
+        let b = builder();
+        let marker = |needle: &str| {
+            Some(VariantMarker {
+                path: "inc/Pro/License/License.php".to_string(),
+                needle: needle.to_string(),
+            })
+        };
+        assert_eq!(b.variant_marker("pro-de"), marker("https://backwpup.de/"));
+        assert_eq!(b.variant_marker("pro-en"), marker("https://backwpup.com/"));
+        // free has its slug to itself; unknown variants have no marker.
+        assert_eq!(b.variant_marker("free"), None);
+        assert_eq!(b.variant_marker("pro"), None);
+    }
+
+    #[test]
+    fn test_family_traits() {
+        assert_eq!(
+            builder().family_traits(),
+            Some(FamilyTraits {
+                conflicts_when_active: true,
+                shared_data: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_every_variant_declares_a_slug() {
+        let b = builder();
+        for variant in b.variants() {
+            assert!(b.plugin_slug(Some(variant.id)).is_some(), "{}", variant.id);
+        }
     }
 }

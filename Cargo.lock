@@ -107,6 +107,7 @@ name = "apvm-core"
 version = "3.3.0"
 dependencies = [
  "apvm-config",
+ "apvm-sites",
  "apvm-storage",
  "chrono",
  "directories",

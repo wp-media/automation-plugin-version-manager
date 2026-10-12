@@ -77,6 +77,11 @@ pub use cache_status::CacheStatus;
 pub use commands::{BuildOutput, BuildRequest, WarmRequest};
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 pub use maintenance::{CacheMaintenance, CleanRequest};
+// What builders declare about their WordPress plugins (`Apvm::plugin_hints`),
+// so consumers read the hints without a direct apvm-sites dependency.
+pub use apvm_sites::{
+    FamilyTraits, PluginHint, PluginHints, ProjectHints, VariantHint, VariantMarker,
+};
 
 use std::path::Path;
 
@@ -310,6 +315,19 @@ impl Apvm {
     /// ```
     pub fn register_project(&mut self, project: projects::Project) {
         self.registry.register(project);
+    }
+
+    /// What the registered projects' builders declare about their WordPress
+    /// plugins (slug per variant, variant markers, family traits), for
+    /// apvm-sites. Delegates to [`ProjectRegistry::plugin_hints`].
+    ///
+    /// # Errors
+    ///
+    /// Only when a project added with [`Apvm::register_project`] declares
+    /// inconsistent hints (see [`ProjectRegistry::plugin_hints`]); the
+    /// built-in projects' hints are always valid (a unit test guards it).
+    pub fn plugin_hints(&self) -> Result<PluginHints> {
+        self.registry.plugin_hints()
     }
 
     /// Check if a GitHub token is available.
@@ -668,6 +686,19 @@ mod tests {
             "store should open for a writable cache dir"
         );
         assert!(apvm.cache_dir().ends_with("cache"));
+    }
+
+    #[tokio::test]
+    async fn plugin_hints_describe_the_registered_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let apvm = Apvm::new(Config::new(dir.path().join("cache"))).unwrap();
+        let hints = apvm.plugin_hints().unwrap();
+        assert_eq!(hints, apvm.registry.plugin_hints().unwrap());
+        let names: Vec<_> = hints.projects().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["backwpup", "imagify", "wp-rocket"]);
+
+        let empty = Apvm::new_empty(Config::new(dir.path().join("empty"))).unwrap();
+        assert_eq!(empty.plugin_hints().unwrap(), PluginHints::default());
     }
 
     /// `path` (absolute) relative to the current directory — `..` up to the

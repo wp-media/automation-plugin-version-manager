@@ -21,6 +21,7 @@ use napi::Status;
 /// - `Git`, `Build` → `GenericFailure`
 /// - `PlatformUnsupported` → `GenericFailure`
 /// - `Io`, `Json` → `GenericFailure`
+/// - `Sites` → `GenericFailure` (today: invalid builder plugin hints)
 ///
 /// The full error message (including any chained context) is preserved
 /// in the JavaScript `Error.message` property.
@@ -51,6 +52,10 @@ pub fn core_error_status(err: &apvm_core::Error) -> Status {
         // A storage error carries an inner `apvm_storage::Error`; classify it
         // with the same rules a direct storage call would use.
         apvm_core::Error::Storage(inner) => storage_error_status(inner),
+        // Today only invalid plugin hints declared by builders (Rust code),
+        // which no JS argument can fix. The site bindings classify their own
+        // errors when they arrive (plan §11).
+        apvm_core::Error::Sites(_) => Status::GenericFailure,
         apvm_core::Error::Cache(_) => Status::GenericFailure,
         apvm_core::Error::Update(_) => Status::GenericFailure,
         apvm_core::Error::Uninstall(_) => Status::GenericFailure,
@@ -134,7 +139,28 @@ mod tests {
             apvm_core::Error::Update("x".to_string()),
             apvm_core::Error::Uninstall("x".to_string()),
             apvm_core::Error::Skill("x".to_string()),
+            invalid_hints(),
         ]
+    }
+
+    /// The error invalid builder declarations produce: a family with one
+    /// slug.
+    fn invalid_hints() -> apvm_core::Error {
+        let project = apvm_core::ProjectHints {
+            name: "solo".to_string(),
+            plugins: vec![apvm_core::PluginHint {
+                slug: "solo".to_string(),
+                variants: Vec::new(),
+            }],
+            family: Some(apvm_core::FamilyTraits {
+                conflicts_when_active: true,
+                shared_data: true,
+            }),
+        };
+        match apvm_core::PluginHints::new(vec![project]) {
+            Ok(_) => panic!("a one-slug family must be refused"),
+            Err(err) => apvm_core::Error::Sites(err),
+        }
     }
 
     #[test]

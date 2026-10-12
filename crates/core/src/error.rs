@@ -127,6 +127,16 @@ pub enum Error {
     #[error("Storage error: {0}")]
     Storage(#[from] apvm_storage::Error),
 
+    /// Site management (apvm-sites) error.
+    ///
+    /// Today only from [`ProjectRegistry::plugin_hints`]: the builders'
+    /// slug, marker and family declarations break a hint rule. Its
+    /// [`apvm_sites::Error::problems`] lists every problem with its location.
+    ///
+    /// [`ProjectRegistry::plugin_hints`]: crate::projects::ProjectRegistry::plugin_hints
+    #[error("Sites error: {0}")]
+    Sites(#[from] apvm_sites::Error),
+
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] io::Error),

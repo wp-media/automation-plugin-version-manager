@@ -88,6 +88,10 @@ pub struct ImagifyBuilder;
 /// Main plugin PHP file used for version detection and override.
 const PLUGIN_FILE: &str = "imagify.php";
 
+/// WordPress plugin slug: the root directory of the packaging script's zip
+/// (plan §3.1).
+const PLUGIN_SLUG: &str = "imagify";
+
 /// Runtime version constant defined in [`PLUGIN_FILE`], rewritten alongside the
 /// header when a version override is applied.
 const VERSION_CONSTANT: &str = "IMAGIFY_VERSION";
@@ -315,6 +319,16 @@ impl Builder for ImagifyBuilder {
             source_path: relative,
             target_name: name,
         }])
+    }
+
+    // =========================================================================
+    // WordPress Plugin Identity
+    // =========================================================================
+
+    /// Every build installs to `imagify`, the zip's root directory;
+    /// there are no variants, so `variant` is ignored.
+    fn plugin_slug(&self, _variant: Option<&str>) -> Option<&'static str> {
+        Some(PLUGIN_SLUG)
     }
 }
 
@@ -559,6 +573,23 @@ mod tests {
     #[test]
     fn test_no_default_variants() {
         assert!(builder().default_variants().is_empty());
+    }
+
+    // =========================================================================
+    // WordPress Plugin Identity (plan §3.1)
+    // =========================================================================
+
+    #[test]
+    fn test_plugin_slug_is_the_zip_root_whatever_the_variant() {
+        let b = builder();
+        assert_eq!(b.plugin_slug(None), Some("imagify"));
+        assert_eq!(b.plugin_slug(Some("anything")), Some("imagify"));
+    }
+
+    #[test]
+    fn test_no_marker_and_no_family() {
+        assert_eq!(builder().variant_marker("anything"), None);
+        assert_eq!(builder().family_traits(), None);
     }
 
     // =========================================================================

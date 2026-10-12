@@ -265,7 +265,9 @@ apvm info backwpup
 apvm info wp-rocket
 ```
 
-Shows repository, version requirement, available variants, and required build tools.
+Shows repository, the WordPress plugin slug(s) its builds install to, version
+requirement, available variants (with their slug, and the marker that tells
+same-slug variants apart), plugin family traits, and required build tools.
 
 ### Configuration
 

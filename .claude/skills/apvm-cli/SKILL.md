@@ -159,7 +159,9 @@ No arguments, no flags beyond `--verbose` / `-h` / `-V`.
 
 ### `apvm info <PLUGIN>`
 
-Show repo, branch, visibility, version requirement, variants, and tool deps:
+Show repo, branch, visibility, the WordPress plugin slug(s) the builds install
+to, version requirement, variants (each with its slug and, when variants share
+a slug, the marker that tells them apart), plugin family traits, and tool deps:
 
 ```
 Plugin: backwpup
@@ -167,6 +169,7 @@ Plugin: backwpup
   GitHub:      wp-media/backwpup-pro
   Branch:      develop
   Private:     yes (requires GITHUB_TOKEN)
+  Slugs:       backwpup, backwpup-pro
 
 Version:
   Requirement: Required (must be provided via --ver)
@@ -174,9 +177,18 @@ Version:
 
 Variants:
   free         Free           BackWPup Free version
+               Slug:    backwpup
   pro-de       Pro (German)   BackWPup Pro German version
+               Slug:    backwpup-pro
+               Marker:  inc/Pro/License/License.php contains "https://backwpup.de/"
   pro-en       Pro (English)  BackWPup Pro English version
+               Slug:    backwpup-pro
+               Marker:  inc/Pro/License/License.php contains "https://backwpup.com/"
   Default:     free, pro-en
+
+Family:
+  Conflicts:   yes (when several are active, only one runs per request)
+  Shared data: yes (each one's uninstall removes data the others use)
 
 Tool dependencies:
   npm          (required)
@@ -190,6 +202,23 @@ Tool dependencies:
 - **Embedded** — version lives only in source; `--ver` is rejected with a warning.
 - **Optional** — version is auto-detected from source; passing `--ver` rewrites
   it into the plugin's source so the built artifact actually carries it (WP Rocket, Imagify).
+
+Plugin identity lines (what a build installs on a WordPress site):
+
+- **`Slug:` / `Slugs:`** (plugin block) — the plugin directory name(s) under
+  `wp-content/plugins`, i.e. the zip's root folder. Single-output plugins show
+  one `Slug:` (`wp-rocket`, `imagify`) and no per-variant lines.
+- **Per variant `Slug:`** — where that variant installs. BackWPup `free` →
+  `backwpup`; `pro-de` and `pro-en` → `backwpup-pro` (so the two pro variants
+  can never be installed side by side).
+- **`Marker:`** — only for variants sharing a slug: a file inside the plugin
+  and a fixed text only that variant contains. The pro-de and pro-en builds
+  differ only in the license-server URL in `inc/Pro/License/License.php`.
+- **`Family:`** — only for projects with several slugs (BackWPup).
+  `Conflicts: yes` = both main files bail out once one edition is loaded, so
+  with both active only one runs. `Shared data: yes` = each edition's
+  uninstall routine drops the tables/options both use (BackWPup skips that
+  cleanup while the other edition is active).
 
 ---
 
@@ -407,11 +436,11 @@ Required for private repos and PR builds. Recommended for public repos
 
 ## Plugin-specific quick reference
 
-| Plugin     | `--ver`        | Variants             | Default variants | Notes                                                   |
-|------------|---------------|----------------------|------------------|---------------------------------------------------------|
-| `backwpup` | **Required**  | `free`, `pro-de`, `pro-en` | `free, pro-en`   | Private. Supports GitHub Release downloads (`release:`). |
-| `wp-rocket`| Optional      | _(none)_             | _(all)_          | Public. `--ver` rewrites source version into the artifact. |
-| `imagify`  | Optional      | _(none)_             | _(all)_          | Public. Imagify publishes git tags but no release assets — build from the tag instead of `release:`. |
+| Plugin     | `--ver`        | Variants             | Default variants | WordPress slug(s) | Notes                                                   |
+|------------|---------------|----------------------|------------------|-------------------|---------------------------------------------------------|
+| `backwpup` | **Required**  | `free`, `pro-de`, `pro-en` | `free, pro-en`   | `free` → `backwpup`; `pro-de`, `pro-en` → `backwpup-pro` (marker: `inc/Pro/License/License.php`) | Private. Supports GitHub Release downloads (`release:`). Free and pro form a family (conflict when both active, shared data). |
+| `wp-rocket`| Optional      | _(none)_             | _(all)_          | `wp-rocket`       | Public. `--ver` rewrites source version into the artifact. |
+| `imagify`  | Optional      | _(none)_             | _(all)_          | `imagify`         | Public. Imagify publishes git tags but no release assets — build from the tag instead of `release:`. |
 
 ---
 
@@ -443,7 +472,7 @@ Required for private repos and PR builds. Recommended for public repos
 ```sh
 apvm --version              # 3.3.0 (or current)
 apvm list                   # registered plugins
-apvm info <plugin>          # version requirement, variants, tool deps
+apvm info <plugin>          # slugs, version requirement, variants (+ markers), family, tool deps
 apvm config path            # config file location
 apvm cache info             # cache size + per-project breakdown
 apvm cache verify           # integrity check (exits 1 on issues)
