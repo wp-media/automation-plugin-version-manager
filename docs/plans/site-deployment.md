@@ -1,6 +1,6 @@
 # Site deployment — manage WordPress plugins on remote sites
 
-Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11) and 6 (CI on the branch). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
+Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1.1 done (2026-10-11, audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1) and 8 (P1.1 audit). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
 
 ---
 
@@ -23,6 +23,32 @@ Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, 
 ---
 
 ## 0. Change log
+
+### Revision 8 (adversarial audit of P1.1, 2026-10-12)
+
+| Topic | Change |
+|---|---|
+| Round trip | `run_as` users named `auto` or `login`, and an `owner` user named `auto`, are refused. They were saved as the keywords, so a reload changed who WP-CLI runs as |
+| `wp_cli` | Restricted by shape, not just characters: one program (a command name or an absolute path), or a PHP interpreter (`php`, `php8.3`, `ea-php81`, …) with its `-n`/`-q` options and an absolute WP-CLI script; at most 4 tokens. Before, `["sudo", …]`, `["env", "-u", …]` or `["wp", "eval-file", …]` could wrap or replace WP-CLI (verified: a root `chown` through the §6.2 sudoers) |
+| SSH local paths | `identity_file`, `known_hosts_file`, `ssh_config_file` and `binary` hold only `[A-Za-z0-9._/\:+-]`, `~` only as a leading `~/`, no leading `-`, and no empty, `.` or `..` component (so `~/../../dev/null` cannot pass for a file). Why: ssh expands `%` tokens and `${VAR}` in key and known_hosts paths, and splits known_hosts paths on whitespace. For a ProxyJump it also pastes the ssh program and the `-F` path unquoted into a command run by the user's shell (verified: `-F 'c$(touch x)'` ran `touch`). `known_hosts_file` may not be `none`, `NUL` or `/dev/…`, which would let any host key pass (T6) |
+| `proxy_jump` | `none` (any case) is refused: it turns off a jump host set in ssh_config. At most 8 hops. A bracketed IPv6 address is allowed in the last hop only (ssh passes the others through `$SHELL -c`, where zsh fails with "no matches found"; verified), and it must parse as IPv6 |
+| Users and root | Names made only of digits, and `.` / `..`, are refused (tools read `0` as root). `root` is matched in any letter case, and in the `owner` group too |
+| Text | Every Unicode Cf, Zl and Zp character (zero-width, tag, line-separator and bidi characters) is refused, and escaped in messages, along with control characters. Remote paths refuse whitespace other than spaces, and components that start or end with a space. Messages quote values with `'` and `\` escaped, so a value cannot pass for message text |
+| `url` | User info is refused without being echoed (the old message showed the password). IPv6 hosts must parse as IPv6. DNS labels are 1–63 characters, with no leading or trailing `-`. A host of digits and dots must be an IPv4 address. No `.` or `..` path segment |
+| Parsing | `null` also reads as unset for `defaults`, `ssh` and the lists. `ownership` is read from a string only. `version` is read from a JSON object only, so a positional `[2]` is invalid, not "newer". An unsupported newer document keeps its problems (`Error::problems`). A generic walk finds records written as arrays |
+| Hints | A project has variants on every slug or on none |
+| Later phases | The audit's obligations are noted in P3.1, P3.3, P3.4, P4.2, P6.3, P6.4 and P8.1 |
+
+### Revision 7 (P1.1 implementation, 2026-10-11)
+
+| Topic | Change |
+|---|---|
+| Hints | `PluginHints` hold every apvm project (≥ 1 slug), so `--project` also works for single-slug projects. Family traits (`conflicts_when_active`, `shared_data`) need ≥ 2 slugs. A slug with several variants needs a marker on each, and its markers must not overlap (same file, one needle inside the other) (§6.9) |
+| Newer inventory | Read-only only when every field and value in it is known here. Otherwise it is refused with `inventory_unsupported`, never read with parts ignored: an ignored field could be a setting that restricts apvm (§7) |
+| Strict parsing | Records written as JSON arrays are refused (serde reads them by position, which bypasses field names). `null` means unset. A leading UTF-8 BOM is ignored (§7) |
+| Allowlists | Remote paths must be canonical (no empty, `.` or `..` component, no trailing `/`, not `/`), so one site cannot hide behind two spellings (same-WordPress warning, site lock). Control and bidirectional-formatting characters are refused in paths and free text, and escaped in messages. The first `wp_cli` token must not start with `-` (an `env` option). `root` as `run_as` or `owner` needs `allow_root`. `owner: auto:<group>` is refused. Timeouts, names and notes have ranges. `proxy_jump` IPv6 hosts need brackets (§7) |
+| Codes | New `inventory_unsupported` and `inventory_read_only` (§4.5) |
+| Modules | `allowlist` (value rules; split into `allowlist/{mod, net, paths}.rs` in revision 8) and `problem.rs` (located problems) join the crate (§8) |
 
 ### Revision 6 (CI on the branch, 2026-10-11)
 
@@ -374,7 +400,7 @@ Stable codes (CLI `--json`, NAPI `code`):
 | WordPress | `wp_cli_missing`, `not_wordpress`, `wp_not_installed`, `plugins_dir_not_writable`, `multisite_unsupported` |
 | Execution | `site_locked`, `insufficient_space`, `upload_corrupted`, `wp_command_failed`, `verification_failed`, `state_drifted`, `outcome_unknown`, `health_check_failed`, `timeout`, `file_mods_disallowed` |
 | Ownership / variants | `ownership_unfixable`, `variant_conflict` (two variants of one slug, or two siblings activated together without `--keep-siblings`) |
-| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid` |
+| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory) |
 | Status | `expectation_not_met`, `undetermined` |
 
 ---
@@ -902,18 +928,21 @@ Family "backwpup"
 |---|---|---|
 | ids | `^[a-z0-9][a-z0-9._-]{0,63}$`, unique per kind | local |
 | `host` | `[A-Za-z0-9._:-]`, no leading `-`, ≤ 253 | ssh argv |
-| `user`, `run_as`, `owner` parts | `[A-Za-z0-9._-]`, no leading `-`, ≤ 64 | ssh argv / remote |
+| `user`, `run_as`, `owner` parts | `[A-Za-z0-9._-]`, no leading `-`, ≤ 64, not all digits, not `.`/`..`; `root` (any case, user or group) needs `allow_root: true`; `owner` is `auto`, `user` or `user:group`; `auto` and `login` never name a user (`auto:<group>` refused) | ssh argv / remote |
 | `port` | 1–65535 | ssh argv |
-| `proxy_jump` | comma list of `[user@]host[:port]` | ssh argv |
-| `path`, `plugins_dir` | absolute POSIX, no `..`, no NUL/CR/LF/backslash, ≤ 4096 | remote |
-| `remote_tmp_dir` | absolute, `^[A-Za-z0-9._/+-]+$` (the `UploadScript` allowlist, §6.1, so the inventory never accepts what an upload would refuse), no `..`, ≤ 4096 | remote |
-| `url` | `http(s)://` host[/path], allowlisted chars | remote |
-| `wp_cli` tokens | `[A-Za-z0-9._/+-]` | remote |
-| local paths | no NUL/LF; `~` expanded and existence checked at use | ssh argv |
+| `connect_timeout_secs` / `command_timeout_secs` | 1–3600 / 1–86400 | ssh argv / local |
+| `proxy_jump` | ≤ 8 comma-separated `[user@]host[:port]` hops, ≤ 1024 bytes, not `none`; a bracketed IPv6 address only in the last hop | ssh argv / ssh's shell |
+| `path`, `plugins_dir` | absolute and canonical (no empty, `.` or `..` component, no trailing `/`, not `/`); no backslash, control or invisible formatting character; no whitespace but spaces, and no component starting or ending with a space; ≤ 4096 bytes | remote |
+| `remote_tmp_dir` | as `path`, and `^[A-Za-z0-9._/+-]+$` (the `UploadScript` allowlist, §6.1, so the inventory never accepts what an upload would refuse) | remote |
+| `url` | `http(s)://host[:port][/path]`: lowercase scheme; a DNS name (labels 1–63 characters, no leading or trailing `-`), an IPv4 address or `[IPv6]`; path `[A-Za-z0-9._~/-]` and `%`-escapes, with no `.` or `..` segment; no user info, query or fragment; ≤ 2048 bytes | remote |
+| `wp_cli` | `[program]` (a command name, or an absolute canonical path), or `[PHP interpreter, -n/-q…, absolute WP-CLI script]`, at most 4 tokens; tokens of `[A-Za-z0-9._/+-]`, none starting with `-` except the options (the command follows `env`, §6.1) | remote |
+| SSH local paths (`identity_file`, `known_hosts_file`, `ssh_config_file`, `binary`) | `[A-Za-z0-9._/\:+-]`, `~` only as a leading `~/`, no leading `-`, canonical (no empty, `.` or `..` component), ≤ 4096 bytes; `known_hosts_file` is not `none`, `NUL` or `/dev/…`; `binary` only in `defaults.ssh`; `~` expanded and existence checked at use | ssh argv / ssh's shell |
+| `name` / `notes` | 1–128 / 1–1024 characters, no control or invisible formatting (Unicode Cf, Zl, Zp) character | local |
 | slug | `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` | remote |
+| variant marker path / needle (hints, §6.9) | relative, canonical, ≤ 1024 bytes, `[A-Za-z0-9._-]` components ≤ 255 / printable ASCII, ≤ 256 bytes (it may hold `'` and `\`, so it is always quoted) | remote |
 
 File handling:
-- **Load:** a missing file is an empty inventory. Parsing uses `deny_unknown_fields`, then full validation, reporting every problem with its location (`sites[1].server: unknown server 'eu-2'`). A newer `version` is read-only.
+- **Load:** a missing file is an empty inventory. Parsing uses `deny_unknown_fields`, requires `version`, accepts records only as JSON objects, reads `null` as unset and ignores a leading UTF-8 BOM. Then full validation runs, reporting every problem with its location (`sites[1].server: unknown server 'eu-2'`). A newer `version` (read from the JSON object) is read-only when this build can read it fully (every field and value known, every rule passed). Otherwise it is refused with `inventory_unsupported`, and its problems stay listable.
 - **Save:** lock (`inventory.json.lock`, `std::fs::File::lock`) → temp file `0600` → fsync → rename → fsync dir. Edits are read-modify-write under the lock.
 - **Refused:** a symlinked path.
 
@@ -931,7 +960,8 @@ apvm-config   apvm-storage        apvm-sites (NEW: inventory · remote · wp · 
 
 ```
 crates/sites/src/
-  lib.rs, error.rs (Error + stable code()), hints.rs, layout.rs (file/dir *names* only)
+  lib.rs, error.rs (Error + stable code()), problem.rs (located problems), allowlist/{mod, net, paths}.rs (value rules),
+  hints.rs, layout.rs (file/dir *names* only)
   inventory/{mod, model, validate, io, resolve}.rs
   package/{mod, headers, rules}.rs
   remote/{mod, quote, script, identity, transport, capture, local, ssh, classify, mux}.rs
@@ -1035,11 +1065,12 @@ Threats:
 | Nonce framing, output caps, strict parsers, `escape_debug`; `ssh_*` classes only when ssh exits 255 (remote stderr shares the stream) | T4 |
 | No stored secrets; inventory and logs `0600`; no secrets in argv | T5 |
 | `BatchMode=yes`; the user's known_hosts; `accept-new` only per run; `no` never | T6 |
+| Plan + one confirmation; non-TTY needs `-y`; `--dry-run`; empty selection = error; site lock | T7 |
 
 **Known limits:**
 - apvm verifies against WordPress's own state, so a site's must-use plugin or drop-in can falsify what it reads. Reads skip regular plugins, nothing more.
 - Refused sudo probes are logged on the server; operators should expect those entries (§6.2).
-| Plan + one confirmation; non-TTY needs `-y`; `--dry-run`; empty selection = error; site lock | T7 |
+- `wp_cli` names the program that runs as the site's identity, so it is trusted configuration, like the host list. Its shape keeps WP-CLI from being wrapped in another program (§7), but a single program can be anything installed on the server.
 
 ---
 
@@ -1189,11 +1220,12 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 
 ### P1 — Foundations (lib)
 
-#### P1.1 — Crate, inventory model, validation, hint types
+#### P1.1 — Crate, inventory model, validation, hint types ✅ (implemented 2026-10-11, audited 2026-10-12)
 - **Goal:** the pure data layer.
-- **Changes:** root `Cargo.toml`; `crates/sites/{Cargo.toml, README.md, src/{lib,error,hints,layout}.rs, src/inventory/{mod,model,validate}.rs}`.
+- **Changes:** root `Cargo.toml`; `crates/sites/{Cargo.toml, README.md, src/{lib,error,problem,hints,layout}.rs, src/allowlist/{mod,net,paths}.rs, src/inventory/{mod,model,validate,tests}.rs, tests/inventory.rs}`.
 - **Tests:** accept/reject tables per rule; CRUD integrity; serde round-trips; unknown field rejected; newer `version` read-only; `PluginHints` validation (a family needs ≥ 2 slugs; a slug belongs to one family; variant names unique; markers are allowlisted relative paths).
 - **Done when:** the crate builds with no `apvm-*` deps and every validator is covered.
+- **Result:** `crates/sites` with `Inventory` (strict parse, located validation, version handling, CRUD that keeps it valid), `PluginHints`, `layout` names, `Error` + `Code`, and the value rules in `allowlist/` and located problems in `problem.rs`. The refinements are in revisions 7 and 8 (audit). Tests: 105 unit tests, including a randomized property test of the always-valid invariant; 4 integration tests on the §7 example; 2 doctests. Unit tests also guard against any `apvm-*` dependency. Line coverage is 99.7%; the rest is an unreachable serialization error.
 - **Depends:** — · **Parallel:** P0
 
 #### P1.2 — Inventory persistence
@@ -1267,6 +1299,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
   - `UploadScript` accepts only `^[A-Za-z0-9._/+-]+$` values (so `'` and `\` are rejected at construction); its templates are single-line and contain neither `\\` nor `\'`;
   - every script starts with `LC_ALL=C`; identity commands never contain a shell (`sh -c`) under sudo or runuser;
   - the hermetic WP-CLI argv: `env WP_CLI_CONFIG_PATH=/dev/null <wp_cli> --skip-packages --exec='umask(umask() & ~0<g>);'`, with `<g>` from the plugins dir mode (golden per mode).
+- **Audit notes (rev 8):** `path` and `plugins_dir` may hold `'`, `$`, `*` and spaces, so they are only ever POSIX-quoted in stdin scripts, never put in an `UploadScript`. Variant needles may hold `'` and `\`.
 - **Depends:** P1.1 · **Parallel:** P1.2–P1.5, P2.x, P0
 
 #### P3.2 — Transport trait, capture, local shell, fake
@@ -1279,12 +1312,14 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** the real transport with actionable errors.
 - **Changes:** `remote/{ssh,classify}.rs`; `tests/support/fake-remote/fake-ssh`.
 - **Tests:** argv goldens across precedence; Windows argv; classification table from P0's stderr samples (§3.5, both OpenSSH versions; noise lines ignored; `ssh_*` only when ssh exits 255, so remote stderr with the same phrases never matches); hermetic fake-ssh; E2E (connect, unknown host key, `accept-new`, wrong key).
+- **Audit notes (rev 8):** jump hosts only get `-l`, `-p`, `-F` and `-v` from the main connection (verified). `BatchMode`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `IdentityFile` and `ConnectTimeout` must reach them through a generated `-F` config, or apvm chains the hops itself; otherwise a hop can prompt, or use `~/.ssh/known_hosts`. The ProxyCommand that ssh builds for a ProxyJump runs through the user's `$SHELL`; the §7 allowlists keep the `-F` path, the ssh program and the hops literal there. Never combine `accept-new` with a known_hosts file that does not persist: at use, refuse a `known_hosts_file` that exists but is not a regular file (a symlink to `/dev/null` passes the §7 rules).
 - **Depends:** P3.2, P1.3 · **Parallel:** P4.1
 
 #### P3.4 — Multiplexing and per-server limits
 - **Goal:** fast repeated execs within `MaxSessions`.
 - **Changes:** `remote/mux.rs`, per-server semaphore.
 - **Tests:** option goldens; long-path/Windows fallback; E2E `ssh -O check` live after the first exec.
+- **Audit notes (rev 8):** ssh splits `ControlPath` on whitespace and expands `%` and `${}` in it. Double-quote it and double its `%`: the front end's home directory may contain spaces.
 - **Depends:** P3.3 · **Parallel:** P4.x
 
 ### P4 — WordPress driver and probe
@@ -1308,6 +1343,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
     - an explicit `owner` that does not own the plugins dir → `plugins_dir_mismatch`;
     - a hostile `~/.wp-cli/config.yml` and package for the identity have no effect on the probe;
     - `fishy`/`noisy` work.
+- **Audit notes (rev 8):** decide root by the resolved uid/gid 0, never by name (`toor`, numeric ids). Names read from the server (`stat %U/%G`) must pass the §7 user rule before they reach argv or an `UploadScript`: remote names such as `a b` or `x'y` exist. Check that `cli version` really is WP-CLI (`WP_CLI_VERSION`), since `wp_cli` is chosen by the operator.
 - **Depends:** P4.1, P3.3 · **Parallel:** P1.4, P1.5, P3.4
 
 #### P4.3 — cli: `site test`, `server test`, probe on `site add`
@@ -1381,12 +1417,14 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
     - `mirror` (default): a foreign-owned tree is reported with the commands, and no root command runs;
     - an `ftpsite` tree installed by `ftpuser` with umask `0022` (group `ftpuser`, no setgid) is repaired to `ftpuser:www-data` + `g+rw`(+setgid) without root (as `ftpuser` ∈ `www-data`);
     - with the `--exec` umask relaxation (§6.1), the same install needs no repair.
+- **Audit notes (rev 8):** pass only numeric ids to `chown`, `chgrp` and `find`, and decide root by id (see P4.2).
 - **Depends:** P6.2 · **Parallel:** P6.4, P7.1, P8.1
 
 #### P6.4 — Site lock
 - **Goal:** §6.13.
 - **Changes:** `ops/lock.rs`; acquire/release wired into `apply` (and later `run_wp`).
 - **Tests:** goldens; path validation; fake: busy → wait → `site_locked`, stale → broken with warning, release on failure paths; E2E: two concurrent applies on one site serialize.
+- **Audit notes (rev 8):** key the lock, and the same-WordPress warning, on the probe's `realpath` of `path`: through a symlink, two canonical spellings can name one WordPress.
 - **Depends:** P6.2 · **Parallel:** P6.3, P7.1, P8.1
 
 ### P7 — Lifecycle front ends
@@ -1438,6 +1476,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** §6.6.
 - **Changes:** `ops/staging.rs`.
 - **Tests:** goldens; path validation (only `<tmp>/apvm.XXXXXXXXXX`); space check; checksum-tool selection; fake mismatch → `upload_corrupted`; stale sweep pattern; E2E: 20 MB upload hash-matches, dir `0700` owned by the identity (incl. `ftpuser:www-data`), removed after success and after failure.
+- **Audit notes (rev 8):** find staging dirs by a literal prefix of `remote_tmp_dir` (it may hold `.` and `+`), never by a regex built from it.
 - **Depends:** P4.2 · **Parallel:** P6.x, P7.x
 
 #### P8.2 — lib: install execution
