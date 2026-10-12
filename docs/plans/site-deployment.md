@@ -1,6 +1,6 @@
 # Site deployment — manage WordPress plugins on remote sites
 
-Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.5 (implemented and audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5), 10 (P1.2–P1.5 audit) and 11 (decisions after P1). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
+Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.5 (implemented and audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5), 10 (P1.2–P1.5 audit), 11 (decisions after P1) and 12 (no lost edits from Node). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
 
 ---
 
@@ -18,11 +18,19 @@ Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, 
 - **Ownership respects owner *and* group:** WP-CLI runs as the plugins directory's owner **and group** (`sudo -n -u <owner> -g <group>`), so `ftpuser:www-data` sites stay `ftpuser:www-data` with the group bits the web server needs. Mismatches are repaired without root (`chgrp`, `chmod g+`); a root `chown` runs only on sites that opt in, under strict preconditions.
 - **Uploads:** each zip is inspected locally, streamed over SSH into a private **staging dir** (`/tmp/apvm.XXXXXXXXXX`, owned by the identity, `0700`), checksum-verified, installed from there, and always cleaned up.
 - **Transport:** system OpenSSH (your `~/.ssh/config`, agent, ProxyJump), multiplexed on Unix. Scripts travel over SSH's stdin, so the remote login shell (bash, zsh, fish, …) never parses them.
-- **Phases:** 44 small ones; libraries first, then the CLI and NAPI front ends in parallel tracks. No new crates.io dependencies.
+- **Phases:** 45 small ones; libraries first, then the CLI and NAPI front ends in parallel tracks. No new crates.io dependencies.
 
 ---
 
 ## 0. Change log
+
+### Revision 12 (no lost edits from Node, 2026-10-12)
+
+| Topic | Change |
+|---|---|
+| The problem | `SiteInventory` (NAPI) is load → edit in memory → `save()`. A plain save writes back the whole document, so an edit made by another process in between (a parallel test worker, `apvm site add` in a terminal while a long-running Node tool holds the inventory) disappears silently. The CLI is not affected: each command is one `io::update` |
+| Library (new P1.6) | `io::load_tracked` returns the inventory with a `Fingerprint` of the exact bytes read (or "missing"). `io::save_if_unchanged` re-reads under the lock and writes only when the file still matches, else fails with the new code `inventory_changed` (nothing written); it returns the new fingerprint, so later saves chain. Byte-identical content is not a conflict; a file deleted or created since the load is |
+| Node (P2.4) | `save()` refuses with `InventoryChanged` when the file changed since `load()`; the object keeps its unsaved changes, so the app reloads, reapplies and saves. `SiteInventory.update(fn)` runs load → `fn` → save in one locked step (the CLI's path), so it never conflicts. `save({ force: true })` overwrites on purpose (e.g. restoring a backup). §4.5, §7, §8.1, §11 |
 
 ### Revision 11 (decisions after P1, 2026-10-12)
 
@@ -431,7 +439,7 @@ Stable codes (CLI `--json`, NAPI `code`):
 | WordPress | `wp_cli_missing`, `not_wordpress`, `wp_not_installed`, `plugins_dir_not_writable`, `multisite_unsupported` |
 | Execution | `site_locked`, `insufficient_space`, `upload_corrupted`, `wp_command_failed`, `verification_failed`, `state_drifted`, `outcome_unknown`, `health_check_failed`, `timeout`, `file_mods_disallowed` |
 | Ownership / variants | `ownership_unfixable`, `variant_conflict` (two variants of one slug, or two siblings activated together without `--keep-siblings`) |
-| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory), `inventory_io` (the inventory file, its lock or its directory cannot be read, written, locked or created, or is not a regular file), `inventory_locked` (another process held the inventory lock for the whole 10 s wait) |
+| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory), `inventory_io` (the inventory file, its lock or its directory cannot be read, written, locked or created, or is not a regular file), `inventory_locked` (another process held the inventory lock for the whole 10 s wait), `inventory_changed` (the file changed since it was loaded; a guarded save wrote nothing) |
 | Status | `expectation_not_met`, `undetermined` |
 
 ---
@@ -980,6 +988,7 @@ File handling:
 - **Limits:** documents over 16 MiB are refused on read and write. A newer (read-only) inventory is never written, even when a change replaces it whole.
 - **Refused:** a symlinked path (the file or its lock file, even dangling; the directories above may be links, e.g. macOS's `/tmp`), a directory or special file at either path, and a path that names no file. Errors carry the path (`inventory_io`).
 - **Lock wait:** a busy lock is retried for at most 10 s (`io::LOCK_WAIT`), then the write fails with `inventory_locked` and nothing is written (revision 11).
+- **No lost edits (revision 12):** callers that keep an inventory in memory between load and save use `io::load_tracked` + `io::save_if_unchanged`: under the lock the file must still match the fingerprint of the bytes loaded (or still be missing), else `inventory_changed` and nothing is written. `io::save` (blind overwrite) is only for a deliberate "force".
 
 ---
 
@@ -1014,6 +1023,7 @@ tests/e2e/sites/…  ·  tests/support/fake-remote/{fake-ssh, fake-sudo, fake-wp
 
 1. **Every capability is an `apvm-sites` API.** It covers `Inventory` (+ io), `SiteManager` (`probe`, `list`, `status`, `plan`/`apply`, `run_wp`, `unlock`), `PluginPackage::inspect`, `wp::classify`, `PluginHints`, and the reporters (including `LogFileReporter`).
 2. **Front ends add only** argument parsing, confirmation, rendering, and default locations (`~/.apvm` + `layout` names). The env override helper `inventory::io::env_override()` (`APVM_INVENTORY`) lives in the library, mirroring `config_io::cache_dir_env_override`.
+   Inventory edits go through `io::update` (CLI, `SiteInventory.update`) or `io::load_tracked` + `io::save_if_unchanged` (`SiteInventory.load` … `save`); a front end never writes back a whole document blindly unless the user forces it.
 3. **Core uses it now** for two things:
    - `ProjectRegistry::plugin_hints()` (family/variant knowledge comes from builders);
    - `Apvm::build_package` + `Apvm::install_build` (plan → build → bind → apply, no prompts), used by NAPI `installBuild` and by any future core feature. The CLI uses the stepwise API so it can confirm before building.
@@ -1120,7 +1130,11 @@ class SiteInventory {                                   // sync, file-backed
   servers(): JsServer[];   upsertServer(s: JsServer): void;  removeServer(id: string, cascade?: boolean): boolean
   sites(): JsSite[];       upsertSite(s: JsSite): void;      removeSite(id: string): boolean
   groups(): JsGroup[];     upsertGroup(g: JsGroup): void;    removeGroup(id: string): boolean
-  save(path?: string): string
+  save(path?: string, opts?: { force?: boolean }): string
+      // refuses with `InventoryChanged` when the file changed since load (or, for a path not
+      // loaded from, when it exists); the object keeps its changes; `force` overwrites
+  static update(fn: (inv: SiteInventory) => void, path?: string): SiteInventory
+      // load → fn → save under the lock: never conflicts; a throw in fn writes nothing
 }
 class SiteManager {
   static create(opts?: { inventory?: SiteInventory | string; controlDir?: string; jobs?: number;
@@ -1299,6 +1313,12 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Result:** `PluginPackage` (`path`, `size`, `sha256`, `uncompressed_size`, `slug`, `main_file`, `headers`, `variant`, `warnings`), `PluginHeaders`, `VariantDetection`, `PackageWarning`, `PackageDefect`, the limits as constants, and `Error::PackageInvalid` (`package_invalid`); rules in §6.10 and revisions 9 and 10. Uses the workspace's `zip` 8.6.0 (deflate only) and `sha2` 0.11.0. Tests: every rule and defect on generated zips, the libzip/PclZip differential shapes, ZIP64, headers, marker boundaries, a 9 000-zip fuzz test, a public-API test; all 43 cached artifacts inspect as §3.1 says (~80 ms each, release). `inspect` is synchronous CPU + I/O: async callers use `spawn_blocking`. Residual (low): a non-UTF-8 name without the UTF-8 flag is written differently by libzip and PclZip; it never affects the folder structure or the slug.
 - **Depends:** P1.1 · **Parallel:** P1.2–P1.4, P2.x, P3.x, P4.x
 
+#### P1.6 — Inventory conflict detection (lib)
+- **Goal:** a save that cannot lose another process's edit, for callers that keep an inventory in memory (revision 12).
+- **Changes:** `inventory/io.rs` (+ tests): `Fingerprint` (opaque: SHA-256 of the exact bytes read, or missing; `sha2` is already a dependency), `load_tracked(path) -> Result<(Inventory, Fingerprint)>` (one read: the inventory and the fingerprint come from the same bytes), `save_if_unchanged(path, &Inventory, &Fingerprint) -> Result<Fingerprint>` (under the lock: re-read safely, compare, write, return the new fingerprint); `Error::InventoryChanged { path }` + code `inventory_changed`; README.
+- **Tests:** unchanged → saved, new fingerprint returned and usable for the next save; changed by another writer → `inventory_changed`, file untouched; deleted since load, or created when it was missing → refused; a byte-identical rewrite is not a conflict; read-only (newer) inventory refused; busy lock → `inventory_locked`; the conflict reproduced across two processes.
+- **Depends:** P1.2 · **Parallel:** P1.3–P1.5, P2.1–P2.3, P3.x
+
 ### P2 — Inventory front ends
 
 #### P2.1 — cli: `apvm server` + `server defaults`
@@ -1309,7 +1329,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
   - `.claude/skills/apvm-cli/{SKILL.md, references/sites.md}`; `skill/embedded.rs` (`SKILL_FILES`); `tests/cli_inventory.rs`.
 - **Tests:** add/edit/show/list/remove; defaults set/unset; invalid input → exit 1; `--json`; `--cascade`; `APVM_INVENTORY`; `0600`.
 - **Audit notes (rev 10):** every edit goes through `io::update` (lock → load → change → save), never `load` then `save`, which can lose a concurrent edit. Map error locations like `sites[1]` / `all_sites` to the flags the user typed (`--site`, `--all-sites`).
-- **Depends:** P1.2, P1.3 · **Parallel:** P1.4, P1.5, P2.4, P3.x
+- **Depends:** P1.2, P1.3 · **Parallel:** P1.4–P1.6, P2.4, P3.x
 
 #### P2.2 — cli: `apvm site`
 - **Goal:** manage sites offline (the probe arrives in P4.3).
@@ -1326,9 +1346,13 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 #### P2.4 — napi: `SiteInventory`
 - **Goal:** the inventory from Node.
 - **Changes:** `crates/napi/Cargo.toml`; `sites_inventory.rs`, `sites_types.rs`; `lib.rs` docs; `__tests__/sites-inventory.test.ts`; `crates/napi/README.md`.
-- **Tests:** round-trip; validation errors with `err.code`; `APVM_INVENTORY` from `process.env`; `save` → `0600`.
-- **Audit notes (rev 10):** `io::save` replaces whatever is on disk. `SiteInventory.load()` … `save()` must not lose another process's edit made in between: either `save` runs `io::update` and refuses when the file changed since `load`, or mutations apply through `io::update` directly. Decide here and test it with two processes. Map `inventory_io` to a rejection code.
-- **Depends:** P1.2, P1.3 · **Parallel:** P2.1–P2.3, P3.x
+- **Behavior (revision 12):**
+  - `load(path?)` uses `io::load_tracked` and remembers the path and fingerprint; `empty()` remembers none.
+  - `save(path?, { force? })`: the target is `path`, else the loaded path, else the default (`APVM_INVENTORY`, else `~/.apvm/inventory.json`). The expected state is the remembered fingerprint when the target is the loaded path (compared as absolute paths), else "missing", so `empty().save()` never wipes an existing inventory. Without `force` it calls `io::save_if_unchanged`; with `force`, `io::save`. On success the object tracks the target and the new fingerprint and returns the path. On `InventoryChanged` nothing is written and the object keeps its changes.
+  - `static update(fn, path?)`: `io::update`; `fn` gets a `SiteInventory` over the locked copy and must be synchronous. A throw in `fn` writes nothing and is rethrown as is (beware napi's pending-exception pitfalls). It returns the saved inventory, tracked. Calling `save`/`update` on the same path inside `fn` fails with `InventoryLocked` after 10 s (documented, tested), never deadlocks.
+  - Rejection codes: `InventoryChanged`, `InventoryLocked`, `InventoryIo`, plus the existing inventory codes.
+- **Tests:** round-trip; validation errors with `err.code`; `APVM_INVENTORY` from `process.env`; `save` → `0600`; a second process edits between `load` and `save` → `InventoryChanged`, the file keeps that edit, the object keeps its own, reload + reapply + save succeeds; `force` overwrites; `empty().save()` over an existing file refused; chained saves on one object; `update` from parallel workers all land; a throwing `fn` writes nothing.
+- **Depends:** P1.3, P1.6 · **Parallel:** P2.1–P2.3, P3.x
 
 ### P3 — Remote execution (lib)
 
@@ -1626,7 +1650,8 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 ```
 P0 (E2E target) ─────────────────────────────────────────────────────────────────────────
 P1.1 ┬ P1.2 ┬ P2.1 ─ P2.2 ─ P2.3 ─────────────┐
-     ├ P1.3 ┴ P2.4 ───────────────────────────┼──────────────┐
+     │      └ P1.6 ┐
+     ├ P1.3 ───────┴ P2.4 ────────────────────┼──────────────┐
      ├ P1.4 ──────────────────────────────────┤              │
      ├ P1.5 ─────────────┐                    │              │
      └ P3.1 ┬ P3.2 ─ P3.3 ─ P3.4              │              │
