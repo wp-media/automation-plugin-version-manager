@@ -6,6 +6,7 @@
 //! option); each front end adds its own.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::inventory::EntityKind;
 use crate::inventory::io::FileKind;
@@ -35,6 +36,9 @@ pub enum Code {
     /// written, locked or created, or is not a regular file
     /// (`inventory_io`).
     InventoryIo,
+    /// Another process held the inventory's lock for the whole wait limit
+    /// (`inventory_locked`); nothing was written.
+    InventoryLocked,
     /// A plugin zip breaks an inspection rule (`package_invalid`).
     PackageInvalid,
 }
@@ -48,6 +52,7 @@ impl Code {
             Self::InventoryUnsupported => "inventory_unsupported",
             Self::InventoryReadOnly => "inventory_read_only",
             Self::InventoryIo => "inventory_io",
+            Self::InventoryLocked => "inventory_locked",
             Self::PackageInvalid => "package_invalid",
         }
     }
@@ -175,6 +180,21 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// Another process held the inventory's lock for the whole wait limit
+    /// ([`crate::inventory::io::LOCK_WAIT`]), so nothing was written. Edits
+    /// hold the lock for milliseconds: a holder this slow is stuck.
+    #[error(
+        "cannot lock the inventory with {}: another process held it for {}",
+        shown(path),
+        span(*waited)
+    )]
+    InventoryLocked {
+        /// The lock file.
+        path: PathBuf,
+        /// How long apvm waited.
+        waited: Duration,
+    },
+
     /// The inventory path, or its lock file, is not a regular file. A
     /// symbolic link is never followed: it could make apvm read or replace
     /// a file elsewhere.
@@ -226,6 +246,7 @@ impl Error {
             Self::InventoryUnsupported { .. } => Code::InventoryUnsupported,
             Self::InventoryReadOnly { .. } => Code::InventoryReadOnly,
             Self::InventoryIo { .. } | Self::InventoryNotAFile { .. } => Code::InventoryIo,
+            Self::InventoryLocked { .. } => Code::InventoryLocked,
             Self::InventoryFile { source, .. } => source.code(),
             Self::InvalidInput { .. }
             | Self::AlreadyExists { .. }
@@ -257,6 +278,16 @@ impl Error {
 /// paths keep single backslashes.
 fn shown(path: &Path) -> String {
     printable(&path.display().to_string())
+}
+
+/// A duration as shown in messages: whole seconds as `10 s`, anything
+/// else in milliseconds (`150 ms`), so short test waits stay exact.
+fn span(duration: Duration) -> String {
+    if duration.subsec_nanos() == 0 {
+        format!("{} s", duration.as_secs())
+    } else {
+        format!("{} ms", duration.as_millis())
+    }
 }
 
 #[cfg(test)]
@@ -292,6 +323,34 @@ mod tests {
         assert_eq!(Code::InventoryReadOnly.as_str(), "inventory_read_only");
         assert_eq!(Code::InventoryReadOnly.to_string(), "inventory_read_only");
         assert_eq!(Code::InventoryIo.as_str(), "inventory_io");
+        assert_eq!(Code::InventoryLocked.as_str(), "inventory_locked");
+    }
+
+    #[test]
+    fn a_busy_lock_names_the_lock_file_and_the_wait() {
+        let error = Error::InventoryLocked {
+            path: PathBuf::from("/home/me/.apvm/inventory.json.lock"),
+            waited: Duration::from_secs(10),
+        };
+        assert_eq!(error.code(), Code::InventoryLocked);
+        assert_eq!(
+            error.to_string(),
+            "cannot lock the inventory with /home/me/.apvm/inventory.json.lock: \
+             another process held it for 10 s"
+        );
+        assert!(error.problems().is_empty());
+    }
+
+    #[test]
+    fn spans_read_in_seconds_or_milliseconds() {
+        assert_eq!(span(Duration::from_secs(10)), "10 s");
+        assert_eq!(span(Duration::from_millis(1500)), "1500 ms");
+        assert_eq!(span(Duration::from_millis(150)), "150 ms");
+        assert_eq!(span(Duration::ZERO), "0 s");
+        assert_eq!(
+            span(Duration::MAX),
+            format!("{} ms", Duration::MAX.as_millis())
+        );
     }
 
     #[test]

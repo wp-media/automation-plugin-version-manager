@@ -19,9 +19,12 @@
 //!
 //! # Locking
 //!
-//! The lock is `std::fs::File::lock` (`flock` on Unix, `LockFileEx` on
-//! Windows): advisory, and only as reliable as the filesystem on network
-//! mounts. Readers take no lock: a save replaces the file in one rename, so
+//! The lock is taken with `std::fs::File::try_lock` (`flock` on Unix,
+//! `LockFileEx` on Windows): advisory, and only as reliable as the
+//! filesystem on network mounts. A writer retries a busy lock for at most
+//! [`LOCK_WAIT`], then fails with [`Error::InventoryLocked`]: edits hold the
+//! lock for milliseconds, so only a stuck process makes it wait that long,
+//! and failing beats hanging forever. Readers take no lock: a save replaces the file in one rename, so
 //! a reader sees the old or the new document, never a mix. The lock file is
 //! left in place: removing it while another process waits on it would let
 //! two writers in, and Windows cannot remove a locked file.
@@ -46,10 +49,12 @@
 //! ```
 
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
+use std::fs::{self, DirBuilder, File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::Inventory;
 use crate::error::{Error, Result};
@@ -66,6 +71,20 @@ pub const MAX_INVENTORY_BYTES: u64 = 16 * 1024 * 1024;
 /// How often opening a file is retried when it is replaced or removed
 /// while it is opened (a concurrent save renames over it).
 const OPEN_ATTEMPTS: usize = 8;
+
+/// How long [`save`] and [`update`] wait for another writer's lock before
+/// failing with [`Error::InventoryLocked`]. An edit holds the lock for
+/// milliseconds, so reaching this limit means the holder is stuck (or
+/// hundreds of writers queue at once: waiters poll, so the lock is not
+/// handed out in arrival order).
+pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// First pause between attempts to take a busy lock; it doubles up to
+/// [`LOCK_POLL_MAX`], so short waits stay short and long ones stay cheap.
+const LOCK_POLL_MIN: Duration = Duration::from_millis(5);
+
+/// Longest pause between attempts to take a busy lock.
+const LOCK_POLL_MAX: Duration = Duration::from_millis(100);
 
 /// Suffix of the lock file's name: `inventory.json.lock`.
 const LOCK_SUFFIX: &str = ".lock";
@@ -182,13 +201,24 @@ pub fn load(path: &Path) -> Result<Inventory> {
 ///   refuse it (nothing is touched).
 /// - [`Error::InventoryNotAFile`]: the path or the lock file is a symbolic
 ///   link, a directory or a special file.
+/// - [`Error::InventoryLocked`]: another process held the lock for
+///   [`LOCK_WAIT`] (nothing is written).
 /// - [`Error::InventoryIo`]: a directory, the lock or the file cannot be
 ///   created, taken or written, or the path names no file. The previous
 ///   file is left whole.
 pub fn save(path: &Path, inventory: &Inventory) -> Result<()> {
+    save_within(path, inventory, LOCK_WAIT)
+}
+
+/// [`save`], waiting at most `wait` for the lock.
+///
+/// # Errors
+///
+/// Those of [`save`].
+fn save_within(path: &Path, inventory: &Inventory, wait: Duration) -> Result<()> {
     let text = inventory.to_json()?;
     check_size(text.len(), path)?;
-    let _lock = InventoryLock::acquire(path)?;
+    let _lock = InventoryLock::acquire(path, wait)?;
     write_atomic(path, &text)
 }
 
@@ -214,8 +244,9 @@ pub fn save(path: &Path, inventory: &Inventory) -> Result<()> {
 ///
 /// `change`'s error (nothing is written); [`Error::InventoryReadOnly`]
 /// when the file has a newer format version and `change` changed it, even
-/// by replacing the whole inventory; otherwise the errors of [`load`] and
-/// [`save`], converted into `E`.
+/// by replacing the whole inventory; [`Error::InventoryLocked`] when
+/// another process held the lock for [`LOCK_WAIT`] (`change` never runs);
+/// otherwise the errors of [`load`] and [`save`], converted into `E`.
 ///
 /// # Example
 ///
@@ -238,7 +269,23 @@ pub fn update<T, E>(
 where
     E: From<Error>,
 {
-    let _lock = InventoryLock::acquire(path)?;
+    update_within(path, change, LOCK_WAIT)
+}
+
+/// [`update`], waiting at most `wait` for the lock.
+///
+/// # Errors
+///
+/// Those of [`update`].
+fn update_within<T, E>(
+    path: &Path,
+    change: impl FnOnce(&mut Inventory) -> std::result::Result<T, E>,
+    wait: Duration,
+) -> std::result::Result<T, E>
+where
+    E: From<Error>,
+{
+    let _lock = InventoryLock::acquire(path, wait)?;
     let original = load(path)?;
     let mut inventory = original.clone();
     let value = change(&mut inventory)?;
@@ -320,26 +367,69 @@ struct InventoryLock {
 }
 
 impl InventoryLock {
-    /// Block until the inventory's lock is held, creating its directory and
-    /// lock file (`0600` on Unix) when missing.
+    /// Take the inventory's lock, waiting at most `wait` while another
+    /// writer holds it, and create its directory and lock file (`0600` on
+    /// Unix) when missing.
     ///
     /// # Arguments
     ///
     /// * `path` - The inventory file (not the lock file)
+    /// * `wait` - How long to retry a busy lock
     ///
     /// # Errors
     ///
     /// [`Error::InventoryNotAFile`] when the lock file is a symbolic link, a
-    /// directory or a special file; [`Error::InventoryIo`] when the path
-    /// names no file, or the directory, the lock file or the lock cannot be
-    /// created or taken.
-    fn acquire(path: &Path) -> Result<Self> {
+    /// directory or a special file; [`Error::InventoryLocked`] when the lock
+    /// stays busy for `wait`; [`Error::InventoryIo`] when the path names no
+    /// file, or the directory, the lock file or the lock cannot be created
+    /// or taken.
+    fn acquire(path: &Path, wait: Duration) -> Result<Self> {
         let lock_path = sibling(path, LOCK_SUFFIX)?;
         create_parent(path)?;
         let file = open_lock_file(&lock_path)?;
-        file.lock()
-            .map_err(|source| io_error(LOCK_CONTEXT, &lock_path, source))?;
+        wait_for_lock(&file, &lock_path, wait)?;
         Ok(Self { file })
+    }
+}
+
+/// Retry `file.try_lock()` until it succeeds or `wait` has passed, pausing
+/// between attempts (from [`LOCK_POLL_MIN`], doubling up to
+/// [`LOCK_POLL_MAX`], never past the deadline). Polling, unlike a blocking
+/// `lock`, lets the wait end: std has no timed lock.
+///
+/// # Arguments
+///
+/// * `file` - The open lock file
+/// * `lock_path` - Its path, for errors
+/// * `wait` - The limit; one so large the deadline overflows means no limit
+///
+/// # Errors
+///
+/// [`Error::InventoryLocked`] when the lock is still busy at the deadline;
+/// [`Error::InventoryIo`] when locking fails for another reason.
+fn wait_for_lock(file: &File, lock_path: &Path, wait: Duration) -> Result<()> {
+    let deadline = Instant::now().checked_add(wait);
+    let mut pause = LOCK_POLL_MIN;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::Error(source)) => {
+                return Err(io_error(LOCK_CONTEXT, lock_path, source));
+            }
+            Err(TryLockError::WouldBlock) => {}
+        }
+        let left = match deadline {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => pause,
+        };
+        if left.is_zero() {
+            return Err(Error::InventoryLocked {
+                path: lock_path.to_path_buf(),
+                waited: wait,
+            });
+        }
+        thread::sleep(pause.min(left));
+        pause = pause.saturating_mul(2).min(LOCK_POLL_MAX);
     }
 }
 

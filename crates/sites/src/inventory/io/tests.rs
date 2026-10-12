@@ -831,6 +831,123 @@ fn the_lock_makes_a_second_writer_wait() {
     assert_eq!(load(&path).unwrap().servers().len(), 2);
 }
 
+/// Hold the lock of the inventory at `path` through another open file, as
+/// another process would, until the guard drops.
+fn hold_lock(path: &Path) -> InventoryLock {
+    InventoryLock::acquire(path, LOCK_WAIT).unwrap()
+}
+
+#[test]
+fn the_default_wait_is_ten_seconds() {
+    assert_eq!(LOCK_WAIT, Duration::from_secs(10));
+}
+
+#[test]
+fn a_lock_held_past_the_wait_fails_with_inventory_locked_and_writes_nothing() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let before = fs::read(&path).unwrap();
+    let lock_path = sibling(&path, LOCK_SUFFIX).unwrap();
+    let held = hold_lock(&path);
+    let wait = Duration::from_millis(150);
+
+    let mut ran = false;
+    let started = Instant::now();
+    let err = update_within(
+        &path,
+        |inventory| {
+            ran = true;
+            inventory.add_server(Server::new("us-1", "h"))
+        },
+        wait,
+    )
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(&err, Error::InventoryLocked { path: at, waited } if at == &lock_path && *waited == wait),
+        "{err:?}"
+    );
+    assert_eq!(err.code(), Code::InventoryLocked);
+    assert!(!ran, "the change ran without the lock");
+    assert!(
+        elapsed >= wait,
+        "gave up after {elapsed:?}, before {wait:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "kept waiting: {elapsed:?}"
+    );
+
+    let err = save_within(&path, &one_server("us-1"), wait).unwrap_err();
+    assert!(matches!(&err, Error::InventoryLocked { .. }), "{err:?}");
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(dir.names(), ["inventory.json", "inventory.json.lock"]);
+
+    // Once the holder lets go, writers get in again.
+    drop(held);
+    add_server(&path, "us-2").unwrap();
+    assert_eq!(load(&path).unwrap().servers().len(), 2);
+}
+
+#[test]
+fn a_lock_released_within_the_wait_is_taken() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    let held = hold_lock(&path);
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        drop(held);
+    });
+    update_within(
+        &path,
+        |inventory| inventory.add_server(Server::new("eu-1", "h")),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    releaser.join().unwrap();
+    assert!(load(&path).unwrap().server("eu-1").is_some());
+}
+
+#[test]
+fn a_zero_wait_tries_once() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    // A free lock is taken at once.
+    save_within(&path, &one_server("eu-1"), Duration::ZERO).unwrap();
+    let held = hold_lock(&path);
+    let started = Instant::now();
+    let err = save_within(&path, &one_server("us-1"), Duration::ZERO).unwrap_err();
+    assert!(
+        matches!(&err, Error::InventoryLocked { waited, .. } if waited.is_zero()),
+        "{err:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    drop(held);
+    assert!(load(&path).unwrap().server("eu-1").is_some());
+}
+
+#[test]
+fn a_wait_too_long_for_a_deadline_still_works() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    // `now + Duration::MAX` overflows: that must mean "no limit", not a panic.
+    save_within(&path, &one_server("eu-1"), Duration::MAX).unwrap();
+    let held = hold_lock(&path);
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        drop(held);
+    });
+    update_within(
+        &path,
+        |inventory| inventory.add_server(Server::new("us-1", "h")),
+        Duration::MAX,
+    )
+    .unwrap();
+    releaser.join().unwrap();
+    assert_eq!(load(&path).unwrap().servers().len(), 2);
+}
+
 #[test]
 fn readers_never_see_a_partial_document() {
     let dir = TempDir::new();

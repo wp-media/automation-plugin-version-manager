@@ -87,7 +87,10 @@ The caller passes the path: front ends use `~/.apvm/inventory.json`, or
   and content problems their locations. Files over 16 MiB, and content that
   is not UTF-8, are refused.
 - **`save`**: replaces the file under an exclusive lock
-  (`inventory.json.lock`, `std::fs::File::lock`). The document is written
+  (`inventory.json.lock`, `std::fs::File::try_lock`). A busy lock is
+  retried for up to 10 s (`io::LOCK_WAIT`), then the write fails with
+  `inventory_locked`: edits hold the lock for milliseconds, so only a stuck
+  process makes a writer wait that long. The document is written
   to a temp file created `0600`, synced, renamed over the inventory, and the
   directory is synced, so a crash or a failed write never leaves a partial
   file. Missing directories are created `0700`.
@@ -176,6 +179,8 @@ code.
 - `inventory_io`: the inventory file, its lock file or its directory cannot
   be read, written, locked or created, or is not a regular file (a symbolic
   link, a directory);
+- `inventory_locked`: another process held the inventory's lock for the
+  whole wait (10 s); nothing was written;
 - `invalid_input`: a refused record, a taken or unknown id, a server in use,
   or invalid hints;
 - `package_invalid`: a plugin zip that breaks an inspection rule.
@@ -202,7 +207,8 @@ cargo test -p apvm-sites
 - the inventory file: missing = empty, located errors, `0600`, no partial
   file after a failed write or a panicking change, concurrent updates from
   threads, refused symbolic links (including one swapped in while the file
-  is opened), a newer inventory never overwritten, the size cap on reads
+  is opened), a newer inventory never overwritten, the bounded lock wait
+  (a busy lock times out, a released one is taken), the size cap on reads
   and writes;
 - settings precedence (every field at every level) and target selection
   (union, order, de-duplication, errors, warnings), including an exhaustive
