@@ -1,0 +1,17 @@
+[package]
+name = "apvm-sites"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Site inventory and WordPress plugin management over SSH for APVM"
+license = "MIT"
+
+# No `apvm-*` dependencies (plan D1): apvm-core depends on this crate, and zip
+# installs or `wp run` need no GitHub/build stack. A unit test enforces it.
+[dependencies]
+# Serialization of the inventory document (`inventory.json`)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }

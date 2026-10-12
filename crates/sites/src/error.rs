@@ -1,0 +1,390 @@
+//! Error types and their stable codes.
+//!
+//! Every fallible operation returns [`Result<T>`]. [`Error`] and [`Code`] are
+//! `#[non_exhaustive]`: later phases add variants, so consumers keep a
+//! wildcard arm. Messages name no front-end remedy (no CLI flag, no Node
+//! option); each front end adds its own.
+
+use crate::inventory::EntityKind;
+use crate::problem::{Problem, printable, quoted};
+
+/// Convenient result alias used across the crate.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Stable, machine-readable error codes (plan §4.5), carried by the CLI's
+/// `--json` output and by the Node bindings' `code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Code {
+    /// A value handed to the library breaks a rule (`invalid_input`).
+    InvalidInput,
+    /// The inventory document cannot be parsed or breaks a rule
+    /// (`inventory_invalid`).
+    InventoryInvalid,
+    /// The inventory was written by a newer apvm, in a form this one cannot
+    /// read (`inventory_unsupported`).
+    InventoryUnsupported,
+    /// The inventory was written by a newer apvm: this one may read it but
+    /// never change it (`inventory_read_only`).
+    InventoryReadOnly,
+}
+
+impl Code {
+    /// The stable `snake_case` code string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_input",
+            Self::InventoryInvalid => "inventory_invalid",
+            Self::InventoryUnsupported => "inventory_unsupported",
+            Self::InventoryReadOnly => "inventory_read_only",
+        }
+    }
+}
+
+impl std::fmt::Display for Code {
+    /// The stable code string ([`Code::as_str`]).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// All errors the sites crate can produce.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    /// The inventory text is not JSON of the inventory's shape (syntax, a
+    /// wrong type, a missing or unknown field). serde_json's message says
+    /// where (line and column).
+    #[error("{context}: {}", printable(&source.to_string()))]
+    InventoryJson {
+        /// What was being done (`"cannot parse the inventory"`, …).
+        context: &'static str,
+        /// The underlying serde_json error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// The inventory parsed but breaks one or more rules. Every problem is
+    /// listed with its location, such as `sites[1].server`.
+    #[error("invalid inventory: {}", Problem::join(problems))]
+    InventoryInvalid {
+        /// Every problem found, in document order.
+        problems: Vec<Problem>,
+    },
+
+    /// The inventory has a newer format version, and this build cannot read
+    /// it: it has fields or values this build does not know, or breaks
+    /// rules this build applies. Ignoring what it does not understand could
+    /// drop a setting that restricts what apvm does, so it is refused.
+    #[error(
+        "the inventory has format version {found}, newer than this apvm supports \
+         ({supported}), and cannot be read: {source}; upgrade apvm"
+    )]
+    InventoryUnsupported {
+        /// Version recorded in the document.
+        found: u32,
+        /// Newest version this build reads and writes.
+        supported: u32,
+        /// Why it could not be read ([`Error::InventoryJson`] or
+        /// [`Error::InventoryInvalid`]); [`Error::problems`] returns its
+        /// problems.
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// A change was attempted on an inventory with a newer format version.
+    /// It can be read, but writing it would drop what the newer version
+    /// means, so it is read-only.
+    #[error(
+        "the inventory has format version {found}, newer than this apvm writes \
+         ({supported}); it is read-only: upgrade apvm to change it"
+    )]
+    InventoryReadOnly {
+        /// Version recorded in the document.
+        found: u32,
+        /// Newest version this build reads and writes.
+        supported: u32,
+    },
+
+    /// A record (or the defaults) handed to the inventory breaks one or more
+    /// rules. Nothing was changed.
+    #[error("invalid {subject}: {}", Problem::join(problems))]
+    InvalidInput {
+        /// What was rejected, such as `site 'shop'` or `defaults`.
+        subject: String,
+        /// Every problem found; locations are relative to the record.
+        problems: Vec<Problem>,
+    },
+
+    /// A record with this id already exists.
+    #[error("{kind} {} already exists", quoted(id))]
+    AlreadyExists {
+        /// The kind of record.
+        kind: EntityKind,
+        /// The id that is taken.
+        id: String,
+    },
+
+    /// No record has this id.
+    #[error("{kind} {} does not exist", quoted(id))]
+    NotFound {
+        /// The kind of record.
+        kind: EntityKind,
+        /// The id that was not found.
+        id: String,
+    },
+
+    /// A server cannot be removed while sites use it (unless the removal
+    /// cascades to them).
+    #[error(
+        "server {} is used by {} site(s): {}",
+        quoted(id),
+        sites.len(),
+        sites.iter().map(|site| quoted(site)).collect::<Vec<_>>().join(", ")
+    )]
+    ServerInUse {
+        /// The server id.
+        id: String,
+        /// Ids of the sites on it, in inventory order.
+        sites: Vec<String>,
+    },
+
+    /// Plugin hints break one or more rules.
+    #[error("invalid plugin hints: {}", Problem::join(problems))]
+    InvalidHints {
+        /// Every problem found, with locations such as
+        /// `projects[0].plugins[1].slug`.
+        problems: Vec<Problem>,
+    },
+}
+
+impl Error {
+    /// The stable code of this error.
+    pub fn code(&self) -> Code {
+        match self {
+            Self::InventoryJson { .. } | Self::InventoryInvalid { .. } => Code::InventoryInvalid,
+            Self::InventoryUnsupported { .. } => Code::InventoryUnsupported,
+            Self::InventoryReadOnly { .. } => Code::InventoryReadOnly,
+            Self::InvalidInput { .. }
+            | Self::AlreadyExists { .. }
+            | Self::NotFound { .. }
+            | Self::ServerInUse { .. }
+            | Self::InvalidHints { .. } => Code::InvalidInput,
+        }
+    }
+
+    /// The located problems this error carries, those of an unreadable newer
+    /// inventory included (empty for errors without any), so front ends can
+    /// list them one per line.
+    pub fn problems(&self) -> &[Problem] {
+        match self {
+            Self::InventoryInvalid { problems }
+            | Self::InvalidInput { problems, .. }
+            | Self::InvalidHints { problems } => problems,
+            Self::InventoryUnsupported { source, .. } => source.problems(),
+            _ => &[],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A shape that refuses unknown fields, like the inventory's records.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Strict {}
+
+    /// A serde_json error whose message holds a raw ESC: serde quotes an
+    /// unknown field name verbatim.
+    fn json_error() -> serde_json::Error {
+        match serde_json::from_str::<Strict>(r#"{"a\u001bb": 1}"#) {
+            Err(err) => err,
+            Ok(value) => panic!("expected a parse error, got {value:?}"),
+        }
+    }
+
+    fn problems() -> Vec<Problem> {
+        vec![
+            Problem::new("sites[1].server", "unknown server 'eu-2'"),
+            Problem::new("groups[0].id", "must not be empty"),
+        ]
+    }
+
+    #[test]
+    fn codes_are_stable_strings() {
+        assert_eq!(Code::InvalidInput.as_str(), "invalid_input");
+        assert_eq!(Code::InventoryInvalid.as_str(), "inventory_invalid");
+        assert_eq!(Code::InventoryUnsupported.as_str(), "inventory_unsupported");
+        assert_eq!(Code::InventoryReadOnly.as_str(), "inventory_read_only");
+        assert_eq!(Code::InventoryReadOnly.to_string(), "inventory_read_only");
+    }
+
+    #[test]
+    fn every_error_maps_to_its_code() {
+        let cases = [
+            (
+                Error::InventoryJson {
+                    context: "cannot parse the inventory",
+                    source: json_error(),
+                },
+                Code::InventoryInvalid,
+            ),
+            (
+                Error::InventoryInvalid {
+                    problems: problems(),
+                },
+                Code::InventoryInvalid,
+            ),
+            (
+                Error::InventoryUnsupported {
+                    found: 2,
+                    supported: 1,
+                    source: Box::new(Error::InventoryInvalid {
+                        problems: problems(),
+                    }),
+                },
+                Code::InventoryUnsupported,
+            ),
+            (
+                Error::InventoryReadOnly {
+                    found: 2,
+                    supported: 1,
+                },
+                Code::InventoryReadOnly,
+            ),
+            (
+                Error::InvalidInput {
+                    subject: "defaults".into(),
+                    problems: problems(),
+                },
+                Code::InvalidInput,
+            ),
+            (
+                Error::AlreadyExists {
+                    kind: EntityKind::Site,
+                    id: "shop".into(),
+                },
+                Code::InvalidInput,
+            ),
+            (
+                Error::NotFound {
+                    kind: EntityKind::Group,
+                    id: "qa".into(),
+                },
+                Code::InvalidInput,
+            ),
+            (
+                Error::ServerInUse {
+                    id: "eu-1".into(),
+                    sites: vec!["shop".into()],
+                },
+                Code::InvalidInput,
+            ),
+            (
+                Error::InvalidHints {
+                    problems: problems(),
+                },
+                Code::InvalidInput,
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.code(), code, "{error}");
+        }
+    }
+
+    #[test]
+    fn messages_list_every_problem_with_its_location() {
+        let error = Error::InventoryInvalid {
+            problems: problems(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid inventory: sites[1].server: unknown server 'eu-2'; \
+             groups[0].id: must not be empty"
+        );
+        assert_eq!(error.problems(), problems().as_slice());
+
+        let error = Error::InvalidInput {
+            subject: "site 'shop'".into(),
+            problems: vec![Problem::new("path", "must not be empty")],
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid site 'shop': path: must not be empty"
+        );
+    }
+
+    #[test]
+    fn errors_without_problems_return_an_empty_list() {
+        let error = Error::NotFound {
+            kind: EntityKind::Server,
+            id: "eu-1".into(),
+        };
+        assert!(error.problems().is_empty());
+        assert_eq!(error.to_string(), "server 'eu-1' does not exist");
+    }
+
+    #[test]
+    fn messages_escape_terminal_control_characters() {
+        // Ids come from callers and documents: an escape sequence must never
+        // reach the terminal raw.
+        let error = Error::AlreadyExists {
+            kind: EntityKind::Site,
+            id: "a\u{1b}[2Jb".into(),
+        };
+        assert_eq!(error.to_string(), "site 'a\\u{1b}[2Jb' already exists");
+
+        let error = Error::ServerInUse {
+            id: "eu-1".into(),
+            sites: vec!["shop".into(), "blog".into()],
+        };
+        assert_eq!(
+            error.to_string(),
+            "server 'eu-1' is used by 2 site(s): 'shop', 'blog'"
+        );
+
+        let source = json_error();
+        assert!(
+            source.to_string().contains('\u{1b}'),
+            "the test needs a raw ESC"
+        );
+        let error = Error::InventoryJson {
+            context: "cannot parse the inventory",
+            source,
+        };
+        let message = error.to_string();
+        assert!(
+            message.starts_with("cannot parse the inventory: "),
+            "{message}"
+        );
+        assert!(message.contains("a\\u{1b}b"), "{message}");
+        assert!(!message.contains('\u{1b}'), "{message}");
+    }
+
+    #[test]
+    fn version_errors_explain_the_remedy() {
+        let error = Error::InventoryReadOnly {
+            found: 2,
+            supported: 1,
+        };
+        assert!(error.to_string().contains("read-only"));
+        assert!(error.to_string().contains("upgrade apvm"));
+        let error = Error::InventoryUnsupported {
+            found: 3,
+            supported: 1,
+            source: Box::new(Error::InventoryInvalid {
+                problems: problems(),
+            }),
+        };
+        assert_eq!(
+            error.to_string(),
+            "the inventory has format version 3, newer than this apvm supports (1), and \
+             cannot be read: invalid inventory: sites[1].server: unknown server 'eu-2'; \
+             groups[0].id: must not be empty; upgrade apvm"
+        );
+        // The problems stay listable.
+        assert_eq!(error.problems(), problems().as_slice());
+    }
+}

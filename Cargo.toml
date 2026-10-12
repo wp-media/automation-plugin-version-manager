@@ -104,6 +104,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 # Internal crates
 apvm-config = { path = "crates/config" }
 apvm-core = { path = "crates/core" }
+apvm-sites = { path = "crates/sites" }
 apvm-storage = { path = "crates/storage" }
 
 # N-API bindings

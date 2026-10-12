@@ -143,6 +143,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "apvm-sites"
+version = "3.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "apvm-storage"
 version = "3.3.0"
 dependencies = [
