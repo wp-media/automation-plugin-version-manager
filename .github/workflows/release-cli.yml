@@ -44,6 +44,10 @@ jobs:
   validate:
     name: Validate release tag
     runs-on: ubuntu-22.04
+    # Job timeouts: well above the usual run time (validate <1 min, builds
+    # 2-6 min, publish <1 min), so a hung step fails instead of burning
+    # GitHub's 6-hour default.
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.check.outputs.version }}
       prerelease: ${{ steps.check.outputs.prerelease }}
@@ -118,6 +122,7 @@ jobs:
             binary: apvm.exe
             artifact: apvm-win32-x64-msvc.exe
     runs-on: ${{ matrix.settings.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -163,6 +168,7 @@ jobs:
     name: Publish GitHub Release
     needs: [validate, build]
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - name: Download all CLI artifacts
         uses: actions/download-artifact@v8

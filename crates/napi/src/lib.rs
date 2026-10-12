@@ -58,4 +58,5 @@ mod config;
 mod error;
 mod progress;
 mod single_copy;
+mod teardown;
 mod types;

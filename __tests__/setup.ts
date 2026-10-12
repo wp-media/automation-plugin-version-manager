@@ -1,7 +1,8 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll } from 'vitest';
+import { removeBestEffort } from './cleanup.js';
 
 // Isolate APVM's artifact cache for the whole test run.
 //
@@ -14,7 +15,7 @@ import { afterAll } from 'vitest';
 const cacheDir = mkdtempSync(join(tmpdir(), 'apvm-test-cache-'));
 process.env.APVM_CACHE_DIR = cacheDir;
 
-afterAll(() => {
+afterAll(async () => {
   // Best-effort removal of the throwaway cache dir.
   //
   // The Rust core opens a WAL-mode SQLite store (apvm.db + -wal/-shm) and holds
@@ -22,13 +23,11 @@ afterAll(() => {
   // on GC, which is non-deterministic, so their file handles may still be open
   // here. On Windows an open handle blocks deletion, surfacing as EPERM/EBUSY.
   //
-  // `maxRetries` lets Node retry with backoff once the handles are released;
-  // if it still can't remove the dir, we warn instead of failing an otherwise
-  // green run — it's a temp dir the OS reclaims regardless. (POSIX unlinks the
-  // files immediately, so this path effectively never triggers off Windows.)
-  try {
-    rmSync(cacheDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-  } catch (err) {
-    console.warn(`[apvm test setup] could not remove temp cache dir ${cacheDir}: ${String(err)}`);
-  }
+  // `removeBestEffort` retries with back-off once the handles are released,
+  // and warns instead of failing an otherwise green run when it still cannot
+  // (or cannot in time — vitest fails a hook that overruns its timeout, even a
+  // synchronous one): it's a temp dir the OS reclaims regardless. (POSIX
+  // unlinks the files immediately, so this path effectively never triggers
+  // off Windows.)
+  await removeBestEffort(cacheDir, 'apvm test setup');
 });

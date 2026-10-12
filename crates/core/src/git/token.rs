@@ -22,7 +22,6 @@
 use std::path::PathBuf;
 
 use directories::BaseDirs;
-use tokio::process::Command;
 use tracing::{debug, trace, warn};
 
 /// Source of a resolved GitHub token.
@@ -171,9 +170,7 @@ fn token_from_explicit_sources(
 async fn try_gh_auth_token() -> Option<String> {
     trace!("Trying 'gh auth token' command");
 
-    let output = Command::new("gh")
-        .args(["auth", "token"])
-        .output()
+    let output = crate::process::output(crate::process::command("gh").args(["auth", "token"]))
         .await
         .ok()?;
 

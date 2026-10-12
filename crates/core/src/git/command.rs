@@ -60,11 +60,17 @@ pub fn command() -> std::process::Command {
 }
 
 /// The async (tokio) form of [`command`], used by apvm's own git operations.
+/// It comes from [`crate::process::command`], so run with
+/// [`crate::process::output`] a cancelled operation also stops git's whole
+/// process tree.
 ///
 /// # Returns
-/// A `tokio::process::Command` for `git` with [`REPOSITORY_ENV_VARS`] removed.
+/// A `tokio::process::Command` for `git` with [`REPOSITORY_ENV_VARS`] removed
+/// and `kill_on_drop` set.
 pub(crate) fn tokio_command() -> tokio::process::Command {
-    command().into()
+    let mut cmd = crate::process::command("git");
+    isolate(cmd.as_std_mut());
+    cmd
 }
 
 #[cfg(test)]
@@ -164,5 +170,15 @@ mod tests {
         for var in REPOSITORY_ENV_VARS {
             assert!(removed.contains(&OsStr::new(var)), "{var} is not removed");
         }
+    }
+
+    #[tokio::test]
+    async fn tokio_command_is_built_for_cancellable_runs() {
+        let cmd = tokio_command();
+        assert_eq!(cmd.as_std().get_program(), OsStr::new("git"));
+        assert!(
+            cmd.get_kill_on_drop(),
+            "not built by crate::process::command"
+        );
     }
 }

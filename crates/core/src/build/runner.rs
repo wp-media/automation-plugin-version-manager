@@ -183,19 +183,21 @@ impl<'r> BuildRunner<'r> {
     /// Source (Windows): <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd>
     pub async fn run(&self, command: &str) -> Result<BuildOutput> {
         #[cfg(unix)]
-        let output = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(self.context.repo_dir())
-            .output()
-            .await?;
+        let output = crate::process::output(
+            crate::process::command("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(self.context.repo_dir()),
+        )
+        .await?;
 
         #[cfg(windows)]
-        let output = tokio::process::Command::new("cmd")
-            .args(["/C", command])
-            .current_dir(self.context.repo_dir())
-            .output()
-            .await?;
+        let output = crate::process::output(
+            crate::process::command("cmd")
+                .args(["/C", command])
+                .current_dir(self.context.repo_dir()),
+        )
+        .await?;
 
         let build_output = BuildOutput::from(output);
 
@@ -1107,5 +1109,30 @@ mod tests {
         let result = runner.execute_build(&builder, "1.0.0", &[]).await.unwrap();
 
         assert!(result.variants_built.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_running_step_kills_its_process() {
+        // A cancelled build (e.g. its Node.js worker exited) must not leave
+        // the current build step running.
+        use crate::process::testutil::{running, sleeper_script, stops_soon, wait_for_pid};
+        let (ws, context) = workspace();
+        let pid_file = ws.path().join("pid");
+        let runner = BuildRunner::new(context);
+        let script = sleeper_script(&pid_file);
+
+        let pending = tokio::spawn(async move { runner.run(&script).await });
+        let pid = tokio::task::spawn_blocking(move || wait_for_pid(&pid_file))
+            .await
+            .unwrap();
+        assert!(running(&pid), "precondition: the step is running");
+
+        pending.abort();
+        let _ = pending.await;
+
+        assert!(
+            stops_soon(&pid),
+            "the step {pid} outlived its dropped build"
+        );
     }
 }

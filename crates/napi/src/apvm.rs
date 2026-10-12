@@ -30,6 +30,7 @@ use crate::config::{ApvmConfig, resolve_config};
 use crate::error::core_error_to_napi;
 use crate::progress::JsProgressReporter;
 use crate::single_copy::ensure_single_copy;
+use crate::teardown;
 use crate::types::{BuildOptions, JsBuildEvent, JsBuildOutput, JsReleaseSelector, WarmOptions};
 
 /// Main APVM instance for building WordPress plugins.
@@ -123,11 +124,12 @@ impl Apvm {
         // is when `create()` is called (not when the promise runs), and the
         // environment is never read off the JS thread while JS may write it.
         let rust_config = resolve_config(env, config);
+        let call = teardown::begin_call(env)?;
         // Octocrab (HTTP client) requires a Tokio runtime during
         // initialization, which is why creation is async. It runs on the
         // blocking pool (still inside the runtime): opening the cache may
         // wait for a repair running meanwhile.
-        env.spawn_future(async move {
+        env.spawn_future(call.run(async move {
             let inner = tokio::task::spawn_blocking(move || apvm_core::Apvm::new(rust_config))
                 .await
                 .map_err(|join| {
@@ -140,7 +142,7 @@ impl Apvm {
             Ok(Self {
                 inner: Arc::new(inner),
             })
-        })
+        }))
     }
 
     /// Create a new APVM instance with automatic GitHub token resolution.
@@ -192,14 +194,15 @@ impl Apvm {
         // `APVM_CACHE_DIR` is read now, as in `create()`. (Token resolution
         // still reads `GITHUB_TOKEN` / `GH_TOKEN` when the promise runs.)
         let rust_config = resolve_config(env, config);
-        env.spawn_future(async move {
+        let call = teardown::begin_call(env)?;
+        env.spawn_future(call.run(async move {
             let inner = apvm_core::Apvm::new_with_token_resolution(rust_config)
                 .await
                 .map_err(core_error_to_napi)?;
             Ok(Self {
                 inner: Arc::new(inner),
             })
-        })
+        }))
     }
 
     /// Check if a GitHub token is available.
@@ -279,7 +282,8 @@ impl Apvm {
         env: &'env Env,
     ) -> napi::Result<PromiseRaw<'env, JsCacheStatus>> {
         let apvm = Arc::clone(&self.inner);
-        env.spawn_future(async move {
+        let call = teardown::begin_call(env)?;
+        env.spawn_future(call.run(async move {
             // A SQLite open, which may wait for a running repair: blocking.
             let status = tokio::task::spawn_blocking(move || apvm.cache_status())
                 .await
@@ -290,7 +294,7 @@ impl Apvm {
                     )
                 })?;
             Ok(JsCacheStatus::from(&status))
-        })
+        }))
     }
 
     /// List all registered project names.
@@ -388,7 +392,8 @@ impl Apvm {
                 .version(options.version)
                 .variants(options.variants.unwrap_or_default())
                 .no_cache(options.no_cache.unwrap_or(false));
-        env.spawn_future(run_build(Arc::clone(&self.inner), request, on_progress))
+        let call = teardown::begin_call(env)?;
+        env.spawn_future(call.run(run_build(Arc::clone(&self.inner), request, on_progress)))
     }
 
     /// Warm the artifact cache for a project without producing any output.
@@ -452,7 +457,8 @@ impl Apvm {
         let request = apvm_core::WarmRequest::new(options.project, options.git_ref)
             .version(options.version)
             .variants(options.variants.unwrap_or_default());
-        env.spawn_future(run_warm(Arc::clone(&self.inner), request, on_progress))
+        let call = teardown::begin_call(env)?;
+        env.spawn_future(call.run(run_warm(Arc::clone(&self.inner), request, on_progress)))
     }
 
     /// Build a project from a pull request number.
