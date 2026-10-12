@@ -39,6 +39,9 @@ pub enum Code {
     /// Another process held the inventory's lock for the whole wait limit
     /// (`inventory_locked`); nothing was written.
     InventoryLocked,
+    /// The inventory file changed after it was loaded, so a guarded save
+    /// wrote nothing (`inventory_changed`).
+    InventoryChanged,
     /// A plugin zip breaks an inspection rule (`package_invalid`).
     PackageInvalid,
 }
@@ -53,6 +56,7 @@ impl Code {
             Self::InventoryReadOnly => "inventory_read_only",
             Self::InventoryIo => "inventory_io",
             Self::InventoryLocked => "inventory_locked",
+            Self::InventoryChanged => "inventory_changed",
             Self::PackageInvalid => "package_invalid",
         }
     }
@@ -195,6 +199,19 @@ pub enum Error {
         waited: Duration,
     },
 
+    /// The inventory file changed after it was loaded (it was saved again,
+    /// deleted, or created where it was missing), so a guarded save
+    /// ([`crate::inventory::io::save_if_unchanged`]) wrote nothing: writing
+    /// would have discarded that change.
+    #[error(
+        "the inventory {} changed after it was loaded; nothing was written",
+        shown(path)
+    )]
+    InventoryChanged {
+        /// The inventory file.
+        path: PathBuf,
+    },
+
     /// The inventory path, or its lock file, is not a regular file. A
     /// symbolic link is never followed: it could make apvm read or replace
     /// a file elsewhere.
@@ -247,6 +264,7 @@ impl Error {
             Self::InventoryReadOnly { .. } => Code::InventoryReadOnly,
             Self::InventoryIo { .. } | Self::InventoryNotAFile { .. } => Code::InventoryIo,
             Self::InventoryLocked { .. } => Code::InventoryLocked,
+            Self::InventoryChanged { .. } => Code::InventoryChanged,
             Self::InventoryFile { source, .. } => source.code(),
             Self::InvalidInput { .. }
             | Self::AlreadyExists { .. }
@@ -324,6 +342,21 @@ mod tests {
         assert_eq!(Code::InventoryReadOnly.to_string(), "inventory_read_only");
         assert_eq!(Code::InventoryIo.as_str(), "inventory_io");
         assert_eq!(Code::InventoryLocked.as_str(), "inventory_locked");
+        assert_eq!(Code::InventoryChanged.as_str(), "inventory_changed");
+    }
+
+    #[test]
+    fn a_changed_inventory_names_the_file() {
+        let error = Error::InventoryChanged {
+            path: PathBuf::from("/home/me/.apvm/inventory.json"),
+        };
+        assert_eq!(error.code(), Code::InventoryChanged);
+        assert_eq!(
+            error.to_string(),
+            "the inventory /home/me/.apvm/inventory.json changed after it was loaded; \
+             nothing was written"
+        );
+        assert!(error.problems().is_empty());
     }
 
     #[test]

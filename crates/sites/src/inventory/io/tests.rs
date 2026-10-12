@@ -971,6 +971,499 @@ fn readers_never_see_a_partial_document() {
     assert_eq!(load(&path).unwrap().servers().len(), 40);
 }
 
+// ---- tracked saves: no lost edits (revision 12) ----
+
+/// Assert `err` is the refusal of a guarded save of `path`.
+fn assert_changed(err: &Error, path: &Path) {
+    assert!(
+        matches!(err, Error::InventoryChanged { path: at } if at == path),
+        "{err:?}"
+    );
+    assert_eq!(err.code(), Code::InventoryChanged);
+}
+
+#[test]
+fn fingerprints_show_their_digest_or_missing() {
+    assert_eq!(
+        format!("{:?}", Fingerprint::missing()),
+        "Fingerprint(missing)"
+    );
+    // The SHA-256 of no bytes: an empty file is not a missing one.
+    let empty = Fingerprint::of(Some(b""));
+    assert_eq!(
+        format!("{empty:?}"),
+        "Fingerprint(sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855)"
+    );
+    assert!(Fingerprint::missing().is_missing());
+    assert!(!empty.is_missing());
+    assert_ne!(empty, Fingerprint::missing());
+    assert_eq!(Fingerprint::of(None), Fingerprint::missing());
+    assert_eq!(Fingerprint::of(Some(b"a")), Fingerprint::of(Some(b"a")));
+    assert_ne!(Fingerprint::of(Some(b"a")), Fingerprint::of(Some(b"a\n")));
+}
+
+#[test]
+fn a_missing_file_loads_as_empty_and_missing_and_nothing_is_created() {
+    let dir = TempDir::new();
+    let deep = dir.0.join("a").join("inventory.json");
+    for path in [dir.inventory(), deep] {
+        let (inventory, fingerprint) = load_tracked(&path).unwrap();
+        assert_eq!(inventory, Inventory::new());
+        assert_eq!(fingerprint, Fingerprint::missing());
+    }
+    assert_eq!(dir.names(), Vec::<String>::new());
+}
+
+#[test]
+fn the_fingerprint_is_that_of_the_bytes_loaded() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let (inventory, fingerprint) = load_tracked(&path).unwrap();
+    assert_eq!(inventory, load(&path).unwrap());
+    assert_eq!(
+        fingerprint,
+        Fingerprint::of(Some(&fs::read(&path).unwrap()))
+    );
+    // Same document, other bytes: a different fingerprint.
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push('\n');
+    fs::write(&path, &text).unwrap();
+    let (reloaded, other) = load_tracked(&path).unwrap();
+    assert_eq!(reloaded, inventory);
+    assert_ne!(other, fingerprint);
+}
+
+#[test]
+fn load_tracked_refuses_what_load_refuses() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    fs::write(
+        &path,
+        r#"{"version":1,"groups":[{"id":"qa","sites":["x"]}]}"#,
+    )
+    .unwrap();
+    let err = load_tracked(&path).unwrap_err();
+    assert_eq!(err.code(), Code::InventoryInvalid);
+    assert_eq!(err.to_string(), load(&path).unwrap_err().to_string());
+    let err = load_tracked(Path::new("")).unwrap_err();
+    assert_eq!(err.code(), Code::InventoryIo);
+}
+
+#[test]
+fn an_unchanged_file_is_saved_and_the_new_fingerprint_chains() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let (mut inventory, loaded) = load_tracked(&path).unwrap();
+
+    inventory.add_server(Server::new("us-1", "h")).unwrap();
+    let first = save_if_unchanged(&path, &inventory, &loaded).unwrap();
+    assert_eq!(load(&path).unwrap(), inventory);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        inventory.to_json().unwrap()
+    );
+    // What a fresh load sees is what the save returned.
+    assert_eq!(load_tracked(&path).unwrap().1, first);
+
+    inventory.add_server(Server::new("ap-1", "h")).unwrap();
+    let second = save_if_unchanged(&path, &inventory, &first).unwrap();
+    assert_ne!(second, first);
+    assert_eq!(load(&path).unwrap().servers().len(), 3);
+    // The superseded fingerprints no longer match.
+    for stale in [&loaded, &first] {
+        assert_changed(
+            &save_if_unchanged(&path, &inventory, stale).unwrap_err(),
+            &path,
+        );
+    }
+    assert_eq!(dir.names(), ["inventory.json", "inventory.json.lock"]);
+}
+
+#[test]
+fn a_file_changed_by_another_writer_is_refused_and_left_untouched() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let (mut inventory, loaded) = load_tracked(&path).unwrap();
+    add_server(&path, "theirs").unwrap();
+    let theirs = fs::read(&path).unwrap();
+
+    inventory.add_server(Server::new("mine", "h")).unwrap();
+    let err = save_if_unchanged(&path, &inventory, &loaded).unwrap_err();
+    assert_changed(&err, &path);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the inventory {} changed after it was loaded; nothing was written",
+            path.display()
+        )
+    );
+    assert_eq!(fs::read(&path).unwrap(), theirs);
+    assert_eq!(dir.names(), ["inventory.json", "inventory.json.lock"]);
+
+    // The caller's way out: load again, reapply, save; both edits land.
+    let (mut fresh, reloaded) = load_tracked(&path).unwrap();
+    fresh.add_server(Server::new("mine", "h")).unwrap();
+    save_if_unchanged(&path, &fresh, &reloaded).unwrap();
+    let saved = load(&path).unwrap();
+    assert!(saved.server("theirs").is_some() && saved.server("mine").is_some());
+}
+
+#[test]
+fn of_two_saves_from_one_load_only_the_first_lands() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    let (mut a, loaded_a) = load_tracked(&path).unwrap();
+    let (mut b, loaded_b) = load_tracked(&path).unwrap();
+    a.add_server(Server::new("a", "h")).unwrap();
+    b.add_server(Server::new("b", "h")).unwrap();
+    save_if_unchanged(&path, &a, &loaded_a).unwrap();
+    assert_changed(&save_if_unchanged(&path, &b, &loaded_b).unwrap_err(), &path);
+    assert_eq!(load(&path).unwrap(), a);
+}
+
+#[test]
+fn a_file_deleted_since_the_load_is_refused_and_stays_missing() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let (inventory, loaded) = load_tracked(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert_changed(
+        &save_if_unchanged(&path, &inventory, &loaded).unwrap_err(),
+        &path,
+    );
+    assert_eq!(dir.names(), ["inventory.json.lock"]);
+}
+
+#[test]
+fn a_file_created_since_a_missing_load_is_refused() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    let (mut inventory, loaded) = load_tracked(&path).unwrap();
+    assert!(loaded.is_missing());
+    save(&path, &one_server("theirs")).unwrap();
+    let theirs = fs::read(&path).unwrap();
+    inventory.add_server(Server::new("mine", "h")).unwrap();
+    assert_changed(
+        &save_if_unchanged(&path, &inventory, &loaded).unwrap_err(),
+        &path,
+    );
+    // An empty inventory expecting no file never wipes an existing one.
+    let err = save_if_unchanged(&path, &Inventory::new(), &Fingerprint::missing()).unwrap_err();
+    assert_changed(&err, &path);
+    assert_eq!(fs::read(&path).unwrap(), theirs);
+}
+
+#[test]
+fn a_file_still_missing_is_created_privately() {
+    let dir = TempDir::new();
+    let path = dir.0.join("apvm").join("inventory.json");
+    let saved = save_if_unchanged(&path, &one_server("eu-1"), &Fingerprint::missing()).unwrap();
+    assert_eq!(load_tracked(&path).unwrap(), (one_server("eu-1"), saved));
+    #[cfg(unix)]
+    {
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mode_of(&dir.0.join("apvm")), 0o700);
+    }
+}
+
+#[test]
+fn a_byte_identical_rewrite_is_not_a_conflict() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let (mut inventory, loaded) = load_tracked(&path).unwrap();
+    // Another writer saves the same document: a new file, the same bytes.
+    save(&path, &one_server("eu-1")).unwrap();
+    inventory.add_server(Server::new("us-1", "h")).unwrap();
+    save_if_unchanged(&path, &inventory, &loaded).unwrap();
+    assert_eq!(load(&path).unwrap(), inventory);
+}
+
+#[test]
+fn a_read_only_inventory_is_never_written_by_a_tracked_save() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    fs::write(&path, newer_document()).unwrap();
+    let (inventory, loaded) = load_tracked(&path).unwrap();
+    assert!(inventory.is_read_only());
+    let err = save_if_unchanged(&path, &inventory, &loaded).unwrap_err();
+    assert_eq!(err.code(), Code::InventoryReadOnly);
+    // Replacing it whole with an older-format inventory is refused too.
+    let err = save_if_unchanged(&path, &one_server("eu-1"), &loaded).unwrap_err();
+    assert_eq!(err.code(), Code::InventoryReadOnly);
+    assert_eq!(fs::read_to_string(&path).unwrap(), newer_document());
+    assert_eq!(dir.names(), ["inventory.json", "inventory.json.lock"]);
+}
+
+#[test]
+fn a_tracked_save_waits_for_a_busy_lock_then_fails_with_inventory_locked() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let before = fs::read(&path).unwrap();
+    let (mut inventory, loaded) = load_tracked(&path).unwrap();
+    inventory.add_server(Server::new("us-1", "h")).unwrap();
+    let held = hold_lock(&path);
+    let wait = Duration::from_millis(150);
+    let err = save_if_unchanged_within(&path, &inventory, &loaded, wait).unwrap_err();
+    assert!(
+        matches!(&err, Error::InventoryLocked { waited, .. } if *waited == wait),
+        "{err:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    // The fingerprint still holds once the lock is free.
+    drop(held);
+    save_if_unchanged(&path, &inventory, &loaded).unwrap();
+    assert_eq!(load(&path).unwrap(), inventory);
+}
+
+#[test]
+fn an_oversized_tracked_save_writes_nothing() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let before = fs::read(&path).unwrap();
+    let (_, loaded) = load_tracked(&path).unwrap();
+    let notes = "n".repeat(1024);
+    let servers: Vec<String> = (0..17_400)
+        .map(|i| format!(r#"{{"id":"s{i}","host":"h","notes":"{notes}"}}"#))
+        .collect();
+    let big = Inventory::from_json(&format!(
+        r#"{{"version":1,"servers":[{}]}}"#,
+        servers.join(",")
+    ))
+    .unwrap();
+    let err = save_if_unchanged(&path, &big, &loaded).unwrap_err();
+    assert_eq!(
+        err.problems(),
+        [Problem::new("", "the file is larger than 16 MiB")]
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_tracked_save_can_be_retried_with_the_same_fingerprint() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let before = fs::read(&path).unwrap();
+    let (mut inventory, loaded) = load_tracked(&path).unwrap();
+    inventory.add_server(Server::new("us-1", "h")).unwrap();
+    set_mode(&dir.0, 0o500);
+    if File::create(dir.0.join("probe")).is_ok() {
+        eprintln!("skipped: permissions are not enforced (running as root?)");
+        return;
+    }
+    let err = save_if_unchanged(&path, &inventory, &loaded).unwrap_err();
+    set_mode(&dir.0, 0o700);
+    assert!(
+        matches!(
+            &err,
+            Error::InventoryIo {
+                context: WRITE_CONTEXT,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    save_if_unchanged(&path, &inventory, &loaded).unwrap();
+    assert_eq!(load(&path).unwrap(), inventory);
+}
+
+#[test]
+fn tracked_saves_from_threads_that_reload_on_conflict_all_land() {
+    // The protocol a Node app follows: load, edit, save; on a conflict,
+    // load again and reapply. Every edit lands, and conflicts do happen.
+    const THREADS: usize = 6;
+    const EACH: usize = 4;
+    let dir = TempDir::new();
+    let path = Arc::new(dir.inventory());
+    let start = Arc::new(Barrier::new(THREADS));
+    let conflicts = Arc::new(AtomicU64::new(0));
+    let workers: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let (path, start, conflicts) = (
+                Arc::clone(&path),
+                Arc::clone(&start),
+                Arc::clone(&conflicts),
+            );
+            thread::spawn(move || {
+                start.wait();
+                for i in 0..EACH {
+                    loop {
+                        let (mut inventory, loaded) = load_tracked(&path).unwrap();
+                        // Widen the window between the load and the save.
+                        thread::sleep(Duration::from_millis(2));
+                        inventory
+                            .add_server(Server::new(format!("t{t}-{i}"), "h"))
+                            .unwrap();
+                        match save_if_unchanged(&path, &inventory, &loaded) {
+                            Ok(_) => break,
+                            Err(Error::InventoryChanged { .. }) => {
+                                conflicts.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(err) => panic!("{err}"),
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let loaded = load(&path).unwrap();
+    assert_eq!(loaded.servers().len(), THREADS * EACH);
+    assert!(
+        conflicts.load(Ordering::Relaxed) > 0,
+        "no conflict happened: the test did not exercise the guard"
+    );
+    assert_eq!(dir.names(), ["inventory.json", "inventory.json.lock"]);
+}
+
+#[test]
+fn a_refusal_seen_before_the_lock_creates_nothing() {
+    // A test's teardown removed the directory: refusing must not bring it
+    // back with a lock file in it.
+    let dir = TempDir::new();
+    let sub = dir.0.join("sub");
+    let path = sub.join("inventory.json");
+    save(&path, &one_server("eu-1")).unwrap();
+    let (inventory, loaded) = load_tracked(&path).unwrap();
+    fs::remove_dir_all(&sub).unwrap();
+    assert_changed(
+        &save_if_unchanged(&path, &inventory, &loaded).unwrap_err(),
+        &path,
+    );
+    assert_eq!(dir.names(), Vec::<String>::new());
+}
+
+#[test]
+fn a_file_replaced_by_an_oversized_one_has_changed() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let (inventory, loaded) = load_tracked(&path).unwrap();
+    let cap = usize::try_from(MAX_INVENTORY_BYTES).unwrap();
+    fs::write(&path, vec![b' '; cap + 1]).unwrap();
+    assert_changed(
+        &save_if_unchanged(&path, &inventory, &loaded).unwrap_err(),
+        &path,
+    );
+    assert_eq!(fs::metadata(&path).unwrap().len(), MAX_INVENTORY_BYTES + 1);
+}
+
+#[test]
+fn a_no_op_update_between_load_and_save_is_not_a_conflict() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let (mut inventory, loaded) = load_tracked(&path).unwrap();
+    update(&path, |inventory| Ok::<_, Error>(inventory.servers().len())).unwrap();
+    inventory.add_server(Server::new("us-1", "h")).unwrap();
+    save_if_unchanged(&path, &inventory, &loaded).unwrap();
+    assert_eq!(load(&path).unwrap(), inventory);
+}
+
+#[test]
+fn a_forced_save_returns_the_fingerprint_to_chain_from() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    let (mut inventory, _) = load_tracked(&path).unwrap();
+    inventory.add_server(Server::new("eu-1", "h")).unwrap();
+    let forced = save(&path, &inventory).unwrap();
+    assert_eq!(
+        load_tracked(&path).unwrap(),
+        (inventory.clone(), forced.clone())
+    );
+
+    // Another writer after the forced save is seen by the next tracked save.
+    add_server(&path, "theirs").unwrap();
+    inventory.add_server(Server::new("mine", "h")).unwrap();
+    assert_changed(
+        &save_if_unchanged(&path, &inventory, &forced).unwrap_err(),
+        &path,
+    );
+    assert!(load(&path).unwrap().server("theirs").is_some());
+}
+
+#[test]
+fn update_tracked_returns_the_saved_inventory_and_its_fingerprint() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    let updated = update_tracked(&path, |inventory| {
+        inventory.add_server(Server::new("eu-1", "h"))?;
+        Ok::<_, Error>("done")
+    })
+    .unwrap();
+    assert_eq!(updated.value, "done");
+    assert_eq!(
+        load_tracked(&path).unwrap(),
+        (updated.inventory.clone(), updated.fingerprint.clone())
+    );
+
+    // The result chains into a tracked save...
+    let mut inventory = updated.inventory;
+    inventory.add_server(Server::new("us-1", "h")).unwrap();
+    let saved = save_if_unchanged(&path, &inventory, &updated.fingerprint).unwrap();
+    // ...and a later writer is still caught.
+    add_server(&path, "theirs").unwrap();
+    assert_changed(
+        &save_if_unchanged(&path, &inventory, &saved).unwrap_err(),
+        &path,
+    );
+}
+
+#[test]
+fn a_no_op_update_tracked_fingerprints_what_it_read() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    // Missing stays missing.
+    let updated = update_tracked(&path, |_| Ok::<_, Error>(())).unwrap();
+    assert_eq!(updated.inventory, Inventory::new());
+    assert!(updated.fingerprint.is_missing());
+    assert_eq!(dir.names(), ["inventory.json.lock"]);
+
+    // Bytes other than this build would write are kept, and fingerprinted
+    // as they are.
+    let text = format!("{}\n\n", one_server("eu-1").to_json().unwrap());
+    fs::write(&path, &text).unwrap();
+    let updated = update_tracked(&path, |_| Ok::<_, Error>(())).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    assert_eq!(updated.fingerprint, Fingerprint::of(Some(text.as_bytes())));
+    assert_eq!(updated.inventory, one_server("eu-1"));
+
+    // A read-only inventory is returned as it is, never written.
+    fs::write(&path, newer_document()).unwrap();
+    let updated = update_tracked(&path, |_| Ok::<_, Error>(())).unwrap();
+    assert!(updated.inventory.is_read_only());
+    assert_eq!(
+        updated.fingerprint,
+        Fingerprint::of(Some(newer_document().as_bytes()))
+    );
+}
+
+#[test]
+fn a_failed_update_tracked_writes_nothing() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let before = fs::read(&path).unwrap();
+    let err = update_tracked(&path, |inventory| {
+        inventory.add_server(Server::new("us-1", "h"))?;
+        inventory.add_server(Server::new("us-1", "h"))
+    })
+    .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidInput);
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
 // ---- symbolic links (Unix: Windows needs a privilege to create them) ----
 
 #[cfg(unix)]
@@ -1009,6 +1502,22 @@ mod symlinks {
         assert_refused(&add_server(&path, "us-1").unwrap_err(), &path);
         assert_eq!(fs::read(&target).unwrap(), before);
         assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn tracked_loads_and_saves_refuse_a_symlinked_inventory() {
+        let dir = TempDir::new();
+        let path = dir.inventory();
+        let target = dir.0.join("elsewhere.json");
+        save(&target, &one_server("eu-1")).unwrap();
+        let before = fs::read(&target).unwrap();
+        let (_, fingerprint) = load_tracked(&target).unwrap();
+        symlink(&target, &path).unwrap();
+        assert_refused(&load_tracked(&path).unwrap_err(), &path);
+        // Even with the fingerprint of the link's target.
+        let err = save_if_unchanged(&path, &one_server("us-1"), &fingerprint).unwrap_err();
+        assert_refused(&err, &path);
+        assert_eq!(fs::read(&target).unwrap(), before);
     }
 
     #[test]

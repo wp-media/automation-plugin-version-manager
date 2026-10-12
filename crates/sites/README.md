@@ -99,12 +99,32 @@ The caller passes the path: front ends use `~/.apvm/inventory.json`, or
   change fails or changes nothing (the lock file and missing directories
   are still created). A change to a newer, read-only inventory is refused,
   even one that replaces it whole.
+- **`load_tracked` + `save_if_unchanged`**: for callers that keep an
+  inventory in memory between loading and saving it (the Node bindings).
+  `load_tracked` also returns a `Fingerprint` (the SHA-256 of the exact
+  bytes read, or "missing"). `save_if_unchanged` re-reads the file under the
+  lock and writes only when it still matches; otherwise it fails with
+  `inventory_changed` and writes nothing, so an edit another process made in
+  between is never lost (load again, reapply, save). It returns the new
+  fingerprint, so saves chain. A byte-identical rewrite is not a conflict; a
+  file deleted, created or grown past 16 MiB since the load is. The file is
+  compared once before taking the lock, so a refusal usually creates no lock
+  file or directory. `Fingerprint::missing()` expects no file, so an empty
+  inventory never wipes an existing one.
+- **`save`** overwrites blindly (use it only to force) and returns the
+  fingerprint of what it wrote; **`update_tracked`** is `update` that also
+  returns the resulting inventory and its fingerprint. Both let a caller
+  keep tracking the file without loading it again, which could pair its
+  inventory with another process's later edit.
 - Documents over 16 MiB are never written (`load` would refuse them), and
   paths that name no file (empty, `/`, `..`, or ending with a separator or
   `/.`) are refused.
 - **Symbolic links are refused** for the inventory file and its lock file
   (even dangling ones), so apvm never reads, locks or replaces a file
   elsewhere. Directories above the file may be links.
+- **Never delete `inventory.json.lock`** while apvm may run: a writer
+  holding the lock keeps it on the deleted file, so the next writer locks a
+  new file and both get in.
 
 ## Settings and targets
 
@@ -181,6 +201,8 @@ code.
   link, a directory);
 - `inventory_locked`: another process held the inventory's lock for the
   whole wait (10 s); nothing was written;
+- `inventory_changed`: the file changed since it was loaded, so a guarded
+  save (`save_if_unchanged`) wrote nothing;
 - `invalid_input`: a refused record, a taken or unknown id, a server in use,
   or invalid hints;
 - `package_invalid`: a plugin zip that breaks an inspection rule.
@@ -209,7 +231,11 @@ cargo test -p apvm-sites
   threads, refused symbolic links (including one swapped in while the file
   is opened), a newer inventory never overwritten, the bounded lock wait
   (a busy lock times out, a released one is taken), the size cap on reads
-  and writes;
+  and writes, and tracked saves (a file changed, deleted or created since
+  the load is refused and left untouched, fingerprints chain from tracked
+  and forced saves and from `update_tracked`, a byte-identical rewrite or a
+  no-op update is no conflict, a refusal creates no lock file, threads that
+  reload on conflict all land);
 - settings precedence (every field at every level) and target selection
   (union, order, de-duplication, errors, warnings), including an exhaustive
   check of every selection on a sample inventory;
@@ -222,6 +248,7 @@ cargo test -p apvm-sites
 
 `tests/inventory.rs` loads the example document of the plan through the
 public API; `tests/targets.rs` resolves targets and settings on it.
-`tests/inventory_io.rs` runs concurrent updates from several processes and
+`tests/inventory_io.rs` runs concurrent updates from several processes,
+reproduces a tracked save's conflict with an edit from another process, and
 checks `APVM_INVENTORY`. `tests/package.rs` inspects a BackWPup Pro zip
 through the public API.

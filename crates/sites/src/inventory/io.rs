@@ -2,7 +2,8 @@
 //!
 //! - [`load`]: a missing file is an empty inventory. Content problems carry
 //!   the file's path and their own locations (`sites[1].server`).
-//! - [`save`] and [`update`] write under an exclusive lock on
+//! - [`save`], [`update`] and their tracked forms write under an exclusive
+//!   lock on
 //!   `<file>.lock` (`inventory.json.lock`). The new document goes to a
 //!   private temp file next to the inventory (`0600` on Unix from its
 //!   creation), is synced to disk, then renamed over the inventory, and the
@@ -11,6 +12,15 @@
 //! - [`update`] is the read-modify-write edit: load, change and save all
 //!   happen under the lock, so concurrent edits (threads or processes) all
 //!   land.
+//! - [`load_tracked`] + [`save_if_unchanged`] are for callers that keep an
+//!   inventory in memory between loading and saving it (the Node bindings'
+//!   `SiteInventory`): the save writes only when the file still holds what
+//!   was loaded (its [`Fingerprint`]), and fails with
+//!   [`Error::InventoryChanged`] otherwise, so another process's edit made
+//!   in between is never silently lost. [`save`] overwrites blindly: it is
+//!   only for a deliberate "force". [`save`], [`save_if_unchanged`] and
+//!   [`update_tracked`] return the fingerprint of what the file holds
+//!   afterwards, so such a caller keeps tracking the file.
 //! - **Symbolic links are refused**: the inventory file and its lock file
 //!   must be regular files (or missing), so apvm never reads, locks or
 //!   replaces a file elsewhere. Only the last component is checked:
@@ -56,6 +66,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use super::Inventory;
 use crate::error::{Error, Result};
 use crate::problem::Problem;
@@ -72,7 +84,8 @@ pub const MAX_INVENTORY_BYTES: u64 = 16 * 1024 * 1024;
 /// while it is opened (a concurrent save renames over it).
 const OPEN_ATTEMPTS: usize = 8;
 
-/// How long [`save`] and [`update`] wait for another writer's lock before
+/// How long writers ([`save`], [`save_if_unchanged`], [`update`] and
+/// [`update_tracked`]) wait for another writer's lock before
 /// failing with [`Error::InventoryLocked`]. An edit holds the lock for
 /// milliseconds, so reaching this limit means the holder is stuck (or
 /// hundreds of writers queue at once: waiters poll, so the lock is not
@@ -133,6 +146,49 @@ impl std::fmt::Display for FileKind {
     }
 }
 
+/// What the inventory file held when it was read or written: the SHA-256 of
+/// its exact bytes, or that it was missing. Opaque: it is only compared, by
+/// [`save_if_unchanged`].
+///
+/// It comes from [`load_tracked`] or [`save_if_unchanged`], or is
+/// [`Fingerprint::missing`] for a caller that expects no file yet. Byte
+/// for byte equal content has the same fingerprint, so a rewrite that
+/// changed nothing is not a conflict.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Fingerprint(Option<[u8; 32]>);
+
+impl Fingerprint {
+    /// The fingerprint of a missing file: a save expecting it creates the
+    /// file, and is refused when one appeared in the meantime.
+    pub const fn missing() -> Self {
+        Self(None)
+    }
+
+    /// Whether this is the fingerprint of a missing file.
+    pub const fn is_missing(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// The fingerprint of a file holding `bytes` (`None`: missing).
+    fn of(bytes: Option<&[u8]>) -> Self {
+        Self(bytes.map(|bytes| Sha256::digest(bytes).into()))
+    }
+}
+
+impl std::fmt::Debug for Fingerprint {
+    /// `Fingerprint(missing)` or `Fingerprint(sha256:<lowercase hex>)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(digest) = &self.0 else {
+            return f.write_str("Fingerprint(missing)");
+        };
+        f.write_str("Fingerprint(sha256:")?;
+        for byte in digest {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
 /// The inventory path from [`INVENTORY_ENV`] (`APVM_INVENTORY`), when it is
 /// set and not empty. Front ends use it in place of their default location
 /// (plan §8.1), like apvm-core's `config_io::cache_dir_env_override`.
@@ -168,14 +224,82 @@ fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
 ///   [`Inventory::from_json`]; content that is not UTF-8 or is larger than
 ///   [`MAX_INVENTORY_BYTES`] is [`Error::InventoryInvalid`] there.
 pub fn load(path: &Path) -> Result<Inventory> {
-    // Checked here too, so `load` never reads as empty a path `save` refuses.
+    parse_file(read_file(path)?.as_deref(), path)
+}
+
+/// [`load`], also returning the [`Fingerprint`] of what was read, for a
+/// later [`save_if_unchanged`]. Both come from one read, so the fingerprint
+/// is exactly that of the returned inventory's bytes (or "missing" when the
+/// file is, and the inventory is empty).
+///
+/// # Arguments
+///
+/// * `path` - The inventory file
+///
+/// # Errors
+///
+/// Those of [`load`].
+///
+/// # Example
+///
+/// ```
+/// use apvm_sites::Server;
+/// use apvm_sites::inventory::io;
+///
+/// # fn main() -> apvm_sites::Result<()> {
+/// # let dir = std::env::temp_dir().join(format!("apvm-sites-io-tracked-doc-{}", std::process::id()));
+/// # std::fs::remove_dir_all(&dir).ok(); // a leftover of a run with this pid
+/// let path = dir.join("inventory.json");
+/// let (mut inventory, loaded) = io::load_tracked(&path)?;
+/// inventory.add_server(Server::new("eu-1", "203.0.113.10"))?;
+/// // Written only if the file still holds what was loaded (here: nothing).
+/// let saved = io::save_if_unchanged(&path, &inventory, &loaded)?;
+/// inventory.add_server(Server::new("us-1", "203.0.113.20"))?;
+/// io::save_if_unchanged(&path, &inventory, &saved)?; // saves chain
+///
+/// // A save from the stale fingerprint would lose `us-1`: it is refused.
+/// let err = io::save_if_unchanged(&path, &inventory, &loaded).unwrap_err();
+/// assert_eq!(err.code(), apvm_sites::Code::InventoryChanged);
+/// # std::fs::remove_dir_all(&dir).ok();
+/// # Ok(())
+/// # }
+/// ```
+pub fn load_tracked(path: &Path) -> Result<(Inventory, Fingerprint)> {
+    let bytes = read_file(path)?;
+    let inventory = parse_file(bytes.as_deref(), path)?;
+    Ok((inventory, Fingerprint::of(bytes.as_deref())))
+}
+
+/// Read the inventory file's bytes, without a lock.
+///
+/// # Returns
+///
+/// `None` when the file (or a directory above it) is missing.
+///
+/// # Errors
+///
+/// [`Error::InventoryNotAFile`], or [`Error::InventoryIo`] (also when the
+/// path names no file), or [`Error::InventoryFile`] for a file over
+/// [`MAX_INVENTORY_BYTES`].
+fn read_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    // Checked here too, so a read never sees as missing a path `save` refuses.
     file_name(path)?;
     let mut open = |path: &Path| open_options(false).open(path);
-    let Some(file) = open_existing(path, READ_CONTEXT, &mut open)? else {
+    open_existing(path, READ_CONTEXT, &mut open)?
+        .map(|file| read_capped(file, path))
+        .transpose()
+}
+
+/// The inventory in the file's `bytes` (`None`: missing, so empty).
+///
+/// # Errors
+///
+/// [`Error::InventoryFile`] wrapping the error of [`parse`].
+fn parse_file(bytes: Option<&[u8]>, path: &Path) -> Result<Inventory> {
+    let Some(bytes) = bytes else {
         return Ok(Inventory::new());
     };
-    let bytes = read_capped(file, path)?;
-    parse(&bytes).map_err(|source| Error::InventoryFile {
+    parse(bytes).map_err(|source| Error::InventoryFile {
         path: path.to_path_buf(),
         source: Box::new(source),
     })
@@ -184,13 +308,20 @@ pub fn load(path: &Path) -> Result<Inventory> {
 /// Save the inventory, replacing the file atomically under the lock.
 /// Missing directories above it are created (`0700` on Unix).
 ///
-/// Replaces the whole document: to change what is on disk, prefer
-/// [`update`], which cannot lose another process's edit.
+/// Replaces the whole document, whatever the file holds now: to change
+/// what is on disk, prefer [`update`]; to save an inventory kept in memory,
+/// [`save_if_unchanged`]. Neither can lose another process's edit.
 ///
 /// # Arguments
 ///
 /// * `path` - The inventory file
 /// * `inventory` - What to save
+///
+/// # Returns
+///
+/// The [`Fingerprint`] of the file just written: a forced save hands it to
+/// the next [`save_if_unchanged`]. (Loading the file again for it could
+/// pair this inventory with another process's later edit, and lose it.)
 ///
 /// # Errors
 ///
@@ -206,7 +337,7 @@ pub fn load(path: &Path) -> Result<Inventory> {
 /// - [`Error::InventoryIo`]: a directory, the lock or the file cannot be
 ///   created, taken or written, or the path names no file. The previous
 ///   file is left whole.
-pub fn save(path: &Path, inventory: &Inventory) -> Result<()> {
+pub fn save(path: &Path, inventory: &Inventory) -> Result<Fingerprint> {
     save_within(path, inventory, LOCK_WAIT)
 }
 
@@ -215,11 +346,103 @@ pub fn save(path: &Path, inventory: &Inventory) -> Result<()> {
 /// # Errors
 ///
 /// Those of [`save`].
-fn save_within(path: &Path, inventory: &Inventory, wait: Duration) -> Result<()> {
+fn save_within(path: &Path, inventory: &Inventory, wait: Duration) -> Result<Fingerprint> {
     let text = inventory.to_json()?;
     check_size(text.len(), path)?;
     let _lock = InventoryLock::acquire(path, wait)?;
     write_atomic(path, &text)
+}
+
+/// Save an inventory loaded earlier, only if the file still holds what it
+/// was loaded from: under the lock, the file is read again and must match
+/// `expected` (byte for byte, or still be missing), then it is replaced as
+/// by [`save`]. Otherwise nothing is written: another process saved,
+/// deleted or created the file in between, and overwriting it would lose
+/// that change. The caller then loads again, reapplies its edits and saves.
+///
+/// The file is first compared without the lock: a mismatch then is
+/// final (every writer replaces the file in one rename), so the common
+/// refusal creates neither the lock file nor a deleted directory. Only a
+/// change that lands between that look and the lock leaves them behind.
+///
+/// A file rewritten with the same bytes still matches. Writers that bypass
+/// the lock (a text editor) can still race with the save.
+///
+/// # Arguments
+///
+/// * `path` - The inventory file
+/// * `inventory` - What to save
+/// * `expected` - What the file must hold: the [`Fingerprint`] from
+///   [`load_tracked`] or from the previous save, or
+///   [`Fingerprint::missing`]
+///
+/// # Returns
+///
+/// The fingerprint of the file just written, for the next save.
+///
+/// # Errors
+///
+/// - [`Error::InventoryChanged`]: the file does not match `expected`; a
+///   file over [`MAX_INVENTORY_BYTES`] never does (nothing is written).
+/// - [`Error::InventoryReadOnly`]: `inventory` has a newer format version
+///   (nothing is touched), or the file it replaces has (nothing is
+///   written).
+/// - The other errors of [`save`] and of [`load`] (reading the file again).
+pub fn save_if_unchanged(
+    path: &Path,
+    inventory: &Inventory,
+    expected: &Fingerprint,
+) -> Result<Fingerprint> {
+    save_if_unchanged_within(path, inventory, expected, LOCK_WAIT)
+}
+
+/// [`save_if_unchanged`], waiting at most `wait` for the lock.
+///
+/// # Errors
+///
+/// Those of [`save_if_unchanged`].
+fn save_if_unchanged_within(
+    path: &Path,
+    inventory: &Inventory,
+    expected: &Fingerprint,
+    wait: Duration,
+) -> Result<Fingerprint> {
+    let text = inventory.to_json()?;
+    check_size(text.len(), path)?;
+    read_unchanged(path, expected)?;
+    let _lock = InventoryLock::acquire(path, wait)?;
+    let current = read_unchanged(path, expected)?;
+    // As in `update`: a caller may have replaced a newer inventory it
+    // loaded with an older-format one, which must not overwrite it.
+    parse_file(current.as_deref(), path)?.ensure_writable()?;
+    write_atomic(path, &text)
+}
+
+/// Read the inventory file, which must match `expected`.
+///
+/// # Returns
+///
+/// Its bytes (`None`: missing).
+///
+/// # Errors
+///
+/// [`Error::InventoryChanged`] when it does not match, a file over
+/// [`MAX_INVENTORY_BYTES`] included: `expected` comes from bytes within
+/// the cap, so it cannot. Otherwise the errors of [`read_file`].
+fn read_unchanged(path: &Path, expected: &Fingerprint) -> Result<Option<Vec<u8>>> {
+    let changed = || Error::InventoryChanged {
+        path: path.to_path_buf(),
+    };
+    let current = match read_file(path) {
+        Ok(current) => current,
+        // `read_file`'s only content error: the size cap.
+        Err(Error::InventoryFile { .. }) => return Err(changed()),
+        Err(err) => return Err(err),
+    };
+    if Fingerprint::of(current.as_deref()) != *expected {
+        return Err(changed());
+    }
+    Ok(current)
 }
 
 /// Change the inventory file: load it, apply `change` and save the result,
@@ -227,9 +450,10 @@ fn save_within(path: &Path, inventory: &Inventory, wait: Duration) -> Result<()>
 /// land. The file is written only when `change` succeeds and changed
 /// something (a missing file stays missing after a no-op).
 ///
-/// Keep `change` quick: other writers wait for it. It must not call
-/// [`save`] or [`update`] on the same path, which would wait for the lock
-/// it holds.
+/// Keep `change` quick: other writers wait for it. It must not write the
+/// same path ([`save`], [`save_if_unchanged`], [`update`],
+/// [`update_tracked`]): that waits for the lock it holds, and fails with
+/// [`Error::InventoryLocked`].
 ///
 /// # Arguments
 ///
@@ -269,10 +493,49 @@ pub fn update<T, E>(
 where
     E: From<Error>,
 {
+    update_within(path, change, LOCK_WAIT).map(|updated| updated.value)
+}
+
+/// What [`update_tracked`] returns: the change's result, and the inventory
+/// the file holds afterwards with its [`Fingerprint`], ready for a later
+/// [`save_if_unchanged`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TrackedUpdate<T> {
+    /// What the change returned.
+    pub value: T,
+    /// The inventory in the file after the update.
+    pub inventory: Inventory,
+    /// The fingerprint of the file after the update: of the bytes written,
+    /// or, when nothing changed, of those read (or "missing").
+    pub fingerprint: Fingerprint,
+}
+
+/// [`update`], also returning the inventory the file holds afterwards and
+/// its [`Fingerprint`], all from inside the lock: for callers that keep the
+/// inventory in memory and save it later with [`save_if_unchanged`].
+/// (Loading again after [`update`] could see another process's later edit:
+/// fine when the loaded inventory and fingerprint are kept together.)
+///
+/// # Arguments
+///
+/// * `path` - The inventory file
+/// * `change` - Edits the loaded inventory; its error aborts the update
+///
+/// # Errors
+///
+/// Those of [`update`].
+pub fn update_tracked<T, E>(
+    path: &Path,
+    change: impl FnOnce(&mut Inventory) -> std::result::Result<T, E>,
+) -> std::result::Result<TrackedUpdate<T>, E>
+where
+    E: From<Error>,
+{
     update_within(path, change, LOCK_WAIT)
 }
 
-/// [`update`], waiting at most `wait` for the lock.
+/// [`update_tracked`], waiting at most `wait` for the lock.
 ///
 /// # Errors
 ///
@@ -281,24 +544,31 @@ fn update_within<T, E>(
     path: &Path,
     change: impl FnOnce(&mut Inventory) -> std::result::Result<T, E>,
     wait: Duration,
-) -> std::result::Result<T, E>
+) -> std::result::Result<TrackedUpdate<T>, E>
 where
     E: From<Error>,
 {
     let _lock = InventoryLock::acquire(path, wait)?;
-    let original = load(path)?;
+    let bytes = read_file(path)?;
+    let original = parse_file(bytes.as_deref(), path)?;
     let mut inventory = original.clone();
     let value = change(&mut inventory)?;
-    if inventory != original {
+    let fingerprint = if inventory == original {
+        Fingerprint::of(bytes.as_deref())
+    } else {
         // The edit methods refuse a read-only inventory, but `change` may
         // replace it whole (`*inventory = …`): that must not overwrite a
         // newer document with an older format.
         original.ensure_writable()?;
         let text = inventory.to_json()?;
         check_size(text.len(), path)?;
-        write_atomic(path, &text)?;
-    }
-    Ok(value)
+        write_atomic(path, &text)?
+    };
+    Ok(TrackedUpdate {
+        value,
+        inventory,
+        fingerprint,
+    })
 }
 
 /// Read at most [`MAX_INVENTORY_BYTES`] of the inventory.
@@ -578,11 +848,16 @@ fn file_kind(metadata: &Metadata) -> Option<FileKind> {
 
 /// Write `text` to `path` atomically (see [`replace_file`]).
 ///
+/// # Returns
+///
+/// The [`Fingerprint`] of the file written.
+///
 /// # Errors
 ///
 /// As [`replace_file`].
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    replace_file(path, |file| file.write_all(text.as_bytes()))
+fn write_atomic(path: &Path, text: &str) -> Result<Fingerprint> {
+    replace_file(path, |file| file.write_all(text.as_bytes()))?;
+    Ok(Fingerprint::of(Some(text.as_bytes())))
 }
 
 /// Replace `path` with a new file: write a private temp file next to it,

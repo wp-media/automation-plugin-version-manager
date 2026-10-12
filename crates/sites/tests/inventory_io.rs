@@ -1,5 +1,6 @@
 //! The inventory file through the public API, across processes: concurrent
-//! `update`s from several processes all land, and `env_override` reads
+//! `update`s from several processes all land, a tracked save refuses to
+//! overwrite another process's edit, and `env_override` reads
 //! `APVM_INVENTORY` from the real environment.
 //!
 //! Child processes re-run this test binary with [`CHILD_ENV`] set, so they
@@ -8,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use apvm_sites::inventory::io::{self, INVENTORY_ENV};
+use apvm_sites::inventory::io::{self, Fingerprint, INVENTORY_ENV};
 use apvm_sites::{Code, Inventory, Server};
 
 /// Tells a child process what to do: `update` or `env`.
@@ -195,5 +196,74 @@ fn a_saved_inventory_loads_back_and_errors_are_located() {
     assert!(
         err.to_string().starts_with(&path.display().to_string()),
         "{err}"
+    );
+}
+
+/// Run one child that adds [`UPDATES_PER_CHILD`] servers named
+/// `<prefix>-<n>` to the inventory at `path`, and wait for it.
+fn update_in_child(path: &Path, prefix: &str) {
+    let path_text = path.to_str().expect("a UTF-8 temp path");
+    let output = child(&[
+        (CHILD_ENV, "update"),
+        (PATH_ENV, path_text),
+        (PREFIX_ENV, prefix),
+    ])
+    .output()
+    .expect("run a child");
+    assert_success(&output);
+}
+
+#[test]
+fn a_tracked_save_never_overwrites_another_process_edit() {
+    let dir = TempDir::new("tracked");
+    let path = dir.0.join("inventory.json");
+    io::save(&path, &Inventory::new()).expect("save");
+    let (mut mine, loaded) = io::load_tracked(&path).expect("load");
+    mine.add_server(Server::new("mine", "203.0.113.20"))
+        .expect("valid");
+
+    // Another process edits the file between this load and this save.
+    update_in_child(&path, "theirs");
+    let theirs = std::fs::read(&path).expect("read");
+    let err = io::save_if_unchanged(&path, &mine, &loaded).expect_err("a conflict");
+    assert_eq!(err.code(), Code::InventoryChanged);
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        theirs,
+        "their edit was lost"
+    );
+
+    // Load again, reapply and save: both edits land, and the returned
+    // fingerprint chains into the next save.
+    let (mut fresh, reloaded) = io::load_tracked(&path).expect("reload");
+    fresh
+        .add_server(Server::new("mine", "203.0.113.20"))
+        .expect("valid");
+    let saved = io::save_if_unchanged(&path, &fresh, &reloaded).expect("save");
+    let on_disk = io::load(&path).expect("load");
+    assert_eq!(on_disk.servers().len(), UPDATES_PER_CHILD + 1);
+    assert!(on_disk.server("mine").is_some());
+
+    // A second child edits again; the fingerprint from the save is stale.
+    update_in_child(&path, "again");
+    let err = io::save_if_unchanged(&path, &fresh, &saved).expect_err("a conflict");
+    assert_eq!(err.code(), Code::InventoryChanged);
+    assert_eq!(
+        io::load(&path).expect("load").servers().len(),
+        2 * UPDATES_PER_CHILD + 1
+    );
+}
+
+#[test]
+fn an_empty_inventory_expecting_no_file_never_wipes_one() {
+    let dir = TempDir::new("missing");
+    let path = dir.0.join("inventory.json");
+    update_in_child(&path, "theirs");
+    let err = io::save_if_unchanged(&path, &Inventory::new(), &Fingerprint::missing())
+        .expect_err("the file exists");
+    assert_eq!(err.code(), Code::InventoryChanged);
+    assert_eq!(
+        io::load(&path).expect("load").servers().len(),
+        UPDATES_PER_CHILD
     );
 }
