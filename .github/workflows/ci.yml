@@ -2,7 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [develop]
+    branches:
+      - develop
+      # TEMPORARY: runs CI on the long-lived site-deployment branch before its
+      # PR exists. `commit-artifacts` stays develop-only. Removed by phase P12
+      # of docs/plans/site-deployment.md once the branch is merged.
+      - feat/site-deployment
   pull_request:
     branches: [develop]
 
