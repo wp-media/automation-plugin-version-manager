@@ -1,6 +1,6 @@
 # Site deployment — manage WordPress plugins on remote sites
 
-Status: **in progress**: P0 implemented and verified locally (macOS and Ubuntu clients); its first CI run is pending. Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11) and 6 (CI on the branch). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
+Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11) and 6 (CI on the branch). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
 
 ---
 
@@ -29,6 +29,7 @@ Status: **in progress**: P0 implemented and verified locally (macOS and Ubuntu c
 | Topic | Change |
 |---|---|
 | CI | `ci.yml` temporarily runs on pushes to `feat/site-deployment` (P0); new last phase P12 removes the trigger after the merge |
+| First CI run | Two fixes: `tests/e2e/sites/.shellcheckrc` (`source-path=SCRIPTDIR`, so the lint follows sourced files from any directory), and the git-isolation test now compares canonical paths (Windows prints `C:/…`, `canonicalize` yields `\\?\C:\…`). P0 is done |
 
 ### Revision 5 (adversarial audit of P0 and revision 4, 2026-10-11)
 
@@ -208,7 +209,7 @@ Zip roots (`zipinfo -1`, real artifacts in `~/.apvm/cache`):
 **How:** `tests/e2e/sites/verify.sh` checks every row below over real SSH (check ids in brackets). It asserts each fact; INFO checks only record versions and network-dependent behavior. CI runs it in the `e2e-sites` job.
 
 **Where it ran:**
-- Clients: macOS (OpenSSH 10.3p1) and an Ubuntu 24.04 container (OpenSSH 9.6p1). The CI run is pending.
+- Clients: macOS (OpenSSH 10.3p1), an Ubuntu 24.04 container (OpenSSH 9.6p1), and CI's GitHub-hosted `ubuntu-24.04` runner (job `e2e-sites`, run 38189801662, 2026-10-11: 43 pass, 0 fail, 2 INFO, 1 SKIP; the optional real-BackWPup check is skipped there).
 - Target: Debian 13, OpenSSH 10.0p2, sudo 1.9.16p2, WordPress 7.1.3, PHP 8.4.26, WP-CLI 2.12.0.
 - Also run once on a PHP 8.5.11 build of the same target.
 
@@ -1170,7 +1171,7 @@ Phase-specific extra conditions appear as **Done when**.
 
 Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 
-### P0 — E2E harness and ground truth (implemented 2026-10-09, audited 2026-10-11; first CI run pending)
+### P0 — E2E harness and ground truth ✅ (implemented 2026-10-09, audited 2026-10-11, CI green 2026-10-11)
 - **Goal:** a reproducible WordPress-over-SSH target (users, sites and fixtures of §12), with every §3.5 item verified.
 - **Changes:**
   - `tests/e2e/sites/`:
@@ -1183,7 +1184,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
   - a **temporary** `push` trigger for `feat/site-deployment` in `ci.yml`, so CI runs on this branch before its PR exists (`commit-artifacts` stays develop-only); P12 removes it;
   - §3.5 results recorded in this plan, which is adjusted in revisions 4 and 5.
 - **Done when:** the harness is healthy locally and in CI; `verify.sh` passes, or each deviation is recorded and the plan adjusted.
-- **Result:** 43 asserted checks pass on macOS and Ubuntu clients, plus the optional real-BackWPup check locally; 2 INFO checks record versions and a network-dependent timeout. The deviations are marked ⚠ in §3.5 and resolved in revisions 4 and 5. P0 is done once the CI job passes.
+- **Result:** 43 asserted checks pass on macOS and Ubuntu clients, plus the optional real-BackWPup check locally; 2 INFO checks record versions and a network-dependent timeout. The deviations are marked ⚠ in §3.5 and resolved in revisions 4 and 5. CI (run 38189801662) passes every job, `e2e-sites` included, with the same 43 checks; its first run caught two bugs, both fixed (revision 6).
 - **Depends:** — · **Parallel:** P1.x, P2.x, P3.1
 
 ### P1 — Foundations (lib)
