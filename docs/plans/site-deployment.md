@@ -24,6 +24,22 @@ Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, 
 
 ## 0. Change log
 
+### Revision 14 (P2.1, P2.4 and P3.1 implementation and audits, 2026-10-12)
+
+Three workers implemented the phases in parallel; two fresh auditors per phase, fixes, then a fresh re-audit of each phase's fixes.
+
+| Topic | Change |
+|---|---|
+| Script framing (P3.1) | Every script is one brace group `{ … }` whose first command is `LC_ALL=C; export LC_ALL` (was: nonce first, no group). A stdin script cut short at its end ran its partial last command (a `search-replace` lost its trailing `--dry-run`); now it is a syntax error that runs nothing, tested by cutting at every byte. Multi-statement bodies come from typed `Statement`s (`remote/statement.rs`) and one `frame()` (§6.1) |
+| Numeric ids (P3.1) | GNU chown, chgrp and find read a bare number as a user/group *name* first: a user named `1001` defeated the chown guards. Ids are rendered `+uid:+gid`; §6.8 uses `find -uid/-gid` and `chgrp +gid` |
+| Root (P3.1) | Root commands run under `sudo -n -u root --` (a sudoers `runas_default` changed the user). Root `stat` prints one value per line (`%u %g %a %F %U %G`, names last) and does not follow links: anything but `directory` is refused, since root cannot `realpath` (§6.2) |
+| Hermetic WP-CLI (P3.1) | `env -u` removes the 18 environment variables that make WP-CLI 2.12 or PHP load code or run programs (`WP_CLI_REQUIRE`, `WP_CLI_EARLY_REQUIRE`, `PHPRC`, `EDITOR`, …; verified in the 2.12.0 phar), and `PAGER=cat`. Login and `runuser` identities passed them through (§6.1) |
+| WP-CLI arguments (P3.1) | WP-CLI reads global parameters anywhere, even after `--` (`--require=`/`--exec=` ran code there). `WpCli::arg` refuses every global in every form except the §6.12 overrides, and a `--url=` override must be a valid site URL. Names match exactly, so `--req=` is not a global (§6.12) |
+| Server CLI (P2.1) | Each field is declared once (`server/fields.rs`), after 17 of 27 audit mutants survived (e.g. `server defaults --connect-timeout 30` silently did nothing). New flags: `server defaults --jump/--known-hosts/--ssh-config`, `server add/edit --connect-timeout`, each with `--unset`. `server remove` re-checks the confirmed server, sites and groups under the lock (`inventory_changed`). New code `internal_error`. "Offline" reworded to "no SSH" (the background update check may still contact GitHub) (§4.5, §5.2) |
+| Inventory library (P2.4) | `io::update_tracked_with` hands the change the fingerprint of the bytes loaded under the lock (Node no longer re-reads). `io::check_path` + a pre-lock target check: refused targets create no lock file or directory; file names ending in `.` or a space are refused (Windows strips them, so two spellings locked different lock files). A forced save refuses a newer inventory, readable or not, and a file it cannot read; damaged, older and same-version files are still replaced (§7) |
+| Node (P2.4) | A rejecting `async` `update()` callback crashed Node even after the caller caught the refusal; the rejection is now handled through the `then` captured at addon load (a subclass overriding `catch` crashed the first fix) and any thenable refused. Paths are checked as given (`x/.` was accepted). Hints fixed: `InventoryLocked` names the `update()` callback only when it caused the wait; `InventoryChanged` no longer suggests `force` (it discards the other process's edit). Non-enumerable keys refused (§11) |
+| Process | A P2.1 auditor ran commands against the real `~/.apvm` (a zsh glob error skipped its env setup) and left a test `inventory.json`. Agent prompts now prefix the env on every command |
+
 ### Revision 13 (P1.6 implementation and audit, 2026-10-12)
 
 | Topic | Change |
@@ -448,7 +464,7 @@ Stable codes (CLI `--json`, NAPI `code`):
 | WordPress | `wp_cli_missing`, `not_wordpress`, `wp_not_installed`, `plugins_dir_not_writable`, `multisite_unsupported` |
 | Execution | `site_locked`, `insufficient_space`, `upload_corrupted`, `wp_command_failed`, `verification_failed`, `state_drifted`, `outcome_unknown`, `health_check_failed`, `timeout`, `file_mods_disallowed` |
 | Ownership / variants | `ownership_unfixable`, `variant_conflict` (two variants of one slug, or two siblings activated together without `--keep-siblings`) |
-| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory), `inventory_io` (the inventory file, its lock or its directory cannot be read, written, locked or created, or is not a regular file), `inventory_locked` (another process held the inventory lock for the whole 10 s wait), `inventory_changed` (the file changed since it was loaded; a guarded save wrote nothing) |
+| Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory), `inventory_io` (the inventory file, its lock or its directory cannot be read, written, locked or created, or is not a regular file), `inventory_locked` (another process held the inventory lock for the whole 10 s wait), `inventory_changed` (the file changed since it was loaded; a guarded save wrote nothing; or a `server remove` whose server, sites or their groups changed during the confirmation), `internal_error` (a JSON document could not be built; not expected to happen, it replaces a panic) |
 | Status | `expectation_not_met`, `undetermined` |
 
 ---
@@ -487,18 +503,18 @@ Every command below is a thin front end over an `apvm-sites` API (§8.1); §11 l
 | `--lock-wait <SECS>` | How long to wait for a busy site lock (default 60) |
 | `--allow-file-mods` | Proceed on sites that set `DISALLOW_FILE_MODS` (install, uninstall, delete; §6.7) |
 
-### 5.2 Inventory commands (offline, except `add`'s connection test and `test`)
+### 5.2 Inventory commands (no SSH, except `add`'s connection test and `test`)
 
 **`apvm server` — SSH hosts**
 
 | Command | Arguments | Notes |
 |---|---|---|
-| `server defaults` | `[--user <USER>] [--port <N>] [--key <PATH>] [--connect-timeout <SECS>] [--ssh-binary <PATH>] [--multiplex \| --no-multiplex] [--unset <FIELD>]… [--json]` | No flags = show. `--key` is the **one main key** |
-| `server add <ID>` | `--host <HOST> [--user <USER>] [--port <N>] [--key <PATH>] [--jump <[USER@]HOST[:PORT]>[,…]] [--known-hosts <PATH>] [--ssh-config <PATH>] [--multiplex \| --no-multiplex] [--name <TEXT>] [--notes <TEXT>] [--no-test] [--trust-new-host-key]` | Tests SSH by default; `--key` overrides the default key for this server; `<HOST>` may be an `~/.ssh/config` alias |
-| `server edit <ID>` | the `add` flags (except `--no-test`) + `[--unset <FIELD>]…` | |
+| `server defaults` | `[--user <USER>] [--port <N>] [--key <PATH>] [--connect-timeout <SECS>] [--jump <[USER@]HOST[:PORT]>[,…]] [--known-hosts <PATH>] [--ssh-config <PATH>] [--ssh-binary <PATH>] [--multiplex \| --no-multiplex] [--unset <FIELD>]… [--json]` | No flags = show. `--key` is the **one main key** |
+| `server add <ID>` | `--host <HOST> [--user <USER>] [--port <N>] [--key <PATH>] [--connect-timeout <SECS>] [--jump <[USER@]HOST[:PORT]>[,…]] [--known-hosts <PATH>] [--ssh-config <PATH>] [--multiplex \| --no-multiplex] [--name <TEXT>] [--notes <TEXT>] [--no-test] [--trust-new-host-key]` | Tests SSH by default; `--key` overrides the default key for this server; `<HOST>` may be an `~/.ssh/config` alias |
+| `server edit <ID>` | the `add` flags (except `--no-test`) + `[--unset <FIELD>]…` | `<FIELD>` is the flag's name (comma lists allowed); the host cannot be unset; setting and unsetting one field is refused; an empty value is refused with `to clear it: --unset <field>` |
 | `server list` | `[--json]` | |
 | `server show <ID>` | `[--json]` | Shows the effective (merged) SSH settings |
-| `server remove <ID>` | `[--cascade] [-y]` | Refused while sites use it, unless `--cascade` |
+| `server remove <ID>` | `[--cascade] [-y]` | Refused while sites use it, unless `--cascade`. Asks first; without a terminal `-y` is required (`confirmation_required`). If the server, its sites or their groups change while the prompt is open, nothing is removed (`inventory_changed`) |
 | `server test <ID>…` | `[--trust-new-host-key] [--json]` | SSH, login user, groups, sudo |
 
 **`apvm site` — WordPress installs on servers**
@@ -612,20 +628,24 @@ Run `wp cache flush` on 3 sites (may write)? [y/N]
 
 ### 6.1 Remote execution contract
 
-1. **Typed scripts.** A `Script` is built from compile-time literals and quoted values (POSIX single quotes, `'` → `'\''`). Every command in it gets `</dev/null` so nothing consumes the script stream. Every script starts with `LC_ALL=C; export LC_ALL`, so sudo and coreutils messages are the English ones the classifiers match (sudo keeps `LC_ALL` for the command, §3.5).
+1. **Typed scripts.** A `Script` is built from compile-time literals and quoted values (POSIX single quotes, `'` → `'\''`). Every command in it gets `</dev/null` so nothing consumes the script stream. Every script is one brace group `{ … }` whose first command is `LC_ALL=C; export LC_ALL`: the shell parses the whole group before running any of it, so a script cut short at its end (a dropped connection) is a syntax error that runs nothing, never a partial last command (P3.1 audit: a cut `… search-replace a b` lost its trailing `--dry-run` and ran). `LC_ALL=C` makes sudo and coreutils messages are the English ones the classifiers match (sudo keeps `LC_ALL` for the command, §3.5).
 2. **Framing.**
-   `printf '%s\n' '<nonce>'; LC_ALL=C; export LC_ALL; cd / && <identity> <argv…> </dev/null; rc=$?; [ "$rc" -eq 255 ] && rc=254; exit "$rc"`
+   `{ LC_ALL=C; export LC_ALL⏎printf '%s\n' '<nonce>'⏎cd / && <s1> </dev/null [&& <s2> </dev/null …]; rc=$?; [ "$rc" -eq 255 ] && rc=254; exit "$rc"⏎}`
+   - One private `frame()` writes the group, prelude, nonce and epilogue; later phases add typed statements (`remote/statement.rs`: a `'static` program plus quoted `Word`s, run as the identity, as root or as the login user), never hand-written framing. Statements are chained with `&&`, so `rc` is the first failing status. Upload scripts use the same frame on one line, `{ …; …; }`.
    - Only stdout after the per-call random nonce is parsed, which ignores `.bashrc`/MOTD noise.
    - 255→254 makes a real 255 always mean an SSH failure. 254 = remote exit 255: a PHP fatal before WordPress loads, or during activation. Once WordPress has loaded, its default fatal-error handler exits **1** (§3.5). Fatals are never detected by 254 alone, nor by WordPress's message, which a site can change.
-   - `cd /` keeps a project `wp-cli.yml` out of play; `--path` and `--url` are always explicit.
+   - `cd /` keeps a project `wp-cli.yml` out of play (only a root-owned `/wp-cli.yml` could still apply); `--path` and `--url` are always explicit.
 3. **Delivery** (D3):
    - **Stdin mode** (everything except uploads): remote command `sh -s`; script bytes on stdin, then EOF. The login shell sees only `sh -s`.
    - **Upload mode:** stdin carries the zip, so the script is the remote command `sh -c '<script>'`.
      - A distinct `UploadScript` type accepts values matching `^[A-Za-z0-9._/+-]+$` only (paths and names). That excludes the `'` and backslash that fish reads as escapes inside single quotes. P0 showed every other printable ASCII character survives all five login shells, so the allowlist keeps a margin.
      - Its templates are single-line (csh/tcsh reject newlines in quotes) and contain neither `\\` nor `\'`.
      - With these rules the quoting survives sh, bash, dash, zsh, fish and tcsh login shells (P0).
-4. **Identity prefix** (§6.2): empty, `sudo -n -u U -g G --`, `sudo -n -u U --`, or `runuser -u U -g G --` (root login without sudo). No shell ever runs under sudo or runuser. Root-level commands form a **closed enum**: `stat`, and `chown -R -P -h --from=…` for the opt-in root repair (§6.8).
-5. **Hermetic WP-CLI.** Every WP-CLI call is `<prefix> env WP_CLI_CONFIG_PATH=/dev/null <wp_cli> --skip-packages --exec='umask(umask() & ~0<g>);' --path=… --url=… <args>`:
+4. **Identity prefix** (§6.2): empty, `sudo -n -u U -g G --`, `sudo -n -u U --`, or `runuser -u U -g G --` (root login without sudo). Every value is quoted, validated names included. No shell ever runs under sudo or runuser. Root-level commands run under `sudo -n -u root --` (a sudoers `runas_default` would otherwise change the user) and form a **closed enum**: `stat`, and `chown -R -P -h --from=+F:+FG -- +U:+G` for the opt-in root repair (§6.8). Ids always carry `+`: GNU chown, chgrp and find resolve a bare number as a user/group *name* first (a user named `1001` would win).
+5. **Hermetic WP-CLI.** Every WP-CLI call is `<prefix> env -u <18 variables> WP_CLI_CONFIG_PATH=/dev/null PAGER=cat <wp_cli> --skip-packages --exec='umask(umask() & ~0<g>);' [--allow-root] --path=… --url=… <args>`:
+   - `env -u` removes what makes WP-CLI 2.12 or PHP load code, run another program or behave differently when set for the identity (the 2.12.0 phar's `getenv` calls and `bin/wp`): `PHPRC`, `PHP_INI_SCAN_DIR`, `WP_CLI_{ALLOW_ROOT, CACHE_DIR, CUSTOM_SHELL, EARLY_REQUIRE, FORCE_USER_LOGIN, PACKAGES_DIR, PHP, PHP_ARGS, PHP_USED, REQUIRE, RUNTIME_ALIAS, SSH_BINARY, SSH_PRE_CMD, STRICT_ARGS_MODE}`, `WP_CONFIG_PATH`, `EDITOR`. sudo's `env_reset` already drops them; login and `runuser` identities did not. `PAGER=cat`: WP-CLI runs the pager for `help` even when not on a terminal. GNU, busybox and BSD `env` all take `-u`.
+   - Arguments cannot set WP-CLI global parameters other than the §6.12 overrides: WP-CLI reads globals anywhere, even after the subcommand and after `--` (verified: `--require=` and `--exec=` ran code there). A `--url=…` override must be a valid site URL.
+   - `--allow-root` is explicit, set by P4.2 exactly when the identity's uid is 0.
    - `WP_CLI_CONFIG_PATH=/dev/null` keeps the identity's `~/.wp-cli/config.yml` out. It could hold `require:` files or command defaults such as `plugin uninstall: deactivate: true`.
    - `--skip-packages` keeps installed WP-CLI packages out.
    - P0 showed both run code on every call, even with `--skip-plugins` (§3.5).
@@ -642,8 +662,8 @@ Run `wp cache flush` on 3 sites (may write)? [y/N]
 
 | Step | Runs as | What (one round trip each) |
 |---|---|---|
-| H — host | login user | `id -un`, `id -u`, `id -Gn`, `$SHELL`; `command -v sudo runuser sha256sum shasum openssl`; `sudo -n -l` (lists the user's rules without running anything); `realpath` + `stat -c '%u %g %U %G %a'` (BSD `stat -f` fallback; root `stat` on EACCES) of `<path>/wp-content/plugins` (or the pinned `plugins_dir`) → reference `(U, G, P)`; `command -v <wp_cli>` |
-| I — identity | — (pure) | the table below; then a probe of the exact command shape: `<prefix> env WP_CLI_CONFIG_PATH=/dev/null <wp_cli> --skip-packages cli version` |
+| H — host | login user | `id -un`, `id -u`, `id -Gn`, `$SHELL`; `command -v sudo runuser sha256sum shasum openssl`; `sudo -n -l` (lists the user's rules without running anything); `realpath` + `stat -c '%u⏎%g⏎%a⏎%F⏎%U⏎%G'` (one value per line, names last since they may hold spaces; `UNKNOWN` = no name; BSD `stat -f` fallback; on EACCES root `sudo -n -u root -- stat` of the same path, which describes a symlink rather than following it, so anything but `directory` is refused: root has no `realpath` in the closed enum) of `<path>/wp-content/plugins` (or the pinned `plugins_dir`) → reference `(U, G, P)`; `command -v <wp_cli>` |
+| I — identity | — (pure) | the table below; then a probe of the exact command shape: `<prefix> env -u … WP_CLI_CONFIG_PATH=/dev/null PAGER=cat <wp_cli> --skip-packages --exec='umask(…);' --path=… cli version` (built with `WpCli`) |
 | W — WordPress | identity | `wp eval` of a constant snippet (`--skip-plugins --skip-themes`): `WP_CLI_VERSION`, `PHP_VERSION`, WP version, `is_multisite()`, `WP_PLUGIN_DIR`, `WP_CONTENT_DIR`, `siteurl`, `home`, `DISALLOW_FILE_MODS`; failures classified |
 | O — consistency | identity | `realpath(WP_PLUGIN_DIR)` (from W) must equal the step-H path, else `blocked: plugins_dir_mismatch` until the site pins `plugins_dir`. The identity is never switched to what WordPress reports, because wp-config.php and must-use plugins are under the site's control |
 | C — capabilities | identity | `test -w` on the plugins dir and `<content>/upgrade`; `df -Pk` of `remote_tmp_dir` and `WP_CONTENT_DIR`; checksum tool; multisite flag; `siteurl` ≠ `url` → warning |
@@ -789,7 +809,7 @@ Plan warnings: `Requires PHP` / `Requires at least` above the site's; the same s
   - files carry the group r/w bits `P` grants.
   - Bits are only ever added; "other" bits are never touched; `o+w` entries are reported.
 - **Check** (one script, as the identity, numeric ids, first 20 offenders listed):
-  - `find T \( ! -user <uid> -o ! -group <gid> \) -print | head -n 20`
+  - `find T \( ! -uid <uid> -o ! -gid <gid> \) -print | head -n 20` (`-uid`/`-gid`: `-user 1001` matches a user *named* 1001 first)
   - `find T -type d ! -perm -<dir bits> -print | head -n 20`
   - `find T -type f ! -perm -<file bits> -print | head -n 20`
   - `find T -perm -0002 ! -type l -print | head -n 20`
@@ -802,17 +822,17 @@ Plan warnings: `Requires PHP` / `Requires at least` above the site's; the same s
 
 | Rung | When | Command | Privilege |
 |---|---|---|---|
-| 1 | Only the group differs and the identity owns the files and is in G (or runs with egid G) | `chgrp -R -h -- <gid> T` | none |
+| 1 | Only the group differs and the identity owns the files and is in G (or runs with egid G) | `chgrp -R -h -- +<gid> T` | none |
 | 2 | Owner differs, and the site opted in with `ownership: mirror-root` | the root rung below | root (closed enum) |
 | 3 | Group bits missing | `find T -type d -exec chmod g+<bits>[s] {} +` and `find T -type f -exec chmod g+<bits> {} +` (symlinks excluded by `-type`) | none (the identity owns T) |
 | — | Still mismatched, or the owner differs on a site without `mirror-root` | item `failed` with `ownership_unfixable`: the entries, and the exact commands an administrator can run; the plugin stays installed | — |
 
 - **Root rung** (opt-in; every precondition re-checked right before the command):
   - Absolute paths only. No `cd` as the login user, who may not reach FTP-style sites at all (§3.5).
-  - `sudo -n stat -c %F -- '<plugins_dir>/<slug>'` (root) must print `directory`; a symlinked slug prints `symbolic link` and is refused.
+  - `sudo -n -u root -- stat -c %F -- '<plugins_dir>/<slug>'` (root) must print `directory`; a symlinked slug prints `symbolic link` and is refused.
   - No multi-linked files: `find T ! -type d -links +1` must print nothing. Symlink flags do not cover hardlinks.
   - `/proc/sys/fs/protected_hardlinks` must be `1` (it is on current Debian and Ubuntu kernels, §3.5).
-  - `sudo -n chown -R -P -h --from=<F>:<FG> -- <uid>:<gid> '<plugins_dir>/<slug>'`, once per foreign owner F the check found. F is never root and never the login user; such trees are reported instead.
+  - `sudo -n -u root -- chown -R -P -h --from=+<F>:+<FG> -- +<uid>:+<gid> '<plugins_dir>/<slug>'`, once per foreign owner/group pair (F, FG) the check found. F is never root, never the login user and never the target uid; such trees are reported instead. busybox `chown` has no `--from`, so it fails closed (`ownership_unfixable`).
   - `--from` changes only entries owned by F, and `-P -h` never follow links. P0 verified both [harness.root-repair-guards].
   - **Residual risk, stated in the docs:** the identity owns `wp-content/` and `plugins/`, so no path check is free of races. A site whose code is not trusted must stay on `mirror`.
 - **Guards:**
@@ -894,8 +914,8 @@ Family "backwpup"
 | Aspect | Design |
 |---|---|
 | Execution | The arguments become `wp` argv elements, quoted, in a stdin-delivered script: no shell interpretation of `; \| & $() * ~`, any byte but NUL allowed. Runs as the site identity (owner:group), hermetic and with the umask relaxation (§6.1), with apvm's `--path` and the site's `--url` |
-| Allowed overrides | `--url=…` (subsite targeting), `--skip-plugins[=…]`, `--skip-themes`, `--user=` (WP user), `--format=…`, `--debug`, `--quiet` |
-| Refused params | Every WP-CLI global parameter except the allowed overrides. Notably: `--exec` and `--require` (they run arbitrary PHP and would bypass the classification); `--path` (apvm owns it); `--ssh` and `--http` (would hop elsewhere); `--allow-root` (identity policy); `--prompt` (interactive); `--skip-packages` and `--context` (apvm sets them); a leading `@alias` |
+| Allowed overrides | `--url=…` (subsite targeting; must be a valid site URL), `--skip-plugins[=…]`, `--skip-themes[=…]`, `--user=…` (WP user), `--format=…` (not a global), `--debug[=…]`, `--quiet` |
+| Refused params | Every WP-CLI global parameter except the allowed overrides. Notably: `--exec` and `--require` (they run arbitrary PHP and would bypass the classification); `--path` (apvm owns it); `--ssh` and `--http` (would hop elsewhere); `--allow-root` (identity policy); `--prompt` (interactive); `--skip-packages` and `--context` (apvm sets them); `--blog`, `--color`; the bare and `--no-…` forms of every global (`--no-skip-packages` would undo apvm's own); a leading `@alias`. WP-CLI matches names exactly (`--req=`, `--REQUIRE=` are not globals), anywhere in the arguments, after `--` too. Enforced by `WpCli::arg` (`allowlist::wp_cli_arg`) for every caller, not only `wp run` |
 | Refused commands | `shell`, `db cli` (interactive); `server` (long-running); `cli update`, `package …` (WP-CLI itself, not the site); `plugin uninstall … --deactivate` and `plugin deactivate … --uninstall` (break two-phase removal: the error points to `apvm wp uninstall`) |
 | Classification | `read-only` = allowlisted command paths (e.g. `plugin list/get/status/is-installed/is-active/path`, `theme list/get/status`, `option get/list/pluck`, `core version/is-installed/check-update/verify-checksums`, `config get/list/has`, `user list/get`, `post list/get`, `post meta get/list`, `term list/get`, `comment list/get/count`, `site list`, `cron event list`, `cron schedule list`, `db size/tables`, `transient get`, `rewrite list`, `role list`, `language core/plugin/theme list`, `cli version/info`, `help`; `search-replace … --dry-run` without `--export` or `--log`, which write files even then, §3.5). Everything else, including `eval`, is `may-write` |
 | Confirmation | `may-write` → plan + confirmation (CLI) / `allowWrites: true` (NAPI). The site lock is held for every `wp run`, read-only ones included: they load plugins, which may write |
@@ -994,8 +1014,8 @@ Family "backwpup"
 File handling:
 - **Load:** a missing file is an empty inventory. Parsing uses `deny_unknown_fields`, requires `version`, accepts records only as JSON objects, reads `null` as unset and ignores a leading UTF-8 BOM. Then full validation runs, reporting every problem with its location (`sites[1].server: unknown server 'eu-2'`). A newer `version` (read from the JSON object) is read-only when this build can read it fully (every field and value known, every rule passed). Otherwise it is refused with `inventory_unsupported`, and its problems stay listable.
 - **Save:** lock (`inventory.json.lock`, `std::fs::File::lock`, created `0600`, never removed) → temp file created `0600` with `create_new` → fsync → rename → fsync dir (best effort: once renamed, the save has landed). Missing parents are created `0700`. Edits are read-modify-write under the lock (`io::update`), which writes only when the change succeeds and changes something; `load` takes no lock (a save is one rename).
-- **Limits:** documents over 16 MiB are refused on read and write. A newer (read-only) inventory is never written, even when a change replaces it whole.
-- **Refused:** a symlinked path (the file or its lock file, even dangling; the directories above may be links, e.g. macOS's `/tmp`), a directory or special file at either path, and a path that names no file. Errors carry the path (`inventory_io`).
+- **Limits:** documents over 16 MiB are refused on read and write. A newer inventory is never written, even when a change replaces it whole or a forced save targets it (`inventory_read_only` if this build can read it, else `inventory_unsupported`, as `update`). A forced save replaces damaged, older and same-version files (a `version` that is not a whole number up to u32 max counts as damaged; with duplicate `version` keys the last one counts), and refuses a file it cannot read (`inventory_io`), since it cannot rule out a newer one; to restore a backup over a newer or unreadable file, move that file aside by hand first.
+- **Refused:** a symlinked path (the file or its lock file, even dangling; the directories above may be links, e.g. macOS's `/tmp`), a directory or special file at either path, and a path that names no file (empty, `/`, `..`, or ending with a separator, `/.` or `/..`) or whose file name ends with `.` or a space (Windows strips those, so two spellings would lock different lock files; refused on every platform). Errors carry the path (`inventory_io`). Writes refuse such targets before taking the lock, so nothing is created; front ends check the path as given (`io::check_path`) before making it absolute.
 - **Lock wait:** a busy lock is retried for at most 10 s (`io::LOCK_WAIT`), then the write fails with `inventory_locked` and nothing is written (revision 11).
 - **No lost edits (revisions 12, 13):** callers that keep an inventory in memory between load and save use `io::load_tracked` + `io::save_if_unchanged`: under the lock the file must still match the fingerprint of the bytes loaded (or still be missing), else `inventory_changed` and nothing is written (the file is also compared before the lock, so a refusal usually creates nothing). `io::save` (blind overwrite) is only for a deliberate "force". `io::save`, `io::save_if_unchanged` and `io::update_tracked` return the fingerprint of the file afterwards; a caller never reloads just to get one.
 
@@ -1112,8 +1132,8 @@ Threats:
 | Allowlists in the library (NAPI covered); POSIX quoting; stdin delivery, so the login shell never parses data; `UploadScript` limited to safe values | T1 |
 | Lifecycle slugs must be echoed back by `wp plugin list` before any mutation | T1, T7 |
 | `wp eval` only with compile-time constant snippets (except `wp run`, where the operator asks for it) | T1 |
-| `wp run`: argv-only, every global parameter refused except the allowed overrides (no `--exec`/`--require`), refused commands, read-only allowlist, confirmation / `allowWrites`, identity-run, lock | T1, T7 |
-| Hermetic WP-CLI: no user config, no packages (§6.1); the identity is derived from the plugins dir's `stat`, never from WordPress's own report (§6.2) | T1, T4 |
+| `wp run`: argv-only, every global parameter refused in every form and position except the allowed overrides (no `--exec`/`--require`), refused commands, read-only allowlist, confirmation / `allowWrites`, identity-run, lock | T1, T7 |
+| Hermetic WP-CLI: no user config, no packages, code-loading environment variables removed with `env -u` (§6.1); the identity is derived from the plugins dir's `stat`, never from WordPress's own report (§6.2) | T1, T4 |
 | Zip rules (§6.10) | T2 |
 | `sudo -n` only; no shell under sudo or runuser, ever (`env` + the WP-CLI argv); root commands are a closed enum (`stat`; `chown -R -P -h --from=…`, opt-in per site, with the §6.8 preconditions); root never deletes; `chgrp` without root first; `mirror` and `check` → zero root | T3 |
 | Nonce framing, output caps, strict parsers, `escape_debug`; `ssh_*` classes only when ssh exits 255 (remote stderr shares the stream) | T4 |
@@ -1134,7 +1154,7 @@ Threats:
 class SiteInventory {                                   // sync, file-backed
   static load(path?: string): SiteInventory              // default ~/.apvm/inventory.json | APVM_INVENTORY
   static empty(): SiteInventory
-  readonly path: string | null
+  readonly path: string | null;  readonly readOnly: boolean
   defaults(): JsDefaults;  setDefaults(d: JsDefaults): void
   servers(): JsServer[];   upsertServer(s: JsServer): void;  removeServer(id: string, cascade?: boolean): boolean
   sites(): JsSite[];       upsertSite(s: JsSite): void;      removeSite(id: string): boolean
@@ -1142,8 +1162,10 @@ class SiteInventory {                                   // sync, file-backed
   save(path?: string, opts?: { force?: boolean }): string
       // refuses with `InventoryChanged` when the file changed since load (or, for a path not
       // loaded from, when it exists); the object keeps its changes; `force` overwrites
+      // (discarding others' edits), never an inventory written by a newer apvm
   static update(fn: (inv: SiteInventory) => void, path?: string): SiteInventory
-      // load → fn → save under the lock: never conflicts; a throw in fn writes nothing
+      // load → fn → save under the lock: never conflicts; a throw in fn writes nothing;
+      // fn must be synchronous: a returned promise/thenable is refused (InvalidArg), its rejection handled
 }
 class SiteManager {
   static create(opts?: { inventory?: SiteInventory | string; controlDir?: string; jobs?: number;
@@ -1326,25 +1348,27 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** a save that cannot lose another process's edit, for callers that keep an inventory in memory (revision 12).
 - **Changes:** `inventory/io.rs` (+ tests): `Fingerprint` (opaque: SHA-256 of the exact bytes read, or missing; `sha2` is already a dependency), `load_tracked(path) -> Result<(Inventory, Fingerprint)>` (one read: the inventory and the fingerprint come from the same bytes), `save_if_unchanged(path, &Inventory, &Fingerprint) -> Result<Fingerprint>` (under the lock: re-read safely, compare, write, return the new fingerprint); `Error::InventoryChanged { path }` + code `inventory_changed`; README.
 - **Tests:** unchanged → saved, new fingerprint returned and usable for the next save; changed by another writer → `inventory_changed`, file untouched; deleted since load, or created when it was missing → refused; a byte-identical rewrite is not a conflict; read-only (newer) inventory refused; busy lock → `inventory_locked`; the conflict reproduced across two processes.
-- **Result:** `io::{Fingerprint, load_tracked, save_if_unchanged, update_tracked, TrackedUpdate}`; `io::save` returns a `Fingerprint`; `Error::InventoryChanged` (`inventory_changed`); README. Audit changes in revision 13. Tests: 25 new unit tests (every case above, plus a deleted directory, a file grown past the cap, a no-op `update` in between, forced-save and `update_tracked` chaining, a failed write retried with the same fingerprint, a symlinked path, and 6 threads that reload on conflict until every edit lands, with conflicts asserted to happen), 2 cross-process tests (a child's edits between load and save, `Fingerprint::missing()` over a file a child created), 1 doctest. Each guard (the comparison, the comparison under the lock, the read-only check, the pre-lock look, the size-cap mapping, the returned fingerprints) was removed in turn and a test failed every time. The threaded test passed 40 of 40 runs. Windows: clippy-clean for `x86_64-pc-windows-msvc`. Workspace: 1 533 tests green.
+- **Result:** `io::{Fingerprint, load_tracked, save_if_unchanged, update_tracked, TrackedUpdate}`; `io::save` returns a `Fingerprint`; `Error::InventoryChanged` (`inventory_changed`); README. Audit changes in revision 13. Tests: 25 new unit tests (every case above, plus a deleted directory, a file grown past the cap, a no-op `update` in between, forced-save and `update_tracked` chaining, a failed write retried with the same fingerprint, a symlinked path, and 6 threads that reload on conflict until every edit lands, with conflicts asserted to happen), 2 cross-process tests (a child's edits between load and save, `Fingerprint::missing()` over a file a child created), 1 doctest. Each guard (the comparison, the comparison under the lock, the read-only check, the pre-lock look, the size-cap mapping, the returned fingerprints) was removed in turn and a test failed every time. The threaded test passed 40 of 40 runs. Windows: clippy-clean for `x86_64-pc-windows-msvc`. Workspace: 1 533 tests green. Rev 14 (P2.4 audit): `update_tracked_with` (the change gets the loaded bytes' fingerprint), `check_path`, a pre-lock target check in `save`/`update*`, and a forced save refuses a newer target.
 - **Depends:** P1.2 · **Parallel:** P1.3–P1.5, P2.1–P2.3, P3.x
 
 ### P2 — Inventory front ends
 
-#### P2.1 — cli: `apvm server` + `server defaults`
+#### P2.1 — cli: `apvm server` + `server defaults` ✅ (2026-10-12)
 - **Goal:** manage servers offline.
 - **Changes:**
   - `crates/cli/Cargo.toml`; `paths.rs` (`inventory_file`, `ssh_control_dir`, `sites_logs_dir`); `main.rs` (dispatch, env override);
-  - `commands/{mod,server}.rs`; `prompt.rs` (shared `confirm`; `uninstall.rs` moves onto it, its tests unchanged);
-  - `.claude/skills/apvm-cli/{SKILL.md, references/sites.md}`; `skill/embedded.rs` (`SKILL_FILES`); `tests/cli_inventory.rs`.
+  - `commands/{mod,server,inventory}.rs`, `commands/server/{fields,render,tests}.rs`; `prompt.rs` (shared `confirm`; `uninstall.rs` and `cache.rs` move onto it, wording and tests unchanged); `status.rs` (`warn_line`);
+  - `.claude/skills/apvm-cli/{SKILL.md, references/sites.md}`; `skill/embedded.rs` (`SKILL_FILES`); `crates/cli/README.md`; `tests/cli_inventory.rs`; `tests/cli_lifecycle.rs` (`SKILL_FILES`); `tests/common/mod.rs`.
 - **Tests:** add/edit/show/list/remove; defaults set/unset; invalid input → exit 1; `--json`; `--cascade`; `APVM_INVENTORY`; `0600`.
 - **Audit notes (rev 10):** every edit goes through `io::update` (lock → load → change → save), never `load` then `save`, which can lose a concurrent edit. Map error locations like `sites[1]` / `all_sites` to the flags the user typed (`--site`, `--all-sites`).
+- **Result (rev 14):** every field is declared once (`server/fields.rs`: one exhaustive `Field::spec()` table; clap structs destructure every flag under `#[deny(unused_variables)]`), so a dropped flag cannot silently do nothing. `commands/inventory.rs` holds the shared plumbing for P2.2/P2.3/P4.3/P5 (`Failure` with codes and remedies, `name_flags`, an injectable `Console`, JSON documents). `--json` failures print `{"schema":1,"error":{code,message,problems}}` on stdout and `Error:` on stderr. Relative `--key`/`--known-hosts`/`--ssh-config`/`--ssh-binary` values warn only when they change. The audit's 17 surviving mutants (of 27) led to the table tests (every flag read from clap saved and reported, every set + unset refused, every relative path warned once); 35/35 mutants are now killed. Not done here, carried to P2.2/P5: mapping target locations (`sites[1]`, `all_sites`) to `--site`/`--all-sites`, since no `server` command takes targets. A refused change on a missing inventory still leaves the `0700` directory and an empty `0600` lock file (library behavior, documented).
 - **Depends:** P1.2, P1.3 · **Parallel:** P1.4–P1.6, P2.4, P3.x
 
 #### P2.2 — cli: `apvm site`
 - **Goal:** manage sites offline (the probe arrives in P4.3).
 - **Changes:** `commands/site.rs`; `SKILL.md`.
 - **Tests:** as P2.1, plus `--wp-cli` tokens, `--run-as`/`--owner`/`--ownership`, filters.
+- **Audit notes (rev 14):** reuse `commands/inventory.rs` (`Failure`, `name_flags`, `Console`, `confirm_change`) and the one-table field pattern of `server/fields.rs`; `remove` re-checks the confirmed record under the lock like `server remove`.
 - **Depends:** P2.1 · **Parallel:** P2.4, P3.x
 
 #### P2.3 — cli: `apvm group`
@@ -1353,34 +1377,39 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Tests:** add/edit/remove; unknown site rejected; site removal updates groups.
 - **Depends:** P2.2 · **Parallel:** P2.4, P3.x
 
-#### P2.4 — napi: `SiteInventory`
+#### P2.4 — napi: `SiteInventory` ✅ (2026-10-12)
 - **Goal:** the inventory from Node.
-- **Changes:** `crates/napi/Cargo.toml`; `sites_inventory.rs`, `sites_types.rs`; `lib.rs` docs; `__tests__/sites-inventory.test.ts`; `crates/napi/README.md`.
+- **Changes:** `crates/napi/Cargo.toml`; `sites_inventory.rs`, `sites_types.rs`, `sites_input.rs` (strict reading of JS records, like `cache_input.rs`); `error.rs` (shared code mapping); `lib.rs` docs; `__tests__/sites-inventory.test.ts`, `__tests__/setup.ts` (per-file temp `APVM_INVENTORY`); `crates/napi/README.md`; library `io::{update_tracked_with, check_path}`.
 - **Behavior (revision 12):**
   - `load(path?)` uses `io::load_tracked` and remembers the path and fingerprint; `empty()` remembers none.
-  - `save(path?, { force? })`: the target is `path`, else the loaded path, else the default (`APVM_INVENTORY`, else `~/.apvm/inventory.json`). The expected state is the remembered fingerprint when the target is the loaded path (compared as absolute paths), else "missing", so `empty().save()` never wipes an existing inventory. Without `force` it calls `io::save_if_unchanged`; with `force`, `io::save`. On success the object tracks the target and the fingerprint the call returned (never one from a reload, which could hold another process's later edit) and returns the path. On `InventoryChanged` nothing is written and the object keeps its changes. A loaded read-only (newer) inventory always rejects `save` with `InventoryReadOnly`. Comparing absolute (not canonical) paths can report a false `InventoryChanged` (`/tmp/x` vs `/private/tmp/x` on macOS): safe, documented.
-  - `static update(fn, path?)`: `io::update_tracked`; `fn` gets a `SiteInventory` over the locked copy and must be synchronous. A throw in `fn` writes nothing and is rethrown as is (beware napi's pending-exception pitfalls). It returns the saved inventory, tracked with the `TrackedUpdate` fingerprint. Calling `save`/`update` on the same path inside `fn` fails with `InventoryLocked` after 10 s (documented, tested), never deadlocks.
+  - `save(path?, { force? })`: the target is `path`, else the loaded path, else the default (`APVM_INVENTORY`, else `~/.apvm/inventory.json`). The expected state is the remembered fingerprint when the target is the loaded path (compared as absolute paths), else "missing", so `empty().save()` never wipes an existing inventory. Without `force` it calls `io::save_if_unchanged`; with `force`, `io::save` (which refuses a newer target, readable or not). On success the object tracks the target and the fingerprint the call returned (never one from a reload, which could hold another process's later edit) and returns the path. On `InventoryChanged` nothing is written and the object keeps its changes. A loaded read-only (newer) inventory always rejects `save` with `InventoryReadOnly`. Comparing absolute (not canonical) paths can report a false `InventoryChanged` (`/tmp/x` vs `/private/tmp/x` on macOS): safe, documented.
+  - Paths are checked as given with `io::check_path` before `absolute()` (Unix keeps `..`; Windows normalizes and adds the drive).
+  - `static update(fn, path?)`: `io::update_tracked_with` (the callback's object tracks the fingerprint loaded under the lock; no re-read); `fn` gets a `SiteInventory` over the locked copy and must be synchronous. A throw in `fn` writes nothing and is rethrown as is (beware napi's pending-exception pitfalls). It returns the saved inventory, tracked with the `TrackedUpdate` fingerprint. Calling `save`/`update` on the same path inside `fn` fails with `InventoryLocked` after 10 s (documented, tested), never deadlocks; only then does the `InventoryLocked` message name the `update()` callback. A promise or any thenable returned by `fn` is refused (`InvalidArg`, nothing written) and its rejection is handled through the `Promise.prototype.then` captured when the addon loads (per JS environment), so a subclass overriding `then`/`catch` cannot crash Node either (only a throwing species constructor can). After a throw or refusal, the object `fn` received keeps its edits, and saving it is guarded like any save.
+  - Records are read strictly: unknown, non-enumerable or wrongly typed keys, list fields that are not plain arrays, and non-whole or out-of-range numbers are `InvalidArg`; a lone surrogate becomes U+FFFD.
   - Rejection codes: `InventoryChanged`, `InventoryLocked`, `InventoryIo`, plus the existing inventory codes.
 - **Tests:** round-trip; validation errors with `err.code`; `APVM_INVENTORY` from `process.env`; `save` → `0600`; a second process edits between `load` and `save` → `InventoryChanged`, the file keeps that edit, the object keeps its own, reload + reapply + save succeeds; `force` overwrites; `empty().save()` over an existing file refused; chained saves on one object; `update` from parallel workers all land; a throwing `fn` writes nothing.
+- **Result (rev 14):** sync API (`update` must call `fn` on the JS thread under the lock; a writer blocks the event loop for at most the 10 s lock wait plus `fn`). Added `readOnly`. Codes: library `invalid_input` → `InvalidArg`, the rest PascalCase. Audit tests added: async throw in a child process (no unhandled rejection), thenables, every `force`-less spelling (`{}`, `{force: undefined}`, `null`, …) stays guarded, forced save over newer files (both kinds), trailing `.`/`..`, no lock file for refused targets, non-enumerable keys, lone surrogates, a lock held by another process (no callback hint), escaped objects, Windows path semantics (`#[cfg(windows)]`, not compiled locally: the napi crate's C dependencies cannot cross-build from macOS; CI covers it). 68 JS tests; every audit and re-audit mutant killed. New `crates/napi/src/intrinsics.rs` (`module_exports` hook).
 - **Depends:** P1.3, P1.6 · **Parallel:** P2.1–P2.3, P3.x
 
 ### P3 — Remote execution (lib)
 
-#### P3.1 — Script builder
+#### P3.1 — Script builder ✅ (2026-10-12)
 - **Goal:** typed, framed scripts for both delivery modes (§6.1).
-- **Changes:** `remote/{mod,quote,script,identity}.rs` (prefixes incl. `-g`, closed `RootCommand`, `UploadScript`).
+- **Changes:** `remote/{mod,quote,script,identity,statement}.rs` (prefixes incl. `-g`, closed `RootCommand`, `UploadScript`, crate-internal `Statement`/`Body`), `remote/tests.rs` (real shells); `allowlist/paths.rs` (`wp_cli` shape rule moved here, `wp_cli_arg`, `upload_value`).
 - **Tests:**
   - render goldens; adversarial round-trips through real `sh -s` and `sh -c` (Unix); outer layer through the locally available shells (skipped if absent);
   - `UploadScript` accepts only `^[A-Za-z0-9._/+-]+$` values (so `'` and `\` are rejected at construction); its templates are single-line and contain neither `\\` nor `\'`;
-  - every script starts with `LC_ALL=C`; identity commands never contain a shell (`sh -c`) under sudo or runuser;
-  - the hermetic WP-CLI argv: `env WP_CLI_CONFIG_PATH=/dev/null <wp_cli> --skip-packages --exec='umask(umask() & ~0<g>);'`, with `<g>` from the plugins dir mode (golden per mode).
+  - every script is one brace group whose first command is `LC_ALL=C`, and a cut at any byte runs nothing (real shells); identity commands never contain a shell (`sh -c`) under sudo or runuser;
+  - the hermetic WP-CLI argv: `env -u … WP_CLI_CONFIG_PATH=/dev/null PAGER=cat <wp_cli> --skip-packages --exec='umask(umask() & ~0<g>);'`, with `<g>` from the plugins dir mode (golden per mode); the argument-refusal table (§6.12); `+id` chown; `sudo -n -u root`; a 30 s per-child timeout.
 - **Audit notes (rev 8):** `path` and `plugins_dir` may hold `'`, `$`, `*` and spaces, so they are only ever POSIX-quoted in stdin scripts, never put in an `UploadScript`. Variant needles may hold `'` and `\`.
+- **Result (rev 14):** public `remote::{quote, Nonce, FileMode, AccountName, Identity, RootAccess, OwnerIds, PluginEntry, RootCommand, WpCli, Script, UploadScript}`; refused values are `invalid_input` with a located problem; no new dependencies (the nonce uses std's randomly keyed `RandomState`). Audit and re-audit changes in revision 14. Verified in Debian 12 with sh, dash, bash, zsh, ksh, mksh, yash (ASCII only: it cannot read non-ASCII input under `LC_ALL=C`), busybox ash, and fish, tcsh, csh as login shells, against real WP-CLI 2.12.0.
 - **Depends:** P1.1 · **Parallel:** P1.2–P1.5, P2.x, P0
 
 #### P3.2 — Transport trait, capture, local shell, fake
 - **Goal:** run scripts and capture results safely.
 - **Changes:** `remote/{transport,capture,local}.rs`, `#[cfg(test)] fake.rs`.
 - **Tests:** caps; timeout kills the child; 20 MB stdin hash round-trip; nonce behind noise; 255 remap.
+- **Audit notes (rev 14):** unframe by the line exactly equal to the nonce (P3.1's test helper `after_nonce` shows the rule); a missing nonce line is a failure, never "no output" (startup files that eat the start of stdin are caught that way).
 - **Depends:** P3.1 · **Parallel:** P4.1, P1.x, P2.x
 
 #### P3.3 — SSH transport
@@ -1419,6 +1448,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
     - a hostile `~/.wp-cli/config.yml` and package for the identity have no effect on the probe;
     - `fishy`/`noisy` work.
 - **Audit notes (rev 8):** decide root by the resolved uid/gid 0, never by name (`toor`, numeric ids). Names read from the server (`stat %U/%G`) must pass the §7 user rule before they reach argv or an `UploadScript`: remote names such as `a b` or `x'y` exist. Check that `cli version` really is WP-CLI (`WP_CLI_VERSION`), since `wp_cli` is chosen by the operator.
+- **Audit notes (rev 14):** parse the six-line `stat` (`%u %g %a %F %U %G`, one per line, `RootCommand::stat_ownership`'s contract): decide by ids, refuse anything but `directory`, `UNKNOWN` = no name; names must pass `AccountName`. The login user's stat uses the same format; verify the BSD `stat -f` equivalent. Set `WpCli::allow_root` exactly when the identity's uid is 0 (test it). Independent probe steps need per-statement status capture added to `remote/statement.rs`'s `Body`, or one `Script` per step; build the exact-shape probe with `WpCli`.
 - **Depends:** P4.1, P3.3 · **Parallel:** P1.4, P1.5, P3.4
 
 #### P4.3 — cli: `site test`, `server test`, probe on `site add`
@@ -1433,6 +1463,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** bounded parallel site work with observable progress.
 - **Changes:** `ops/runner.rs`, `progress.rs` (incl. `LogFileReporter`: `0600`, keep newest 50); CLI `commands/wp/render.rs` (`MultiProgress`, plain lines without a TTY).
 - **Tests:** limits and ordering; event delivery; log retention/permissions.
+- **Audit notes (rev 14):** map target locations (`sites[1]`, `groups[0]`, `all_sites`) to the flags typed (`--site`, `--group`, `--all-sites`) with `commands/inventory.rs`'s `name_flags` (deferred from P2.1, which takes no targets).
 - **Depends:** P4.2 · **Parallel:** P4.3, P6.1
 
 #### P5.2 — lib + cli: `apvm wp list`
@@ -1493,6 +1524,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
     - an `ftpsite` tree installed by `ftpuser` with umask `0022` (group `ftpuser`, no setgid) is repaired to `ftpuser:www-data` + `g+rw`(+setgid) without root (as `ftpuser` ∈ `www-data`);
     - with the `--exec` umask relaxation (§6.1), the same install needs no repair.
 - **Audit notes (rev 8):** pass only numeric ids to `chown`, `chgrp` and `find`, and decide root by id (see P4.2).
+- **Audit notes (rev 14):** use `chgrp +<gid>` and `find -uid/-gid` (numeric, name-first lookup otherwise); `find … | head -n 20` with `find`'s own status needs a pipeline statement kind added inside `statement.rs`/`frame`, never hand-written text; root `chown` is per (F, FG) pair; busybox root `chown` has no `--from` → `ownership_unfixable`.
 - **Depends:** P6.2 · **Parallel:** P6.4, P7.1, P8.1
 
 #### P6.4 — Site lock
@@ -1500,6 +1532,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Changes:** `ops/lock.rs`; acquire/release wired into `apply` (and later `run_wp`).
 - **Tests:** goldens; path validation; fake: busy → wait → `site_locked`, stale → broken with warning, release on failure paths; E2E: two concurrent applies on one site serialize.
 - **Audit notes (rev 8):** key the lock, and the same-WordPress warning, on the probe's `realpath` of `path`: through a symlink, two canonical spellings can name one WordPress.
+- **Audit notes (rev 14):** the holder file needs an output-redirect statement kind added in `statement.rs`; `rm -rf` only on a validated path.
 - **Depends:** P6.2 · **Parallel:** P6.3, P7.1, P8.1
 
 ### P7 — Lifecycle front ends
@@ -1553,6 +1586,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Tests:** goldens; path validation (only `<tmp>/apvm.XXXXXXXXXX`); space check; checksum-tool selection; fake mismatch → `upload_corrupted`; stale sweep pattern; E2E: 20 MB upload hash-matches, dir `0700` owned by the identity (incl. `ftpuser:www-data`), removed after success and after failure.
 - **Audit notes (rev 8):** find staging dirs by a literal prefix of `remote_tmp_dir` (it may hold `.` and `+`), never by a regex built from it.
 - **Audit notes (rev 10):** `PluginPackage::main_file()` and header values may hold any character, control characters included: treat them as data (quote, escape before printing), never splice them into a command. Call `inspect` through `spawn_blocking`.
+- **Audit notes (rev 14):** upload through `UploadScript::tee`, restricted to a typed staging path (`<tmp>/apvm.XXXXXXXXXX/package-<n>.zip`) rather than any safe absolute path; `mktemp -d`, `df` and the checksum run in stdin `Script` bodies.
 - **Depends:** P4.2 · **Parallel:** P6.x, P7.x
 
 #### P8.2 — lib: install execution
@@ -1609,6 +1643,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** §6.12 in the library.
 - **Changes:** `wp/classify.rs`, `ops/run.rs`, `SiteManager::run_wp`.
 - **Tests:** classification tables (read-only paths at depth 1–3, `--dry-run` cases incl. `search-replace --dry-run --log/--export` → may-write, every global parameter outside the allowed overrides refused incl. `--exec`/`--require` in any position and `--exec=…` forms, refused commands, `@alias`, two-phase violators); every `wp run` takes the lock; single-target exit codes (WP-CLI's, 254, 255 = not run); hermetic run with arguments holding quotes, backslashes, newlines and `$()` arriving verbatim; a read-only command also acquires and releases the lock, waits for a busy one and then fails with `site_locked`; the lock is released on every exit path; timeouts; per-site results.
+- **Audit notes (rev 14):** `WpCli::arg` already enforces §6.12's global-parameter rule (`allowlist::wp_cli_arg`); the classifier adds the command rules. Treat `post edit`, `config edit` and `--edit` as refused or `may-write` (they run `$EDITOR`, which apvm now unsets). `help` is safe (`PAGER=cat`).
 - **Depends:** P6.4 · **Parallel:** P7.x, P8.x
 
 #### P9.2 — cli: `apvm wp run`
