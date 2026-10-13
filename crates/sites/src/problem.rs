@@ -231,6 +231,14 @@ pub(crate) fn printable(text: &str) -> String {
     out
 }
 
+/// A local path or program in single quotes, for messages: control and
+/// invisible formatting characters escaped as by [`printable`], backslashes
+/// kept single so a Windows path reads as the platform shows it. Use it,
+/// not [`quoted`], for local paths (`quoted` doubles every `\\`).
+pub(crate) fn quoted_path(path: &str) -> String {
+    format!("'{}'", printable(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +317,14 @@ mod tests {
             "unknown field `a\\u{2028}b`"
         );
         assert_eq!(printable("it's C:\\x"), "it's C:\\x");
+    }
+
+    #[test]
+    fn quoted_path_keeps_backslashes_and_escapes_invisible_characters() {
+        assert_eq!(
+            quoted_path("C:\\Users\\RUNNER~1\\kh"),
+            "'C:\\Users\\RUNNER~1\\kh'"
+        );
+        assert_eq!(quoted_path("/tmp/a\u{1b}b"), "'/tmp/a\\u{1b}b'");
     }
 }

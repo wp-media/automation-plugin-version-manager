@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::inventory::EntityKind;
 use crate::inventory::io::FileKind;
 use crate::package::PackageDefect;
-use crate::problem::{Problem, printable, quoted};
+use crate::problem::{Problem, printable, quoted, quoted_path};
 use crate::remote::SshFailure;
 use crate::wp::OutputDefect;
 
@@ -306,7 +306,7 @@ pub enum Error {
     /// A local program a transport runs (`ssh`, or a shell) could not be
     /// started, or reading its output or waiting for it failed. When it
     /// had started, it was killed along with every process it started.
-    #[error("{context} {}: {source}", quoted(program))]
+    #[error("{context} {}: {source}", quoted_path(program))]
     Process {
         /// What failed (`"cannot start"`, `"cannot read the output of"`, …).
         context: &'static str,
@@ -344,7 +344,7 @@ pub enum Error {
 
     /// The ssh program could not be started: it is missing, or not
     /// executable. Nothing ran.
-    #[error("cannot run the ssh program {}: {source}", quoted(program))]
+    #[error("cannot run the ssh program {}: {source}", quoted_path(program))]
     SshMissing {
         /// The program, as configured (`ssh`, or a path).
         program: String,
@@ -358,7 +358,7 @@ pub enum Error {
     /// was sent to a server.
     #[error(
         "the ssh program {} is not a usable OpenSSH client: {reason}",
-        quoted(program)
+        quoted_path(program)
     )]
     SshUnusable {
         /// The program, as configured.

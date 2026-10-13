@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use super::HostKeyPolicy;
 use crate::inventory::ResolvedSsh;
-use crate::problem::{Problem, quoted};
+use crate::problem::{Problem, quoted_path};
 
 /// The `known_hosts_file` field.
 const KNOWN_HOSTS: &str = "known_hosts_file";
@@ -291,7 +291,7 @@ fn no_home(field: &'static str, value: &str) -> Problem {
         field,
         format!(
             "{} starts with '~', but no home directory is known",
-            quoted(value)
+            quoted_path(value)
         ),
     )
 }
@@ -535,7 +535,7 @@ fn system_includable(system: &Path) -> Result<(), Problem> {
              its own, but refuses to include it, as apvm must (set ssh_config_file to a file of \
              your own, or have that one belong to root and not be writable by its group or \
              others)",
-            quoted(&system.to_string_lossy())
+            quoted_path(&system.to_string_lossy())
         ),
     ))
 }
@@ -622,7 +622,7 @@ fn new_file_directory(file: &LocalPath) -> Result<(), Problem> {
                 "does not exist yet, and neither does its directory {}, so a new host key \
                  could not be kept (create the directory, mode 0700, or set known_hosts_file \
                  to a file in an existing one)",
-                quoted(&directory.to_string_lossy())
+                quoted_path(&directory.to_string_lossy())
             ),
         )),
     }
@@ -671,7 +671,7 @@ fn writable(_file: &LocalPath, _path: &Path, _reason: &str) -> Result<(), Proble
 fn problem(file: &LocalPath, reason: &str) -> Problem {
     Problem::new(
         file.field,
-        format!("{} {reason}", quoted(&file.path.to_string_lossy())),
+        format!("{} {reason}", quoted_path(&file.path.to_string_lossy())),
     )
 }
 
@@ -832,6 +832,24 @@ mod tests {
         let problems = check(files, host_keys).unwrap_err();
         assert_eq!(problems.len(), 1, "{problems:?}");
         problems[0].to_string()
+    }
+
+    #[test]
+    fn messages_show_windows_paths_with_single_backslashes() {
+        // Checked on every platform: `\\` is an ordinary file-name character
+        // on Unix, so the Windows-only CI failure is caught everywhere.
+        let file = LocalPath {
+            field: "known_hosts_file",
+            path: PathBuf::from(r"C:\Users\RUNNER~1\kh"),
+        };
+        assert_eq!(
+            problem(&file, "is odd").to_string(),
+            r"known_hosts_file: 'C:\Users\RUNNER~1\kh' is odd"
+        );
+        assert_eq!(
+            no_home("identity_file", r"~\.ssh\id").to_string(),
+            r"identity_file: '~\.ssh\id' starts with '~', but no home directory is known"
+        );
     }
 
     #[test]

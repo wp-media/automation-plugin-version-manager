@@ -43,7 +43,7 @@ use std::path::Path;
 use super::HostKeyPolicy;
 use crate::allowlist::is_forbidden;
 use crate::inventory::ResolvedServer;
-use crate::problem::quoted;
+use crate::problem::quoted_path;
 
 /// `ServerAliveInterval` (plan §6.1 item 7): seconds without data before
 /// ssh asks the server whether it is still there.
@@ -324,7 +324,7 @@ fn utf8(path: &Path) -> Result<&str, String> {
     path.to_str().ok_or_else(|| {
         format!(
             "{} is not valid UTF-8, so ssh_config cannot name it",
-            quoted(&path.to_string_lossy())
+            quoted_path(&path.to_string_lossy())
         )
     })
 }
@@ -336,7 +336,7 @@ fn utf8(path: &Path) -> Result<&str, String> {
 /// * `text` - The path
 /// * `reason` - Why
 fn refusal(text: &str, reason: &str) -> String {
-    format!("{} {reason}", quoted(text))
+    format!("{} {reason}", quoted_path(text))
 }
 
 /// A character for messages: `'x'`, or its code point when it is not
@@ -701,6 +701,15 @@ mod tests {
             message,
             "'/a b' holds ' ': ssh pastes it unquoted into the shell command that reaches a \
              jump host, so only letters, digits, '.', '_', '/', ':', '+' and '-' are allowed"
+        );
+    }
+
+    #[test]
+    fn refusals_show_backslashes_as_written() {
+        let refused = config_path(Path::new(r"/tmp/a\b"), PathUse::Identity, Platform::Unix);
+        assert_eq!(
+            refused,
+            Err(r"'/tmp/a\b' holds '\', which ssh would read as an escape".to_string())
         );
     }
 }
