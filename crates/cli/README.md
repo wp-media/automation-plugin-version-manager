@@ -13,6 +13,7 @@ This crate produces the `apvm` binary. All heavy logic is delegated to [`apvm-co
 | `info`      | Show details about a plugin (repo, slugs, variants, version, tools)         |
 | `cache`     | Inspect and maintain the artifact cache                                     |
 | `config`    | View or change configuration settings                                       |
+| `server`    | Manage the SSH servers of the site inventory (never connects to them)       |
 | `skill`     | Install or remove the Claude Code skill for apvm (project-local or global)  |
 | `update`    | Download and install the latest APVM release                                |
 | `uninstall` | Remove the APVM binary from this system                                     |
@@ -279,12 +280,75 @@ Input values are sanitized before storage:
 - **`APVM_CACHE_DIR`** — Overrides the artifact cache directory for the current invocation. Takes precedence over the config `cache-dir` and the default `~/.apvm/cache`, and is honored by both builds and the `cache` command. Useful for CI or local testing: point it at a throwaway directory so a run never reads from or warms your real cache.
 - **`GITHUB_TOKEN`** / **`GH_TOKEN`** — Fallback GitHub token when none is in config.
 - **`RUST_LOG`** — Enables logging (`debug`, `trace`, …) on stderr. Independent of `--verbose`, which shows the build commands' own output; while logging, the build spinner is hidden.
+- **`APVM_INVENTORY`** — Uses another site inventory file instead of `~/.apvm/inventory.json` for the current invocation (see [Server Command](#server-command)). An empty value means the default.
 - **`APVM_NO_UPDATE_CHECK`** — Set to any non-empty value to disable the automatic background update check and its notice (see [Update Command](#update-command)).
 
 ```sh
 # Build against an ephemeral cache; your real cache is left untouched
 APVM_CACHE_DIR="$(mktemp -d)" apvm build imagify develop ./out
 ```
+
+## Server Command
+
+Manages the SSH **servers** of the site inventory (`~/.apvm/inventory.json`,
+or `APVM_INVENTORY`) and the SSH **defaults** every server inherits. It never
+connects to the servers (no SSH): the file is read or edited only. The inventory
+itself (format, validation, locking, atomic `0600` writes) lives in the
+[`apvm-sites`](../sites/README.md) library; the CLI adds the flags, the
+confirmation, and the rendering.
+
+```sh
+# Default SSH settings every server inherits (no flags: show them)
+apvm server defaults --user deploy --key ~/.ssh/id_ed25519 --connect-timeout 20
+apvm server defaults --jump bastion.example.com --known-hosts ~/.ssh/apvm_known_hosts
+apvm server defaults --unset connect-timeout,jump
+apvm server defaults --json
+
+# Servers (<HOST> may be an ~/.ssh/config alias)
+apvm server add eu-1 --host 203.0.113.10 --user ubuntu --name "EU VPS"
+apvm server add behind --host 10.0.0.5 --jump bastion.example.com
+apvm server edit eu-1 --port 2222 --unset name
+apvm server list [--json]
+apvm server show eu-1 [--json]     # record + effective SSH settings and their source
+apvm server remove eu-1 [--cascade] [-y]
+```
+
+| Subcommand | Flags |
+|------------|-------|
+| `defaults` | the SSH flags (`--key` is the one main key), `--ssh-binary`, `--unset <FIELD>` (repeatable or comma-separated), `--json` |
+| `add <ID>` | `--host` (required), the SSH flags, `--name`, `--notes` |
+| `edit <ID>` | the `add` flags (`--host` optional) and `--unset <FIELD>`; at least one change |
+| `list`, `show <ID>` | `--json` |
+| `remove <ID>` | `--cascade` (also remove its sites; they leave their groups), `-y`/`--yes` |
+
+The SSH flags are `--user`, `--port`, `--key`, `--connect-timeout`, `--jump`,
+`--known-hosts`, `--ssh-config` and `--multiplex`/`--no-multiplex`; a
+server's own value wins over the default. `--unset` takes the flag's name
+(`--unset key,jump`); the host cannot be unset.
+
+Behavior:
+
+- Every change is one locked read-modify-write, so concurrent `apvm`
+  processes never lose each other's edits; a refused change writes nothing,
+  and a change that changes nothing writes nothing.
+- Refused values exit 1 and name the flag you typed, one problem per line
+  (`--port: must be between 1 and 65535`); an empty value in `edit` or
+  `defaults` adds `to clear it: --unset <field>`. Argument errors (clap)
+  exit 2.
+- A relative `--key`, `--known-hosts`, `--ssh-config` or `--ssh-binary` (with
+  a path separator) is saved with a warning, since ssh would resolve it from
+  wherever apvm later runs; only a value the command changes is warned about.
+- An inventory file that does not parse or breaks a rule fails every command
+  with its located problems (`servers[1].host: …`) and is never rewritten. One
+  written by a newer apvm is read-only: reads warn, changes fail.
+- `remove` asks for confirmation unless `-y`; without a terminal on stdin it
+  fails instead of asking (pass `-y` in scripts). It is refused while sites
+  use the server unless `--cascade`, and refused (`inventory_changed`) when
+  the server, its sites or their groups change while you answer.
+- `--json` (`list`, `show`, `defaults`) prints `{"schema": 1, …}` on stdout;
+  failures then print `{"schema": 1, "error": {"code", "message",
+  "problems"}}` too, with the stable codes of `apvm-sites`
+  (`invalid_input`, `inventory_invalid`, `inventory_read_only`, …).
 
 ## Skill Command
 
@@ -423,6 +487,7 @@ A token is **required** for private repositories and PR builds. It is optional f
 | `~/.apvm/config.json`       | Configuration file                            |
 | `~/.apvm/update-check.json` | Background update-notifier state (throttle)   |
 | `~/.apvm/cache/`            | Default artifact cache store                  |
+| `~/.apvm/inventory.json`    | Site inventory (`APVM_INVENTORY` overrides)   |
 
 These defaults are determined using the [`directories`](https://docs.rs/directories/6) crate for cross-platform home directory resolution.
 
@@ -480,6 +545,7 @@ cargo build
 | [tempfile](https://docs.rs/tempfile/3)             | 3       | Staging downloaded binaries       |
 | [apvm-core](../core/README.md)                    | workspace | Core build and git logic        |
 | [apvm-config](../config/)                          | workspace | Configuration types             |
+| [apvm-sites](../sites/README.md)                   | workspace | Site inventory (servers, sites, groups) |
 | [apvm-storage](../storage/)                        | workspace | Artifact storage                |
 
 ## Running Tests

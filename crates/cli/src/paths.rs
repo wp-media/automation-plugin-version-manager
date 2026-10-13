@@ -9,16 +9,23 @@
 //! ~/.apvm/                    (base APVM directory)
 //! ├── config.json             (config_file)
 //! ├── update-check.json       (update_state_file — background notifier state)
+//! ├── inventory.json          (inventory_file — servers, sites and groups)
+//! ├── ssh-mux/                (ssh_control_dir — OpenSSH multiplexing sockets)
+//! ├── logs/sites/             (sites_logs_dir — site operation run logs)
 //! └── cache/                  (cache_dir — the artifact cache store)
 //! ```
+//!
+//! The site file names come from [`apvm_sites::layout`], so the CLI and the
+//! Node bindings share the same files.
 //!
 //! Note: Repository cloning uses automatic temp directories that are
 //! cleaned up after builds complete. The artifact cache under `cache_dir`
 //! is the only persistent store.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use apvm_config::Config;
+use apvm_sites::layout;
 
 /// CLI application paths.
 ///
@@ -43,6 +50,12 @@ pub struct Paths {
     update_state_file: PathBuf,
     /// Artifact cache directory.
     cache_dir: PathBuf,
+    /// Site inventory file (servers, sites, groups).
+    inventory_file: PathBuf,
+    /// Directory of OpenSSH multiplexing sockets.
+    ssh_control_dir: PathBuf,
+    /// Directory of site operation run logs.
+    sites_logs_dir: PathBuf,
 }
 
 impl Paths {
@@ -52,6 +65,9 @@ impl Paths {
     /// - `config_file` = `{apvm_dir}/config.json`
     /// - `update_state_file` = `{apvm_dir}/update-check.json`
     /// - `cache_dir` = `{apvm_dir}/cache`
+    /// - `inventory_file` = `{apvm_dir}/inventory.json`
+    /// - `ssh_control_dir` = `{apvm_dir}/ssh-mux`
+    /// - `sites_logs_dir` = `{apvm_dir}/logs/sites`
     ///
     /// # Arguments
     ///
@@ -61,6 +77,11 @@ impl Paths {
             config_file: apvm_dir.join("config.json"),
             update_state_file: apvm_dir.join("update-check.json"),
             cache_dir: apvm_dir.join("cache"),
+            inventory_file: apvm_dir.join(layout::INVENTORY_FILE_NAME),
+            ssh_control_dir: apvm_dir.join(layout::SSH_CONTROL_DIR_NAME),
+            sites_logs_dir: layout::SITES_LOG_DIR
+                .iter()
+                .fold(apvm_dir, |dir, part| dir.join(part)),
         }
     }
 
@@ -76,6 +97,35 @@ impl Paths {
     /// bookkeeping into the user-facing configuration.
     pub fn update_state_file(&self) -> &PathBuf {
         &self.update_state_file
+    }
+
+    /// The site inventory file to use: `env_override` (the `APVM_INVENTORY`
+    /// value, from [`apvm_sites::inventory::io::env_override`]) when set,
+    /// else the default `~/.apvm/inventory.json`.
+    ///
+    /// # Arguments
+    ///
+    /// * `env_override` - The override path, if any
+    pub fn inventory_file(&self, env_override: Option<PathBuf>) -> PathBuf {
+        env_override.unwrap_or_else(|| self.inventory_file.clone())
+    }
+
+    /// Get the directory of OpenSSH multiplexing sockets (`~/.apvm/ssh-mux`).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the SSH transport (plan P3.4)")
+    )]
+    pub fn ssh_control_dir(&self) -> &Path {
+        &self.ssh_control_dir
+    }
+
+    /// Get the directory of site operation run logs (`~/.apvm/logs/sites`).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the run log (plan P5.1)")
+    )]
+    pub fn sites_logs_dir(&self) -> &Path {
+        &self.sites_logs_dir
     }
 
     /// Convert to a Config for the core library.
@@ -116,6 +166,35 @@ mod tests {
         assert_eq!(
             paths.update_state_file().parent(),
             paths.config_file().parent()
+        );
+    }
+
+    #[test]
+    fn new_derives_the_site_paths_from_the_shared_layout_names() {
+        let paths = Paths::new(PathBuf::from("/var/lib/apvm"));
+
+        assert_eq!(
+            paths.inventory_file(None),
+            PathBuf::from("/var/lib/apvm/inventory.json")
+        );
+        assert_eq!(paths.ssh_control_dir(), Path::new("/var/lib/apvm/ssh-mux"));
+        assert_eq!(
+            paths.sites_logs_dir(),
+            Path::new("/var/lib/apvm/logs/sites")
+        );
+    }
+
+    #[test]
+    fn inventory_file_prefers_the_override() {
+        let paths = Paths::new(PathBuf::from("/base"));
+
+        assert_eq!(
+            paths.inventory_file(None),
+            PathBuf::from("/base/inventory.json")
+        );
+        assert_eq!(
+            paths.inventory_file(Some(PathBuf::from("/tmp/inv.json"))),
+            PathBuf::from("/tmp/inv.json")
         );
     }
 

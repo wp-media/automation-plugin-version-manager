@@ -20,6 +20,7 @@
 // Each integration-test binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -100,6 +101,12 @@ impl Sandbox {
         self.home().join(".apvm").join("config.json")
     }
 
+    /// `~/.apvm/inventory.json` inside the fake home: the default site
+    /// inventory.
+    pub fn inventory_file(&self) -> PathBuf {
+        self.home().join(".apvm").join("inventory.json")
+    }
+
     /// `~/.claude/skills/apvm-cli` inside the fake home.
     pub fn global_skill_dir(&self) -> PathBuf {
         self.home().join(".claude").join("skills").join("apvm-cli")
@@ -137,6 +144,23 @@ impl Sandbox {
     /// Run the test's `apvm` binary with `args` and empty stdin.
     pub fn run(&self, args: &[&str]) -> Output {
         self.run_binary(Path::new(APVM), args, "")
+    }
+
+    /// Run the test's `apvm` binary with `args`, empty stdin, and the extra
+    /// environment variables `env` (e.g. `APVM_INVENTORY`).
+    pub fn run_with_env(&self, args: &[&str], env: &[(&str, &OsStr)]) -> Output {
+        spawn_retrying_busy(|| {
+            self.command_for(Path::new(APVM))
+                .args(args)
+                .envs(env.iter().copied())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .expect("apvm must be spawnable")
+        .wait_with_output()
+        .expect("apvm must finish")
     }
 
     /// Run `binary` with `args`, feeding `stdin` and then closing it.

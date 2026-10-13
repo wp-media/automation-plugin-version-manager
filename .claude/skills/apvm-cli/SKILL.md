@@ -1,7 +1,7 @@
 ---
 name: apvm-cli
-description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm skill` (install/uninstall this Claude Code skill), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
-when_to_use: Trigger on requests like "build backwpup from PR 123", "what plugins does apvm know about", "clean the apvm cache", "set my GitHub token for apvm", "update apvm", "download the latest release of imagify", "install the apvm skill", or any direct `apvm <subcommand>` invocation. Also trigger when the user references a plugin artifact path under `~/.apvm/` or asks about the WP Media plugin version manager.
+description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm server` (the site inventory's SSH servers and default SSH settings, `~/.apvm/inventory.json`), `apvm skill` (install/uninstall this Claude Code skill), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
+when_to_use: Trigger on requests like "build backwpup from PR 123", "what plugins does apvm know about", "clean the apvm cache", "set my GitHub token for apvm", "update apvm", "download the latest release of imagify", "install the apvm skill", "add a server to apvm", "set apvm's default SSH key", or any direct `apvm <subcommand>` invocation. Also trigger when the user references a plugin artifact path under `~/.apvm/` or asks about the WP Media plugin version manager.
 allowed-tools: Bash(apvm *)
 ---
 
@@ -53,6 +53,11 @@ Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.3.0**
   **stderr** as the last output, suggesting `apvm update`. The check and notice
   are skipped when stderr is not a TTY (pipes/CI) and never change the exit
   code — only `apvm update` itself can fail.
+- **`APVM_INVENTORY=<path>`** — use another site inventory file instead of
+  `~/.apvm/inventory.json` for one invocation (all `apvm server` commands). An
+  empty value means the default; a relative path is relative to the current
+  directory. Like `APVM_CACHE_DIR`, only set it when asked to isolate (tests,
+  CI, developing apvm itself).
 - **`APVM_NO_UPDATE_CHECK=<non-empty>`** — disable the automatic update check
   and its notice entirely (e.g. `APVM_NO_UPDATE_CHECK=1`). `NO_COLOR` also
   applies to the notice.
@@ -65,6 +70,7 @@ Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.3.0**
 | `~/.apvm/config.json`      | Configuration file                          |
 | `~/.apvm/update-check.json`| Background update-notifier state (throttle) |
 | `~/.apvm/cache/`           | Default artifact cache store (SQLite)       |
+| `~/.apvm/inventory.json`   | Site inventory: servers, sites, groups (`0600`; `APVM_INVENTORY` overrides) |
 
 ---
 
@@ -335,6 +341,47 @@ apvm config unset token
 
 ---
 
+### `apvm server <SUBCMD>`
+
+Manages the SSH **servers** of the site inventory (`~/.apvm/inventory.json`,
+or `APVM_INVENTORY`) and the SSH **defaults** every server inherits. It never
+connects to the servers (no SSH): it edits the file only. Full reference
+(every flag and rule, output, `--json` shapes, error codes):
+[references/sites.md](references/sites.md).
+
+SSH flags (shared by `defaults`, `add`, `edit`): `[--user] [--port] [--key]
+[--connect-timeout] [--jump] [--known-hosts] [--ssh-config] [--multiplex |
+--no-multiplex]`.
+
+| Subcommand | Arguments |
+|------------|-----------|
+| `defaults` | `[SSH flags] [--ssh-binary] [--unset <FIELD>]… [--json]` — no change flags = show; `--key` is the one main key |
+| `add <ID>` | `--host <HOST> [SSH flags] [--name] [--notes]` |
+| `edit <ID>` | the `add` flags + `[--unset <FIELD>]…` (at least one change; `<FIELD>` is the flag's name, e.g. `--unset key,jump`) |
+| `list` / `show <ID>` | `[--json]` — `show` prints the effective (merged) SSH settings and where each comes from |
+| `remove <ID>` | `[--cascade] [-y\|--yes]` — refused while sites use it unless `--cascade`; asks first, and **needs `-y` when stdin is not a terminal** |
+
+- Every change is one locked, atomic edit: concurrent apvm processes never
+  lose each other's edits; a refused change writes nothing.
+- Refused input exits 1 and names the flag (`--port: must be between 1 and
+  65535`); an empty value (`--notes ""`) is refused with `to clear it:
+  --unset notes`. An invalid inventory file is never rewritten (fix it by
+  hand); one written by a newer apvm is read-only.
+- A relative `--key`/`--known-hosts`/`--ssh-config`/`--ssh-binary` path is
+  saved with a `warn` line (resolved from wherever apvm later runs): prefer
+  absolute or `~/` paths.
+
+```sh
+apvm server defaults --user deploy --key ~/.ssh/id_ed25519
+apvm server add eu-1 --host 203.0.113.10 --user ubuntu
+apvm server edit eu-1 --port 2222 --unset name
+apvm server list --json
+apvm server show eu-1
+apvm server remove eu-1 --cascade -y
+```
+
+---
+
 ### `apvm skill <SUBCMD> [-g|--global]`
 
 Installs or removes **this very skill** (`apvm-cli`) as a
@@ -463,6 +510,11 @@ Required for private repos and PR builds. Recommended for public repos
 | `… refusing to use <dir> as an artifact store: it is not an apvm cache, yet already contains '<entry>' …` | The cache dir holds other data: anything at all when a cache would be created there, or store-shaped dirs without apvm's `.apvm.lock` file (whatever `apvm.db` holds). Nothing was changed. Point the cache at a new or empty directory (source: `APVM_CACHE_DIR` if set, else config `cache-dir`, else `~/.apvm/cache`). |
 | `Error: IO error: cannot access cache directory '<path>': …` / `… is a symbolic link to a missing target` | `<path>` is the effective cache dir (as above). One of its components is a regular file, a parent can't be traversed, or the dir is a dangling symlink. Fix or re-point it — note `apvm config get cache-dir` shows the config/default only, not `APVM_CACHE_DIR`. On Windows such a path may just print "Cache is empty". |
 | `Error: Cache error: cannot list store directory <dir>: …`      | The cache dir exists but can't be read (permissions). apvm refuses rather than mistake it for an empty cache. Fix its permissions. |
+| `Error: invalid server '<id>':` + one `--flag: …` line per problem | The listed flag values break a rule (see [references/sites.md](references/sites.md)); nothing was written. |
+| `Error: <path>: invalid inventory:` + `servers[N].…` lines | The inventory file was edited by hand into an invalid state. apvm never rewrites it: fix the listed fields (or point `APVM_INVENTORY` elsewhere). |
+| `… is read-only: upgrade apvm to change it`                      | The inventory was written by a newer apvm. Reads work; run `apvm update` to edit it. |
+| `cannot lock the inventory with <path>.lock: another process held it for 10 s` | Another apvm process is stuck holding the inventory lock (apvm adds: `edits hold the lock for milliseconds, so that process is likely stuck: stop it, then retry`). Nothing was written. |
+| `server '<id>' or its sites changed while you were confirming; nothing was removed` | Another process changed the server, its sites or their groups during the `remove` prompt. Run the command again. |
 | `Error: failed to determine home directory`                      | `HOME` unset on Unix / `USERPROFILE` unset on Windows. Rare; set the env var.     |
 | `Error: --ver required` (BackWPup)                               | Pass `-v 5.1.0` (or whatever version). See `apvm info backwpup` for the default. |
 | `Warning: --ver ignored for '<plugin>'`                          | Plugin has `Embedded`/`Optional` version handling but you passed `--ver`. Harmless for `Optional` (it rewrites source); for `Embedded` it's rejected. |
@@ -488,6 +540,8 @@ apvm cache verify           # integrity check (exits 1 on issues)
 
 - [references/git-refs.md](references/git-refs.md) — full git reference format
   guide (auto-detection, explicit prefixes, `tag:` / `release:` keyword refs).
+- [references/sites.md](references/sites.md) — the site inventory and
+  `apvm server` (flags, rules, output, `--json`, error codes).
 - Source of truth: `crates/cli/src/main.rs`, `crates/cli/src/commands/*.rs`,
   and `crates/cli/README.md` in this repo.
 - Always trust `apvm <command> --help` over this file when they disagree —

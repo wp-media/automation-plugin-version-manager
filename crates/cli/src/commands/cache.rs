@@ -17,7 +17,7 @@
 //! swallowed so a build still succeeds), errors here surface normally: the
 //! user explicitly asked for the operation.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::Path;
 
 use clap::{Args, Subcommand};
@@ -27,6 +27,8 @@ use apvm_core::maintenance::{
     CacheMaintenance, CleanReport, CleanRequest, CleanTarget, GcReport, ProjectUsage, RepairReport,
     UsageReport, VerifyIssue, VerifyMode, VerifyProblem,
 };
+
+use crate::prompt;
 
 /// Arguments for the `cache` command.
 #[derive(Args, Debug)]
@@ -561,30 +563,17 @@ fn with_hint(err: Error, offer_repair: bool) -> Error {
     }
 }
 
-/// Prompt on stderr for a yes/no answer; `true` only for `y`/`yes`.
-fn confirm(prompt: &str) -> apvm_core::Result<bool> {
-    eprint!("{prompt}");
-    io::stderr().flush().map_err(|e| {
-        Error::Io(io::Error::new(
-            e.kind(),
-            format!("failed to flush stderr: {e}"),
-        ))
-    })?;
-    let mut input = String::new();
-    io::stdin().lock().read_line(&mut input).map_err(|e| {
-        Error::Io(io::Error::new(
-            e.kind(),
-            format!("failed to read input: {e}"),
-        ))
-    })?;
-    Ok(is_yes(&input))
-}
+/// How `cache clear`'s prompt words its I/O failures (as before it moved
+/// onto the shared [`prompt`] module).
+const PROMPT_WORDING: prompt::Wording = prompt::Wording {
+    write: "failed to flush stderr",
+    read: "failed to read input",
+};
 
-/// Whether a typed answer means yes: `y` or `yes`, any case, surrounding
-/// whitespace ignored. Anything else — including nothing — is no.
-fn is_yes(answer: &str) -> bool {
-    let answer = answer.trim().to_ascii_lowercase();
-    answer == "y" || answer == "yes"
+/// Prompt on stderr for a yes/no answer read from stdin (a terminal or a
+/// pipe); `true` only for `y`/`yes` ([`prompt::is_affirmative`]).
+fn confirm(question: &str) -> apvm_core::Result<bool> {
+    prompt::confirm_worded(question, PROMPT_WORDING).map_err(Error::Io)
 }
 
 /// Format a byte count with a binary (KiB/MiB/GiB) unit and one decimal.
@@ -605,6 +594,8 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The answer rule `cache clear` relies on, now the shared one.
+    use crate::prompt::is_affirmative as is_yes;
 
     #[test]
     fn human_bytes_scales() {

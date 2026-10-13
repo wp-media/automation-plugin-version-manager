@@ -27,11 +27,14 @@
 //! inside the `bin/` directory, which lets us remove that directory too.
 //! Source: <https://docs.rs/self-replace/1.5.0/self_replace/fn.self_delete_outside_path.html>
 
-use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use apvm_core::error::{Error, Result};
 
+use crate::prompt::confirm;
+// The unit tests below check the shared answer rule this command relies on.
+#[cfg(test)]
+use crate::prompt::is_affirmative;
 use crate::status::{bold, dim, info, success, warn, yellow};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,47 +80,6 @@ fn resolve_bin_dir(exe_path: &std::path::Path) -> Result<PathBuf> {
         .parent()
         .map(|p| p.to_path_buf())
         .ok_or_else(|| Error::Uninstall("Binary path has no parent directory".into()))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// User confirmation
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Prompt the user for yes/no confirmation on stdin.
-///
-/// Returns `true` if the user types `y` or `yes` (case-insensitive).
-/// Returns `false` for anything else (including empty input / just pressing Enter).
-///
-/// # Sources
-///
-/// - [`std::io::stdin`]: standard input handle.
-///   <https://doc.rust-lang.org/std/io/fn.stdin.html>
-/// - [`std::io::BufRead::read_line`]: reads a line from the buffered reader.
-///   <https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line>
-/// - [`std::io::Write::flush`]: ensures the prompt is displayed before blocking.
-///   <https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush>
-fn confirm(prompt: &str) -> Result<bool> {
-    eprint!("{prompt}");
-
-    io::stderr()
-        .flush()
-        .map_err(|e| Error::Uninstall(format!("Failed to flush stderr: {e}")))?;
-
-    let mut input = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut input)
-        .map_err(|e| Error::Uninstall(format!("Failed to read user input: {e}")))?;
-
-    Ok(is_affirmative(&input))
-}
-
-/// Whether a raw confirmation answer means "yes": exactly `y` or `yes`,
-/// ignoring surrounding whitespace and case. Anything else — including an
-/// empty line — is a refusal, so a stray Enter never uninstalls.
-fn is_affirmative(input: &str) -> bool {
-    let answer = input.trim().to_lowercase();
-    answer == "y" || answer == "yes"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -213,7 +175,8 @@ pub fn execute(skip_confirm: bool) -> Result<()> {
         let confirmed = confirm(&format!(
             "  {} ",
             yellow("? Are you sure you want to uninstall apvm? [y/N]")
-        ))?;
+        ))
+        .map_err(|e| Error::Uninstall(e.to_string()))?;
 
         if !confirmed {
             eprintln!();

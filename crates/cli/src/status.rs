@@ -58,6 +58,16 @@ pub fn warn(msg: &str) {
     emit(Kind::Warn, msg);
 }
 
+/// A warning line (`warn  msg`) exactly as [`warn`] prints it, without the
+/// trailing newline, for output that goes through an injected writer.
+///
+/// # Arguments
+///
+/// * `msg` - The message text (never styled)
+pub fn warn_line(msg: &str) -> String {
+    line(Kind::Warn, msg, color::colors_enabled(Stream::Stderr))
+}
+
 /// Print an error line (`error msg`) to stderr.
 pub fn error(msg: &str) {
     emit(Kind::Error, msg);
@@ -111,6 +121,13 @@ mod tests {
             line(Kind::Error, "failed", true),
             "\x1b[31merror\x1b[0m failed"
         );
+    }
+
+    #[test]
+    fn warn_line_keeps_the_message_and_prefix() {
+        let rendered = warn_line("careful");
+        assert!(rendered.contains("warn"), "{rendered:?}");
+        assert!(rendered.ends_with("  careful"), "{rendered:?}");
     }
 
     #[test]

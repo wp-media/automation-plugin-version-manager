@@ -56,6 +56,13 @@ pub const SKILL_FILES: &[EmbeddedFile] = &[
             "/../../.claude/skills/apvm-cli/references/git-refs.md"
         )),
     },
+    EmbeddedFile {
+        rel_path: "references/sites.md",
+        contents: include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.claude/skills/apvm-cli/references/sites.md"
+        )),
+    },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

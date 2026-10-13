@@ -7,6 +7,7 @@ mod color;
 mod commands;
 mod defaults;
 mod paths;
+mod prompt;
 mod sanitize;
 mod status;
 mod update_check;
@@ -16,10 +17,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use apvm_core::Apvm;
 use apvm_core::config_io::load_config_file;
-use apvm_core::{Apvm, Result};
+use apvm_sites::inventory::io as inventory_io;
 
-use crate::commands::{BuildArgs, CacheArgs, ConfigArgs, InfoArgs, SkillArgs};
+use crate::commands::{BuildArgs, CacheArgs, ConfigArgs, InfoArgs, ServerArgs, SkillArgs};
 use crate::paths::Paths;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,6 +68,8 @@ enum Commands {
     Cache(CacheArgs),
     /// View or change configuration settings
     Config(ConfigArgs),
+    /// Manage the SSH servers of the site inventory (never connects to them)
+    Server(ServerArgs),
     /// Install or remove the Claude Code skill for apvm (project-local or global)
     Skill(SkillArgs),
     /// Update apvm to the latest version
@@ -152,34 +156,47 @@ async fn run() -> ExitCode {
     }
 }
 
+/// Why a command failed: an `apvm-core` error, or an inventory command's
+/// own failure (which renders its problems one per line). [`run`] prints it
+/// after `Error: ` and exits with status 1.
+type CommandError = Box<dyn std::error::Error>;
+
 /// Dispatch to the appropriate command handler.
 ///
 /// Separated from [`run`] so the update-notifier orchestration stays free of
 /// per-command branching. Each handler owns its user-facing success output;
 /// this returns the command's `Result` for [`run`] to map to an exit code.
-async fn dispatch(cli: Cli, paths: &Paths) -> Result<()> {
+async fn dispatch(cli: Cli, paths: &Paths) -> std::result::Result<(), CommandError> {
     // Default configuration derived from the standard paths.
     let default_config = paths.to_config();
 
     // Config command doesn't need APVM instance — handle it early
     if let Commands::Config(args) = &cli.command {
-        return args.execute(paths);
+        return Ok(args.execute(paths)?);
     }
 
     // Update command has its own GitHub client — handle it early
     if matches!(cli.command, Commands::Update) {
-        return commands::update::execute(paths).await;
+        return Ok(commands::update::execute(paths).await?);
     }
 
     // Skill command is self-contained (embedded files, no network) — handle
     // it early
     if let Commands::Skill(args) = &cli.command {
-        return args.execute(cli.verbose);
+        return Ok(args.execute(cli.verbose)?);
     }
 
     // Uninstall command is self-contained — handle it early
     if let Commands::Uninstall { yes } = &cli.command {
-        return commands::uninstall::execute(*yes);
+        return Ok(commands::uninstall::execute(*yes)?);
+    }
+
+    // Inventory commands never connect to the servers (no SSH) and need
+    // neither the config file nor a GitHub client. APVM_INVENTORY (when set and not empty) replaces the
+    // default ~/.apvm/inventory.json.
+    if let Commands::Server(args) = &cli.command {
+        let inventory = paths.inventory_file(inventory_io::env_override());
+        return Ok(args.execute(&inventory)?);
     }
 
     // Load config: file values override defaults, missing fields use defaults.
@@ -195,7 +212,7 @@ async fn dispatch(cli: Cli, paths: &Paths) -> Result<()> {
     // GitHub client — handle it before creating the APVM instance. It works
     // regardless of the `cache` on/off setting.
     if let Commands::Cache(args) = &cli.command {
-        return args.execute(&config.cache_dir);
+        return Ok(args.execute(&config.cache_dir)?);
     }
 
     // Create APVM instance with automatic token resolution
@@ -222,6 +239,7 @@ async fn dispatch(cli: Cli, paths: &Paths) -> Result<()> {
         }
         Commands::Cache(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
+        Commands::Server(_) => unreachable!("handled above"),
         Commands::Skill(_) => unreachable!("handled above"),
         Commands::Update => unreachable!("handled above"),
         Commands::Uninstall { .. } => unreachable!("handled above"),

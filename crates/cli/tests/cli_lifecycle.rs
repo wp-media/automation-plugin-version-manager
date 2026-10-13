@@ -15,7 +15,7 @@ use std::path::Path;
 use common::{Sandbox, assert_exit, repo_skill_file, stderr};
 
 /// Files the binary embeds and installs, relative to the skill directory.
-const SKILL_FILES: [&str; 2] = ["SKILL.md", "references/git-refs.md"];
+const SKILL_FILES: [&str; 3] = ["SKILL.md", "references/git-refs.md", "references/sites.md"];
 
 /// Assert `dir` holds a byte-exact copy of every embedded skill file.
 #[track_caller]

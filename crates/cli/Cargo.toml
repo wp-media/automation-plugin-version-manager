@@ -22,6 +22,7 @@ vendored-openssl = ["dep:openssl"]
 # Internal crates
 apvm-config = { workspace = true }
 apvm-core = { workspace = true }
+apvm-sites = { workspace = true }
 apvm-storage = { workspace = true }
 
 # CLI argument parsing
