@@ -127,11 +127,15 @@ pub enum Error {
         supported: u32,
     },
 
-    /// A record (or the defaults) handed to the inventory breaks one or more
-    /// rules. Nothing was changed.
+    /// A value handed to the library breaks one or more rules: a record
+    /// (or the defaults) handed to the inventory, in which case nothing was
+    /// changed, or a value refused while building a remote script (an
+    /// account name, a path, a WP-CLI token or argument, a nonce, a file
+    /// mode, a root command's owners).
     #[error("invalid {subject}: {}", Problem::join(problems))]
     InvalidInput {
-        /// What was rejected, such as `site 'shop'` or `defaults`.
+        /// What was rejected, such as `site 'shop'`, `defaults` or
+        /// `WP-CLI command`.
         subject: String,
         /// Every problem found; locations are relative to the record.
         problems: Vec<Problem>,

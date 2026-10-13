@@ -1,7 +1,8 @@
 //! Path-like values: remote directories, local files ssh reads, the WP-CLI
-//! command, and variant markers.
+//! command and its arguments, and variant markers.
 
-use super::{FORBIDDEN_CHARS, Rule, Word, describe, is_forbidden, is_name_char};
+use super::{FORBIDDEN_CHARS, Rule, Word, describe, is_forbidden, is_name_char, url};
+use crate::problem::Scope;
 
 /// Longest path accepted, in bytes (Linux `PATH_MAX`).
 const PATH_MAX_BYTES: usize = 4096;
@@ -11,7 +12,7 @@ const MARKER_PATH_MAX_BYTES: usize = 1024;
 const NEEDLE_MAX_BYTES: usize = 256;
 /// Most tokens a site's `wp_cli` command may have: a PHP interpreter, both
 /// [`PHP_FLAGS`] and the WP-CLI script.
-pub(crate) const WP_CLI_MAX_TOKENS: usize = 2 + PHP_FLAGS.len();
+const WP_CLI_MAX_TOKENS: usize = 2 + PHP_FLAGS.len();
 /// PHP options allowed between the interpreter and the WP-CLI script. Both
 /// only change how PHP starts (`-n`: no php.ini; `-q`: no CGI headers);
 /// options that run code (`-r`, `-d auto_prepend_file=…`, …) are refused.
@@ -78,16 +79,19 @@ pub(crate) fn remote_path(value: &str) -> Rule {
     Ok(())
 }
 
-/// The remote temporary directory: a [`remote_path`] of `[A-Za-z0-9._/+-]`
-/// only, the upload-script allowlist, so the inventory never accepts a
-/// directory an upload would refuse (plan §6.1, §7).
+/// A value of an upload script (plan §6.1): `^[A-Za-z0-9._/+-]+$` without a
+/// leading `-`, at most 4096 characters. Such a value is literal inside
+/// single quotes under every login shell P0 tested (fish reads `\\` and
+/// `\'` there as escapes), so it needs no escaping.
+pub(crate) fn upload_value(value: &str) -> Rule {
+    SAFE.check(value)
+}
+
+/// The remote temporary directory: a [`remote_path`] that is also an
+/// [`upload_value`], so the inventory never accepts a directory an upload
+/// would refuse (plan §6.1, §7).
 pub(crate) fn remote_tmp_dir(value: &str) -> Rule {
-    if let Some(bad) = value.chars().find(|c| !is_safe_char(*c)) {
-        return Err(format!(
-            "contains {}; only {SAFE_CHARS} are allowed",
-            describe(bad)
-        ));
-    }
+    upload_value(value)?;
     remote_path(value)
 }
 
@@ -155,6 +159,39 @@ pub(crate) fn known_hosts_file(value: &str) -> Rule {
     Ok(())
 }
 
+/// Rules for a site's `wp_cli`: one program, or a PHP interpreter, its
+/// allowed options and an absolute WP-CLI script. Only an interpreter may
+/// take arguments, so WP-CLI cannot be wrapped in another program.
+///
+/// # Arguments
+///
+/// * `argv` - The `wp_cli` tokens
+/// * `scope` - Where problems go, located as `wp_cli` or `wp_cli[<i>]`
+pub(crate) fn wp_cli(argv: &[String], scope: &mut Scope<'_>) {
+    let Some((program, rest)) = argv.split_first() else {
+        scope.problem("wp_cli", "must name the WP-CLI program");
+        return;
+    };
+    if argv.len() > WP_CLI_MAX_TOKENS {
+        let message = format!(
+            "must have at most {WP_CLI_MAX_TOKENS} tokens: a PHP interpreter, its -n and -q \
+             options, and the WP-CLI script"
+        );
+        scope.problem("wp_cli", message);
+        return;
+    }
+    let Some((script, options)) = rest.split_last() else {
+        scope.check("wp_cli[0]", wp_cli_program(program));
+        return;
+    };
+    scope.check("wp_cli[0]", php_interpreter(program));
+    for (index, option) in options.iter().enumerate() {
+        scope.check(&format!("wp_cli[{}]", index + 1), php_flag(option));
+    }
+    let at = format!("wp_cli[{}]", options.len() + 1);
+    scope.check(&at, wp_cli_script(script));
+}
+
 /// The program WP-CLI runs as (`wp_cli[0]`): a command name found in `PATH`,
 /// or an absolute canonical path, of `[A-Za-z0-9._/+-]` with no leading `-`.
 /// It follows `env WP_CLI_CONFIG_PATH=/dev/null` (plan §6.1), where a
@@ -219,6 +256,123 @@ pub(crate) fn wp_cli_script(value: &str) -> Rule {
         return Err("must be an absolute path (WP-CLI runs from '/')".into());
     }
     remote_path(value)
+}
+
+/// WP-CLI 2.12's global parameters: the `config-spec.php` entries with a
+/// command-line form. WP-CLI reads one anywhere in its arguments, after the
+/// subcommand and after `--` included, by its exact (case-sensitive) name.
+const WP_CLI_GLOBALS: [&str; 17] = [
+    "allow-root",
+    "blog",
+    "color",
+    "context",
+    "debug",
+    "exec",
+    "http",
+    "path",
+    "prompt",
+    "quiet",
+    "require",
+    "skip-packages",
+    "skip-plugins",
+    "skip-themes",
+    "ssh",
+    "url",
+    "user",
+];
+/// The global parameters an argument may set as `--<name>=<value>` (plan
+/// §6.12's allowed overrides).
+const WP_CLI_VALUE_OVERRIDES: [&str; 5] = ["url", "user", "skip-plugins", "skip-themes", "debug"];
+/// The global parameters an argument may set as a bare `--<name>`.
+const WP_CLI_FLAG_OVERRIDES: [&str; 4] = ["skip-plugins", "skip-themes", "debug", "quiet"];
+/// The allowed overrides, for messages.
+const WP_CLI_OVERRIDES: &str =
+    "--url=…, --user=…, --skip-plugins[=…], --skip-themes[=…], --debug[=…] and --quiet";
+
+/// How WP-CLI reads an argument that starts with `--` (its
+/// `Configurator::extract_assoc`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WpCliOption<'a> {
+    /// `--<name>`: the parameter set to true.
+    Flag(&'a str),
+    /// `--no-<name>`: the parameter set to false.
+    Negated(&'a str),
+    /// `--<name>=<value>`.
+    Value(&'a str),
+}
+
+/// Read `arg` the way WP-CLI 2.12 does: `--no-<name>`, `--<name>` or
+/// `--<name>=<value>`, where `<name>` is not empty and holds no `=`.
+///
+/// # Arguments
+///
+/// * `arg` - One argument
+///
+/// # Returns
+///
+/// The option form and its name, or `None` for a positional argument.
+fn wp_cli_option(arg: &str) -> Option<WpCliOption<'_>> {
+    let rest = arg.strip_prefix("--")?;
+    if let Some((name, _)) = rest.split_once('=') {
+        return (!name.is_empty()).then_some(WpCliOption::Value(name));
+    }
+    match rest.strip_prefix("no-") {
+        Some(name) if !name.is_empty() => Some(WpCliOption::Negated(name)),
+        _ => (!rest.is_empty()).then_some(WpCliOption::Flag(rest)),
+    }
+}
+
+/// An argument apvm passes to WP-CLI after its own (plan §6.12): any
+/// character but NUL, and no WP-CLI global parameter except the allowed
+/// overrides (`--url=…`, `--user=…`, `--skip-plugins[=…]`,
+/// `--skip-themes[=…]`, `--debug[=…]`, `--quiet`). WP-CLI reads globals
+/// anywhere, so `--require=…` or `--exec=…` would run code, `--path`,
+/// `--ssh` or `--http` would target another site, and `--no-skip-packages`
+/// would undo apvm's own setting. A `--url=…` value must be a valid site
+/// URL. A first argument starting with `@` (an
+/// alias) is refused too.
+///
+/// # Arguments
+///
+/// * `arg` - The argument
+/// * `first` - Whether it is the first argument after apvm's own
+pub(crate) fn wp_cli_arg(arg: &str, first: bool) -> Rule {
+    if arg.contains('\0') {
+        return Err("contains U+0000 (NUL)".into());
+    }
+    if first && arg.starts_with('@') {
+        return Err("must not be a WP-CLI alias ('@…'): apvm picks the site".into());
+    }
+    let allowed = match wp_cli_option(arg) {
+        Some(WpCliOption::Value(name)) if WP_CLI_GLOBALS.contains(&name) => {
+            WP_CLI_VALUE_OVERRIDES.contains(&name)
+        }
+        Some(WpCliOption::Flag(name)) if WP_CLI_GLOBALS.contains(&name) => {
+            WP_CLI_FLAG_OVERRIDES.contains(&name)
+        }
+        Some(WpCliOption::Negated(name)) => !WP_CLI_GLOBALS.contains(&name),
+        _ => true,
+    };
+    if !allowed {
+        return Err(format!(
+            "is a WP-CLI global parameter that apvm sets or refuses; only {WP_CLI_OVERRIDES} \
+             are allowed"
+        ));
+    }
+    url_override(arg)
+}
+
+/// The value of a `--url=…` override must pass the same rule as a site URL:
+/// WP-CLI keeps the last `--url`, so it replaces the one apvm checked.
+///
+/// # Arguments
+///
+/// * `arg` - An argument already known to be allowed
+fn url_override(arg: &str) -> Rule {
+    match arg.strip_prefix("--url=") {
+        Some(value) => url(value).map_err(|reason| format!("is a '--url=' whose URL {reason}")),
+        None => Ok(()),
+    }
 }
 
 /// A variant marker path: relative to the plugin directory, canonical, at
@@ -543,5 +697,175 @@ mod tests {
                 (&too_long, "at most 256 bytes"),
             ],
         );
+    }
+
+    #[test]
+    fn upload_values() {
+        // `^[A-Za-z0-9._/+-]+$` without a leading '-', against every ASCII
+        // character and a few others.
+        let others = ['é', '\u{a0}', '\u{2028}', '😀', '\u{ff0f}'];
+        for c in (0u8..=127).map(char::from).chain(others) {
+            let allowed = c.is_ascii_alphanumeric() || "._/+-".contains(c);
+            let value = format!("a{c}b");
+            assert_eq!(upload_value(&value).is_ok(), allowed, "{c:?}");
+            // The temporary directory rule admits the same characters.
+            let dir = format!("/a{c}b");
+            assert_eq!(remote_tmp_dir(&dir).is_ok(), allowed, "{c:?}");
+        }
+        let longest = "a".repeat(4096);
+        let too_long = "a".repeat(4097);
+        table(
+            upload_value,
+            &["x-", "/tmp/apvm.Ab3/package-1.zip", "a+b", &longest],
+            &[
+                ("", "must not be empty"),
+                ("-x", "other than '-'"),
+                ("a'b", "'\\''"),
+                ("a\\b", "'\\\\'"),
+                ("a b", "U+0020"),
+                (&too_long, "at most 4096 characters"),
+            ],
+        );
+    }
+
+    /// [`wp_cli_arg`] as a rule for a first argument.
+    fn first_wp_cli_arg(arg: &str) -> Rule {
+        wp_cli_arg(arg, true)
+    }
+
+    /// [`wp_cli_arg`] as a rule for a later argument.
+    fn later_wp_cli_arg(arg: &str) -> Rule {
+        wp_cli_arg(arg, false)
+    }
+
+    #[test]
+    fn wp_cli_args_refuse_global_parameters_but_the_overrides() {
+        const GLOBAL: &str = "WP-CLI global parameter";
+        // WP-CLI 2.12 matches names exactly (no abbreviations, case
+        // sensitive), reads `--` as a positional argument, and a value
+        // with a trailing newline is part of the name (verified).
+        let ok = [
+            "plugin",
+            "it's $(id) \\ \n é",
+            "--format=json",
+            "--skip-plugins",
+            "--skip-plugins=akismet,hello",
+            "--skip-themes",
+            "--skip-themes=twentytwenty",
+            "--debug",
+            "--debug=bootstrap",
+            "--quiet",
+            "--url=https://shop.example.com/sub",
+            "--user=admin",
+            "--req=/tmp/x.php",
+            "--REQUIRE=/tmp/x.php",
+            "--require\n",
+            "--no-foo",
+            "--no-",
+            "--",
+            "--=x",
+            "-",
+            "-r",
+            "@alias",
+        ];
+        let refused = [
+            ("--require=/tmp/x.php", GLOBAL),
+            ("--require", GLOBAL),
+            ("--no-require", GLOBAL),
+            ("--exec=system('id');", GLOBAL),
+            ("--exec", GLOBAL),
+            ("--path=/srv/other", GLOBAL),
+            ("--path", GLOBAL),
+            ("--ssh=evil.example.com", GLOBAL),
+            ("--http=https://evil.example.com", GLOBAL),
+            ("--blog=https://x", GLOBAL),
+            ("--context=admin", GLOBAL),
+            ("--color", GLOBAL),
+            ("--no-color", GLOBAL),
+            ("--prompt", GLOBAL),
+            ("--prompt=user", GLOBAL),
+            ("--allow-root", GLOBAL),
+            ("--skip-packages", GLOBAL),
+            ("--skip-packages=0", GLOBAL),
+            ("--no-skip-packages", GLOBAL),
+            ("--no-skip-plugins", GLOBAL),
+            ("--no-skip-themes", GLOBAL),
+            ("--no-debug", GLOBAL),
+            ("--no-quiet", GLOBAL),
+            ("--no-url", GLOBAL),
+            ("--no-user", GLOBAL),
+            ("--url", GLOBAL),
+            ("--user", GLOBAL),
+            ("--quiet=1", GLOBAL),
+            ("a\0b", "U+0000"),
+            ("--url=https://user@x.example.com", "user info"),
+            ("--url=https://x.example.com/a\nb", "--url="),
+            ("--url=ftp://x.example.com", "--url="),
+            ("--url=", "--url="),
+        ];
+        table(later_wp_cli_arg, &ok, &refused);
+        let mut first_ok = ok.to_vec();
+        first_ok.retain(|arg| !arg.starts_with('@'));
+        let mut first_refused = refused.to_vec();
+        first_refused.extend([("@alias", "alias"), ("@all", "alias"), ("@", "alias")]);
+        table(first_wp_cli_arg, &first_ok, &first_refused);
+    }
+
+    #[test]
+    fn every_wp_cli_global_is_refused_in_every_other_form() {
+        for name in WP_CLI_GLOBALS {
+            // `--url=` values must also be valid URLs (`url_override`).
+            let sample = if name == "url" {
+                "https://x.example.com"
+            } else {
+                "x"
+            };
+            let value = format!("--{name}={sample}");
+            let flag = format!("--{name}");
+            let negated = format!("--no-{name}");
+            let value_ok = WP_CLI_VALUE_OVERRIDES.contains(&name);
+            let flag_ok = WP_CLI_FLAG_OVERRIDES.contains(&name);
+            assert_eq!(later_wp_cli_arg(&value).is_ok(), value_ok, "{value}");
+            assert_eq!(later_wp_cli_arg(&flag).is_ok(), flag_ok, "{flag}");
+            assert!(later_wp_cli_arg(&negated).is_err(), "{negated}");
+        }
+        // The overrides are exactly plan §6.12's list.
+        let mut overrides: Vec<&str> = WP_CLI_VALUE_OVERRIDES
+            .iter()
+            .chain(&WP_CLI_FLAG_OVERRIDES)
+            .copied()
+            .collect();
+        overrides.sort_unstable();
+        overrides.dedup();
+        assert_eq!(
+            overrides,
+            [
+                "debug",
+                "quiet",
+                "skip-plugins",
+                "skip-themes",
+                "url",
+                "user"
+            ]
+        );
+    }
+
+    #[test]
+    fn wp_cli_options_are_read_like_wp_cli_does() {
+        let cases = [
+            ("--a", Some(WpCliOption::Flag("a"))),
+            ("--no-a", Some(WpCliOption::Negated("a"))),
+            ("--no-a=1", Some(WpCliOption::Value("no-a"))),
+            ("--a=", Some(WpCliOption::Value("a"))),
+            ("--a=b=c", Some(WpCliOption::Value("a"))),
+            ("--no-", Some(WpCliOption::Flag("no-"))),
+            ("--", None),
+            ("--=a", None),
+            ("-a", None),
+            ("a", None),
+        ];
+        for (arg, expected) in cases {
+            assert_eq!(wp_cli_option(arg), expected, "{arg:?}");
+        }
     }
 }

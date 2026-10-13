@@ -10,15 +10,20 @@
 //!
 //! - this module: names, ids, numbers and free text;
 //! - [`net`]: site URLs and SSH jump hosts;
-//! - [`paths`]: remote and local paths, the WP-CLI command, variant markers.
+//! - [`paths`]: remote and local paths, the WP-CLI command and its
+//!   arguments, upload-script values, variant markers.
 
 mod net;
 mod paths;
 
 pub(crate) use net::{proxy_jump, url};
+/// Only the tests outside `paths` call it; the library reaches it through
+/// [`remote_tmp_dir`].
+#[cfg(test)]
+pub(crate) use paths::upload_value;
 pub(crate) use paths::{
-    WP_CLI_MAX_TOKENS, known_hosts_file, marker_path, needle, php_flag, php_interpreter,
-    remote_path, remote_tmp_dir, ssh_path, wp_cli_program, wp_cli_script,
+    known_hosts_file, marker_path, needle, remote_path, remote_tmp_dir, ssh_path, wp_cli,
+    wp_cli_arg,
 };
 
 /// A rule's verdict: `Err` holds the reason the value is refused.

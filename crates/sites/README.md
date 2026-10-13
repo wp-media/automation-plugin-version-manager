@@ -7,11 +7,12 @@ apvm-core's build-and-install path. The design and the phase plan are in
 
 **Status:** phase P1 (foundations): the data layer (P1.1), inventory
 persistence (P1.2), settings and targets (P1.3), the plugin hint types that
-apvm-core fills (P1.4) and local package inspection (P1.5). It has the
-inventory model and its validation, safe reading and writing of the
-inventory file, settings resolution and target selection, plugin hints,
-plugin zip inspection and the shared file names. SSH, WP-CLI and the plugin
-operations arrive in later phases.
+apvm-core fills (P1.4) and local package inspection (P1.5); phase P3.1
+adds the remote script builder. It has the inventory model and its
+validation, safe reading and writing of the inventory file, settings
+resolution and target selection, plugin hints, plugin zip inspection, the
+shared file names, and the scripts apvm will run on servers. Running them
+over SSH, WP-CLI parsing and the plugin operations arrive in later phases.
 
 ## Design rules
 
@@ -189,6 +190,28 @@ breaks (`PackageDefect`):
 Inspection hashes and decompresses: run it on a blocking thread in async
 code.
 
+## Remote scripts (`remote`)
+
+Every script apvm sends to a server is built from typed parts, so an unsafe
+one cannot be built (plan §6.1). sshd runs commands through the login shell
+(bash, dash, zsh, fish, tcsh, …), so data never reaches that shell:
+
+| Type | What it is |
+|---|---|
+| `Script` | stdin delivery: the remote command is `sh -s`, the script travels on stdin, and values are POSIX-quoted (`quote`), so they may hold any character but NUL |
+| `UploadScript` | upload delivery (stdin carries a file): `sh -c '<script>'`, parsed by the login shell, so its values must match `^[A-Za-z0-9._/+-]+$` and its one-line template has neither `\\` nor `\'` |
+| `Identity` | who runs a command: the login user, `sudo -n -u U [-g G] --` or `runuser -u U -g G --`; names follow the user rule (`AccountName`) |
+| `RootCommand` + `RootAccess` | the closed set of root commands, through `sudo -n -u root --` or a root login: `stat` of a directory (uid, gid, mode, file type, then the names, one per line) or of a plugin entry (its file type), and the guarded `chown -R -P -h --from=+F:+FG -- +U:+G` of `mirror-root` sites (numeric ids: GNU `chown` would read a bare `1001` as a user name first) |
+| `WpCli` | `env -u EDITOR -u PHPRC … -u WP_CONFIG_PATH WP_CLI_CONFIG_PATH=/dev/null PAGER=cat <wp_cli> --skip-packages --exec='umask(umask() & ~0<g>);' --path=… [--url=…] <args>`, with `<g>` from the plugins directory's `FileMode`. `env -u` removes the 18 variables that make WP-CLI 2.12 or PHP load code, run another program or behave differently (`WP_CLI_REQUIRE`, `EDITOR`, `WP_CLI_CACHE_DIR`, `WP_CLI_EARLY_REQUIRE`, `PHPRC`, `PHP_INI_SCAN_DIR`, `WP_CLI_ALLOW_ROOT`, …). Arguments may hold any character but NUL, but cannot set a WP-CLI global parameter (WP-CLI reads them anywhere, even after `--`) other than plan §6.12's overrides: `--url=…` (a valid site URL), `--user=…`, `--skip-plugins[=…]`, `--skip-themes[=…]`, `--debug[=…]`, `--quiet` |
+| `Nonce` | the per-call random marker; only stdout after its line is the payload |
+
+Every script is one brace group, `{ LC_ALL=C; export LC_ALL … }`: the shell
+reads it whole before running any of it, so a script cut short runs
+nothing. It prints the nonce, runs its command from `/` with stdin from
+`/dev/null`, and exits with the command's status, 255 mapped to 254 (a 255
+always means ssh failed). No shell ever runs under `sudo` or `runuser`.
+Refused values are `invalid_input` errors naming the rule.
+
 ## Errors
 
 `Error::code()` returns a stable `Code`:
@@ -204,7 +227,9 @@ code.
 - `inventory_changed`: the file changed since it was loaded, so a guarded
   save (`save_if_unchanged`) wrote nothing;
 - `invalid_input`: a refused record, a taken or unknown id, a server in use,
-  or invalid hints;
+  invalid hints, or a value refused while building a remote script (an
+  account name, a path, a WP-CLI token or argument, a nonce, a file mode,
+  a root command's owners);
 - `package_invalid`: a plugin zip that breaks an inspection rule.
 
 `Error::problems()` lists the located problems, so a front end can print
@@ -244,7 +269,21 @@ cargo test -p apvm-sites
   crate would read differently, and ZIP64 end records), damaged and
   encrypted entries, other compression methods, WordPress header parsing
   (8 KiB window, CRLF, a multibyte character cut at the boundary) and
-  variant markers, plus a small fuzz test (mutated zips never panic).
+  variant markers, plus a small fuzz test (mutated zips never panic);
+- remote scripts: goldens per delivery mode, identity, root command and
+  plugins directory mode; the upload allowlist and template rules; the
+  WP-CLI global parameters an argument may not set; and, on Unix, real
+  shells (whichever are installed): thousands of hostile and generated
+  values quoted through `sh`, `bash`, `dash`, `zsh`, `ksh`, `mksh`, `yash`
+  and busybox (`-s` and `-c`) arrive byte for byte (yash gets ASCII
+  values only: it cannot read other bytes under the C locale); framed
+  WP-CLI scripts deliver their argv, `LC_ALL=C`, `WP_CLI_CONFIG_PATH`,
+  `PAGER=cat`, the removed variables and `/` as working directory, never
+  run text after the script, and map 255 to 254; a script cut at any byte
+  runs nothing; uploads stream 1 MiB byte for byte through every installed
+  login shell (fish, tcsh and csh too, where installed); GNU `stat` and
+  `chown` accept the root commands (Linux). Every child process is killed
+  after 30 s.
 
 `tests/inventory.rs` loads the example document of the plan through the
 public API; `tests/targets.rs` resolves targets and settings on it.

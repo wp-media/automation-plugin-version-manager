@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use serde_json::{Map, Value};
 
 use super::model::{Defaults, Document, Group, Owner, Record, RunAs, Server, Site, SshSettings};
-use crate::allowlist::{self, Rule, WP_CLI_MAX_TOKENS};
+use crate::allowlist::{self, Rule};
 use crate::problem::{FirstSeen, Problem, Scope, quoted};
 
 /// Most characters in a record's `name`.
@@ -214,7 +214,7 @@ fn site(record: &Site, scope: &mut Scope<'_>, servers: &HashSet<&str>) {
 /// the directories and the timeout.
 fn site_execution(record: &Site, scope: &mut Scope<'_>) {
     if let Some(argv) = &record.wp_cli {
-        wp_cli(argv, scope);
+        allowlist::wp_cli(argv, scope);
     }
     let allow_root = record.allow_root == Some(true);
     let run_as = |run_as: &RunAs| run_as_rule(run_as, allow_root);
@@ -229,37 +229,6 @@ fn site_execution(record: &Site, scope: &mut Scope<'_>) {
         let verdict = allowlist::seconds(secs, COMMAND_TIMEOUT_MAX_SECS);
         scope.check("command_timeout_secs", verdict);
     }
-}
-
-/// Rules for a site's `wp_cli`: one program, or a PHP interpreter, its
-/// allowed options and an absolute WP-CLI script. Only an interpreter may
-/// take arguments, so WP-CLI cannot be wrapped in another program.
-fn wp_cli(argv: &[String], scope: &mut Scope<'_>) {
-    let Some((program, rest)) = argv.split_first() else {
-        scope.problem("wp_cli", "must name the WP-CLI program");
-        return;
-    };
-    if argv.len() > WP_CLI_MAX_TOKENS {
-        let message = format!(
-            "must have at most {WP_CLI_MAX_TOKENS} tokens: a PHP interpreter, its -n and -q \
-             options, and the WP-CLI script"
-        );
-        scope.problem("wp_cli", message);
-        return;
-    }
-    let Some((script, options)) = rest.split_last() else {
-        scope.check("wp_cli[0]", allowlist::wp_cli_program(program));
-        return;
-    };
-    scope.check("wp_cli[0]", allowlist::php_interpreter(program));
-    for (index, option) in options.iter().enumerate() {
-        scope.check(
-            &format!("wp_cli[{}]", index + 1),
-            allowlist::php_flag(option),
-        );
-    }
-    let at = format!("wp_cli[{}]", options.len() + 1);
-    scope.check(&at, allowlist::wp_cli_script(script));
 }
 
 /// Rules for `run_as`: a valid user that is not a keyword, and root only

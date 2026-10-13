@@ -4,7 +4,7 @@
 //! `apvm server|site|group` and `apvm wp`, the Node bindings, and apvm-core's
 //! build-and-install path (design: `docs/plans/site-deployment.md`).
 //!
-//! This version holds the data layer:
+//! This version holds the data layer and the remote script builder:
 //!
 //! - [`Inventory`]: servers, the WordPress sites on them, groups of sites,
 //!   and default SSH settings, read from and written to the
@@ -25,6 +25,10 @@
 //! - [`PluginPackage`]: a plugin zip inspected locally before an install
 //!   (single plugin folder, safe paths, size limits, headers read as
 //!   WordPress reads them, variant markers, SHA-256).
+//! - [`remote`]: the scripts apvm runs on a server: POSIX quoting, framed
+//!   scripts for stdin (`sh -s`) and upload (`sh -c`) delivery, identity
+//!   prefixes (`sudo -n -u U -g G`, `runuser`), the closed set of root
+//!   commands, and the hermetic WP-CLI command.
 //! - [`Error`] with stable [`Code`]s for the CLI's `--json` and the Node
 //!   bindings.
 //!
@@ -74,6 +78,7 @@ pub mod inventory;
 pub mod layout;
 pub mod package;
 mod problem;
+pub mod remote;
 
 pub use error::{Code, Error, Result};
 pub use hints::{FamilyTraits, PluginHint, PluginHints, ProjectHints, VariantHint, VariantMarker};
