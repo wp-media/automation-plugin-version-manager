@@ -1,0 +1,4 @@
+# Captured WP-CLI outputs are test inputs that must stay byte-exact: a
+# Windows checkout with core.autocrlf=true would turn their LF into CRLF, so
+# the parsers would see bytes WP-CLI never printed.
+crates/sites/tests/fixtures/** -text
