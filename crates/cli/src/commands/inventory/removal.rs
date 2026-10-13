@@ -1,6 +1,7 @@
-//! Removals that ask first (`server remove`, `site remove`): show what
-//! would go, ask once (unless `-y`), then remove in one `io::update` that
-//! refuses when what would go is no longer what the user confirmed.
+//! Removals that ask first (`server remove`, `site remove`, `group remove`):
+//! show what would go, ask once (unless `-y`), then remove in one
+//! `io::update` that refuses when what would go is no longer what the user
+//! confirmed.
 //!
 //! The question is built from a preview on a plain load (no lock is held
 //! while a person reads it), so another process may change the inventory

@@ -1,5 +1,5 @@
 //! End-to-end tests of the site-inventory commands (`apvm server …`,
-//! `apvm site …`) through the real binary: the file on disk
+//! `apvm site …`, `apvm group …`) through the real binary: the file on disk
 //! (`~/.apvm/inventory.json` or `APVM_INVENTORY`), its `0600` mode, exit
 //! codes, `--json`, `--cascade`, confirmation, and the inventory states that
 //! must never be rewritten (invalid, newer, locked, symlinked).
@@ -950,12 +950,7 @@ fn site_list_filters_and_json() {
     );
     assert_eq!(
         stderr(&out),
-        format!(
-            "Error: group 'nope' does not exist\n  apvm has no group commands yet: add the group \
-             to the 'groups' list of the inventory file by hand, as {{\"id\": \"<ID>\", \
-             \"sites\": []}}, or from Node with SiteInventory\n  the inventory file is {:?}\n",
-            sandbox.inventory_file()
-        )
+        "Error: group 'nope' does not exist\n  'apvm group list' shows the groups\n"
     );
 }
 
@@ -1023,12 +1018,7 @@ fn site_invalid_input_exits_1_naming_the_flags_and_writes_nothing() {
 fn site_ids_and_groups_exit_1_with_a_remedy() {
     let sandbox = Sandbox::new();
     write_inventory(&sandbox, SAMPLE);
-    let group_error = format!(
-        "Error: group 'nope' does not exist\n  apvm has no group commands yet: add the group to \
-         the 'groups' list of the inventory file by hand, as {{\"id\": \"<ID>\", \"sites\": []}}, \
-         or from Node with SiteInventory\n  the inventory file is {:?}\n",
-        sandbox.inventory_file()
-    );
+    let group_error = "Error: group 'nope' does not exist\n  'apvm group list' shows the groups\n";
     for (args, message) in [
         (
             &["site", "add", "shop", "--server", "eu-1", "--path", "/x"][..],
@@ -1043,7 +1033,7 @@ fn site_ids_and_groups_exit_1_with_a_remedy() {
             &[
                 "site", "add", "x", "--server", "eu-1", "--path", "/x", "--group", "nope",
             ],
-            group_error.as_str(),
+            group_error,
         ),
         (
             &["site", "remove", "nope", "-y"],
@@ -1185,4 +1175,327 @@ fn concurrent_site_adds_from_many_processes_all_land() {
     assert_eq!(stored, ids);
     let members = doc["groups"][0]["sites"].as_array().map(Vec::len);
     assert_eq!(members, Some(1 + ids.len()), "every group join landed too");
+}
+
+// ── apvm group ───────────────────────────────────────────────────────────
+
+#[test]
+fn group_add_edit_show_list_remove_round_trip() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let file = sandbox.inventory_file();
+
+    let out = sandbox.run(&[
+        "group",
+        "add",
+        "web",
+        "blog,shop",
+        "blog",
+        "--notes",
+        "front",
+    ]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "Added group 'web'.\nIt lists 2 sites: 'blog', 'shop'.\n"
+    );
+    assert!(stderr(&out).is_empty(), "{}", stderr(&out));
+    assert_eq!(mode(&file), 0o600, "a rewrite stays private");
+    assert_eq!(
+        inventory_json(&sandbox)["groups"],
+        serde_json::json!([
+            {"id": "qa", "sites": ["shop"]},
+            {"id": "web", "sites": ["blog", "shop"], "notes": "front"}
+        ])
+    );
+
+    let out = sandbox.run(&[
+        "group", "edit", "web", "--remove", "blog", "--unset", "notes",
+    ]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "Updated group 'web': sites, notes.\nRemoved 1 site from it: 'blog'.\n"
+    );
+    let out = sandbox.run(&["group", "edit", "qa", "--add", "blog"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "Updated group 'qa': sites.\nAdded 1 site to it: 'blog'.\n"
+    );
+
+    let out = sandbox.run(&["group", "list"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "ID   SITES  MEMBERS\nqa   2      shop, blog\nweb  1      shop\n"
+    );
+    let out = sandbox.run(&["group", "show", "qa"]);
+    assert_exit(&out, 0);
+    assert_eq!(stdout(&out), "Group 'qa'\n  sites  shop, blog\n");
+    let out = sandbox.run(&["site", "show", "blog", "--json"]);
+    assert_eq!(
+        json_stdout(&out)["site"]["groups"],
+        serde_json::json!(["qa"])
+    );
+
+    let out = sandbox.run(&["group", "remove", "web", "-y"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "Removed group 'web'.\nThe sites it listed stay in the inventory: 'shop'.\n"
+    );
+    let out = sandbox.run(&["group", "edit", "qa", "--remove", "blog"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        inventory_json(&sandbox),
+        serde_json::from_str::<serde_json::Value>(SAMPLE).expect("JSON"),
+        "back to the start, every site kept"
+    );
+}
+
+#[test]
+fn group_reads_of_a_missing_inventory_create_nothing() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&["group", "list"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "No groups yet. Add one with: apvm group add <ID> [<SITE>…]\n"
+    );
+    let out = sandbox.run(&["group", "list", "--json"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        json_stdout(&out),
+        serde_json::json!({"schema": 1, "groups": []})
+    );
+    assert_exit(&sandbox.run(&["group", "show", "qa"]), 1);
+    assert_exit(&sandbox.run(&["group", "add", "qa", "shop"]), 1);
+    assert!(!sandbox.inventory_file().exists(), "nothing was written");
+}
+
+#[test]
+fn bare_group_command_prints_usage_with_exit_2() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&["group"]);
+    assert_exit(&out, 2);
+    for sub in ["add", "edit", "list", "show", "remove"] {
+        assert!(
+            stderr(&out).contains(sub),
+            "usage lists `{sub}`:\n{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn group_unknown_sites_and_ids_exit_1_with_a_remedy() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let unknown_site = "Error: site 'nope' does not exist\n  'apvm site list' shows the sites\n";
+    let unknown_group =
+        "Error: group 'nope' does not exist\n  'apvm group list' shows the groups\n";
+    for (args, message) in [
+        (&["group", "add", "web", "shop", "nope"][..], unknown_site),
+        (&["group", "edit", "qa", "--add", "blog,nope"], unknown_site),
+        (&["group", "edit", "qa", "--remove", "nope"], unknown_site),
+        (&["group", "edit", "nope", "--add", "blog"], unknown_group),
+        (&["group", "show", "nope"], unknown_group),
+        (&["group", "remove", "nope", "-y"], unknown_group),
+        (
+            &["group", "add", "qa"],
+            "Error: group 'qa' already exists\n  \
+             change it with 'apvm group edit', or choose another id\n",
+        ),
+        (
+            &["group", "add", "QA"],
+            "Error: invalid group 'QA':\n  <ID>: contains 'Q'; only lowercase letters, digits, \
+             '.', '_' and '-' are allowed\n",
+        ),
+        (
+            &["group", "edit", "qa", "--notes", ""],
+            "Error: invalid group 'qa':\n  --notes: must not be empty (omit it instead)\n  \
+             to clear it: --unset notes\n",
+        ),
+    ] {
+        let out = sandbox.run(args);
+        assert_exit(&out, 1);
+        assert_eq!(stderr(&out), message, "{args:?}");
+        assert!(stdout(&out).is_empty(), "{args:?}");
+    }
+    let out = sandbox.run(&["group", "show", "nope", "--json"]);
+    assert_exit(&out, 1);
+    assert_eq!(
+        json_stdout(&out),
+        serde_json::json!({
+            "schema": 1,
+            "error": {"code": "invalid_input", "message": "group 'nope' does not exist", "problems": []}
+        })
+    );
+    assert_eq!(inventory_text(&sandbox), SAMPLE);
+}
+
+#[test]
+fn group_contradicting_and_malformed_arguments() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    for (args, message) in [
+        (
+            &["group", "edit", "qa", "--add", "blog", "--remove", "blog"][..],
+            "Error: --add 'blog' and --remove 'blog' contradict each other: pass only one\n",
+        ),
+        (
+            &["group", "edit", "qa", "--notes", "n", "--unset", "notes"],
+            "Error: --notes and --unset notes contradict each other: pass only one\n",
+        ),
+    ] {
+        let out = sandbox.run(args);
+        assert_exit(&out, 1);
+        assert_eq!(stderr(&out), message, "{args:?}");
+    }
+    for args in [
+        &["group", "add"][..],
+        &["group", "edit", "qa"],
+        &["group", "edit", "qa", "--unset", "sites"],
+        &["group", "add", "web", "--json"],
+        &["group", "remove", "qa", "--cascade"],
+    ] {
+        assert_exit(&sandbox.run(args), 2);
+    }
+    assert_eq!(inventory_text(&sandbox), SAMPLE);
+}
+
+#[test]
+fn group_remove_without_a_terminal_needs_yes_even_with_a_piped_answer() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let out = sandbox.run_binary(Path::new(common::APVM), &["group", "remove", "qa"], "y\n");
+    assert_exit(&out, 1);
+    assert_eq!(
+        stderr(&out),
+        "Error: not removing group 'qa': it needs a confirmation, and stdin is not a terminal; \
+         pass -y (--yes) to remove it without asking\n"
+    );
+    assert_eq!(inventory_text(&sandbox), SAMPLE);
+}
+
+#[test]
+fn removing_a_site_or_its_server_takes_it_out_of_every_group() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    assert_exit(&sandbox.run(&["group", "add", "all", "shop,blog"]), 0);
+
+    let out = sandbox.run(&["site", "remove", "shop", "-y"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "Removed site 'shop'.\nIt was removed from 2 groups: 'qa', 'all'.\n"
+    );
+    let out = sandbox.run(&["group", "list"]);
+    assert_eq!(
+        stdout(&out),
+        "ID   SITES  MEMBERS\nqa   0\nall  1      blog\n"
+    );
+
+    assert_exit(
+        &sandbox.run(&["server", "remove", "eu-1", "--cascade", "-y"]),
+        0,
+    );
+    let out = sandbox.run(&["group", "show", "all", "--json"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        json_stdout(&out),
+        serde_json::json!({"schema": 1, "group": {"id": "all", "sites": []}}),
+        "the group stays, without the cascaded site"
+    );
+}
+
+#[test]
+fn group_commands_on_a_newer_inventory_are_read_only() {
+    let sandbox = Sandbox::new();
+    let text = r#"{"version": 9, "servers": [{"id": "a", "host": "h"}],
+        "sites": [{"id": "s", "server": "a", "path": "/var/www/s"}],
+        "groups": [{"id": "g", "sites": ["s"]}]}"#;
+    write_inventory(&sandbox, text);
+    let out = sandbox.run(&["group", "list"]);
+    assert_exit(&out, 0);
+    assert!(stdout(&out).contains("g   1      s"), "{}", stdout(&out));
+    assert!(stderr(&out).contains("read-only"), "{}", stderr(&out));
+    for args in [
+        &["group", "add", "h", "s"][..],
+        &["group", "edit", "g", "--remove", "s"],
+        &["group", "remove", "g", "-y"],
+    ] {
+        let out = sandbox.run(args);
+        assert_exit(&out, 1);
+        assert!(stderr(&out).contains("read-only"), "{}", stderr(&out));
+    }
+    assert_eq!(inventory_text(&sandbox), text);
+}
+
+#[test]
+fn apvm_inventory_points_group_commands_at_another_file() {
+    let sandbox = Sandbox::new();
+    let other = sandbox.scratch().join("inv.json");
+    fs::write(&other, SAMPLE).expect("write");
+    let env = [("APVM_INVENTORY", other.as_os_str())];
+    let out = sandbox.run_with_env(&["group", "add", "web", "blog"], &env);
+    assert_exit(&out, 0);
+    assert_eq!(mode(&other), 0o600);
+    assert!(
+        !sandbox.inventory_file().exists(),
+        "the default stays untouched"
+    );
+    let out = sandbox.run_with_env(&["group", "show", "web", "--json"], &env);
+    assert_eq!(
+        json_stdout(&out)["group"]["sites"],
+        serde_json::json!(["blog"])
+    );
+}
+
+#[test]
+fn concurrent_group_edits_from_many_processes_all_land() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let ids: Vec<String> = (0..8).map(|n| format!("s{n}")).collect();
+    for id in &ids {
+        let path = format!("/var/www/{id}");
+        let out = sandbox.run(&["site", "add", id, "--server", "bare", "--path", &path]);
+        assert_exit(&out, 0);
+    }
+    let children: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            common::spawn_retrying_busy(|| {
+                sandbox
+                    .command_for(Path::new(common::APVM))
+                    .args(["group", "edit", "qa", "--add", id])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            })
+            .expect("spawn")
+        })
+        .collect();
+    for child in children {
+        assert_exit(&child.wait_with_output().expect("finish"), 0);
+    }
+    let doc = inventory_json(&sandbox);
+    let mut members: Vec<&str> = doc["groups"][0]["sites"]
+        .as_array()
+        .expect("sites")
+        .iter()
+        .filter_map(|site| site.as_str())
+        .collect();
+    assert_eq!(
+        members.first(),
+        Some(&"shop"),
+        "the first member stays first"
+    );
+    members.sort_unstable();
+    let mut expected: Vec<&str> = ids.iter().map(String::as_str).collect();
+    expected.push("shop");
+    expected.sort_unstable();
+    assert_eq!(members, expected, "every edit landed");
 }

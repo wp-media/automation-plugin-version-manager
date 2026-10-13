@@ -1,5 +1,5 @@
-//! Shared plumbing of the site-inventory commands (`apvm server`, and the
-//! `site` and `group` commands built on it).
+//! Shared plumbing of the site-inventory commands (`apvm server`, `apvm site`
+//! and `apvm group`).
 //!
 //! - [`Failure`]: why an inventory command failed, with the stable code of
 //!   plan §4.5, a human rendering (one problem per line, plus a remedy) and
@@ -259,21 +259,9 @@ fn remedy(error: &Error) -> Option<String> {
 }
 
 /// Where to see the records of `kind`: `'apvm site list' shows the sites`.
-/// Groups have no command yet (plan P2.3 adds `apvm group`; then this is
-/// the same remedy as the others), so their remedy says how to make one.
 fn list_remedy(kind: EntityKind) -> String {
-    match kind {
-        EntityKind::Group => GROUPS_WITHOUT_COMMAND.to_string(),
-        EntityKind::Server | EntityKind::Site => format!("'apvm {kind} list' shows the {kind}s"),
-    }
+    format!("'apvm {kind} list' shows the {kind}s")
 }
-
-/// The remedy for an unknown group while apvm has no group commands. It
-/// gives the smallest valid record: a group without `sites` makes the file
-/// invalid.
-const GROUPS_WITHOUT_COMMAND: &str = "apvm has no group commands yet: add the group to the \
-     'groups' list of the inventory file by hand, as {\"id\": \"<ID>\", \"sites\": []}, or \
-     from Node with SiteInventory";
 
 /// A [`Error::NotFound`] for `id` of `kind`, as the library reports one.
 ///
@@ -728,15 +716,10 @@ mod tests {
             not_found(EntityKind::Site, "x").to_string(),
             "site 'x' does not exist\n  'apvm site list' shows the sites"
         );
-        // No `apvm group` command exists yet, so none is suggested.
-        let group = not_found(EntityKind::Group, "qa").to_string();
         assert_eq!(
-            group,
-            "group 'qa' does not exist\n  apvm has no group commands yet: add the group to \
-             the 'groups' list of the inventory file by hand, as {\"id\": \"<ID>\", \
-             \"sites\": []}, or from Node with SiteInventory"
+            not_found(EntityKind::Group, "qa").to_string(),
+            "group 'qa' does not exist\n  'apvm group list' shows the groups"
         );
-        assert!(!group.contains("apvm group"), "{group}");
     }
 
     #[test]

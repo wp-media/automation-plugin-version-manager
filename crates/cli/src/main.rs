@@ -22,7 +22,7 @@ use apvm_core::config_io::load_config_file;
 use apvm_sites::inventory::io as inventory_io;
 
 use crate::commands::{
-    BuildArgs, CacheArgs, ConfigArgs, InfoArgs, ServerArgs, SiteArgs, SkillArgs,
+    BuildArgs, CacheArgs, ConfigArgs, GroupArgs, InfoArgs, ServerArgs, SiteArgs, SkillArgs,
 };
 use crate::paths::Paths;
 
@@ -74,6 +74,8 @@ enum Commands {
     Server(ServerArgs),
     /// Manage the WordPress sites of the site inventory (never connects to them)
     Site(SiteArgs),
+    /// Manage the groups of sites of the site inventory (never connects to them)
+    Group(GroupArgs),
     /// Install or remove the Claude Code skill for apvm (project-local or global)
     Skill(SkillArgs),
     /// Update apvm to the latest version
@@ -202,6 +204,7 @@ async fn dispatch(cli: Cli, paths: &Paths) -> std::result::Result<(), CommandErr
     match &cli.command {
         Commands::Server(args) => return Ok(args.execute(&inventory())?),
         Commands::Site(args) => return Ok(args.execute(&inventory())?),
+        Commands::Group(args) => return Ok(args.execute(&inventory())?),
         _ => {}
     }
 
@@ -247,6 +250,7 @@ async fn dispatch(cli: Cli, paths: &Paths) -> std::result::Result<(), CommandErr
         Commands::Config(_) => unreachable!("handled above"),
         Commands::Server(_) => unreachable!("handled above"),
         Commands::Site(_) => unreachable!("handled above"),
+        Commands::Group(_) => unreachable!("handled above"),
         Commands::Skill(_) => unreachable!("handled above"),
         Commands::Update => unreachable!("handled above"),
         Commands::Uninstall { .. } => unreachable!("handled above"),

@@ -2,15 +2,15 @@
 
 apvm keeps the WordPress sites it can deploy to in a **site inventory**: SSH
 **servers**, the WordPress **sites** on them, and **groups** of sites, plus
-default SSH settings every server inherits. This release ships the server
-and site commands (`apvm server …`, `apvm site …`); the `group` and `wp`
-commands come later.
+default SSH settings every server inherits. This release ships the server,
+site and group commands (`apvm server …`, `apvm site …`, `apvm group …`);
+the `wp` commands come later.
 
 No inventory command connects to your servers: it reads or edits the file
 only, and no SSH connection is made (the connection tests, `apvm server
 test`, `apvm site test` and the probe on `site add`, come with a later
-release). Removing a site or a server changes nothing on the machine
-itself. Like every apvm command run on a
+release). Removing a site, a server or a group changes nothing on the
+machine itself. Like every apvm command run on a
 terminal, it may check GitHub for a newer apvm in the background
 (`APVM_NO_UPDATE_CHECK=1` turns that off).
 
@@ -212,8 +212,8 @@ APVM_INVENTORY=/tmp/test-inventory.json apvm server list
 
 | Command | Arguments | Notes |
 |---------|-----------|-------|
-| `apvm site add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]…` | The server must exist. `--group` (repeatable or comma-separated) adds the site to **existing** groups, in the same change (apvm has no group commands yet: add groups to the file's `groups` list by hand, each as `{"id": "qa", "sites": []}` — `sites` is required —, or from Node with `SiteInventory`) |
-| `apvm site edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` | At least one change (else exit 2). The id cannot change. `--server` moves the site to another server. `--group` only joins groups: it never leaves one |
+| `apvm site add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]…` | The server must exist. `--group` (repeatable or comma-separated) adds the site to **existing** groups, in the same change (create them with `apvm group add`) |
+| `apvm site edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` | At least one change (else exit 2). The id cannot change. `--server` moves the site to another server. `--group` only joins groups: it never leaves one (`apvm group edit <GROUP> --remove <SITE>` does) |
 | `apvm site list` | `[--server <ID>]… [--group <ID>]… [--json]` | Inventory order. Filters (repeatable or comma-separated): a site is listed when it is on any listed server **and** in any listed group. An unknown server or group id is an error (exit 1), never an empty list |
 | `apvm site show <ID>` | `[--json]` | The record, its groups, where ssh connects, and the **effective** settings with where each comes from |
 | `apvm site remove <ID>` | `[-y\|--yes]` | Removes it from the inventory (and from its groups); nothing on the server changes. Asks first unless `-y` |
@@ -353,7 +353,7 @@ the server table above; site-specific messages:
 | `site 'x' already exists` | `invalid_input` | `change it with 'apvm site edit', or choose another id` |
 | `invalid site 'x':` + `--server: unknown server 'y'` | `invalid_input` | *fix the id (`apvm server list`), or add the server first (`apvm server add`)* |
 | `invalid site 'x':` + `--run-as: 'root' needs allow_root: true` (or `--owner: user/group 'root' …`) | `invalid_input` | `root needs --allow-root: pass it, or name another user in --run-as/--owner`; after `--unset allow-root`: `--run-as/--owner name root, which needs --allow-root: keep it (drop --unset allow-root), or name another user there first` |
-| `group 'x' does not exist` (`--group`) | `invalid_input` | `apvm has no group commands yet: add the group to the 'groups' list of the inventory file by hand, as {"id": "<ID>", "sites": []}, or from Node with SiteInventory`, then `the inventory file is "<path>"` (group commands come in a later release) |
+| `group 'x' does not exist` (`--group`) | `invalid_input` | `'apvm group list' shows the groups` (create it with `apvm group add`) |
 | `server 'x' does not exist` (`list --server`) | `invalid_input` | `'apvm server list' shows the servers` |
 | `site 'x' or its groups changed while you were confirming; nothing was removed: run the command again` | `inventory_changed` | *none: the message already says to run the command again* |
 
@@ -366,4 +366,109 @@ apvm site edit shop --unset url,timeout
 apvm site list --server eu-1 --group qa --json
 apvm site show shop --json
 apvm site remove legacy -y
+```
+
+## `apvm group` — named lists of sites
+
+| Command | Arguments | Notes |
+|---------|-----------|-------|
+| `apvm group add <ID>` | `[<SITE>…] [--notes <TEXT>]` | The sites must exist; none is fine (an empty group). The group is added last |
+| `apvm group edit <ID>` | `[--add <SITE>]… [--remove <SITE>]… [--notes <TEXT>] [--unset notes]` | At least one change (else exit 2). The id cannot change. `--remove` takes a site out of the group only: the site stays in the inventory |
+| `apvm group list` | `[--json]` | Inventory order, with each group's site count and members |
+| `apvm group show <ID>` | `[--json]` | Its sites, in the group's order, and its notes |
+| `apvm group remove <ID>` | `[-y\|--yes]` | Removes the group only: its sites stay. Asks first unless `-y` |
+
+| Flag | Meaning | Rule (checked by apvm; exit 1 otherwise) |
+|------|---------|------------------------------------------|
+| `<ID>` | Group id | `^[a-z0-9][a-z0-9._-]{0,63}$`, unique among groups |
+| `<SITE>…` (`add`), `--add`, `--remove` (`edit`) | Site ids; repeatable and comma-separated (`add qa shop,blog api`, `--add a,b --add c`) | each an existing site (`site '<id>' does not exist` + `'apvm site list' shows the sites` for the first unknown one: the `add` sites in order, or the `--add` ones, then the `--remove` ones; nothing written), `--remove` included. The group's own refusals (taken or invalid id, invalid `--notes`, a read-only inventory) are reported first |
+| `--notes` | Free-form notes | 1–1024 characters; no control or invisible formatting characters. `--unset notes` clears them; an empty `--notes ""` in `edit` adds `to clear it: --unset notes` |
+
+- A site named twice counts once; adding a member or removing a non-member
+  changes nothing. Members keep their order; added ones go last, in the
+  order typed.
+- One site in both `--add` and `--remove` is exit 1 (`--add 'blog' and
+  --remove 'blog' contradict each other: pass only one`), and so are
+  `--notes` with `--unset notes`.
+- Removing a site (`apvm site remove`, or `apvm server remove --cascade`
+  for its server's sites) takes it out of every group in the same change.
+  The groups stay, even when that leaves them empty.
+
+### Output
+
+```text
+$ apvm group add qa shop blog --notes "release candidates"
+Added group 'qa'.
+It lists 2 sites: 'shop', 'blog'.
+$ apvm group add empty
+Added group 'empty'.
+$ apvm group edit qa --add api --remove blog
+Updated group 'qa': sites.
+Added 1 site to it: 'api'.
+Removed 1 site from it: 'blog'.
+$ apvm group edit qa --add shop --unset notes
+Updated group 'qa': notes.
+$ apvm group edit qa --add shop
+Group 'qa' is unchanged.
+$ apvm group list
+ID     SITES  MEMBERS
+qa     2      shop, api
+empty  0
+$ apvm group show qa
+Group 'qa'
+  sites  shop, api
+$ apvm group remove qa
+? Remove group 'qa' from the inventory (the sites it lists stay: 'shop', 'api')? [y/N] y
+Removed group 'qa'.
+The sites it listed stay in the inventory: 'shop', 'api'.
+```
+
+Changes report `sites` (when the members changed), then `notes`. `show`
+prints `notes` only when set, and `sites  none` for an empty group. With no
+groups, `list` prints `No groups yet. Add one with: apvm group add <ID> [<SITE>…]`.
+
+### Confirmation (`group remove`)
+
+As `server remove`: asked once on stderr unless `-y`/`--yes`; without a
+terminal on stdin it fails (exit 1, `not removing group '<id>': it needs a
+confirmation, and stdin is not a terminal; pass -y (--yes) to remove it
+without asking`). If the group's sites or notes change while you answer,
+nothing is removed: `group '<id>' changed while you were confirming; nothing
+was removed: run the command again` (`inventory_changed`). An unknown group
+or a read-only inventory fails before asking.
+
+### `--json`
+
+```text
+apvm group list --json      → {"schema": 1, "groups": [{"id": "qa", "sites": ["shop", "api"], "notes": "…"}, …]}
+apvm group show <ID> --json → {"schema": 1, "group": {"id": "qa", "sites": ["shop", "api"]}}
+```
+
+Records appear as the inventory stores them (`notes` omitted when unset).
+Failures print the same `{"schema": 1, "error": {…}}` document as
+`apvm server`.
+
+### Errors
+
+Exit codes as for `apvm server` (`0` success or declined, `1` refusal, `2`
+invalid arguments: `add` without an id, `edit` without a change, an `--unset`
+field other than `notes`).
+
+| Message | Code | Line apvm prints after it |
+|---------|------|---------------------------|
+| `group 'x' does not exist` | `invalid_input` | `'apvm group list' shows the groups` |
+| `group 'x' already exists` | `invalid_input` | `change it with 'apvm group edit', or choose another id` |
+| `site 'x' does not exist` | `invalid_input` | `'apvm site list' shows the sites` |
+| `invalid group 'X':` + `<ID>: …` / `--notes: …` | `invalid_input` | `to clear it: --unset notes` after an empty `--notes` in `edit` |
+| `group 'x' changed while you were confirming; nothing was removed: run the command again` | `inventory_changed` | — |
+
+```sh
+apvm group add qa shop blog --notes "release candidates"
+apvm group add later                          # empty for now
+apvm group edit qa --add api,ftpsite --remove blog
+apvm group edit qa --unset notes
+apvm group list --json
+apvm group show qa
+apvm group remove qa -y
+apvm site list --group qa                     # the sites of a group, with their servers
 ```

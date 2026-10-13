@@ -1,7 +1,7 @@
 ---
 name: apvm-cli
-description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm server` (the site inventory's SSH servers and default SSH settings, `~/.apvm/inventory.json`), `apvm site` (the WordPress sites on those servers: path, URL, WP-CLI command, identity, ownership policy), `apvm skill` (install/uninstall this Claude Code skill), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
-when_to_use: Trigger on requests like "build backwpup from PR 123", "what plugins does apvm know about", "clean the apvm cache", "set my GitHub token for apvm", "update apvm", "download the latest release of imagify", "install the apvm skill", "add a server to apvm", "set apvm's default SSH key", "add a WordPress site to apvm", "list apvm's sites", or any direct `apvm <subcommand>` invocation. Also trigger when the user references a plugin artifact path under `~/.apvm/` or asks about the WP Media plugin version manager.
+description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm server` (the site inventory's SSH servers and default SSH settings, `~/.apvm/inventory.json`), `apvm site` (the WordPress sites on those servers: path, URL, WP-CLI command, identity, ownership), `apvm group` (named lists of sites), `apvm skill` (install/uninstall this skill), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
+when_to_use: Trigger on requests like "build backwpup from PR 123", "what plugins does apvm know about", "clean the apvm cache", "set my GitHub token for apvm", "update apvm", "download the latest release of imagify", "install the apvm skill", "add a server to apvm", "set apvm's default SSH key", "add a WordPress site to apvm", "list apvm's sites", "put these sites in an apvm group", or any direct `apvm <subcommand>` invocation. Also trigger when the user references a plugin artifact path under `~/.apvm/` or asks about the WP Media plugin version manager.
 allowed-tools: Bash(apvm *)
 ---
 
@@ -54,7 +54,7 @@ Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.3.0**
   are skipped when stderr is not a TTY (pipes/CI) and never change the exit
   code — only `apvm update` itself can fail.
 - **`APVM_INVENTORY=<path>`** — use another site inventory file instead of
-  `~/.apvm/inventory.json` for one invocation (all `apvm server` and `apvm site` commands). An
+  `~/.apvm/inventory.json` for one invocation (all `apvm server`, `apvm site` and `apvm group` commands). An
   empty value means the default; a relative path is relative to the current
   directory. Like `APVM_CACHE_DIR`, only set it when asked to isolate (tests,
   CI, developing apvm itself).
@@ -398,8 +398,8 @@ Site flags (shared by `add` and `edit`): `[--url <URL>] [--wp-cli "<CMD>"]
 
 | Subcommand | Arguments |
 |------------|-----------|
-| `add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]…` — `--group` adds it to existing groups (apvm has no group commands yet: groups are added to the inventory file by hand, or from Node with `SiteInventory`) |
-| `edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` (at least one change; `--group` only joins groups, never leaves one) |
+| `add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]…` — `--group` adds it to existing groups (create them with `apvm group add`) |
+| `edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` (at least one change; `--group` only joins groups, never leaves one: `apvm group edit <GROUP> --remove <SITE>` does) |
 | `list` | `[--server <ID>]… [--group <ID>]… [--json]` — filters: any listed server **and** any listed group |
 | `show <ID>` | `[--json]` — the record, its groups, and the **effective** settings with where each comes from |
 | `remove <ID>` | `[-y\|--yes]` — also leaves its groups; asks first, and **needs `-y` when stdin is not a terminal** |
@@ -426,6 +426,42 @@ apvm site edit shop --owner ftpuser:www-data --ownership check --unset url
 apvm site list --server eu-1 --json
 apvm site show shop
 apvm site remove legacy -y
+```
+
+---
+
+### `apvm group <SUBCMD>`
+
+Manages **groups**: named lists of sites, so later commands can target
+several sites at once (`--group qa`). It never connects to the sites (no
+SSH); removing a group or taking a site out of one keeps the sites. Full
+reference: [references/sites.md](references/sites.md).
+
+| Subcommand | Arguments |
+|------------|-----------|
+| `add <ID>` | `[<SITE>…] [--notes <TEXT>]` — the sites must exist; a group may start empty |
+| `edit <ID>` | `[--add <SITE>]… [--remove <SITE>]… [--notes <TEXT>] [--unset notes]` (at least one change) |
+| `list` | `[--json]` — each group with its site count and members |
+| `show <ID>` | `[--json]` — the group's sites (in order) and notes |
+| `remove <ID>` | `[-y\|--yes]` — the sites stay; asks first, and **needs `-y` when stdin is not a terminal** |
+
+- Sites are site ids, repeatable and comma-separated (`web shop,blog`,
+  `--add a,b --add c`). Every named site must exist (`--remove` too): the
+  first unknown one fails with `site '<id>' does not exist` and nothing is
+  written. A repeat counts once; adding a member or removing a non-member
+  changes nothing (`Group '<id>' is unchanged.`). Members keep their order;
+  added ones go last.
+- Naming one site in both `--add` and `--remove` is refused (`--add '<id>'
+  and --remove '<id>' contradict each other: pass only one`).
+- Removing a site (`apvm site remove`, `apvm server remove --cascade`) takes
+  it out of every group in the same change; the groups stay, even empty.
+
+```sh
+apvm group add qa shop blog --notes "release candidates"
+apvm group edit qa --add api --remove blog
+apvm group list --json
+apvm group show qa
+apvm group remove qa -y
 ```
 
 ---
@@ -565,6 +601,10 @@ Required for private repos and PR builds. Recommended for public repos
 | `server '<id>' or its sites changed while you were confirming; nothing was removed` | Another process changed the server, its sites or their groups during the `remove` prompt. Run the command again. |
 | `Error: invalid site '<id>':` + one `--flag: …` line per problem | The listed `apvm site` flag values break a rule (see [references/sites.md](references/sites.md)); nothing was written. `'root' needs allow_root: true` is followed by `root needs --allow-root: pass it, or name another user in --run-as/--owner`. |
 | `site '<id>' or its groups changed while you were confirming; nothing was removed` | Another process changed the site record or its group memberships during the `site remove` prompt. Run the command again. |
+| `site '<id>' does not exist` (from `apvm group add`/`edit`) | A site named in `group add`, `--add` or `--remove` is not in the inventory (apvm adds `'apvm site list' shows the sites`). Nothing was written. |
+| `group '<id>' does not exist` | No such group (apvm adds `'apvm group list' shows the groups`); also from `site add/edit --group` and `site list --group`. Create it with `apvm group add`. |
+| `Error: invalid group '<id>':` + one `<ID>: …` / `--notes: …` line per problem | The group id or notes break a rule (see [references/sites.md](references/sites.md)); nothing was written. An empty `--notes ""` in `group edit` is followed by `to clear it: --unset notes`. |
+| `group '<id>' changed while you were confirming; nothing was removed` | Another process changed the group's sites or notes during the `group remove` prompt. Run the command again. |
 | `Error: failed to determine home directory`                      | `HOME` unset on Unix / `USERPROFILE` unset on Windows. Rare; set the env var.     |
 | `Error: --ver required` (BackWPup)                               | Pass `-v 5.1.0` (or whatever version). See `apvm info backwpup` for the default. |
 | `Warning: --ver ignored for '<plugin>'`                          | Plugin has `Embedded`/`Optional` version handling but you passed `--ver`. Harmless for `Optional` (it rewrites source); for `Embedded` it's rejected. |
@@ -591,7 +631,8 @@ apvm cache verify           # integrity check (exits 1 on issues)
 - [references/git-refs.md](references/git-refs.md) — full git reference format
   guide (auto-detection, explicit prefixes, `tag:` / `release:` keyword refs).
 - [references/sites.md](references/sites.md) — the site inventory,
-  `apvm server` and `apvm site` (flags, rules, output, `--json`, error codes).
+  `apvm server`, `apvm site` and `apvm group` (flags, rules, output,
+  `--json`, error codes).
 - Source of truth: `crates/cli/src/main.rs`, `crates/cli/src/commands/*.rs`,
   and `crates/cli/README.md` in this repo.
 - Always trust `apvm <command> --help` over this file when they disagree —

@@ -186,6 +186,32 @@ mod tests {
         );
     }
 
+    /// The value of the one-line frontmatter key `key` of `SKILL.md`.
+    fn frontmatter_value(key: &str) -> &'static str {
+        let prefix = format!("{key}: ");
+        SKILL_FILES[0]
+            .contents
+            .split("\n---")
+            .next()
+            .and_then(|front| front.lines().find_map(|line| line.strip_prefix(&prefix)))
+            .unwrap_or_else(|| panic!("SKILL.md frontmatter has no one-line `{key}`"))
+    }
+
+    #[test]
+    fn manifest_listing_text_fits_the_claude_code_cap() {
+        // Claude Code truncates the combined `description` + `when_to_use`
+        // at 1,536 characters in its skill listing, so text past the cap
+        // never reaches the model (code.claude.com/docs/en/skills).
+        const LISTING_CAP_CHARS: usize = 1536;
+        let combined = frontmatter_value("description").chars().count()
+            + frontmatter_value("when_to_use").chars().count();
+        assert!(
+            combined <= LISTING_CAP_CHARS,
+            "SKILL.md description + when_to_use are {combined} characters, over the \
+             {LISTING_CAP_CHARS}-character listing cap: shorten them"
+        );
+    }
+
     #[test]
     fn manifest_mentions_current_version() {
         // The skill documents the binary version it ships with; CLAUDE.md

@@ -433,9 +433,7 @@ fn join_groups_skips_memberships_and_repeats_and_refuses_unknown_groups() {
         join_groups(&mut inventory, "blog", &owned(&["qa", "nope"])).expect_err("unknown group");
     assert_eq!(
         failure.to_string(),
-        "group 'nope' does not exist\n  apvm has no group commands yet: add the group to \
-         the 'groups' list of the inventory file by hand, as {\"id\": \"<ID>\", \"sites\": []}, \
-         or from Node with SiteInventory"
+        "group 'nope' does not exist\n  'apvm group list' shows the groups"
     );
 }
 
@@ -818,7 +816,7 @@ fn unset_allow_root_on_a_site_that_never_allowed_it_says_to_pass_it() {
 }
 
 #[test]
-fn an_unknown_group_names_the_inventory_file() {
+fn an_unknown_group_points_at_the_group_commands() {
     let fixture = Fixture::with(&sample());
     for args in [
         &[
@@ -828,32 +826,12 @@ fn an_unknown_group_names_the_inventory_file() {
         &["list", "--group", "nope"],
     ] {
         let (failure, _) = fixture.fails(args);
-        let text = failure.to_string();
-        let line = format!("\n  the inventory file is {:?}", fixture.path);
-        assert!(text.ends_with(&line), "{args:?}: {text}");
-        assert!(text.contains(r#"as {"id": "<ID>", "sites": []}"#), "{text}");
+        assert_eq!(
+            failure.to_string(),
+            "group 'nope' does not exist\n  'apvm group list' shows the groups",
+            "{args:?}"
+        );
     }
-    // Other failures are untouched.
-    let (failure, _) = fixture.fails(&["show", "nope"]);
-    assert!(
-        !failure.to_string().contains("inventory file is"),
-        "{failure}"
-    );
-    let plain = with_inventory_path(not_found(EntityKind::Site, "x"), &fixture.path);
-    assert!(!plain.to_string().contains("inventory file"), "{plain}");
-}
-
-#[test]
-fn the_inventory_path_is_escaped() {
-    let failure = with_inventory_path(
-        not_found(EntityKind::Group, "g"),
-        std::path::Path::new("/tmp/a\u{1b}[2J\u{202e}b.json"),
-    );
-    let text = failure.to_string();
-    assert!(
-        !text.contains('\u{1b}') && !text.contains('\u{202e}'),
-        "{text:?}"
-    );
 }
 
 #[test]

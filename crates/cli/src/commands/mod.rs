@@ -5,6 +5,7 @@
 mod build;
 mod cache;
 mod config;
+mod group;
 mod info;
 mod inventory;
 pub mod list;
@@ -17,6 +18,7 @@ pub mod update;
 pub use build::BuildArgs;
 pub use cache::CacheArgs;
 pub use config::ConfigArgs;
+pub use group::GroupArgs;
 pub use info::InfoArgs;
 pub use server::ServerArgs;
 pub use site::SiteArgs;

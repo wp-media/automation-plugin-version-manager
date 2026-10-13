@@ -15,6 +15,7 @@ This crate produces the `apvm` binary. All heavy logic is delegated to [`apvm-co
 | `config`    | View or change configuration settings                                       |
 | `server`    | Manage the SSH servers of the site inventory (never connects to them)       |
 | `site`      | Manage the WordPress sites of the site inventory (never connects to them)   |
+| `group`     | Manage the groups of sites of the site inventory (never connects to them)   |
 | `skill`     | Install or remove the Claude Code skill for apvm (project-local or global)  |
 | `update`    | Download and install the latest APVM release                                |
 | `uninstall` | Remove the APVM binary from this system                                     |
@@ -281,7 +282,7 @@ Input values are sanitized before storage:
 - **`APVM_CACHE_DIR`** — Overrides the artifact cache directory for the current invocation. Takes precedence over the config `cache-dir` and the default `~/.apvm/cache`, and is honored by both builds and the `cache` command. Useful for CI or local testing: point it at a throwaway directory so a run never reads from or warms your real cache.
 - **`GITHUB_TOKEN`** / **`GH_TOKEN`** — Fallback GitHub token when none is in config.
 - **`RUST_LOG`** — Enables logging (`debug`, `trace`, …) on stderr. Independent of `--verbose`, which shows the build commands' own output; while logging, the build spinner is hidden.
-- **`APVM_INVENTORY`** — Uses another site inventory file instead of `~/.apvm/inventory.json` for the current invocation (see [Server Command](#server-command) and [Site Command](#site-command)). An empty value means the default.
+- **`APVM_INVENTORY`** — Uses another site inventory file instead of `~/.apvm/inventory.json` for the current invocation (see [Server Command](#server-command), [Site Command](#site-command) and [Group Command](#group-command)). An empty value means the default.
 - **`APVM_NO_UPDATE_CHECK`** — Set to any non-empty value to disable the automatic background update check and its notice (see [Update Command](#update-command)).
 
 ```sh
@@ -386,8 +387,40 @@ behaves as in `server`: one locked change, refused input named by flag
 `--json` documents and codes, and a removal re-checked under the lock
 (`inventory_changed` when the site or its groups change while you answer).
 The connection probe on `add` and `site test` arrive in a later release.
-`--group` needs an existing group, and apvm has no group commands yet: groups
-are added to the inventory file by hand or from Node (`SiteInventory`).
+`--group` needs an existing group (`apvm group add`).
+
+## Group Command
+
+Manages **groups**: named lists of sites, for targeting several at once. It
+never connects (no SSH); removing a group, or a site from one, keeps the
+sites.
+
+```sh
+apvm group add qa shop blog --notes "release candidates"
+apvm group edit qa --add api,ftpsite --remove blog
+apvm group edit qa --unset notes
+apvm group list [--json]
+apvm group show qa [--json]
+apvm group remove qa [-y]       # its sites stay
+```
+
+| Subcommand | Flags |
+|------------|-------|
+| `add <ID> [<SITE>…]` | `--notes` |
+| `edit <ID>` | `--add <SITE>`, `--remove <SITE>` (repeatable or comma-separated), `--notes`, `--unset notes`; at least one change |
+| `list` | `--json` |
+| `show <ID>` | `--json` |
+| `remove <ID>` | `-y`/`--yes` |
+
+Every named site must exist (the first unknown one fails with `site '<id>'
+does not exist`, and nothing is written); a repeat counts once, adding a
+member or removing a non-member changes nothing, and new members go last.
+One site in both `--add` and `--remove` is refused. Removing a site (`site
+remove`, `server remove --cascade`) takes it out of every group in the same
+change. Everything else behaves as in `server`: one locked change, the
+`--unset` remedy for an empty `--notes`, the `--json` documents and codes,
+and a removal re-checked under the lock (`inventory_changed` when the group
+changes while you answer).
 
 ## Skill Command
 

@@ -17,10 +17,11 @@
 //! [`Setting`]s they carry. Each change is one `io::update` (lock → load →
 //! change → save), so concurrent edits all land; a refused change writes
 //! nothing. Refused input names the flag the user typed (`--run-as: …`).
-//! `--group` joins existing groups and never leaves one. The probe on
-//! `add` and `site test` arrive with the probe (plan P4.3): `add` builds
-//! the record ([`AddArgs::to_site`]) before saving it, which is where the
-//! probe will run.
+//! `--group` joins existing groups and never leaves one (`apvm group edit
+//! <GROUP> --remove <SITE>` does). The probe on `add` and `site test`
+//! arrive with the probe (plan P4.3): `add` builds the record
+//! ([`AddArgs::to_site`]) before saving it, which is where the probe will
+//! run.
 
 use std::path::Path;
 
@@ -299,8 +300,7 @@ impl SiteArgs {
             SiteAction::List(args) => list(path, args, console),
             SiteAction::Show(args) => show(path, args, console),
             SiteAction::Remove(args) => remove(path, args, console),
-        }
-        .map_err(|failure| with_inventory_path(failure, path));
+        };
         print_json_failure(&result, self.json(), console);
         result
     }
@@ -312,25 +312,6 @@ impl SiteArgs {
             SiteAction::Show(args) => args.json,
             SiteAction::Add(_) | SiteAction::Edit(_) | SiteAction::Remove(_) => false,
         }
-    }
-}
-
-/// An unknown group (`--group`) has no command to create it yet, so its
-/// failure also names the file to add it to; any other failure is
-/// returned as is.
-///
-/// # Arguments
-///
-/// * `failure` - What the command returned
-/// * `path` - The inventory file (`APVM_INVENTORY` or the default), shown
-///   with control and invisible characters escaped
-fn with_inventory_path(failure: Failure, path: &Path) -> Failure {
-    match &failure {
-        Failure::Sites(apvm_sites::Error::NotFound {
-            kind: EntityKind::Group,
-            ..
-        }) => failure.with_remedy(format!("the inventory file is {path:?}")),
-        _ => failure,
     }
 }
 

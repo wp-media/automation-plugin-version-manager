@@ -1,4 +1,5 @@
-//! The one-table field pattern of the inventory commands (`server`, `site`).
+//! The one-table field pattern of the inventory commands (`server`, `site`,
+//! `group`).
 //!
 //! Each command declares the settings its flags change once: a
 //! [`TableField`] enum whose facts come from one exhaustive `match`, a
