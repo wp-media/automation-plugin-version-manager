@@ -28,13 +28,14 @@ tokio = { workspace = true }
 # its whole tree and joins the caller's ProcessScope (shared with apvm-core;
 # itself free of apvm dependencies)
 apvm-process = { workspace = true }
+# The private, self-deleting ssh_config file of each SSH call (remote/ssh.rs)
+tempfile = { workspace = true }
 
-# `O_NONBLOCK` for opening an upload's file (remote/local.rs)
+# `O_NONBLOCK` for opening an upload's file (remote/local.rs); `access(2)`
+# for the known_hosts check (remote/ssh/files.rs)
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
 [dev-dependencies]
 # PID-file and heartbeat helpers for the transport's kill tests
 apvm-process = { workspace = true, features = ["test-support"] }
-# Temporary zip files for the package tests
-tempfile = { workspace = true }

@@ -116,6 +116,19 @@ It uses the plan's execution contract (§6.1), so the checks exercise the shapes
 
 The helpers live in `lib/verify.sh`, and each check group is a file in `checks/`.
 
+**Checks that need an SSH client home of their own** (`checks/ssh.sh`: what a jump host reads from `~/.ssh`, `accept-new` with a known_hosts file that keeps nothing) run the target's own OpenSSH client inside the container, as a throwaway user `apvm-e2e-client` that the check creates and removes (`in_target_client`, scripts in `lib/client_*.sh`). `ssh.system-config-include` runs `lib/client_system_config.sh` as root in the target: it changes the owner and mode of the target's `/etc/ssh/ssh_config` for a throwaway user `apvm-e2e-sysconf` (and, in that user's home, the mode of a file of its own, for Debian's exception to the include check), and restores the file (and removes the users) when it ends; its backup is `/etc/ssh/ssh_config.apvm-e2e-orig`, outside what `harness.sh reset` deletes, so a run killed before its cleanup is undone by the next one. ssh takes `~` from the password database, never from `HOME`, so this is the only way to test them without writing the real `~/.ssh` of whoever runs `verify.sh`. Checks that run this machine's client only read `~/.ssh` (`-F /dev/null` or a generated config keeps the user's ssh_config out) and write only to their scratch directory (`ssh.agent-isolation` also starts a throwaway `ssh-agent` on a socket in `/tmp/apvm-e2e-agent.*`, and stops it and removes the directory before it ends).
+
+## Rust E2E tests
+
+`crates/sites/tests/ssh_e2e.rs` runs apvm's SSH transport (plan P3.3) against the harness through this machine's ssh client: a script and an upload, ssh's own `UpdateHostKeys` default when apvm uses ssh's own known_hosts files (in the sandbox's home), an unknown host key refused and then recorded with `accept-new`, a changed key, a key marked `@revoked`, a wrong key, a key file others can read, a closed port, the target as its own jump host, an ssh_config that tries to take the session away (`SessionType none`, `StdinNull yes`, `ForkAfterAuthentication yes`, a 1 s `ChannelTimeout`), a timed-out call through a jump host that must leave no ssh process (`pgrep`), and a transport without `ssh_config_file`, which includes the sandbox's `~/.ssh/config` and this machine's system ssh_config (read only). It is gated on the variables `harness.sh env` prints:
+
+```sh
+tests/e2e/sites/harness.sh up
+eval "$(tests/e2e/sites/harness.sh env)" && cargo test -p apvm-sites --test ssh_e2e
+```
+
+Every transport there gets a temporary home, its own empty ssh_config file and temporary known_hosts files; each test checks that the generated configuration names them before ssh runs. CI's `e2e-sites` job runs these tests after `verify.sh`.
+
 **Adding a check:**
 1. Write a `check_*` function. It returns 0 (PASS), 1 (FAIL), 2 (INFO: recorded, no expectation) or 3 (SKIP). It asserts with `expect_eq`, `expect_match` and `expect_ran`, and records observations with `note`.
 2. Register it in the file's `group_*` function.

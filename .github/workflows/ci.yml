@@ -213,7 +213,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Lint harness scripts
-        run: shellcheck -x tests/e2e/sites/*.sh tests/e2e/sites/lib/*.sh tests/e2e/sites/checks/*.sh tests/e2e/sites/target/*.sh
+        run: shellcheck -x tests/e2e/sites/*.sh tests/e2e/sites/lib/*.sh tests/e2e/sites/checks/*.sh tests/e2e/sites/target/*.sh tests/support/fake-remote/fake-ssh
+      - uses: dtolnay/rust-toolchain@stable
+      # Built before the harness starts, so a compile error fails fast.
+      - name: Build the SSH transport E2E tests
+        run: cargo test -p apvm-sites --locked --test ssh_e2e --no-run
       - name: Start harness
         run: tests/e2e/sites/harness.sh up
       - name: Verify ground truth
@@ -221,6 +225,20 @@ jobs:
         env:
           # Outside the repo's dot-dirs: upload-artifact skips hidden paths.
           APVM_E2E_RESULTS_DIR: ${{ runner.temp }}/e2e-sites-results
+      # apvm's SSH transport (plan P3.3) through this runner's OpenSSH client:
+      # connect, unknown host key, accept-new, changed key, revoked key, wrong
+      # key, a key file others can read, refused port, a jump host, a hostile
+      # ssh_config, a timed-out call through a jump host, the default
+      # ssh_config files (the runner's system one included). Gated on the
+      # variables `harness.sh env` prints.
+      # The assignment fails the step if `harness.sh env` fails; `eval "$(…)"`
+      # would not, and every test would then skip and pass.
+      - name: SSH transport E2E
+        run: |
+          harness_env=$(tests/e2e/sites/harness.sh env)
+          eval "$harness_env"
+          test "${APVM_E2E_SITES:-}" = 1
+          cargo test -p apvm-sites --locked --test ssh_e2e
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7

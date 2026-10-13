@@ -12,6 +12,7 @@ use crate::inventory::EntityKind;
 use crate::inventory::io::FileKind;
 use crate::package::PackageDefect;
 use crate::problem::{Problem, printable, quoted};
+use crate::remote::SshFailure;
 use crate::wp::OutputDefect;
 
 /// Convenient result alias used across the crate.
@@ -53,6 +54,28 @@ pub enum Code {
     /// A WP-CLI command failed, or printed output apvm cannot read with
     /// certainty (`wp_command_failed`).
     WpCommandFailed,
+    /// The ssh program cannot be run, or is not an OpenSSH client apvm can
+    /// use (`ssh_missing`).
+    SshMissing,
+    /// The server refused the SSH login (`ssh_auth_failed`).
+    SshAuthFailed,
+    /// No host key is known for the server (or a jump host), and new ones
+    /// are not trusted on this call (`ssh_host_key_unknown`).
+    SshHostKeyUnknown,
+    /// A server's (or jump host's) host key differs from the known one
+    /// (`ssh_host_key_changed`).
+    SshHostKeyChanged,
+    /// The server cannot be reached over SSH (`ssh_unreachable`).
+    SshUnreachable,
+    /// The SSH connection or handshake timed out (`ssh_timeout`).
+    SshTimeout,
+    /// The SSH connection was lost after it was made; the remote command
+    /// may have run in part (`ssh_connection_lost`).
+    SshConnectionLost,
+    /// ssh failed for a reason apvm does not recognize, or refused a host
+    /// key for a reason no other code names (an invalid host certificate;
+    /// `ssh_failed`).
+    SshFailed,
 }
 
 impl Code {
@@ -69,6 +92,14 @@ impl Code {
             Self::PackageInvalid => "package_invalid",
             Self::ProcessFailed => "process_failed",
             Self::WpCommandFailed => "wp_command_failed",
+            Self::SshMissing => "ssh_missing",
+            Self::SshAuthFailed => "ssh_auth_failed",
+            Self::SshHostKeyUnknown => "ssh_host_key_unknown",
+            Self::SshHostKeyChanged => "ssh_host_key_changed",
+            Self::SshUnreachable => "ssh_unreachable",
+            Self::SshTimeout => "ssh_timeout",
+            Self::SshConnectionLost => "ssh_connection_lost",
+            Self::SshFailed => "ssh_failed",
         }
     }
 }
@@ -310,6 +341,50 @@ pub enum Error {
         #[source]
         defect: OutputDefect,
     },
+
+    /// The ssh program could not be started: it is missing, or not
+    /// executable. Nothing ran.
+    #[error("cannot run the ssh program {}: {source}", quoted(program))]
+    SshMissing {
+        /// The program, as configured (`ssh`, or a path).
+        program: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The ssh program ran but did not behave like an OpenSSH client apvm
+    /// can use (it could not report its configuration with `-G`). Nothing
+    /// was sent to a server.
+    #[error(
+        "the ssh program {} is not a usable OpenSSH client: {reason}",
+        quoted(program)
+    )]
+    SshUnusable {
+        /// The program, as configured.
+        program: String,
+        /// What went wrong, escaped.
+        reason: String,
+    },
+
+    /// The private directory and file apvm writes for one ssh call (its
+    /// generated ssh configuration, plan P3.3), or the private directory
+    /// ssh's defaults are read in, could not be created or written. Nothing
+    /// ran.
+    #[error("cannot write the ssh configuration file in {}: {source}", shown(dir))]
+    SshConfigFile {
+        /// The directory it was written to.
+        dir: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// ssh itself failed (it exited 255): the class
+    /// ([`crate::remote::SshFailureKind`]) and the stderr line that shows
+    /// it. Built by callers from [`crate::remote::classify`].
+    #[error("{0}")]
+    Ssh(SshFailure),
 }
 
 impl Error {
@@ -331,6 +406,9 @@ impl Error {
             Self::PackageInvalid { .. } => Code::PackageInvalid,
             Self::Process { .. } | Self::UploadSource { .. } => Code::ProcessFailed,
             Self::WpOutput { .. } => Code::WpCommandFailed,
+            Self::SshMissing { .. } | Self::SshUnusable { .. } => Code::SshMissing,
+            Self::SshConfigFile { .. } => Code::ProcessFailed,
+            Self::Ssh(failure) => failure.code(),
         }
     }
 
@@ -403,6 +481,49 @@ mod tests {
         assert_eq!(Code::InventoryLocked.as_str(), "inventory_locked");
         assert_eq!(Code::InventoryChanged.as_str(), "inventory_changed");
         assert_eq!(Code::WpCommandFailed.as_str(), "wp_command_failed");
+        assert_eq!(Code::SshMissing.as_str(), "ssh_missing");
+        assert_eq!(Code::SshAuthFailed.as_str(), "ssh_auth_failed");
+        assert_eq!(Code::SshHostKeyUnknown.as_str(), "ssh_host_key_unknown");
+        assert_eq!(Code::SshHostKeyChanged.as_str(), "ssh_host_key_changed");
+        assert_eq!(Code::SshUnreachable.as_str(), "ssh_unreachable");
+        assert_eq!(Code::SshTimeout.as_str(), "ssh_timeout");
+        assert_eq!(Code::SshConnectionLost.as_str(), "ssh_connection_lost");
+        assert_eq!(Code::SshFailed.as_str(), "ssh_failed");
+    }
+
+    #[test]
+    fn ssh_errors_name_the_program_or_directory_and_map_to_their_codes() {
+        let error = Error::SshMissing {
+            program: "/opt/s\u{1b}sh".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        assert_eq!(error.code(), Code::SshMissing);
+        assert!(
+            error
+                .to_string()
+                .starts_with("cannot run the ssh program '/opt/s\\u{1b}sh': "),
+            "{error}"
+        );
+        let error = Error::SshUnusable {
+            program: "ssh".into(),
+            reason: "it printed no globalknownhostsfile".into(),
+        };
+        assert_eq!(error.code(), Code::SshMissing);
+        assert_eq!(
+            error.to_string(),
+            "the ssh program 'ssh' is not a usable OpenSSH client: it printed no \
+             globalknownhostsfile"
+        );
+        let error = Error::SshConfigFile {
+            dir: PathBuf::from("/tmp/a\u{1b}b"),
+            source: std::io::Error::other("full"),
+        };
+        assert_eq!(error.code(), Code::ProcessFailed);
+        assert_eq!(
+            error.to_string(),
+            "cannot write the ssh configuration file in /tmp/a\\u{1b}b: full"
+        );
+        assert!(error.problems().is_empty());
     }
 
     #[test]

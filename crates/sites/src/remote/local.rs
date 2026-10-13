@@ -19,7 +19,9 @@
 //! Dropping the call's future kills the child's whole tree (the guard).
 //!
 //! The child inherits apvm's environment (as `ssh` must: `SSH_AUTH_SOCK`,
-//! `HOME`); the SSH transport decides what to remove.
+//! `PATH`) and directory, changed only by what the caller's [`Launch`]
+//! says (the SSH transport removes apvm's GitHub tokens, sets `LC_ALL=C`,
+//! and runs ssh in the directory of its generated file).
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -78,18 +80,54 @@ impl Transport for LocalShell {
     fn execute<'a>(&'a self, request: &'a Request) -> BoxFuture<'a, Result<Execution>> {
         Box::pin(async move {
             let args = [OsString::from("-c"), request.remote_command().into()];
-            run(&self.login_shell, &args, request).await
+            run(&Launch::new(&self.login_shell, &args), request).await
         })
     }
 }
 
-/// Run `program` with `args` as one call of `request`: its stdin, capped
-/// output, timeout and cancellation (see the module docs).
+/// One change to the environment a child inherits: the variable, and its
+/// new value (`None` removes it).
+pub(crate) type EnvChange = (&'static str, Option<&'static str>);
+
+/// What a call starts: the program, its arguments, changes to the
+/// environment it inherits, and the directory it runs in.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Launch<'a> {
+    /// The program (`ssh`, or a login shell), looked up on `PATH` unless a
+    /// path.
+    pub(crate) program: &'a OsStr,
+    /// Its arguments, the remote command included.
+    pub(crate) args: &'a [OsString],
+    /// Changes to the environment it inherits.
+    pub(crate) env: &'a [EnvChange],
+    /// The directory it runs in (`None`: apvm's).
+    pub(crate) dir: Option<&'a Path>,
+}
+
+#[cfg(test)]
+impl<'a> Launch<'a> {
+    /// `program` with `args`, apvm's environment and directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `program` - The program
+    /// * `args` - Its arguments
+    pub(crate) fn new(program: &'a OsStr, args: &'a [OsString]) -> Self {
+        Self {
+            program,
+            args,
+            env: &[],
+            dir: None,
+        }
+    }
+}
+
+/// Run `launch` as one call of `request`: its stdin, capped output,
+/// timeout and cancellation (see the module docs).
 ///
 /// # Arguments
 ///
-/// * `program` - The program (`ssh`, or a login shell)
-/// * `args` - Its arguments, the remote command included
+/// * `launch` - What to start
 /// * `request` - What its stdin carries, its nonce and its timeout
 ///
 /// # Returns
@@ -103,19 +141,12 @@ impl Transport for LocalShell {
 /// it fails mid-call; [`Error::Process`] when the program cannot be
 /// started, or its output read, or waited for. A started child was killed
 /// with its tree.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the SSH transport (P3.3) runs through it")
-)]
-pub(crate) async fn run(
-    program: &OsStr,
-    args: &[OsString],
-    request: &Request,
-) -> Result<Execution> {
+pub(crate) async fn run(launch: &Launch<'_>, request: &Request) -> Result<Execution> {
+    let program = launch.program;
     let mut input = Input::open(request).await?;
     // Pipes before the guard: dropped after it (see `apvm_process::spawn`).
     let (mut pipes, mut guard) =
-        start(program, args).map_err(|source| failed("cannot start", program, source))?;
+        start(launch).map_err(|source| failed(CANNOT_START, program, source))?;
     let started = Instant::now();
     let mut kept = Kept::new();
     let (exit, ended) = {
@@ -125,25 +156,47 @@ pub(crate) async fn run(
     Ok(kept.into_execution(request, exit, ended.saturating_duration_since(started)))
 }
 
-/// Start `program` with `args`, its stdin, stdout and stderr piped and its
-/// environment inherited, through apvm's one spawn.
+/// The context of an [`Error::Process`] for a program that could not be
+/// started (the SSH transport reports a missing ssh by it).
+pub(crate) const CANNOT_START: &str = "cannot start";
+
+/// Start `launch` with its stdin, stdout and stderr piped, through apvm's
+/// one spawn.
 ///
 /// # Arguments
 ///
-/// * `program` - The program, looked up on `PATH` unless a path
-/// * `args` - Its arguments
+/// * `launch` - What to start
 ///
 /// # Errors
 ///
 /// When it cannot be started, or the caller's process scope was closed.
-fn start(program: &OsStr, args: &[OsString]) -> std::io::Result<(Pipes, Running)> {
-    let mut command = apvm_process::command(program);
+fn start(launch: &Launch<'_>) -> std::io::Result<(Pipes, Running)> {
+    let mut command = apvm_process::command(launch.program);
     command
-        .args(args)
+        .args(launch.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(dir) = launch.dir {
+        command.current_dir(dir);
+    }
+    apply_env(&mut command, launch.env);
     apvm_process::spawn(&mut command)
+}
+
+/// Apply `env` to the environment `command` inherits.
+///
+/// # Arguments
+///
+/// * `command` - The command
+/// * `env` - The changes
+pub(crate) fn apply_env(command: &mut tokio::process::Command, env: &[EnvChange]) {
+    for (name, value) in env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
 }
 
 /// What a call collects while it runs.
@@ -827,7 +880,9 @@ mod tests {
                 "login".into(),
                 request.remote_command().into(),
             ];
-            run(OsStr::new("sh"), &args, request).await.unwrap()
+            run(&Launch::new(OsStr::new("sh"), &args), request)
+                .await
+                .unwrap()
         }
 
         /// `len` pseudo-random bytes (a 64-bit LCG), the same every run.

@@ -1,0 +1,183 @@
+#!/bin/sh
+#
+# fake-ssh — a stand-in for the OpenSSH client in apvm's hermetic tests
+# (docs/plans/site-deployment.md §12, P3.3). Point `defaults.ssh.binary` at it.
+#
+# It takes the argv apvm's SSH transport builds and runs the remote command on
+# this machine, through `sh -c`, the way sshd runs it through the login shell:
+# stdin, stdout and stderr pass through, and the exit status is the command's.
+#
+#   fake-ssh -F CONFIG [-l USER] [-p PORT] [-J HOPS] -- HOST COMMAND
+#   fake-ssh [-T] -F none -G HOST
+#                                prints ssh's compiled-in defaults, as OpenSSH does:
+#                                those of 10.3p1, or, when run through a link whose
+#                                name ends in `-old`, those of a client like 8.2p1
+#                                (no `sessiontype`, `stdinnull`, `forkafterauthentication`,
+#                                `channeltimeout`; `updatehostkeys false`); through a
+#                                link whose name ends in `-sysconf`, the link's directory
+#                                is ssh's configuration directory (its `ssh_config` is
+#                                the system-wide one). Without `-T` it first prints
+#                                OpenSSH's pseudo-terminal notice on stderr, as ssh does
+#                                when stdin is not a terminal
+#
+# Behavior comes from `#fake-ssh: KEY VALUE` lines in CONFIG or in a file it
+# Includes (one level), so each test sets its own through its ssh_config_file:
+#
+#   #fake-ssh: log FILE      append the argv (`arg: …` lines), the directory it
+#                            runs in (`cwd: …`), CONFIG's mode (`mode: 600`), that
+#                            directory's mode and entries (`dir: 700 NAME…`) and
+#                            CONFIG's text (`config:` … `end`) to FILE
+#   #fake-ssh: env FILE      write the environment the command gets to FILE
+#   #fake-ssh: fail CLASS    print what OpenSSH prints for CLASS and exit 255,
+#                            running nothing: auth, host-key-unknown,
+#                            host-key-changed, refused, dns, timeout; `lost`
+#                            runs the command, then reports a dropped connection
+#   #fake-ssh: host-key new  the host key is new: with `StrictHostKeyChecking
+#                            accept-new` it is recorded in the first
+#                            UserKnownHostsFile (with OpenSSH's notice), else
+#                            the call fails as host-key-unknown
+#
+# Messages are OpenSSH's (captured with 9.6p1–10.3p1), lines ended by CR LF as
+# ssh ends them. POSIX sh only; never edited by tests (exec'ing a file being
+# written fails with ETXTBSY on Linux).
+set -u
+
+config="" user="" port="" print_defaults=0 no_tty=0
+while [ $# -gt 0 ]; do
+	case $1 in
+	-T) no_tty=1; shift ;;
+	-F) config=$2; shift 2 ;;
+	-l) user=$2; shift 2 ;;
+	-p) port=$2; shift 2 ;;
+	-J) shift 2 ;;
+	-o) shift 2 ;;
+	-G) print_defaults=1; shift ;;
+	--) shift; break ;;
+	-*) printf 'fake-ssh: unknown option %s\r\n' "$1" >&2; exit 255 ;;
+	*) break ;;
+	esac
+done
+host=${1:-}
+[ $# -gt 0 ] && shift
+command=$*
+
+# say LINE... — prints each LINE to stderr, ended by CR LF.
+say() {
+	for line in "$@"; do printf '%s\r\n' "$line" >&2; done
+}
+
+if [ "$print_defaults" = 1 ]; then
+	[ "$no_tty" = 1 ] || say "Pseudo-terminal will not be allocated because stdin is not a terminal."
+	printf 'user %s\nport 22\n' "$(id -un)"
+	case $0 in
+	*-old) printf 'updatehostkeys false\n' ;;
+	*) printf 'sessiontype default\nstdinnull no\nforkafterauthentication no\nchanneltimeout none\nupdatehostkeys true\n' ;;
+	esac
+	case $0 in
+	*-sysconf) printf 'globalknownhostsfile %s/ssh_known_hosts\n' "$(dirname -- "$0")" ;;
+	*) printf 'globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2\n' ;;
+	esac
+	exit 0
+fi
+if [ -z "$config" ] || [ ! -f "$config" ]; then
+	say "Can't open user config file $config: No such file or directory"
+	exit 255
+fi
+
+# config_text — CONFIG, then every file it Includes.
+config_text() {
+	cat "$config"
+	sed -n 's/^Include "\(.*\)"$/\1/p' "$config" | while IFS= read -r included; do
+		[ -f "$included" ] && cat "$included"
+	done
+}
+
+# directive KEY — prints the value of the first `#fake-ssh: KEY VALUE` line.
+directive() {
+	config_text | sed -n "s/^#fake-ssh: $1 //p" | head -n 1
+}
+
+# option NAME — prints the first value CONFIG gives option NAME (first wins, as in ssh).
+option() {
+	sed -n "s/^$1 //p" "$config" | head -n 1
+}
+
+# mode_of PATH — prints PATH's permission bits in octal (GNU or BSD stat).
+mode_of() {
+	stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+}
+
+# entries — prints ` NAME` for each entry of the current directory. A pattern that
+# matches nothing stays as it is (`.*` too, in a bash 5.2+ /bin/sh, whose `.*` skips
+# `.` and `..`).
+entries() {
+	for entry in .* *; do
+		case $entry in
+		. | .. | '.*' | '*') ;;
+		*) printf ' %s' "$entry" ;;
+		esac
+	done
+}
+
+shown_host=$host
+[ -n "$port" ] && [ "$port" != 22 ] && shown_host="[$host]:$port"
+
+log=$(directive log)
+if [ -n "$log" ]; then
+	{
+		for arg in -F "$config" ${user:+-l "$user"} ${port:+-p "$port"} -- "$host" "$command"; do
+			printf 'arg: %s\n' "$arg"
+		done
+		printf 'cwd: %s\n' "$(pwd -P)"
+		printf 'mode: %s\n' "$(mode_of "$config")"
+		printf 'dir: %s%s\n' "$(mode_of .)" "$(entries)"
+		echo "config:"
+		cat "$config"
+		echo "end"
+	} >>"$log"
+fi
+envfile=$(directive env)
+[ -n "$envfile" ] && env >"$envfile"
+
+if [ "$(directive host-key)" = new ]; then
+	if [ "$(option StrictHostKeyChecking)" = accept-new ]; then
+		known=$(option UserKnownHostsFile | sed 's/^"\([^"]*\)".*/\1/; s/%%/%/g')
+		printf '%s ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFakeFakeFakeFakeFakeFakeFakeFakeFake\n' \
+			"$shown_host" >>"$known" || { say "Failed to add the host to the list of known hosts ($known)."; }
+		say "Warning: Permanently added '$shown_host' (ED25519) to the list of known hosts."
+	else
+		say "No ED25519 host key is known for $shown_host and you have requested strict checking." \
+			"Host key verification failed."
+		exit 255
+	fi
+fi
+
+case $(directive fail) in
+"") ;;
+auth) say "${user:-$(id -un)}@$host: Permission denied (publickey)."; exit 255 ;;
+host-key-unknown)
+	say "No ED25519 host key is known for $shown_host and you have requested strict checking." \
+		"Host key verification failed."
+	exit 255
+	;;
+host-key-changed)
+	say "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" \
+		"@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @" \
+		"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" \
+		"IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!" \
+		"Host key for $shown_host has changed and you have requested strict checking." \
+		"Host key verification failed."
+	exit 255
+	;;
+refused) say "ssh: connect to host $host port ${port:-22}: Connection refused"; exit 255 ;;
+dns) say "ssh: Could not resolve hostname $host: Name or service not known"; exit 255 ;;
+timeout) say "ssh: connect to host $host port ${port:-22}: Connection timed out"; exit 255 ;;
+lost)
+	sh -c "$command"
+	say "Connection to $host closed by remote host."
+	exit 255
+	;;
+*) say "fake-ssh: unknown failure class"; exit 255 ;;
+esac
+
+exec sh -c "$command"

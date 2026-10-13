@@ -78,8 +78,17 @@
 //!
 //! A call never outlives its future: dropped, or past its timeout, it
 //! kills the local process and everything it started. The crate's tests
-//! run requests through a local shell, the way sshd runs them; the SSH
-//! transport follows the same pattern.
+//! run requests through a local shell, the way sshd runs them.
+//!
+//! **Over SSH** ([`SshTransport`]): one `ssh` process per call, every
+//! option in a private generated ssh_config file passed with `-F`, the one
+//! part of the call ssh hands to jump hosts, so they cannot prompt or
+//! check host keys elsewhere; the user's and the system's ssh_config are
+//! included after apvm's options. Unknown host keys are refused unless the
+//! caller trusts new ones for the call ([`HostKeyPolicy`]). When ssh itself
+//! fails (exit 255), [`classify`] tells why ([`SshFailureKind`], with the
+//! plan §4.5 `ssh_*` codes) from its stderr; a remote command's stderr is
+//! never read that way.
 //!
 //! # Example
 //!
@@ -108,19 +117,23 @@
 //! ```
 
 mod capture;
+mod classify;
 #[cfg(test)]
 pub(crate) mod fake;
 mod identity;
 mod local;
 mod quote;
 mod script;
+mod ssh;
 mod statement;
 mod transport;
 
 pub use capture::{Captured, PayloadError, STDERR_LIMIT, STDOUT_LIMIT, unframe};
+pub use classify::{HostKeyNotices, SshFailure, SshFailureKind, classify, host_key_notices};
 pub use identity::{AccountName, Identity, OwnerIds, PluginEntry, RootAccess, RootCommand};
 pub use quote::quote;
 pub use script::{FileMode, Nonce, Script, UploadScript, WpCli};
+pub use ssh::{HostKeyPolicy, SshOptions, SshTransport};
 pub use transport::{BoxFuture, Delivery, Execution, Exit, Payload, Request, Transport};
 
 use crate::error::Error;

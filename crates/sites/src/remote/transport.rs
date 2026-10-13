@@ -374,6 +374,21 @@ impl Execution {
         self.elapsed
     }
 
+    /// Whether the script started on the other side: a kept stdout line
+    /// equals the nonce, which the script prints before anything else
+    /// (whether or not the call then ran to its end).
+    ///
+    /// A started script means the transport had connected: an SSH failure
+    /// after it is a lost connection, never a refused login
+    /// ([`classify`](super::classify())). After a mutation, `false` still
+    /// does not prove that nothing ran (plan §6.1 item 2).
+    pub fn script_started(&self) -> bool {
+        !matches!(
+            unframe(&self.stdout, &self.nonce),
+            Err(PayloadError::NonceMissing { .. })
+        )
+    }
+
     /// The script's whole output: stdout after the nonce line (plan §6.1
     /// item 2; see [`unframe`]), from a call that ran to its end
     /// ([`Exit::Status`]).
@@ -534,6 +549,28 @@ mod tests {
         assert!(done.stdin_written());
         assert_eq!(done.elapsed(), Duration::from_millis(5));
         assert_eq!(done.exit(), Exit::Status(0));
+    }
+
+    #[test]
+    fn a_script_started_once_its_nonce_line_is_out_however_the_call_ended() {
+        let framed = format!("motd\n{}\nstarted", nonce());
+        for exit in [Exit::Status(0), Exit::TransportFailed, Exit::TimedOut] {
+            assert!(execution(exit, &framed).script_started(), "{exit:?}");
+            assert!(!execution(exit, "motd\n").script_started(), "{exit:?}");
+        }
+        // A cut stdout that holds the nonce line still started.
+        let cut = Execution::new(
+            nonce(),
+            Exit::Status(0),
+            Captured::new(format!("{}\n[1,", nonce()).into_bytes(), true),
+            Captured::default(),
+            true,
+            Duration::ZERO,
+        );
+        assert!(cut.script_started());
+        // The nonce without its line end, or inside a line, does not count.
+        assert!(!execution(Exit::Status(0), &format!("x{}\n", nonce())).script_started());
+        assert!(!execution(Exit::Status(0), nonce().as_str()).script_started());
     }
 
     #[test]

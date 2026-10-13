@@ -4,7 +4,8 @@
 //! `apvm server|site|group` and `apvm wp`, the Node bindings, and apvm-core's
 //! build-and-install path (design: `docs/plans/site-deployment.md`).
 //!
-//! This version holds the data layer and the remote script builder:
+//! This version holds the data layer, the remote script builder and the
+//! SSH transport:
 //!
 //! - [`Inventory`]: servers, the WordPress sites on them, groups of sites,
 //!   and default SSH settings, read from and written to the
@@ -28,7 +29,10 @@
 //! - [`remote`]: the scripts apvm runs on a server: POSIX quoting, framed
 //!   scripts for stdin (`sh -s`) and upload (`sh -c`) delivery, identity
 //!   prefixes (`sudo -n -u U -g G`, `runuser`), the closed set of root
-//!   commands, and the hermetic WP-CLI command.
+//!   commands, and the hermetic WP-CLI command; the transport contract and
+//!   the SSH transport that runs them (every option in a private generated
+//!   ssh_config, so jump hosts get them too), and the classification of
+//!   ssh's own failures into stable codes.
 //! - [`wp`]: the typed WP-CLI commands apvm runs on a site (no caller can
 //!   add a flag), and strict parsers for their output (PHP notices
 //!   skipped and reported; HTML pages, truncated or ambiguous output

@@ -9,12 +9,14 @@ apvm-core's build-and-install path. The design and the phase plan are in
 persistence (P1.2), settings and targets (P1.3), the plugin hint types that
 apvm-core fills (P1.4) and local package inspection (P1.5); phase P3.1
 adds the remote script builder, P3.2 the transport contract that runs
-scripts (with a local-shell transport), and P4.1 the WP-CLI commands and
+scripts (with a local-shell transport), P3.3 the SSH transport and the
+classification of ssh's failures, and P4.1 the WP-CLI commands and
 parsers. It has the inventory model and its
 validation, safe reading and writing of the inventory file, settings
 resolution and target selection, plugin hints, plugin zip inspection, the
-shared file names, and the scripts apvm will run on servers. Running them
-over SSH and the plugin operations arrive in later phases.
+shared file names, the scripts apvm runs on servers, and the transport that
+runs them over SSH. Multiplexing and the plugin operations arrive in later
+phases.
 
 ## Design rules
 
@@ -267,8 +269,8 @@ file is `invalid_input` and runs nothing (its type is checked before and
 after opening, and on Unix it is opened with `O_NONBLOCK`, cleared once it
 is known to be a regular file, so a FIFO cannot block); a program that
 cannot start, any other failure to open the file, or a file that fails
-mid-read, is `process_failed`. Nothing is retried. The child inherits the
-environment.
+mid-read, is `process_failed`. Nothing is retried. The local shell's child
+inherits the environment (for ssh's, see below).
 
 `Execution::new` and `Captured::new` are public, so a transport (or a fake
 in another crate's tests) can be written outside this crate;
@@ -278,6 +280,142 @@ The crate's tests run requests through a local shell, the way sshd does:
 `<login shell> -c 'sh -s'` with the script on stdin, or `<login shell> -c
 "sh -c '<script>'"` with the upload on stdin. The SSH transport follows the
 same pattern. apvm itself runs nothing through a local shell.
+
+## Over SSH (`remote::SshTransport`)
+
+`SshTransport::new(server, SshOptions)` runs each request as one process of
+the system OpenSSH client (plan D2), in a private directory it creates for
+that call, next to the file it writes there:
+
+```text
+<binary> -F apvm-ssh.conf [-l <user>] [-p <port>] [-J <hops>] -- <host> <remote command>
+```
+
+- **Every option is in the generated file**, because `-F` is the only part
+  of a call ssh hands to jump hosts (it runs `ssh -l -p -F -v -W … <hop>`
+  for them; verified on OpenSSH 9.6p1, 10.0p2 and 10.3p1: with `-o` options
+  alone a jump host prompted on a terminal and used `~/.ssh/known_hosts`).
+  Its options come first, so they win over the user's ssh_config for the
+  server and every jump host: `BatchMode yes`; `StrictHostKeyChecking yes`
+  (`accept-new` with `HostKeyPolicy::AcceptNew`, never `no`);
+  `UserKnownHostsFile` = the inventory's `known_hosts_file`, else
+  `~/.ssh/known_hosts ~/.ssh/known_hosts2` (an ssh_config can still add
+  trusted keys with `GlobalKnownHostsFile`, `KnownHostsCommand` or
+  `VerifyHostKeyDNS`); the inventory's key, first, with `IdentitiesOnly
+  yes` (`IdentityFile` adds up: an ssh_config's keys are offered after
+  it); `ConnectTimeout`; `ServerAliveInterval 15`,
+  `ServerAliveCountMax 4`; `LogLevel INFO`; no pseudo-terminal, no remote
+  command from ssh_config, no reused connection (`ControlMaster no`,
+  `ControlPath none`; P3.4 adds apvm's own), no forwarding, no local
+  command, the key kept out of the user's agent (`AddKeysToAgent no`: from
+  an ssh_config, `yes` added it there and `ask` would open ssh-askpass,
+  verified); when the client knows them, `SessionType default`, `StdinNull
+  no`, `ForkAfterAuthentication no` (OpenSSH 8.7+) and `ChannelTimeout
+  none` (9.6+, the client's): from an ssh_config they hang the call, drop the script,
+  detach ssh from apvm, or kill a silent command (verified). Then it
+  `Include`s what ssh would read without `-F`: the inventory's
+  `ssh_config_file` alone, or `~/.ssh/config` and the system's
+  `ssh_config` (one this user cannot read is left out: ssh skips it,
+  while an `Include` of it fails, verified; when it does not exist, its
+  vendor copy `/usr/etc/ssh/ssh_config`, if that exists, as openSUSE's
+  ssh reads it, verified on Tumbleweed; no other ssh binary checked holds a
+  vendor path). When the known_hosts files are ssh's own pair, the file
+  ends with ssh's own default `UpdateHostKeys yes` (8.5+), which naming
+  them would turn off: ssh then records the other host keys a server
+  proves with the known one, as plain ssh does (an included file's value
+  wins).
+- **ssh's defaults** are read once per transport with `ssh -T -F none -G`
+  (`-T` keeps ssh's pseudo-terminal notice off stderr), in a private
+  directory like the calls (so a bare `ssh` is the same program): the
+  compiled-in `globalknownhostsfile` sits next to the system `ssh_config`
+  (checked on Debian, Ubuntu, Fedora, AlmaLinux 8 and 9, Alpine, Arch,
+  openSUSE, nixpkgs and macOS builds), the keywords it prints tell which
+  of those session options the client knows (an older one refuses unknown
+  options; checked on 7.6p1, 8.2p1, 8.7p1, 8.9p1, 9.2p1, 9.6p1, 10.0p2,
+  10.3p1, 10.6p1), and `updatehostkeys true` its `UpdateHostKeys` default.
+- **Only what belongs to the server** is on the command line (`-l`, `-p`,
+  `-J`: ssh keeps them from jump hosts).
+- **`~` is the home apvm was given** (`SshOptions::with_home`), else `HOME`;
+  relative paths are taken from the current directory. apvm writes absolute
+  paths, so ssh opens what apvm checked (ssh would take `~` from the
+  password database and ignore `HOME`, verified). Paths are double-quoted;
+  `%` is doubled in the key path; a `"`, a control character, a `\`
+  (Unix), `${`, a `%` in a known_hosts path (ssh before 8.4 reads `%%`
+  literally there, verified on 7.6p1 and 8.2p1) or an `Include` pattern is
+  refused (`invalid_input`).
+- **Checked before ssh runs:** the key and the inventory's ssh_config file
+  must be regular files (an `Include` of a missing file is silent), the
+  ssh_config file not writable by group or others nor another user's
+  (OpenSSH refuses to include it; Debian's and Ubuntu's ssh also accept
+  one that only the owner's private group may write, which apvm still
+  refuses); without one, the system's `ssh_config` must pass
+  the same check (ssh reads it unchecked on its own, but checks it once
+  included: one owned by another user, such as a Homebrew install of
+  another account, or one its group may write, is refused with what to
+  do; verified: another user's on 7.6p1, 8.2p1 and 10.0p2, a group-writable
+  one on 10.0p2); the known_hosts file new keys go to must be a regular file or not
+  exist yet (a link to `/dev/null` is refused: ssh "permanently adds" every
+  key there and runs the command, verified), and with `accept-new` it, or
+  its directory, must be writable. The ssh program's path must be
+  shell-literal: ssh pastes it unquoted into a jump host's shell command.
+- **The generated file** is `0600`, created exclusively in a new `0700`
+  directory with a random name, and deleted with it when the call ends,
+  however it ends. ssh runs in that directory and gets the file's path
+  when it is shell-literal (a jump host's command goes through the user's
+  shell, which pastes it unquoted, after a startup file such as `.zshenv`
+  that may change directory), else its bare name. The directory goes in
+  the system's temporary directory when its path is shell-literal, else on
+  Unix in `/tmp` (when root's and sticky), so only a configured
+  directory (`SshOptions::with_config_dir`) or a Windows temporary
+  directory with a space gets the bare name. The directory is private because
+  ssh, its jump hosts' `exec ssh …`, and an ssh_config's `ProxyCommand`
+  and `Match exec` run in it: a relative `PATH` entry (`PATH=:/usr/bin`)
+  finds programs there, and in a shared `/tmp` another user could plant
+  one (verified). `SshTransport::config_text()` shows the file, for logs.
+- **ssh's environment** is apvm's minus `GITHUB_TOKEN` and `GH_TOKEN`, plus
+  `LC_ALL=C` (English system messages for the classifier) and
+  `SSH_ASKPASS_REQUIRE=never` (no ssh-askpass dialog from an ssh that a
+  ProxyCommand of the user's starts, OpenSSH 8.4+; such an ssh can still
+  ask on apvm's terminal, which ssh shares so that Ctrl+C reaches it).
+- **A missing ssh** is `ssh_missing` (a program that cannot report its
+  defaults with `-G` too). An exit 255 is a result, not an error.
+
+`remote::classify(&execution)` tells why ssh failed, only when it exited
+255 (a remote command's stderr is never read this way; scripts map their
+own 255 to 254), from phrases in its stderr captured from real OpenSSH
+7.6p1 to 10.6p1 runs, jump hosts included: `ssh_host_key_changed`,
+`ssh_host_key_unknown`, `ssh_auth_failed`, `ssh_timeout`,
+`ssh_unreachable`, `ssh_connection_lost` (always, once the script printed
+its nonce line: `Execution::script_started()`), else `ssh_failed`. **The
+cause is ssh's last message** (audit 6): ssh stops at its first fatal
+error, and ends every message it logs with `\r\n`, while what it relays
+from the server (a login banner, a remote startup file's stderr) ends as
+the server wrote it, so the last line ending with `\r\n` decides (lines
+that only sum up the one before it skipped), and a banner that says
+sessions are "timed out", or quotes `Host key verification failed.`,
+decides nothing. Earlier lines refine it: a jump host's `stdio forwarding
+failed` takes its class from the channel refusal before it; ssh's closing
+`Host key verification failed.` from the lines before it (a key that
+differs from the one known for the server's address, with `CheckHostIP`,
+and a revoked key are `ssh_host_key_changed`; a host certificate an
+`@cert-authority` line rejects, an unreadable `RevokedHostKeys` file and
+the refusal alone (a ProxyCommand's own ssh) are `ssh_failed`, as neither
+trusting new keys nor forgetting the known one fixes them). Noise (the
+`accept-new` notice, a remote locale warning, OpenSSH 10.1's warning
+about a key exchange that is not post-quantum, an ssh_config option the
+build lacks, a missing ssh_config key file, the lines ssh prints after a
+jump host failed) is skipped. `SshFailure::line()` keeps the telling
+line, escaped: for a refused login, why ssh could not use the key file
+(`Permissions 0644 for '…' are too open.`, `Load key "…": invalid
+format`); for a jump host that opened no channel, its refusal; for
+`ssh_failed`, ssh's last message (`… line 3: Bad configuration option:
+…`, not `…: terminating, 1 bad configuration options`), or, when ssh
+printed none, the last line as text. `Error::Ssh(failure)` carries it
+with its code. `remote::host_key_notices(stderr)` lists, from ssh's own
+lines, the hosts whose new key ssh recorded, whether one could not be
+saved, and why ssh refused a host certificate first (with `accept-new`
+ssh then trusts its plain key as new, bypassing the certificate
+authority).
 
 ## WP-CLI commands and parsing (`wp`)
 
@@ -316,7 +454,14 @@ Pure, no I/O: the commands apvm runs, and strict parsers for what they print
   be opened or read for a reason other than the caller's path (missing,
   not permitted or not a regular file are `invalid_input`).
 - `wp_command_failed`: a WP-CLI command failed, or printed output a parser
-  refuses (`Error::WpOutput` with its `OutputDefect`).
+  refuses (`Error::WpOutput` with its `OutputDefect`);
+- `ssh_missing`: the ssh program cannot be started, or does not report its
+  defaults like OpenSSH (`Error::SshMissing`, `Error::SshUnusable`); the
+  file a call writes for ssh failing is `process_failed`
+  (`Error::SshConfigFile`);
+- `ssh_auth_failed`, `ssh_host_key_unknown`, `ssh_host_key_changed`,
+  `ssh_unreachable`, `ssh_timeout`, `ssh_connection_lost`, `ssh_failed`:
+  ssh itself failed (`Error::Ssh`, from `remote::classify`).
 
 `Error::problems()` lists the located problems, so a front end can print
 them one per line.
@@ -387,12 +532,48 @@ cargo test -p apvm-sites
   table with `/bin/ps`: where a sandbox forbids it (`sandbox-exec`), the
   descendant checks are skipped. Timeout tests check only what marker
   files prove happened, so they hold under CPU load.
+- the SSH transport: the generated file for Unix and Windows paths, every
+  setting at every level of the inventory in the argv (and nothing a jump
+  host would need on the command line), `%` and quoting rules, refused
+  paths with their field, `~` and relative paths, the checks before ssh
+  (missing files, a known_hosts link to `/dev/null`, a read-only one with
+  `accept-new`, a group-writable ssh_config; the system ssh_config ssh
+  would refuse to include, an unreadable default one left out, the
+  vendor copy when the system file is missing), finding
+  the system ssh_config from `ssh -G` output, where the private directory
+  goes, the environment; and, through the
+  hermetic `tests/support/fake-remote/fake-ssh` (Unix), the argv and file
+  ssh gets (mode `0600`, alone in a `0700` directory, deleted after the
+  call, after a timeout and when the call is dropped, with ssh's process
+  tree gone), the pinned session options only for a client that knows
+  them, the system ssh_config included, refused or left out, concurrent
+  calls in directories of their own,
+  uploads, a missing or unusable ssh, `accept-new`, and every failure
+  class;
+- ssh failure classes on stderr samples captured from OpenSSH 7.6p1 to
+  10.6p1 (glibc, musl and macOS wording; noise lines anywhere, a remote
+  command's same phrases never classified, a login banner or remote text
+  before ssh's last message deciding nothing, a lost connection once the
+  script started);
 - WP-CLI commands: argv goldens per command, banned flags never present,
   apvm's global options set exactly once, every command's argv delivered
   verbatim through `sh` (Unix); parsers on real outputs captured from the
   E2E harness (`tests/fixtures/wp/`, provenance in `wp/parse/tests.rs`) and
   on synthetic ones (truncated, unknown status, wrong types, extra or
   duplicate fields, large lists).
+
+`tests/ssh_e2e.rs` runs the SSH transport against the E2E harness's real
+sshd (`tests/e2e/sites/`), gated by `APVM_E2E_SITES=1` (`eval "$(
+tests/e2e/sites/harness.sh env)"`; CI's `e2e-sites` job runs it): a script
+and an upload, ssh's own `UpdateHostKeys` default with ssh's own
+known_hosts files, an unknown host key refused then recorded with `accept-new`,
+a changed key, a wrong key, a closed port, a jump host that checks host
+keys with apvm's file and records both keys with `accept-new`, an
+ssh_config with `SessionType none`, `StdinNull yes`,
+`ForkAfterAuthentication yes` and a 1 s `ChannelTimeout` that changes
+nothing, and a timed-out call
+through a jump host that leaves no ssh process behind. It never touches
+the user's own `~/.ssh`.
 
 `tests/inventory.rs` loads the example document of the plan through the
 public API; `tests/targets.rs` resolves targets and settings on it.
