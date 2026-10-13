@@ -1,6 +1,6 @@
 # Site deployment — manage WordPress plugins on remote sites
 
-Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.6 (implemented and audited 2026-10-12). Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5), 10 (P1.2–P1.5 audit), 11 (decisions after P1), 12 (no lost edits from Node) and 13 (P1.6 and its audit). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
+Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.6 (implemented and audited 2026-10-12); done 2026-10-12: P2.1, P2.2, P2.4, P3.1, P3.2, P4.1. Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5), 10 (P1.2–P1.5 audit), 11 (decisions after P1), 12 (no lost edits from Node) and 13 (P1.6 and its audit), 14 (P2.1, P2.4, P3.1) and 15 (P2.2, P3.2, P4.1, and the shared `apvm-process` crate). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
 
 ---
 
@@ -8,7 +8,7 @@ Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, 
 
 - **What:** a new **library crate `apvm-sites`**, used by the CLI, the Node bindings (NAPI) and `apvm-core`.
   - **Inventory:** servers → sites → groups, with one default SSH key and per-server overrides.
-  - **Plugin operations:** install (apvm builds, cached or built on demand, or **any zip**), list, **status checks** (is it installed/active, which version/variant), activate, deactivate, uninstall, reset (uninstall but keep files), delete, and ownership check/fix. They work by slug (or by apvm project, or `--all`), on one site or a batch of sites.
+  - **Plugin operations:** install (apvm builds, cached or built on demand, or **any zip**), list, **status checks** (is it installed/active, which version/variant), activate, deactivate, uninstall, reset (uninstall but keep the plugin's files; its translations are deleted), delete, and ownership check/fix. They work by slug (or by apvm project, or `--all`), on one site or a batch of sites.
   - **`apvm wp run`:** runs any WP-CLI command on many sites, safely.
 - **How it stays safe:** every command runs **plan → confirm → apply → verify → report**. Each step is one WP-CLI process, confirmed by **re-reading WordPress state**; exit codes are never trusted alone. Removal is always **two-phase** (deactivate, verify, then uninstall in a separate process).
 - **Variants are managed:** apvm knows which slug each variant installs to and tells pro-de from pro-en on a site.
@@ -23,6 +23,21 @@ Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, 
 ---
 
 ## 0. Change log
+
+### Revision 15 (P2.2, P3.2 and P4.1 implementation and audits, shared process crate, 2026-10-12)
+
+Three workers implemented the phases in parallel in separate worktrees; each phase then went through fresh adversarial audits and fix rounds until no high or medium finding remained (P2.2: 2 rounds, P3.2: 3, P4.1: 4).
+
+| Topic | Change |
+|---|---|
+| Shared process crate (user decision) | Core's `process.rs` moved into a new leaf crate `apvm-process` (`crates/process`, no `apvm-*` dependencies). Core re-exports `ProcessScope`; sites spawns only through it, so every transport child is recorded in the caller's `ProcessScope` and napi's teardown kills it at `process.exit()` (the ported copy in sites could not). D1 now allows exactly this one apvm dependency in sites (a test guards the manifest, section by section). Fixes made once: a failed `wait` no longer lets tokio signal a possibly reused PID; on Linux the held child is pinned by a pidfd (§6.1, §8) |
+| Framing (P3.2) | The nonce line is printed after a newline (`printf '\n%s\n'`): login noise without a final newline made every call fail. `payload()` is an error for a missing nonce, a capped stdout and an interrupted call (timeout, transport loss, signal), never a shorter payload (§6.1) |
+| Uploads (P3.2) | Files are opened `O_NONBLOCK` and type-checked on the handle, so a FIFO swapped in cannot hang a call; a bad path is `invalid_input` |
+| WP-CLI lookups (P4.1) | Verified against WP-CLI 2.12.0: `plugin list` hides a regular plugin behind a same-named must-use plugin or drop-in and prints `null` for non-UTF-8 file names, while the fetcher can still act on both; WP-CLI renames plugins whose names repeat. Lookups follow the fetcher's file rules, report `Shadowed`/`Unreadable` (resolved by a constant `REGULAR_PLUGINS` read), and lifecycle commands take a `Resolved` plugin, so "apvm resolved X, WP-CLI acted on Y" cannot be built. `--no-load` skips by WP-CLI's plugin name |
+| Boot check (P4.1) | Exit 0 with empty output, HTML or extra lines is a failed boot (a plugin printing a page and exiting returned 0). A changed siteurl is a warning, not a failure (force-https, domain mapping) |
+| `reset` (P4.1) | `uninstall --skip-delete` deletes translation files: `reset` changes files and is blocked under `DISALLOW_FILE_MODS` (§6.7, P7.3) |
+| Site CLI (P2.2) | `apvm site`; `server` moved onto shared field-table and removal modules with byte-identical output; `auto`/`login` keywords in any letter case (an inventory holding such a value is now invalid on load) |
+| Process | A P3.2 fixer ran 24 busy loops to test under CPU load and froze the user's machine; agent prompts now forbid load generators and require cleaning up background and stopped processes |
 
 ### Revision 14 (P2.1, P2.4 and P3.1 implementation and audits, 2026-10-12)
 
@@ -205,7 +220,7 @@ Arbitrary slugs and zips are in scope; inventory with defaults/servers/sites/gro
 
 | # | Decision | Choice | Rationale | Rejected |
 |---|---|---|---|---|
-| D1 | Placement | New crate `apvm-sites` (no `apvm-*` deps). `apvm-core` depends on it for plugin hints and build→install. | Zip installs and `wp run` need no GitHub/build stack; core stays the glue library (CLAUDE.md); one dependency direction | All in core; CLI-only |
+| D1 | Placement | New crate `apvm-sites`; its only apvm dependency is the leaf `apvm-process` (rev 15). `apvm-core` depends on it for plugin hints and build→install. | Zip installs and `wp run` need no GitHub/build stack; core stays the glue library (CLAUDE.md); one dependency direction | All in core; CLI-only |
 | D2 | Transport | System OpenSSH, argv only (no local shell) | Inherits `~/.ssh/config`, agent, known_hosts; no new crypto deps | `russh`/`async-ssh2-tokio` |
 | D3 | Script delivery | **stdin**: remote command `sh -s`, script on stdin. Uploads: `sh -c '<script>'` with allowlisted values only | sshd runs commands via the login shell (§3.4). With stdin delivery that shell parses only `sh -s`, so `wp run` arguments may contain any byte but NUL | Quoted command strings for everything (fish mangles `\\`; csh rejects newlines) |
 | D4 | Identity | `run_as = auto`: run as the plugins dir's **owner U with primary group G** (`sudo -n -u U -g G`); root only by explicit opt-in | Files *and* activation side effects get owner + group right from creation | SSH user + chown afterwards (kept as `run_as = login`) |
@@ -630,9 +645,9 @@ Run `wp cache flush` on 3 sites (may write)? [y/N]
 
 1. **Typed scripts.** A `Script` is built from compile-time literals and quoted values (POSIX single quotes, `'` → `'\''`). Every command in it gets `</dev/null` so nothing consumes the script stream. Every script is one brace group `{ … }` whose first command is `LC_ALL=C; export LC_ALL`: the shell parses the whole group before running any of it, so a script cut short at its end (a dropped connection) is a syntax error that runs nothing, never a partial last command (P3.1 audit: a cut `… search-replace a b` lost its trailing `--dry-run` and ran). `LC_ALL=C` makes sudo and coreutils messages are the English ones the classifiers match (sudo keeps `LC_ALL` for the command, §3.5).
 2. **Framing.**
-   `{ LC_ALL=C; export LC_ALL⏎printf '%s\n' '<nonce>'⏎cd / && <s1> </dev/null [&& <s2> </dev/null …]; rc=$?; [ "$rc" -eq 255 ] && rc=254; exit "$rc"⏎}`
+   `{ LC_ALL=C; export LC_ALL⏎printf '\n%s\n' '<nonce>'⏎cd / && <s1> </dev/null [&& <s2> </dev/null …]; rc=$?; [ "$rc" -eq 255 ] && rc=254; exit "$rc"⏎}`
    - One private `frame()` writes the group, prelude, nonce and epilogue; later phases add typed statements (`remote/statement.rs`: a `'static` program plus quoted `Word`s, run as the identity, as root or as the login user), never hand-written framing. Statements are chained with `&&`, so `rc` is the first failing status. Upload scripts use the same frame on one line, `{ …; …; }`.
-   - Only stdout after the per-call random nonce is parsed, which ignores `.bashrc`/MOTD noise.
+   - Only stdout after the line exactly equal to the per-call random nonce is parsed, which ignores `.bashrc`/MOTD noise. The newline printed before the nonce keeps noise without a final newline from gluing onto the nonce line (rev 15). No nonce line → `PayloadError::NonceMissing` (never "no output"); a call that did not end with an exit status (timeout, transport loss, signal) → `PayloadError::Interrupted`; capped stdout → `PayloadError::Truncated`. A script whose start a login shell ate may still have run: after a mutation, `NonceMissing` is treated like a transport loss (re-read).
    - 255→254 makes a real 255 always mean an SSH failure. 254 = remote exit 255: a PHP fatal before WordPress loads, or during activation. Once WordPress has loaded, its default fatal-error handler exits **1** (§3.5). Fatals are never detected by 254 alone, nor by WordPress's message, which a site can change.
    - `cd /` keeps a project `wp-cli.yml` out of play (only a root-owned `/wp-cli.yml` could still apply); `--path` and `--url` are always explicit.
 3. **Delivery** (D3):
@@ -652,7 +667,7 @@ Run `wp cache flush` on 3 sites (may write)? [y/N]
    - `--exec` relaxes, inside the WP-CLI process, only the group bits `P` grants (`<g>` = `P & 070`, constant digits). So WordPress keeps setgid and group bits at creation, and the identity's own "other" bits stay: a `0027` identity is never made world-readable.
    - It is needed because the default umask differs by login path: `0002` via Debian's `pam_umask`, `0022` under `runuser` (§3.5).
    - Staging needs neither: `mktemp -d` always creates `0700`, and the staged zip never reaches the site.
-6. **Limits:** stdout 8 MiB, stderr 1 MiB (with a truncation flag); `kill_on_drop`.
+6. **Limits:** stdout 8 MiB, stderr 1 MiB (with a truncation flag), drained to the end so the child never blocks; a timeout or a dropped call kills the child's whole process tree (`apvm-process`), and every child is recorded in the caller's `ProcessScope`, so napi kills it at `process.exit()` (rev 15).
 7. **Timeouts:** `ConnectTimeout` 15 s; `ServerAliveInterval=15`, `ServerAliveCountMax=4`; per command 300 s, install 900 s, `wp run --timeout`. A timed-out mutation → re-read → done/failed/unknown.
 8. **Retries:** reads only, on transport failures only, twice (1 s, 3 s). Mutations never.
 9. **Multiplexing (Unix):** `ControlMaster=auto`, `ControlPath=<control_dir>/%C`, `ControlPersist=60s`, `control_dir` `0700`. Off on Windows, for paths > 100 bytes, or with `multiplex: false`.
@@ -798,7 +813,7 @@ per site (lock held), per package, sequential:
 
 Plan warnings: `Requires PHP` / `Requires at least` above the site's; the same slug from two sources; replacing one variant with another (§6.9).
 
-`DISALLOW_FILE_MODS` (read in probe step W): WP-CLI ignores it (§3.5), so apvm honors the site's policy itself. Install, reinstall, uninstall and delete are `blocked` with `file_mods_disallowed` unless `--allow-file-mods` is given. Activate, deactivate and reset change no files and proceed.
+`DISALLOW_FILE_MODS` (read in probe step W): WP-CLI ignores it (§3.5), so apvm honors the site's policy itself. Install, reinstall, uninstall, **reset** and delete are `blocked` with `file_mods_disallowed` unless `--allow-file-mods` is given (rev 15: `reset` deletes the plugin's translation files). Activate and deactivate change no files and proceed.
 
 ### 6.8 Ownership, group and group access
 
@@ -1024,7 +1039,7 @@ File handling:
 ## 8. Architecture
 
 ```
-apvm-config   apvm-storage        apvm-sites (NEW: inventory · remote · wp · package · ops · hints)
+apvm-config   apvm-storage        apvm-sites (NEW: inventory · remote · wp · package · ops · hints) ──► apvm-process (rev 15)
        \         /                  ▲      ▲
         apvm-core ──────────────────┘      │   core uses: PluginHints (from builders), build → package → install
          ▲     ▲                           │
@@ -1037,11 +1052,11 @@ crates/sites/src/
   hints.rs, layout.rs (file/dir *names* only)
   inventory/{mod, model, validate, io, resolve}.rs
   package/{mod, headers, rules, archive, layout}.rs
-  remote/{mod, quote, script, identity, transport, capture, local, ssh, classify, mux}.rs
+  remote/{mod, quote, script, statement, identity, transport, capture, local, fake, ssh, classify, mux}.rs
   wp/{mod, command, parse, state, snippets, probe, classify}.rs
   ops/{model, plan, order, apply, verify, ownership, variants, staging, install, list, status, lock, run, runner, report}.rs
   progress.rs (SiteEvent, SiteReporter, Null/Closure/LogFileReporter) · session.rs · manager.rs
-crates/core/src/deploy.rs  ·  crates/core/src/build/plugins/*.rs (slugs, markers)  ·  projects/{registry, hints}.rs (plugin_hints)
+crates/process/src/lib.rs (rev 15: core's former process.rs; command/spawn/output, tree kill, ProcessScope)  ·  crates/core/src/deploy.rs  ·  crates/core/src/build/plugins/*.rs (slugs, markers)  ·  projects/{registry, hints}.rs (plugin_hints)
 crates/cli/src/commands/{server, site, group}.rs · commands/wp/{mod, args, render, list, status, install, activate,
   deactivate, uninstall, reset, delete, ownership, run}.rs · prompt.rs
 crates/napi/src/{sites_inventory, sites, sites_types, sites_progress}.rs
@@ -1304,7 +1319,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** the pure data layer.
 - **Changes:** root `Cargo.toml`; `crates/sites/{Cargo.toml, README.md, src/{lib,error,problem,hints,layout}.rs, src/allowlist/{mod,net,paths}.rs, src/inventory/{mod,model,validate,tests}.rs, tests/inventory.rs}`.
 - **Tests:** accept/reject tables per rule; CRUD integrity; serde round-trips; unknown field rejected; newer `version` read-only; `PluginHints` validation (a family needs ≥ 2 slugs; a slug belongs to one family; variant names unique; markers are allowlisted relative paths).
-- **Done when:** the crate builds with no `apvm-*` deps and every validator is covered.
+- **Done when:** the crate builds with no `apvm-*` deps (since rev 15: only the leaf `apvm-process`) and every validator is covered.
 - **Result:** `crates/sites` with `Inventory` (strict parse, located validation, version handling, CRUD that keeps it valid), `PluginHints`, `layout` names, `Error` + `Code`, and the value rules in `allowlist/` and located problems in `problem.rs`. The refinements are in revisions 7 and 8 (audit). Tests: 105 unit tests, including a randomized property test of the always-valid invariant; 4 integration tests on the §7 example; 2 doctests. Unit tests also guard against any `apvm-*` dependency. Line coverage is 99.7%; the rest is an unreachable serialization error.
 - **Depends:** — · **Parallel:** P0
 
@@ -1364,11 +1379,12 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Result (rev 14):** every field is declared once (`server/fields.rs`: one exhaustive `Field::spec()` table; clap structs destructure every flag under `#[deny(unused_variables)]`), so a dropped flag cannot silently do nothing. `commands/inventory.rs` holds the shared plumbing for P2.2/P2.3/P4.3/P5 (`Failure` with codes and remedies, `name_flags`, an injectable `Console`, JSON documents). `--json` failures print `{"schema":1,"error":{code,message,problems}}` on stdout and `Error:` on stderr. Relative `--key`/`--known-hosts`/`--ssh-config`/`--ssh-binary` values warn only when they change. The audit's 17 surviving mutants (of 27) led to the table tests (every flag read from clap saved and reported, every set + unset refused, every relative path warned once); 35/35 mutants are now killed. Not done here, carried to P2.2/P5: mapping target locations (`sites[1]`, `all_sites`) to `--site`/`--all-sites`, since no `server` command takes targets. A refused change on a missing inventory still leaves the `0700` directory and an empty `0600` lock file (library behavior, documented).
 - **Depends:** P1.2, P1.3 · **Parallel:** P1.4–P1.6, P2.4, P3.x
 
-#### P2.2 — cli: `apvm site`
+#### P2.2 — cli: `apvm site` ✅ (2026-10-12)
 - **Goal:** manage sites offline (the probe arrives in P4.3).
 - **Changes:** `commands/site.rs`; `SKILL.md`.
 - **Tests:** as P2.1, plus `--wp-cli` tokens, `--run-as`/`--owner`/`--ownership`, filters.
 - **Audit notes (rev 14):** reuse `commands/inventory.rs` (`Failure`, `name_flags`, `Console`, `confirm_change`) and the one-table field pattern of `server/fields.rs`; `remove` re-checks the confirmed record under the lock like `server remove`.
+- **Result (rev 15):** `apvm site add|edit|list|show|remove`, no SSH. Each field is declared once (`site/fields.rs`, clap structs destructured under `#[deny(unused_variables)]`); the one-table pattern and the confirm-then-recheck removal became shared modules (`commands/inventory/{field_table,removal}.rs`), and `server` moved onto them with byte-identical output (35 commands compared against the old binary). `--wp-cli` is split at ASCII whitespace, refused tokens named `--wp-cli[i]`. `--group` on `add`/`edit` joins existing groups in the same locked change and never leaves one (leaving is P2.3). `list --server/--group`: union within a flag, intersection across, an unknown id is an error. `show` prints effective settings with their source; `--json` embeds `ResolvedSite`. `remove` re-checks the site and its groups under the lock. Remedies name flags: root refusals add `--allow-root` advice only when root is the actual cause (re-validated with root allowed), with wording that depends on whether the edit revoked `allow_root`; an unknown group says groups have no CLI yet and gives the inventory path and the minimal `{"id":…,"sites":[]}` shape (switch to `apvm group list` in P2.3). Library: `auto`/`login` are keywords in any letter case for `run_as` (and `auto` for `owner`), like `root`; an inventory holding such a value is now `inventory_invalid` on load. 3 audit rounds; 14/14 mutants killed. Carried to P4.3/P5: mapping `sites[i]`/`all_sites` locations to `--site`/`--all-sites`.
 - **Depends:** P2.1 · **Parallel:** P2.4, P3.x
 
 #### P2.3 — cli: `apvm group`
@@ -1405,11 +1421,12 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Result (rev 14):** public `remote::{quote, Nonce, FileMode, AccountName, Identity, RootAccess, OwnerIds, PluginEntry, RootCommand, WpCli, Script, UploadScript}`; refused values are `invalid_input` with a located problem; no new dependencies (the nonce uses std's randomly keyed `RandomState`). Audit and re-audit changes in revision 14. Verified in Debian 12 with sh, dash, bash, zsh, ksh, mksh, yash (ASCII only: it cannot read non-ASCII input under `LC_ALL=C`), busybox ash, and fish, tcsh, csh as login shells, against real WP-CLI 2.12.0.
 - **Depends:** P1.1 · **Parallel:** P1.2–P1.5, P2.x, P0
 
-#### P3.2 — Transport trait, capture, local shell, fake
+#### P3.2 — Transport trait, capture, local shell, fake ✅ (2026-10-12)
 - **Goal:** run scripts and capture results safely.
 - **Changes:** `remote/{transport,capture,local}.rs`, `#[cfg(test)] fake.rs`.
 - **Tests:** caps; timeout kills the child; 20 MB stdin hash round-trip; nonce behind noise; 255 remap.
 - **Audit notes (rev 14):** unframe by the line exactly equal to the nonce (P3.1's test helper `after_nonce` shows the rule); a missing nonce line is a failure, never "no output" (startup files that eat the start of stdin are caught that way).
+- **Result (rev 15):** `remote::{Transport, BoxFuture, Request, Delivery, Payload, Exit, Execution, Captured, PayloadError, unframe, STDOUT_LIMIT, STDERR_LIMIT}`; crate-internal `local::run` (P3.3's runner) and `#[cfg(test)]` `LocalShell` and `fake::{FakeTransport, Reply}`. `Exit::Status` is never 255 (`TransportFailed`; 254 = a command's 255); `Execution::new`/`Captured::new` are public so other crates can implement `Transport` (P8.5). `payload()` is `Ok` only for an exit status and an uncut stdout: `NonceMissing { stdout_truncated }`, `Truncated`, `Interrupted { exit }`. `stdin_written()` means handed to the transport, not received (staging verifies by SHA-256). Upload files are opened `O_NONBLOCK` (a FIFO swapped in cannot hang the call), type-checked on the opened handle, then streamed; a missing/forbidden/wrong-kind path is `invalid_input`, a read failure `process_failed`. Output gets a 2 s settle after exit. **Process handling moved to the new leaf crate `apvm-process`** (user decision): core's `process.rs` moved there unchanged in behavior (core re-exports `ProcessScope`); sites spawns through `apvm_process::spawn`, so every child is recorded in the caller's `ProcessScope` and killed by napi's teardown at `process.exit()`; a failed `wait` forgets the tokio handle (no signal to a reused PID); on Linux the held child is pinned by a pidfd; the stop-then-kill window when the killer itself dies is documented. Tests check that every recorded PID disappears (a merely stopped tree fails); verified on macOS, Linux (slim container) and Windows clippy. 3 audit rounds. Obligations: P3.3 decides which environment variables `ssh` gets (`GITHUB_TOKEN`/`GH_TOKEN` are inherited today) and maps a spawn `NotFound` to `ssh_missing`; P5.1 runs each `tokio::spawn`ed site task inside `ProcessScope::current()`; P5.4 runs `SiteManager` calls under napi's `CallGuard`; P6.2 checks `exit()` and treats `NonceMissing` after a mutation as unknown → re-read.
 - **Depends:** P3.1 · **Parallel:** P4.1, P1.x, P2.x
 
 #### P3.3 — SSH transport
@@ -1428,10 +1445,16 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 
 ### P4 — WordPress driver and probe
 
-#### P4.1 — lib: WP-CLI commands and parsers
+#### P4.1 — lib: WP-CLI commands and parsers ✅ (2026-10-12)
 - **Goal:** typed `wp` argv and robust parsing.
 - **Changes:** `wp/{mod,command,parse,state,snippets}.rs`.
 - **Tests:** argv goldens per command, **asserting the banned flags never appear**; parser fixtures (clean, notice-prefixed incl. the PHP 8.5 deprecation line, notice-suffixed (shutdown), HTML error, truncated, empty, unknown status, single-file plugin, must-use and drop-in rows).
+- **Result (rev 15):** `wp::{WpCommand, CommandKind, WpSite, Slug, StagedZip, Resolved, PluginList, PluginRow, PluginStatus, Lookup, CommandOutput, Parsed, Notices, OutputDefect, SiteFacts, WpCliVersion, BootCheck, RequiresPlugins}`, `wp::parse::{plugin_list, regular_plugins, cli_version, site_facts, requires_plugins, boot_check}`, `wp::snippets::{SITE_FACTS, REGULAR_PLUGINS}` (constant `eval` snippets, §10), code `wp_command_failed`. Pure; every argv goes through P3.1's `WpCli`.
+  - **Commands:** typed values only; one plugin per process, never `--all/--exclude/--deactivate/--uninstall/--activate` (goldens). Lifecycle commands and `requires_plugins` take a `Resolved` plugin (`PluginList::resolve`: a unique regular `Found` only), so no command can name a slug WP-CLI's fetcher would take for another plugin; `--no-load` skips by WP-CLI's own plugin name (`get_plugin_name`), not the slug (verified: `--skip-plugins=hello.php` still loads Hello Dolly). `StagedZip` is built from `(remote_tmp_dir, mktemp name, n)`. `CommandKind`: `is_read` (plugins skipped: retried, no lock), `loads_plugins` (boot check and mutations: locked, never retried), `changes_files` (install, uninstall, **reset**, delete).
+  - **Lookups follow WP-CLI's fetcher** (`$name.php === $file || $file === $name || dirname($file) === $name`), never display names (WP-CLI renames regular plugins whose names repeat: `twofiles/a.php` → `twofiles/a`). `Lookup::{Absent, Found, Ambiguous, Shadowed, Unreadable}`: `plugin list` hides a regular plugin behind a must-use plugin or drop-in at `<slug>.php` or `<slug>` (verified: an active Hello Dolly vanished), and prints `null` for non-UTF-8 file names, which WP-CLI can still act on; both read as undetermined until `REGULAR_PLUGINS` (raw `get_plugins()`, with lossless `file_hex`) resolves them. apvm never acts on a non-UTF-8 file.
+  - **Parsers:** a strict line grammar (a state machine, bounded memory and lookahead) skips PHP diagnostics, multi-line messages, PHP and Xdebug traces and BOMs around exactly one payload and returns them as notices; it refuses a non-zero exit, empty or notice-only output, HTML, any other line (remedy names wp-config.php, must-use plugins, drop-ins or php.ini), two payloads, cut or invalid JSON, cut line payloads (no trailing newline), stdout flagged truncated, missing/unknown/duplicate/mistyped fields, and duplicate files. Site facts are observations (absolute paths and URLs without control characters, canonical or not; `content_dir_realpath` added): a value must pass its own argument rule before it becomes one. The boot check passes on exit 0 plus exactly one `http(s)://` line with a host; a changed siteurl is a warning; it catches fatals, `die()`, HTML and empty output, not a plugin faking a boot. `requires_plugins` mirrors WordPress 7.1.3's `sanitize_dependency_slugs`; `PluginRow::dependency_slug` mirrors `convert_to_slug` (`hello.php` → `hello-dolly`).
+  - **Fixtures:** 38, captured from the P0 harness (WP-CLI 2.12.0, PHP 8.4.26; PHP 8.5.11 and Xdebug 3 for their lines) except the synthetic ones listed in `wp/parse/tests.rs`. Four audit rounds (two HIGH "Found X while WP-CLI acts on Y" cases fixed by making them unbuildable).
+  - **Obligations:** P4.2 sets `with_stdout_truncated` from the transport and maps `OutputDefect::Failed` to `not_wordpress`/`wp_not_installed`; P5/P6 treat `Ambiguous`, `Shadowed` and `Unreadable` (after `REGULAR_PLUGINS` fails) as undetermined, never absent, and block them for mutations; P6.1 orders by `requires_plugins` mapped through `dependency_slug`; `--all` reports rows it cannot resolve instead of skipping them silently (conservative: `slug_of` gives none when the WP-CLI name is ambiguous, e.g. `a.php` next to `a/b.php`). A `Resolved` is unique in *a* parsed list, not tied to a site: P4.2's session binds the list to its `WpSite`, and P6.2 re-reads under the site lock before each mutation. `--no-load` skips every plugin sharing the target's WP-CLI name (a WP-CLI limit): P6.2/P7.2 warn when another regular row shares it. Filters (`all_plugins`) apply to lifecycle commands but not to the reads: only an entry a site deliberately adds could redirect `uninstall`/`delete` (site code, §10 known limits).
 - **Depends:** P3.1 · **Parallel:** P3.2–P3.4
 
 #### P4.2 — lib: probe, identity (owner + group), session
@@ -1564,6 +1587,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
   - independent removal: uninstalling `guarded-pro` while `guarded` stays active succeeds and keeps the shared data (note shown); with `guarded` inactive, the shared data is removed (note shown); `guarded` keeps working in both cases;
   - `reset` keeps files, clears data (`--activate` restores); `delete` keeps data;
   - foreign-owned dir repaired, then removed; `--all --exclude`; `--project`.
+- **Rev 15 note:** `wp plugin uninstall --skip-delete` deletes the plugin's translation files (`languages/plugins/<slug>-*.{po,mo,l10n.php,json}`) before its `--skip-delete` branch (verified, WP-CLI 2.12.0). So `reset` changes files (`CommandKind::changes_files`): it is blocked under `DISALLOW_FILE_MODS` like the other file changes, and its confirmation says the translations go.
 - **Depends:** P7.2, P6.3 · **Parallel:** P7.4, P7.5, P8.1, P8.5
 
 #### P7.4 — cli: `apvm wp ownership` + `apvm site unlock`
