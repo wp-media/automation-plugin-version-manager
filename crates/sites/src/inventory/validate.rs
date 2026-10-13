@@ -231,16 +231,17 @@ fn site_execution(record: &Site, scope: &mut Scope<'_>) {
     }
 }
 
-/// Rules for `run_as`: a valid user that is not a keyword, and root only
-/// with `allow_root`.
+/// Rules for `run_as`: a valid user that is not a keyword (in any letter
+/// case), and root only with `allow_root`.
 fn run_as_rule(run_as: &RunAs, allow_root: bool) -> Rule {
     let RunAs::User(user) = run_as else {
         return Ok(());
     };
-    if matches!(user.as_str(), "auto" | "login") {
+    if is_keyword(user, "auto") || is_keyword(user, "login") {
         return Err(format!(
-            "a user cannot be named {}: 'auto' and 'login' are keywords here",
-            quoted(user)
+            "a user cannot be named {}: 'auto' and 'login' are keywords here{}",
+            quoted(user),
+            case_note(user)
         ));
     }
     allowlist::user(user)?;
@@ -248,19 +249,14 @@ fn run_as_rule(run_as: &RunAs, allow_root: bool) -> Rule {
 }
 
 /// Rules for `owner`: valid user and group names, a user that is not the
-/// `auto` keyword, and root (user or group) only with `allow_root`.
+/// `auto` keyword (in any letter case), and root (user or group) only with
+/// `allow_root`.
 fn owner_rule(owner: &Owner, allow_root: bool) -> Rule {
     let Owner::Explicit { user, group } = owner else {
         return Ok(());
     };
-    if user == "auto" {
-        return Err(match group {
-            Some(_) => "'auto' takes no group: use 'auto', or name the owner as user:group",
-            None => {
-                "a user cannot be named 'auto': it is the keyword for the plugins directory's owner"
-            }
-        }
-        .into());
+    if is_keyword(user, "auto") {
+        return Err(auto_owner_problem(user, group.is_some()));
     }
     let user_rule = allowlist::user(user).and_then(|()| root_rule(user, allow_root));
     user_rule.map_err(|reason| format!("user {reason}"))?;
@@ -269,6 +265,51 @@ fn owner_rule(owner: &Owner, allow_root: bool) -> Rule {
     };
     let group_rule = allowlist::user(group).and_then(|()| root_rule(group, allow_root));
     group_rule.map_err(|reason| format!("group {reason}"))
+}
+
+/// Whether `name` is `keyword` in any letter case. The keywords are
+/// matched like `root`: a user `Auto` or `LOGIN` would read as the keyword
+/// to a person, so it is refused rather than run as a distinct account.
+fn is_keyword(name: &str, keyword: &str) -> bool {
+    name.eq_ignore_ascii_case(keyword)
+}
+
+/// What a keyword refusal adds when the name differs from the keyword in
+/// letter case only (`Auto`), so the message explains the match.
+fn case_note(name: &str) -> &'static str {
+    if name.chars().any(|c| c.is_ascii_uppercase()) {
+        ", in any letter case"
+    } else {
+        ""
+    }
+}
+
+/// Why an explicit owner named `auto` (in any letter case) is refused:
+/// with a group it reads as `auto:<group>`, which is no form; alone it is
+/// the keyword. The exact keyword keeps its short message.
+///
+/// # Arguments
+///
+/// * `user` - The owner's user part
+/// * `has_group` - Whether a group follows it
+fn auto_owner_problem(user: &str, has_group: bool) -> String {
+    let name = if user == "auto" {
+        "'auto'".to_string()
+    } else {
+        format!("{} (the keyword 'auto' in any letter case)", quoted(user))
+    };
+    if has_group {
+        return format!("{name} takes no group: use 'auto', or name the owner as user:group");
+    }
+    if user == "auto" {
+        return "a user cannot be named 'auto': it is the keyword for the plugins directory's owner"
+            .into();
+    }
+    format!(
+        "a user cannot be named {}: 'auto', in any letter case, is the keyword for the plugins \
+         directory's owner",
+        quoted(user)
+    )
 }
 
 /// Running or owning as root needs the site's explicit `allow_root`
@@ -789,6 +830,65 @@ mod tests {
     }
 
     #[test]
+    fn keywords_in_other_letter_cases_cannot_name_users_either() {
+        let check = |run_as: Option<&str>, owner: Option<&str>| {
+            let mut site = Site::new("s", "eu-1", "/p");
+            site.run_as = run_as.map(RunAs::from);
+            site.owner = owner.map(Owner::from);
+            site_problems(&site)
+        };
+        for variant in ["Auto", "AUTO", "Login", "lOgIn"] {
+            assert_eq!(
+                check(Some(variant), None),
+                [format!(
+                    "run_as: a user cannot be named '{variant}': 'auto' and 'login' are \
+                     keywords here, in any letter case"
+                )],
+                "{variant}"
+            );
+        }
+        assert_eq!(
+            check(None, Some("Auto")),
+            [
+                "owner: a user cannot be named 'Auto': 'auto', in any letter case, is the \
+              keyword for the plugins directory's owner"
+            ]
+        );
+        assert_eq!(
+            check(None, Some("AUTO:www-data")),
+            [
+                "owner: 'AUTO' (the keyword 'auto' in any letter case) takes no group: use \
+              'auto', or name the owner as user:group"
+            ]
+        );
+        // Names that merely contain a keyword are users, and `Login` is no
+        // keyword for `owner` (as `login` is not).
+        assert!(check(Some("autobot"), Some("Login:www-data")).is_empty());
+        assert!(check(Some("login2"), Some("Login")).is_empty());
+    }
+
+    #[test]
+    fn a_document_with_a_keyword_variant_is_invalid_like_a_root_variant() {
+        let mut doc = valid();
+        let mut site = Site::new("odd", "eu-1", "/var/www/odd");
+        site.run_as = Some(RunAs::from("Login"));
+        site.owner = Some(Owner::from("Auto"));
+        doc.sites.push(site);
+        let mut rooted = Site::new("rooted", "eu-1", "/var/www/rooted");
+        rooted.run_as = Some(RunAs::from("Root"));
+        doc.sites.push(rooted);
+        let at = doc.sites.len();
+        assert_eq!(
+            locations(&doc),
+            [
+                format!("sites[{}].run_as", at - 2),
+                format!("sites[{}].owner", at - 2),
+                format!("sites[{}].run_as", at - 1),
+            ]
+        );
+    }
+
+    #[test]
     fn root_needs_allow_root() {
         let check = |run_as: Option<&str>, owner: Option<&str>, allow_root: Option<bool>| {
             let mut site = Site::new("s", "eu-1", "/p");
@@ -836,7 +936,8 @@ mod tests {
         assert_eq!(check(":www-data"), ["owner: user must not be empty"]);
         assert_eq!(
             check("a:b:c"),
-            ["owner: group contains ':'; only letters, digits, '.', '_' and '-' are allowed"]
+            // "ASCII letters": the user/group message names the class exactly.
+            ["owner: group contains ':'; only ASCII letters, digits, '.', '_' and '-' are allowed"]
         );
         assert_eq!(
             check("ftpuser:.."),

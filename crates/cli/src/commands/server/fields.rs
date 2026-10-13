@@ -5,22 +5,31 @@
 //! `--unset` name, its flags, its place in a record, whether it is a local
 //! path, which records have it, how a record stores it — is one arm of an
 //! exhaustive `match`, so a new field does not compile until every fact is
-//! given. The commands derive the rest from here: applying and clearing
-//! settings, set + unset conflicts, what changed, the relative-path
-//! warning, the `--unset` values, and the flag names of refused input.
+//! given. The commands derive the rest from here and from the shared
+//! [`field_table`]: applying and
+//! clearing settings, set + unset conflicts, what changed, the
+//! relative-path warning, the `--unset` values, and the flag names of
+//! refused input.
 
 use std::path::{Path, is_separator};
 
 use apvm_sites::{Defaults, Server, SshSettings};
 use clap::ValueEnum;
-use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::builder::TypedValueParser;
 
-use crate::commands::inventory::Failure;
+use crate::commands::inventory::field_table::{self, TableField, TableSetting};
+
+pub(super) use crate::commands::inventory::field_table::{TableRecord as Record, apply, changed};
+// Only the table's tests call these directly; the commands reach them
+// through `field_table::Change`.
+#[cfg(test)]
+use crate::commands::inventory::field_table::{check, empty_value_remedy};
 
 /// A setting of a server or of the SSH defaults. The variant docs are the
-/// `--unset` value help.
+/// `--unset` value help. Visible to `commands`, like the shared table
+/// traits it implements.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Field {
+pub(in crate::commands) enum Field {
     /// Host name or address
     Host,
     /// SSH login user
@@ -49,7 +58,7 @@ pub(super) enum Field {
 
 /// The record a command changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Scope {
+pub(in crate::commands) enum Scope {
     /// A server (`server add` / `server edit`).
     Server,
     /// The SSH defaults (`server defaults`).
@@ -173,12 +182,6 @@ impl Field {
         self.spec().flags
     }
 
-    /// Whether `scope`'s `--unset` can clear this field.
-    fn clearable_in(self, scope: Scope) -> bool {
-        let spec = self.spec();
-        !spec.required && spec.scopes.contains(&scope)
-    }
-
     /// Every field, in report order.
     fn all() -> impl Iterator<Item = Self> {
         Self::value_variants().iter().copied()
@@ -187,7 +190,7 @@ impl Field {
 
 /// A [`Field`] with its value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Setting {
+pub(in crate::commands) enum Setting {
     /// `--host`
     Host(String),
     /// `--user`
@@ -264,22 +267,43 @@ impl Setting {
 // Records
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A record the `server` flags change: a server, or the SSH defaults.
-pub(super) trait Record: Clone {
-    /// The value of `field`: `None` when unset, or not a field of this
-    /// record.
-    fn get(&self, field: Field) -> Option<Setting>;
+impl TableField for Field {
+    type Scope = Scope;
 
-    /// Store `setting`. A field this record does not have is ignored (the
-    /// flags of a command only set fields of its record).
-    fn put(&mut self, setting: Setting);
+    fn name(self) -> &'static str {
+        Field::name(self)
+    }
 
-    /// Clear `field`. A required field, or one this record does not have,
-    /// is left as is (`--unset` never offers them).
-    fn clear(&mut self, field: Field);
+    fn clearable_in(self, scope: Scope) -> bool {
+        let spec = self.spec();
+        !spec.required && spec.scopes.contains(&scope)
+    }
+
+    fn flag_map(scope: Scope) -> Vec<(&'static str, &'static str)> {
+        flag_map(scope)
+    }
 }
 
+impl TableSetting for Setting {
+    type Field = Field;
+
+    fn field(&self) -> Field {
+        Setting::field(self)
+    }
+
+    fn flag(&self) -> &'static str {
+        Setting::flag(self)
+    }
+
+    fn is_empty_value(&self) -> bool {
+        self.text() == Some("")
+    }
+}
+
+/// The SSH settings of a server or of the defaults.
 impl Record for SshSettings {
+    type Setting = Setting;
+
     fn get(&self, field: Field) -> Option<Setting> {
         match field {
             Field::User => self.user.clone().map(Setting::User),
@@ -329,6 +353,8 @@ impl Record for SshSettings {
 /// A server's own fields, plus its SSH settings except the ssh program,
 /// which only the defaults have (the inventory refuses it on a server).
 impl Record for Server {
+    type Setting = Setting;
+
     fn get(&self, field: Field) -> Option<Setting> {
         match field {
             Field::Host => Some(Setting::Host(self.host.clone())),
@@ -359,7 +385,10 @@ impl Record for Server {
     }
 }
 
+/// The SSH defaults (only their `ssh` settings).
 impl Record for Defaults {
+    type Setting = Setting;
+
     fn get(&self, field: Field) -> Option<Setting> {
         self.ssh.get(field)
     }
@@ -377,53 +406,6 @@ impl Record for Defaults {
 // What the commands derive from the table
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `record` with `settings` stored, then the `unset` fields cleared.
-///
-/// # Arguments
-///
-/// * `record` - The current record
-/// * `settings` - What the flags set
-/// * `unset` - What `--unset` clears
-pub(super) fn apply<R: Record>(record: &R, settings: &[Setting], unset: &[Field]) -> R {
-    let mut record = record.clone();
-    for setting in settings {
-        record.put(setting.clone());
-    }
-    for field in unset {
-        record.clear(*field);
-    }
-    record
-}
-
-/// Refuse a field that is both set and cleared in one command.
-///
-/// # Errors
-///
-/// [`Failure::Usage`] naming the first such field by the flag typed
-/// (`--no-multiplex and --unset multiplex contradict each other: pass only
-/// one`).
-pub(super) fn check(settings: &[Setting], unset: &[Field]) -> Result<(), Failure> {
-    match settings
-        .iter()
-        .find(|setting| unset.contains(&setting.field()))
-    {
-        Some(setting) => Err(Failure::Usage(format!(
-            "{} and --unset {} contradict each other: pass only one",
-            setting.flag(),
-            setting.field().name()
-        ))),
-        None => Ok(()),
-    }
-}
-
-/// The fields whose values differ between two versions of a record, in
-/// [`Field`] order.
-pub(super) fn changed<R: Record>(before: &R, after: &R) -> Vec<Field> {
-    Field::all()
-        .filter(|field| before.get(*field) != after.get(*field))
-        .collect()
-}
-
 /// The local paths `after` holds that are new (not in `before`) and
 /// relative to the directory apvm runs in: `(flag, value)` pairs.
 ///
@@ -431,7 +413,7 @@ pub(super) fn changed<R: Record>(before: &R, after: &R) -> Vec<Field> {
 ///
 /// * `before` - The record before the change (`None`: a new record)
 /// * `after` - The record after the change
-pub(super) fn new_relative_paths<R: Record>(
+pub(super) fn new_relative_paths<R: Record<Setting = Setting>>(
     before: Option<&R>,
     after: &R,
 ) -> Vec<(&'static str, String)> {
@@ -470,25 +452,6 @@ pub(super) fn is_cwd_relative(value: &str) -> bool {
     !home && !Path::new(value).has_root()
 }
 
-/// The `--unset` remedy for empty values (`--notes ""`), which the library
-/// refuses: `to clear it: --unset notes`. `None` without an empty value
-/// that `scope`'s `--unset` can clear (an empty `--host` has no remedy).
-pub(super) fn empty_value_remedy(settings: &[Setting], scope: Scope) -> Option<String> {
-    let empty: Vec<&str> = settings
-        .iter()
-        .filter(|setting| setting.text() == Some(""))
-        .map(Setting::field)
-        .filter(|field| field.clearable_in(scope))
-        .map(Field::name)
-        .collect();
-    let pronoun = match empty.len() {
-        0 => return None,
-        1 => "it",
-        _ => "them",
-    };
-    Some(format!("to clear {pronoun}: --unset {}", empty.join(",")))
-}
-
 /// Where each flag of `scope`'s commands lands in its record, for
 /// `inventory::name_flags`: `(location, flag)`.
 pub(super) fn flag_map(scope: Scope) -> Vec<(&'static str, &'static str)> {
@@ -503,10 +466,7 @@ pub(super) fn flag_map(scope: Scope) -> Vec<(&'static str, &'static str)> {
 /// The `--unset` values of `scope`'s command: the fields it can clear,
 /// with their help.
 pub(super) fn unset_parser(scope: Scope) -> impl TypedValueParser<Value = Field> {
-    let values = Field::all()
-        .filter(move |field| field.clearable_in(scope))
-        .filter_map(|field| field.to_possible_value());
-    PossibleValuesParser::new(values).try_map(|name| <Field as ValueEnum>::from_str(&name, false))
+    field_table::unset_parser::<Field>(scope)
 }
 
 #[cfg(test)]

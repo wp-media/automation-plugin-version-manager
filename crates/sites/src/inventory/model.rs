@@ -327,7 +327,9 @@ impl Record for Group {
 /// Who WP-CLI runs as on a site (plan §6.2). Written as `auto`, `login` or
 /// a user name. The two keywords cannot name users: validation refuses
 /// `User("auto")` and `User("login")`, which would be written back as the
-/// keywords and change meaning on reload.
+/// keywords and change meaning on reload, and their letter-case variants
+/// (`User("Auto")`, `User("LOGIN")`), which a person would read as the
+/// keywords (like `root`, matched in any case).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum RunAs {
@@ -380,7 +382,9 @@ impl fmt::Display for RunAs {
 
 /// Who must own a site's plugin files. Written as `auto`, `user` or
 /// `user:group`. `auto` cannot name a user: validation refuses an explicit
-/// user `auto`, which would be written back as the keyword.
+/// user `auto`, which would be written back as the keyword, and its
+/// letter-case variants (`Auto`, `AUTO:www-data`). `login` is no keyword
+/// here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum Owner {

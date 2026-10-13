@@ -1,8 +1,8 @@
-//! End-to-end tests of the site-inventory commands (`apvm server …`)
-//! through the real binary: the file on disk (`~/.apvm/inventory.json` or
-//! `APVM_INVENTORY`), its `0600` mode, exit codes, `--json`, `--cascade`,
-//! confirmation, and the inventory states that must never be rewritten
-//! (invalid, newer, locked, symlinked).
+//! End-to-end tests of the site-inventory commands (`apvm server …`,
+//! `apvm site …`) through the real binary: the file on disk
+//! (`~/.apvm/inventory.json` or `APVM_INVENTORY`), its `0600` mode, exit
+//! codes, `--json`, `--cascade`, confirmation, and the inventory states that
+//! must never be rewritten (invalid, newer, locked, symlinked).
 //!
 //! Each test runs inside a hermetic [`common::Sandbox`] whose fake `$HOME`
 //! holds the default inventory, so the developer's real one is never
@@ -772,4 +772,417 @@ fn concurrent_adds_from_many_processes_all_land() {
         .collect();
     stored.sort_unstable();
     assert_eq!(stored, ids);
+}
+
+// ── apvm site ────────────────────────────────────────────────────────────
+
+/// The current default inventory's text.
+fn inventory_text(sandbox: &Sandbox) -> String {
+    fs::read_to_string(sandbox.inventory_file()).expect("read inventory")
+}
+
+#[test]
+fn site_add_edit_show_list_remove_round_trip() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let file = sandbox.inventory_file();
+
+    let out = sandbox.run(&[
+        "site",
+        "add",
+        "legacy",
+        "--server",
+        "bare",
+        "--path",
+        "/srv/legacy",
+        "--wp-cli",
+        "/usr/bin/php8.3 -n /opt/wp-cli.phar",
+        "--run-as",
+        "login",
+        "--owner",
+        "ftpuser:www-data",
+        "--ownership",
+        "check",
+        "--group",
+        "qa",
+    ]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "Added site 'legacy'.\nIt joined 1 group: 'qa'.\n"
+    );
+    assert!(stderr(&out).is_empty(), "{}", stderr(&out));
+    assert_eq!(mode(&file), 0o600, "a rewrite stays private");
+    let doc = inventory_json(&sandbox);
+    assert_eq!(
+        doc["sites"][2],
+        serde_json::json!({
+            "id": "legacy",
+            "server": "bare",
+            "path": "/srv/legacy",
+            "wp_cli": ["/usr/bin/php8.3", "-n", "/opt/wp-cli.phar"],
+            "run_as": "login",
+            "owner": "ftpuser:www-data",
+            "ownership": "check"
+        })
+    );
+    assert_eq!(
+        doc["groups"],
+        serde_json::json!([{"id": "qa", "sites": ["shop", "legacy"]}])
+    );
+
+    let out = sandbox.run(&[
+        "site",
+        "edit",
+        "legacy",
+        "--timeout",
+        "600",
+        "--unset",
+        "owner,wp-cli",
+    ]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "Updated site 'legacy': wp-cli, owner, timeout.\n"
+    );
+
+    let out = sandbox.run(&["site", "list"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "ID      SERVER  PATH           URL  NAME\n\
+         shop    eu-1    /var/www/shop\n\
+         blog    eu-1    /var/www/blog\n\
+         legacy  bare    /srv/legacy\n"
+    );
+
+    let out = sandbox.run(&["site", "show", "legacy"]);
+    assert_exit(&out, 0);
+    let text = stdout(&out);
+    assert!(
+        text.starts_with("Site 'legacy'\n  server  bare (bare.example.com)\n"),
+        "{text}"
+    );
+    assert!(text.contains("\n  groups  qa\n"), "{text}");
+    // VALUE is as wide as the longest value, the plugins directory.
+    let width = "/srv/legacy/wp-content/plugins".len();
+    for (setting, value, from) in [
+        ("wp-cli", "wp", "built-in"),
+        ("run as", "login", "site"),
+        ("ownership", "check", "site"),
+        ("timeout", "600 s", "site"),
+    ] {
+        let line = format!("\n  {setting:<11}  {value:<width$}  {from}\n");
+        assert!(text.contains(&line), "{line:?} in:\n{text}");
+    }
+
+    let out = sandbox.run(&["site", "remove", "legacy", "-y"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "Removed site 'legacy'.\nIt was removed from 1 group: 'qa'.\n"
+    );
+    assert_eq!(
+        inventory_json(&sandbox),
+        serde_json::from_str::<serde_json::Value>(SAMPLE).expect("JSON")
+    );
+}
+
+#[test]
+fn site_reads_of_a_missing_inventory_create_nothing() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&["site", "list"]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "No sites yet. Add one with: apvm site add <ID> --server <SERVER> --path <WP_ROOT>\n"
+    );
+    assert_exit(&sandbox.run(&["site", "list", "--json"]), 0);
+    assert_exit(&sandbox.run(&["site", "show", "shop"]), 1);
+    assert_exit(&sandbox.run(&["site", "list", "--server", "eu-1"]), 1);
+    assert!(
+        !sandbox.home().join(".apvm").exists(),
+        "nothing was created"
+    );
+}
+
+#[test]
+fn bare_site_command_prints_usage_with_exit_2() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&["site"]);
+    assert_exit(&out, 2);
+    for sub in ["add", "edit", "list", "show", "remove"] {
+        assert!(
+            stderr(&out).contains(sub),
+            "usage lists `{sub}`:\n{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn site_list_filters_and_json() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let out = sandbox.run(&[
+        "site", "list", "--server", "eu-1", "--group", "qa", "--json",
+    ]);
+    assert_exit(&out, 0);
+    assert_eq!(
+        json_stdout(&out),
+        serde_json::json!({
+            "schema": 1,
+            "sites": [{"id": "shop", "server": "eu-1", "path": "/var/www/shop", "groups": ["qa"]}]
+        })
+    );
+    let out = sandbox.run(&["site", "list", "--server", "bare"]);
+    assert_exit(&out, 0);
+    assert_eq!(stdout(&out), "No site matches the filters.\n");
+
+    let out = sandbox.run(&["site", "list", "--group", "nope", "--json"]);
+    assert_exit(&out, 1);
+    assert_eq!(
+        json_stdout(&out),
+        serde_json::json!({
+            "schema": 1,
+            "error": {"code": "invalid_input", "message": "group 'nope' does not exist", "problems": []}
+        })
+    );
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "Error: group 'nope' does not exist\n  apvm has no group commands yet: add the group \
+             to the 'groups' list of the inventory file by hand, as {{\"id\": \"<ID>\", \
+             \"sites\": []}}, or from Node with SiteInventory\n  the inventory file is {:?}\n",
+            sandbox.inventory_file()
+        )
+    );
+}
+
+#[test]
+fn site_show_json_holds_the_effective_settings() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let out = sandbox.run(&["site", "show", "shop", "--json"]);
+    assert_exit(&out, 0);
+    let doc = json_stdout(&out);
+    assert_eq!(
+        doc["site"],
+        serde_json::json!({"id": "shop", "server": "eu-1", "path": "/var/www/shop", "groups": ["qa"]})
+    );
+    assert_eq!(
+        doc["effective"]["plugins_dir"],
+        serde_json::json!({"value": "/var/www/shop/wp-content/plugins", "source": "built-in"})
+    );
+    assert_eq!(doc["effective"]["server"]["host"], "203.0.113.10");
+    assert_eq!(
+        doc["effective"]["server"]["ssh"]["multiplex"],
+        serde_json::json!({"value": true, "source": "built-in"})
+    );
+}
+
+#[test]
+fn site_invalid_input_exits_1_naming_the_flags_and_writes_nothing() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let out = sandbox.run(&[
+        "site", "add", "x", "--server", "eu-9", "--path", "/srv/x/", "--wp-cli", "sudo wp",
+        "--run-as", "root",
+    ]);
+    assert_exit(&out, 1);
+    let err = stderr(&out);
+    assert!(err.starts_with("Error: invalid site 'x':\n"), "{err}");
+    for line in [
+        "\n  --server: unknown server 'eu-9'",
+        "\n  --path: ",
+        "\n  --wp-cli[0]: must be a PHP interpreter",
+        "\n  --wp-cli[1]: must be an absolute path",
+        "\n  --run-as: 'root' needs allow_root: true",
+    ] {
+        assert!(err.contains(line), "{line:?} in:\n{err}");
+    }
+    assert!(
+        err.ends_with(
+            "\n  root needs --allow-root: pass it, or name another user in --run-as/--owner\n"
+        ),
+        "{err}"
+    );
+    assert!(stdout(&out).is_empty());
+
+    let out = sandbox.run(&["site", "edit", "shop", "--url", ""]);
+    assert_exit(&out, 1);
+    assert_eq!(
+        stderr(&out),
+        "Error: invalid site 'shop':\n  --url: must start with 'http://' or 'https://'\n  \
+         to clear it: --unset url\n"
+    );
+    assert_eq!(inventory_text(&sandbox), SAMPLE);
+}
+
+#[test]
+fn site_ids_and_groups_exit_1_with_a_remedy() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let group_error = format!(
+        "Error: group 'nope' does not exist\n  apvm has no group commands yet: add the group to \
+         the 'groups' list of the inventory file by hand, as {{\"id\": \"<ID>\", \"sites\": []}}, \
+         or from Node with SiteInventory\n  the inventory file is {:?}\n",
+        sandbox.inventory_file()
+    );
+    for (args, message) in [
+        (
+            &["site", "add", "shop", "--server", "eu-1", "--path", "/x"][..],
+            "Error: site 'shop' already exists\n  \
+             change it with 'apvm site edit', or choose another id\n",
+        ),
+        (
+            &["site", "edit", "nope", "--notes", "n"],
+            "Error: site 'nope' does not exist\n  'apvm site list' shows the sites\n",
+        ),
+        (
+            &[
+                "site", "add", "x", "--server", "eu-1", "--path", "/x", "--group", "nope",
+            ],
+            group_error.as_str(),
+        ),
+        (
+            &["site", "remove", "nope", "-y"],
+            "Error: site 'nope' does not exist\n  'apvm site list' shows the sites\n",
+        ),
+    ] {
+        let out = sandbox.run(args);
+        assert_exit(&out, 1);
+        assert_eq!(stderr(&out), message, "{args:?}");
+    }
+    assert_eq!(inventory_text(&sandbox), SAMPLE);
+}
+
+#[test]
+fn site_contradicting_and_malformed_arguments() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let out = sandbox.run(&[
+        "site",
+        "edit",
+        "shop",
+        "--allow-root",
+        "--unset",
+        "allow-root",
+    ]);
+    assert_exit(&out, 1);
+    assert_eq!(
+        stderr(&out),
+        "Error: --allow-root and --unset allow-root contradict each other: pass only one\n"
+    );
+    for args in [
+        &["site", "edit", "shop"][..],
+        &["site", "edit", "shop", "--unset", "path"],
+        &["site", "edit", "shop", "--unset", "server"],
+        &["site", "add", "x", "--server", "eu-1"],
+        &["site", "add", "x", "--path", "/x"],
+        &["site", "edit", "shop", "--ownership", "always"],
+        &["site", "edit", "shop", "--timeout", "soon"],
+        &[
+            "site", "add", "x", "--server", "eu-1", "--path", "/x", "--json",
+        ],
+    ] {
+        assert_exit(&sandbox.run(args), 2);
+    }
+    assert_eq!(inventory_text(&sandbox), SAMPLE);
+}
+
+#[test]
+fn site_remove_without_a_terminal_needs_yes_even_with_a_piped_answer() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let out = sandbox.run_binary(Path::new(common::APVM), &["site", "remove", "blog"], "y\n");
+    assert_exit(&out, 1);
+    assert_eq!(
+        stderr(&out),
+        "Error: not removing site 'blog': it needs a confirmation, and stdin is not a terminal; \
+         pass -y (--yes) to remove it without asking\n"
+    );
+    assert_eq!(inventory_text(&sandbox), SAMPLE);
+}
+
+#[test]
+fn site_commands_on_a_newer_inventory_are_read_only() {
+    let sandbox = Sandbox::new();
+    let text = r#"{"version": 9, "servers": [{"id": "a", "host": "h"}],
+        "sites": [{"id": "s", "server": "a", "path": "/var/www/s"}]}"#;
+    write_inventory(&sandbox, text);
+    let out = sandbox.run(&["site", "list"]);
+    assert_exit(&out, 0);
+    assert!(stdout(&out).contains("s   a"), "{}", stdout(&out));
+    assert!(stderr(&out).contains("read-only"), "{}", stderr(&out));
+    for args in [
+        &["site", "add", "t", "--server", "a", "--path", "/q"][..],
+        &["site", "edit", "s", "--notes", "n"],
+        &["site", "remove", "s", "-y"],
+    ] {
+        let out = sandbox.run(args);
+        assert_exit(&out, 1);
+        assert!(stderr(&out).contains("read-only"), "{}", stderr(&out));
+    }
+    assert_eq!(inventory_text(&sandbox), text);
+}
+
+#[test]
+fn apvm_inventory_points_site_commands_at_another_file() {
+    let sandbox = Sandbox::new();
+    let other = sandbox.scratch().join("inv.json");
+    fs::write(&other, SAMPLE).expect("write");
+    let env = [("APVM_INVENTORY", other.as_os_str())];
+    let out = sandbox.run_with_env(
+        &["site", "add", "x", "--server", "bare", "--path", "/srv/x"],
+        &env,
+    );
+    assert_exit(&out, 0);
+    assert_eq!(mode(&other), 0o600);
+    assert!(
+        !sandbox.inventory_file().exists(),
+        "the default stays untouched"
+    );
+    let out = sandbox.run_with_env(&["site", "show", "x", "--json"], &env);
+    assert_eq!(json_stdout(&out)["site"]["server"], "bare");
+}
+
+#[test]
+fn concurrent_site_adds_from_many_processes_all_land() {
+    let sandbox = Sandbox::new();
+    write_inventory(&sandbox, SAMPLE);
+    let ids: Vec<String> = (0..8).map(|n| format!("s{n}")).collect();
+    let children: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let path = format!("/var/www/{id}");
+            common::spawn_retrying_busy(|| {
+                sandbox
+                    .command_for(Path::new(common::APVM))
+                    .args([
+                        "site", "add", id, "--server", "bare", "--path", &path, "--group", "qa",
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            })
+            .expect("spawn")
+        })
+        .collect();
+    for child in children {
+        assert_exit(&child.wait_with_output().expect("finish"), 0);
+    }
+    let doc = inventory_json(&sandbox);
+    let mut stored: Vec<&str> = doc["sites"]
+        .as_array()
+        .expect("sites")
+        .iter()
+        .filter_map(|site| site["id"].as_str())
+        .filter(|id| id.starts_with('s') && *id != "shop")
+        .collect();
+    stored.sort_unstable();
+    assert_eq!(stored, ids);
+    let members = doc["groups"][0]["sites"].as_array().map(Vec::len);
+    assert_eq!(members, Some(1 + ids.len()), "every group join landed too");
 }

@@ -3,11 +3,14 @@
 apvm keeps the WordPress sites it can deploy to in a **site inventory**: SSH
 **servers**, the WordPress **sites** on them, and **groups** of sites, plus
 default SSH settings every server inherits. This release ships the server
-commands (`apvm server …`); the `site`, `group` and `wp` commands come later.
+and site commands (`apvm server …`, `apvm site …`); the `group` and `wp`
+commands come later.
 
 No inventory command connects to your servers: it reads or edits the file
-only, and no SSH connection is made (the connection test, `apvm server
-test`, comes with a later release). Like every apvm command run on a
+only, and no SSH connection is made (the connection tests, `apvm server
+test`, `apvm site test` and the probe on `site add`, come with a later
+release). Removing a site or a server changes nothing on the machine
+itself. Like every apvm command run on a
 terminal, it may check GitHub for a newer apvm in the background
 (`APVM_NO_UPDATE_CHECK=1` turns that off).
 
@@ -16,7 +19,7 @@ terminal, it may check GitHub for a newer apvm in the background
 | Topic | Behavior |
 |-------|----------|
 | Location | `~/.apvm/inventory.json`. **`APVM_INVENTORY=<path>`** replaces it for one invocation (tests, CI, a second set of servers); an empty value means the default; a relative path is relative to the current directory |
-| Missing file | An empty inventory. Reads (`list`, `show`, `defaults` without flags) never create it; the first change does. A change refused after taking the lock (invalid value, unknown id) writes no inventory, but leaves the directory it created (`0700`) and the empty lock file (`inventory.json.lock`, `0600`); contradicting flags (`--user u --unset user`) touch nothing |
+| Missing file | An empty inventory. Reads (`list`, `show`, `server defaults` without flags) never create it; the first change does. A change refused after taking the lock (invalid value, unknown id) writes no inventory, but leaves the directory it created (`0700`) and the empty lock file (`inventory.json.lock`, `0600`); contradicting flags (`--user u --unset user`) touch nothing |
 | Permissions | The file and its lock file are `0600`; a missing directory is created `0700` |
 | Safe edits | Every change is one locked read-modify-write (lock `inventory.json.lock`, written atomically), so concurrent apvm processes never lose each other's edits. A refused change writes nothing. A change that changes nothing (`--user` to the same value) writes nothing |
 | Locked | Writers wait at most **10 s** for another process's lock, then fail: `cannot lock the inventory with <path>.lock: another process held it for 10 s` + `edits hold the lock for milliseconds, so that process is likely stuck: stop it, then retry` (nothing written). Reads take no lock |
@@ -203,4 +206,164 @@ apvm server show eu-1
 apvm server remove staging -y
 apvm server remove eu-1 --cascade -y                   # also removes its sites
 APVM_INVENTORY=/tmp/test-inventory.json apvm server list
+```
+
+## `apvm site` — WordPress installs on servers
+
+| Command | Arguments | Notes |
+|---------|-----------|-------|
+| `apvm site add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]…` | The server must exist. `--group` (repeatable or comma-separated) adds the site to **existing** groups, in the same change (apvm has no group commands yet: add groups to the file's `groups` list by hand, each as `{"id": "qa", "sites": []}` — `sites` is required —, or from Node with `SiteInventory`) |
+| `apvm site edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` | At least one change (else exit 2). The id cannot change. `--server` moves the site to another server. `--group` only joins groups: it never leaves one |
+| `apvm site list` | `[--server <ID>]… [--group <ID>]… [--json]` | Inventory order. Filters (repeatable or comma-separated): a site is listed when it is on any listed server **and** in any listed group. An unknown server or group id is an error (exit 1), never an empty list |
+| `apvm site show <ID>` | `[--json]` | The record, its groups, where ssh connects, and the **effective** settings with where each comes from |
+| `apvm site remove <ID>` | `[-y\|--yes]` | Removes it from the inventory (and from its groups); nothing on the server changes. Asks first unless `-y` |
+
+Site flags (the same for `add` and `edit`): `[--url <URL>] [--wp-cli "<CMD>"]
+[--run-as auto|login|<USER>] [--owner auto|<USER>[:<GROUP>]]
+[--ownership mirror|mirror-root|check|off] [--plugins-dir <PATH>]
+[--allow-root] [--tmp-dir <PATH>] [--timeout <SECS>] [--name <TEXT>]
+[--notes <TEXT>]`.
+
+### Flags
+
+| Flag | Meaning (built-in when unset) | Rule (checked by apvm; exit 1 otherwise) |
+|------|-------------------------------|------------------------------------------|
+| `<ID>` | Site id | `^[a-z0-9][a-z0-9._-]{0,63}$`, unique among sites |
+| `--server` | The server the site is on | an existing server id |
+| `--path` | The WordPress root on the server | absolute and canonical (no empty, `.` or `..` component, no trailing `/`, not `/`); no backslash, control or invisible character; no whitespace but spaces, no component starting or ending with a space; ≤ 4096 bytes |
+| `--url` | Site URL, passed to WP-CLI as `--url` (needed on multisite) | `http(s)://host[:port][/path]`: lowercase scheme; DNS name, IPv4 or `[IPv6]`; path `[A-Za-z0-9._~/-]` and `%`-escapes, no `.`/`..` segment; no user info (never echoed back), query or fragment; ≤ 2048 bytes |
+| `--wp-cli "<CMD>"` | The WP-CLI command (`wp`) | One string, split at ASCII spaces, tabs and newlines into ≤ 4 tokens of `[A-Za-z0-9._/+-]` (quotes are not syntax: they are refused). Either one program (a command name or an absolute path), or a PHP interpreter (`php`, `php8.3`, `php-8.3`, `ea-php81`, or an absolute path to one) + optional `-n`/`-q` + the absolute WP-CLI script. Wrappers (`sudo wp`, `env -u X wp`, `wp eval-file`) are refused. A value starting with `-` needs `--wp-cli=…` |
+| `--run-as` | Who WP-CLI runs as: `auto` (the plugins directory's owner and group), `login` (the SSH user, no sudo) or a user (`auto`) | a user: `[A-Za-z0-9._-]`, no leading `-`, ≤ 64, not all digits, not `.`/`..`; the keywords are lowercase, and a user named `auto` or `login` in any letter case (`Auto`, `LOGIN`) is refused; `root` (any case) needs `--allow-root` |
+| `--owner` | Who must own the plugin files: `auto` (the plugins directory's owner), `USER` or `USER:GROUP` (`auto`) | user and group as `--run-as`, but only `auto` is a keyword here, in any letter case: `Auto` alone is refused as the keyword (`a user cannot be named 'Auto': …`), and `auto:<group>` or `AUTO:<group>` because the keyword takes no group; `login`/`Login` is an ordinary user here; `root` (any case) as user or group needs `--allow-root` |
+| `--ownership` | How ownership is checked and repaired (`mirror`) | `mirror` (repair without root), `mirror-root` (also the guarded root `chown`), `check` (report only), `off`; anything else is exit 2 |
+| `--plugins-dir` | Pins a plugins directory for a site that sets `WP_PLUGIN_DIR` (`<path>/wp-content/plugins`) | as `--path` |
+| `--allow-root` | Allows WP-CLI as root and root-owned files (no) | a switch; `--unset allow-root` turns it off again (refused while `--run-as`/`--owner` name root). The library's refusal names the file field (`'root' needs allow_root: true`); apvm adds the flag remedy |
+| `--tmp-dir` | Remote temporary directory for uploads and the site lock (`/tmp`) | as `--path`, and only `[A-Za-z0-9._/+-]` |
+| `--timeout` | Seconds a remote command may run (each operation's own default) | 1–86400 (a non-number, a negative number or one above 4294967295 is exit 2) |
+| `--name` / `--notes` | Display name / free-form notes | 1–128 / 1–1024 characters; no control or invisible formatting characters |
+| `--group` (`add`/`edit`) | Join these existing groups | an existing group id (`group '<id>' does not exist` otherwise; nothing written) |
+
+- `--unset <FIELD>` clears a setting back to its built-in value; repeatable
+  or comma-separated (`--unset url,timeout`). The field is the flag's name:
+  `url`, `wp-cli`, `run-as`, `owner`, `ownership`, `plugins-dir`,
+  `allow-root`, `tmp-dir`, `timeout`, `name`, `notes`. The server and the
+  path cannot be unset (exit 2), nor can a group be left with `--unset`.
+  Setting and unsetting one field is exit 1 (`--url and --unset url
+  contradict each other: pass only one`).
+- An empty value (`--url ""`, `--wp-cli " "`) is an error, not "unset"; `edit`
+  names the remedy (`to clear it: --unset url`).
+- Refused `--wp-cli` tokens are named by position, from 0:
+  `--wp-cli[0]: must be a PHP interpreter (php, php8.3, php-8.3, ea-php81) when
+  more tokens follow`, `--wp-cli[1]: must be an absolute path (WP-CLI runs from '/')`.
+- Nothing is a local path, so nothing warns about relative paths: a relative
+  `--path`, `--plugins-dir` or `--tmp-dir` is refused.
+
+### Output
+
+```text
+$ apvm site add shop --server eu-1 --path /var/www/shop --url https://shop.example.com --group qa
+Added site 'shop'.
+It joined 1 group: 'qa'.
+$ apvm site edit shop --run-as login --unset url
+Updated site 'shop': url, run-as.
+$ apvm site edit shop --group qa
+Site 'shop' is unchanged.
+$ apvm site edit shop --group prod --notes "main store"
+Updated site 'shop': notes, groups.
+It joined 1 group: 'prod'.
+$ apvm site list
+ID    SERVER  PATH           URL                       NAME
+shop  eu-1    /var/www/shop  https://shop.example.com  Shop
+blog  eu-1    /var/www/blog
+$ apvm site show shop
+Site 'shop'
+  name    Shop
+  server  eu-1 (ubuntu@203.0.113.10:2222)
+  path    /var/www/shop
+  url     https://shop.example.com
+  groups  qa, prod
+
+Effective settings
+  SETTING      VALUE                             FROM
+  wp-cli       /usr/bin/php8.3 /opt/wp-cli.phar  site
+  run as       login                             site
+  owner        auto                              built-in
+  ownership    mirror                            built-in
+  plugins dir  /var/www/shop/wp-content/plugins  built-in
+  allow root   no                                built-in
+  tmp dir      /tmp                              built-in
+  timeout      not set                           each operation's default
+$ apvm site remove shop
+? Remove site 'shop' from the inventory (it also leaves 2 groups: 'qa', 'prod')? [y/N] y
+Removed site 'shop'.
+It was removed from 2 groups: 'qa', 'prod'.
+```
+
+Changes report the changed fields in a fixed order (`server`, `path`, `url`,
+`wp-cli`, `run-as`, `owner`, `ownership`, `plugins-dir`, `allow-root`,
+`tmp-dir`, `timeout`, `name`, `notes`, then `groups`). `show` prints `name`,
+`url` and `notes` only when set; `server` is followed by where ssh connects
+(`[user@]host[:port]`, as in `server list`). With no sites, `list` prints
+`No sites yet. Add one with: apvm site add <ID> --server <SERVER> --path <WP_ROOT>`;
+when filters match nothing, `No site matches the filters.` (exit 0).
+
+### Confirmation (`site remove`)
+
+As `server remove`: asked once on stderr unless `-y`/`--yes` (only `y`/`yes`
+confirms; declining prints `Aborted. Nothing changed.`, exit 0); without a
+terminal on stdin it fails (exit 1, `not removing site '<id>': it needs a
+confirmation, and stdin is not a terminal; pass -y (--yes) to remove it
+without asking`). If the site record or its group memberships change while
+you answer, nothing is removed: `site '<id>' or its groups changed while you
+were confirming; nothing was removed: run the command again`. An unknown site
+or a read-only inventory fails before asking.
+
+### `--json`
+
+`list` and `show` accept `--json` (stdout, `"schema": 1`); records appear as
+the inventory stores them (unset fields omitted; `wp_cli` as its token list,
+`run_as`/`owner`/`ownership` as written).
+
+```text
+apvm site list --json      → {"schema": 1, "sites": [{"id", "server", "path", …, "groups": ["qa", …]}]}
+apvm site show <ID> --json → {"schema": 1, "site": {…, "groups": […]},
+                              "effective": {"id", "path", "url" | null,
+                                            "server": {"id", "host", "ssh": {…as server show…}},
+                                            "wp_cli": {"value": ["wp"], "source": "built-in"},
+                                            "run_as", "owner", "ownership", "plugins_dir",
+                                            "allow_root", "remote_tmp_dir": {value, source},
+                                            "command_timeout_secs": 600 | null}}
+```
+
+`source` is `site` or `built-in` for the site's settings (`server`,
+`defaults` or `built-in` for SSH). Failures print the same
+`{"schema": 1, "error": {…}}` document as `apvm server`; `location` names the
+flag for refused input (`--run-as`, `--wp-cli[1]`).
+
+### Errors
+
+Exit codes as for `apvm server` (`0` success or declined, `1` refusal, `2`
+invalid arguments: missing `--server`/`--path` on `add`, unknown `--unset`
+field or `--ownership` value, `edit` without a change). The codes are those of
+the server table above; site-specific messages:
+
+| Message | Code | Line apvm prints after it (or, in *italics*, what to do when it prints none) |
+|---------|------|--------------------------------------------------------------------------------|
+| `site 'x' does not exist` | `invalid_input` | `'apvm site list' shows the sites` |
+| `site 'x' already exists` | `invalid_input` | `change it with 'apvm site edit', or choose another id` |
+| `invalid site 'x':` + `--server: unknown server 'y'` | `invalid_input` | *fix the id (`apvm server list`), or add the server first (`apvm server add`)* |
+| `invalid site 'x':` + `--run-as: 'root' needs allow_root: true` (or `--owner: user/group 'root' …`) | `invalid_input` | `root needs --allow-root: pass it, or name another user in --run-as/--owner`; after `--unset allow-root`: `--run-as/--owner name root, which needs --allow-root: keep it (drop --unset allow-root), or name another user there first` |
+| `group 'x' does not exist` (`--group`) | `invalid_input` | `apvm has no group commands yet: add the group to the 'groups' list of the inventory file by hand, as {"id": "<ID>", "sites": []}, or from Node with SiteInventory`, then `the inventory file is "<path>"` (group commands come in a later release) |
+| `server 'x' does not exist` (`list --server`) | `invalid_input` | `'apvm server list' shows the servers` |
+| `site 'x' or its groups changed while you were confirming; nothing was removed: run the command again` | `inventory_changed` | *none: the message already says to run the command again* |
+
+```sh
+apvm site add shop --server eu-1 --path /var/www/shop --url https://shop.example.com
+apvm site add legacy --server eu-1 --path /srv/legacy --wp-cli "/usr/bin/php8.3 -n /opt/wp-cli.phar" --run-as login
+apvm site add ftpsite --server eu-1 --path /home/ftpuser/public_html --owner ftpuser:www-data --ownership check
+apvm site edit shop --plugins-dir /var/www/shop/app/plugins --timeout 600
+apvm site edit shop --unset url,timeout
+apvm site list --server eu-1 --group qa --json
+apvm site show shop --json
+apvm site remove legacy -y
 ```

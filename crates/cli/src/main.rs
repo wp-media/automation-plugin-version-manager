@@ -21,7 +21,9 @@ use apvm_core::Apvm;
 use apvm_core::config_io::load_config_file;
 use apvm_sites::inventory::io as inventory_io;
 
-use crate::commands::{BuildArgs, CacheArgs, ConfigArgs, InfoArgs, ServerArgs, SkillArgs};
+use crate::commands::{
+    BuildArgs, CacheArgs, ConfigArgs, InfoArgs, ServerArgs, SiteArgs, SkillArgs,
+};
 use crate::paths::Paths;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,6 +72,8 @@ enum Commands {
     Config(ConfigArgs),
     /// Manage the SSH servers of the site inventory (never connects to them)
     Server(ServerArgs),
+    /// Manage the WordPress sites of the site inventory (never connects to them)
+    Site(SiteArgs),
     /// Install or remove the Claude Code skill for apvm (project-local or global)
     Skill(SkillArgs),
     /// Update apvm to the latest version
@@ -194,9 +198,11 @@ async fn dispatch(cli: Cli, paths: &Paths) -> std::result::Result<(), CommandErr
     // Inventory commands never connect to the servers (no SSH) and need
     // neither the config file nor a GitHub client. APVM_INVENTORY (when set and not empty) replaces the
     // default ~/.apvm/inventory.json.
-    if let Commands::Server(args) = &cli.command {
-        let inventory = paths.inventory_file(inventory_io::env_override());
-        return Ok(args.execute(&inventory)?);
+    let inventory = || paths.inventory_file(inventory_io::env_override());
+    match &cli.command {
+        Commands::Server(args) => return Ok(args.execute(&inventory())?),
+        Commands::Site(args) => return Ok(args.execute(&inventory())?),
+        _ => {}
     }
 
     // Load config: file values override defaults, missing fields use defaults.
@@ -240,6 +246,7 @@ async fn dispatch(cli: Cli, paths: &Paths) -> std::result::Result<(), CommandErr
         Commands::Cache(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
         Commands::Server(_) => unreachable!("handled above"),
+        Commands::Site(_) => unreachable!("handled above"),
         Commands::Skill(_) => unreachable!("handled above"),
         Commands::Update => unreachable!("handled above"),
         Commands::Uninstall { .. } => unreachable!("handled above"),

@@ -1,7 +1,7 @@
 ---
 name: apvm-cli
-description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm server` (the site inventory's SSH servers and default SSH settings, `~/.apvm/inventory.json`), `apvm skill` (install/uninstall this Claude Code skill), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
-when_to_use: Trigger on requests like "build backwpup from PR 123", "what plugins does apvm know about", "clean the apvm cache", "set my GitHub token for apvm", "update apvm", "download the latest release of imagify", "install the apvm skill", "add a server to apvm", "set apvm's default SSH key", or any direct `apvm <subcommand>` invocation. Also trigger when the user references a plugin artifact path under `~/.apvm/` or asks about the WP Media plugin version manager.
+description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm server` (the site inventory's SSH servers and default SSH settings, `~/.apvm/inventory.json`), `apvm site` (the WordPress sites on those servers: path, URL, WP-CLI command, identity, ownership policy), `apvm skill` (install/uninstall this Claude Code skill), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
+when_to_use: Trigger on requests like "build backwpup from PR 123", "what plugins does apvm know about", "clean the apvm cache", "set my GitHub token for apvm", "update apvm", "download the latest release of imagify", "install the apvm skill", "add a server to apvm", "set apvm's default SSH key", "add a WordPress site to apvm", "list apvm's sites", or any direct `apvm <subcommand>` invocation. Also trigger when the user references a plugin artifact path under `~/.apvm/` or asks about the WP Media plugin version manager.
 allowed-tools: Bash(apvm *)
 ---
 
@@ -54,7 +54,7 @@ Binary path (after install): `~/.apvm/bin/apvm`. Version in this repo: **3.3.0**
   are skipped when stderr is not a TTY (pipes/CI) and never change the exit
   code — only `apvm update` itself can fail.
 - **`APVM_INVENTORY=<path>`** — use another site inventory file instead of
-  `~/.apvm/inventory.json` for one invocation (all `apvm server` commands). An
+  `~/.apvm/inventory.json` for one invocation (all `apvm server` and `apvm site` commands). An
   empty value means the default; a relative path is relative to the current
   directory. Like `APVM_CACHE_DIR`, only set it when asked to isolate (tests,
   CI, developing apvm itself).
@@ -382,6 +382,54 @@ apvm server remove eu-1 --cascade -y
 
 ---
 
+### `apvm site <SUBCMD>`
+
+Manages the **WordPress sites** of the site inventory: which server each is
+on, its WordPress root, and how apvm will work on it (WP-CLI command, who
+WP-CLI runs as, who owns the plugin files). It never connects to the sites
+(no SSH), and `remove` only edits the inventory: nothing on the server
+changes. Full reference: [references/sites.md](references/sites.md).
+
+Site flags (shared by `add` and `edit`): `[--url <URL>] [--wp-cli "<CMD>"]
+[--run-as auto|login|<USER>] [--owner auto|<USER>[:<GROUP>]]
+[--ownership mirror|mirror-root|check|off] [--plugins-dir <PATH>]
+[--allow-root] [--tmp-dir <PATH>] [--timeout <SECS>] [--name <TEXT>]
+[--notes <TEXT>]`.
+
+| Subcommand | Arguments |
+|------------|-----------|
+| `add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]…` — `--group` adds it to existing groups (apvm has no group commands yet: groups are added to the inventory file by hand, or from Node with `SiteInventory`) |
+| `edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` (at least one change; `--group` only joins groups, never leaves one) |
+| `list` | `[--server <ID>]… [--group <ID>]… [--json]` — filters: any listed server **and** any listed group |
+| `show <ID>` | `[--json]` — the record, its groups, and the **effective** settings with where each comes from |
+| `remove <ID>` | `[-y\|--yes]` — also leaves its groups; asks first, and **needs `-y` when stdin is not a terminal** |
+
+- `--wp-cli` is one string split at spaces (and tabs): one program (`wp`, `/usr/local/bin/wp`)
+  or a PHP interpreter with `-n`/`-q` and the absolute WP-CLI script
+  (`"/usr/bin/php8.3 /opt/wp-cli.phar"`). Wrappers (`sudo wp`, `env …`) are
+  refused; problems name the token (`--wp-cli[1]: …`, counted from 0).
+- `root` (any letter case) as `--run-as` or in `--owner` needs
+  `--allow-root`: the error says `'root' needs allow_root: true` and apvm adds
+  `root needs --allow-root: pass it, or name another user in --run-as/--owner`.
+  The keywords `auto`/`login` are lowercase; `--run-as Auto` or `LOGIN` is
+  refused (`… in any letter case`), and so is `--owner Auto`. `login` is no
+  keyword for `--owner`, so `--owner login`/`Login`/`LOGIN` name a user.
+- Paths (`--path`, `--plugins-dir`, `--tmp-dir`) are on the server and must be
+  absolute and canonical. Refused input names the flag; an empty value
+  (`--url ""`) is refused with `to clear it: --unset url`.
+- The connection probe on `add` and `apvm site test` come in a later release.
+
+```sh
+apvm site add shop --server eu-1 --path /var/www/shop --url https://shop.example.com
+apvm site add legacy --server eu-1 --path /srv/legacy --wp-cli "/usr/bin/php8.3 /opt/wp-cli.phar" --run-as login
+apvm site edit shop --owner ftpuser:www-data --ownership check --unset url
+apvm site list --server eu-1 --json
+apvm site show shop
+apvm site remove legacy -y
+```
+
+---
+
 ### `apvm skill <SUBCMD> [-g|--global]`
 
 Installs or removes **this very skill** (`apvm-cli`) as a
@@ -515,6 +563,8 @@ Required for private repos and PR builds. Recommended for public repos
 | `… is read-only: upgrade apvm to change it`                      | The inventory was written by a newer apvm. Reads work; run `apvm update` to edit it. |
 | `cannot lock the inventory with <path>.lock: another process held it for 10 s` | Another apvm process is stuck holding the inventory lock (apvm adds: `edits hold the lock for milliseconds, so that process is likely stuck: stop it, then retry`). Nothing was written. |
 | `server '<id>' or its sites changed while you were confirming; nothing was removed` | Another process changed the server, its sites or their groups during the `remove` prompt. Run the command again. |
+| `Error: invalid site '<id>':` + one `--flag: …` line per problem | The listed `apvm site` flag values break a rule (see [references/sites.md](references/sites.md)); nothing was written. `'root' needs allow_root: true` is followed by `root needs --allow-root: pass it, or name another user in --run-as/--owner`. |
+| `site '<id>' or its groups changed while you were confirming; nothing was removed` | Another process changed the site record or its group memberships during the `site remove` prompt. Run the command again. |
 | `Error: failed to determine home directory`                      | `HOME` unset on Unix / `USERPROFILE` unset on Windows. Rare; set the env var.     |
 | `Error: --ver required` (BackWPup)                               | Pass `-v 5.1.0` (or whatever version). See `apvm info backwpup` for the default. |
 | `Warning: --ver ignored for '<plugin>'`                          | Plugin has `Embedded`/`Optional` version handling but you passed `--ver`. Harmless for `Optional` (it rewrites source); for `Embedded` it's rejected. |
@@ -540,8 +590,8 @@ apvm cache verify           # integrity check (exits 1 on issues)
 
 - [references/git-refs.md](references/git-refs.md) — full git reference format
   guide (auto-detection, explicit prefixes, `tag:` / `release:` keyword refs).
-- [references/sites.md](references/sites.md) — the site inventory and
-  `apvm server` (flags, rules, output, `--json`, error codes).
+- [references/sites.md](references/sites.md) — the site inventory,
+  `apvm server` and `apvm site` (flags, rules, output, `--json`, error codes).
 - Source of truth: `crates/cli/src/main.rs`, `crates/cli/src/commands/*.rs`,
   and `crates/cli/README.md` in this repo.
 - Always trust `apvm <command> --help` over this file when they disagree —

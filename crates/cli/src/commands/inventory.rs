@@ -11,6 +11,11 @@
 //! - [`load`], [`confirm_change`], [`json_document`] and [`table`]: reading the
 //!   inventory, asking before a removal, `--json` documents
 //!   (`"schema": 1`) and aligned columns.
+//! - [`field_table`]: the one-table field pattern (each command declares its
+//!   settings once; applying, clearing, conflicts, reports and the locked
+//!   change derive from it).
+//! - [`remove_confirmed`]: removals that ask first and re-check what was
+//!   confirmed under the lock.
 //!
 //! Every change goes through `apvm_sites::inventory::io::update` (lock →
 //! load → change → save, all under the inventory's lock), never a `load`
@@ -20,11 +25,16 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use apvm_sites::inventory::io as inventory_io;
-use apvm_sites::{Code, EntityKind, Error, INVENTORY_VERSION, Inventory, Problem};
+use apvm_sites::{Code, EntityKind, Error, INVENTORY_VERSION, Inventory, Problem, ResolvedSsh};
 use serde::Serialize;
 
 use crate::prompt;
 use crate::status::{warn_line, yellow};
+
+pub mod field_table;
+mod removal;
+
+pub use removal::{Removal, remove_confirmed};
 
 /// Version of every `--json` document (`"schema": 1`, plan §5.1).
 pub const JSON_SCHEMA: u32 = 1;
@@ -53,7 +63,8 @@ pub enum Failure {
     Remedied {
         /// What the library returned.
         error: Error,
-        /// What the user can do, shown after the library's message.
+        /// What the user can do, shown after the library's message (one
+        /// line per remedy).
         remedy: String,
     },
     /// Arguments that contradict each other (`--user` with `--unset user`).
@@ -139,7 +150,8 @@ impl std::error::Error for Failure {}
 
 impl Failure {
     /// This failure with `remedy` shown after it, when it is a library
-    /// refusal; any other failure is returned as is.
+    /// refusal (after any remedy it already has, on its own line); any
+    /// other failure is returned as is.
     ///
     /// # Arguments
     ///
@@ -147,6 +159,13 @@ impl Failure {
     pub fn with_remedy(self, remedy: String) -> Self {
         match self {
             Self::Sites(error) => Self::Remedied { error, remedy },
+            Self::Remedied {
+                error,
+                remedy: first,
+            } => Self::Remedied {
+                error,
+                remedy: format!("{first}\n  {remedy}"),
+            },
             other => other,
         }
     }
@@ -220,7 +239,7 @@ fn listed(error: &Error) -> Option<String> {
 /// What the user can do about `error`, when apvm knows.
 fn remedy(error: &Error) -> Option<String> {
     match error {
-        Error::NotFound { kind, .. } => Some(format!("'apvm {kind} list' shows the {kind}s")),
+        Error::NotFound { kind, .. } => Some(list_remedy(*kind)),
         Error::AlreadyExists { kind, .. } => Some(format!(
             "change it with 'apvm {kind} edit', or choose another id"
         )),
@@ -238,6 +257,23 @@ fn remedy(error: &Error) -> Option<String> {
         _ => None,
     }
 }
+
+/// Where to see the records of `kind`: `'apvm site list' shows the sites`.
+/// Groups have no command yet (plan P2.3 adds `apvm group`; then this is
+/// the same remedy as the others), so their remedy says how to make one.
+fn list_remedy(kind: EntityKind) -> String {
+    match kind {
+        EntityKind::Group => GROUPS_WITHOUT_COMMAND.to_string(),
+        EntityKind::Server | EntityKind::Site => format!("'apvm {kind} list' shows the {kind}s"),
+    }
+}
+
+/// The remedy for an unknown group while apvm has no group commands. It
+/// gives the smallest valid record: a group without `sites` makes the file
+/// invalid.
+const GROUPS_WITHOUT_COMMAND: &str = "apvm has no group commands yet: add the group to the \
+     'groups' list of the inventory file by hand, as {\"id\": \"<ID>\", \"sites\": []}, or \
+     from Node with SiteInventory";
 
 /// A [`Error::NotFound`] for `id` of `kind`, as the library reports one.
 ///
@@ -386,6 +422,24 @@ pub fn confirm_change(
 // Reading and output helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// With `--json`, print a failed command's `--json` document on the
+/// output (stderr still gets the `Error:` line from `main`). A document
+/// that cannot be built prints nothing: the failure itself is reported.
+///
+/// # Arguments
+///
+/// * `result` - What the command returned
+/// * `json` - Whether the user asked for JSON output
+/// * `console` - Where the document goes
+pub fn print_json_failure(result: &Result<(), Failure>, json: bool, console: &mut Console<'_>) {
+    if let Err(failure) = result
+        && json
+        && let Ok(document) = failure.to_json()
+    {
+        console.print(&document);
+    }
+}
+
 /// Load the inventory for reading, warning when it is read-only (written by
 /// a newer apvm: it can be shown but not changed).
 ///
@@ -469,6 +523,26 @@ pub fn table(indent: &str, rows: &[Vec<String>]) -> String {
             format!("{indent}{}\n", cells.join("  ").trim_end())
         })
         .collect()
+}
+
+/// Where ssh connects: `[user@]host[:port]`, with the effective user and
+/// port; an IPv6 address is bracketed when a port follows.
+///
+/// # Arguments
+///
+/// * `host` - The server's host, as written
+/// * `ssh` - The server's effective SSH settings
+pub fn destination(host: &str, ssh: &ResolvedSsh) -> String {
+    let user = ssh
+        .user
+        .as_ref()
+        .map(|user| format!("{}@", user.value))
+        .unwrap_or_default();
+    match &ssh.port {
+        Some(port) if host.contains(':') => format!("{user}[{host}]:{}", port.value),
+        Some(port) => format!("{user}{host}:{}", port.value),
+        None => format!("{user}{host}"),
+    }
 }
 
 /// `n` and `noun`, plural when `n` is not 1: `1 site`, `2 sites`.
@@ -646,6 +720,36 @@ mod tests {
             "server 'eu-1' already exists\n  \
              change it with 'apvm server edit', or choose another id"
         );
+    }
+
+    #[test]
+    fn unknown_ids_name_where_to_find_the_records() {
+        assert_eq!(
+            not_found(EntityKind::Site, "x").to_string(),
+            "site 'x' does not exist\n  'apvm site list' shows the sites"
+        );
+        // No `apvm group` command exists yet, so none is suggested.
+        let group = not_found(EntityKind::Group, "qa").to_string();
+        assert_eq!(
+            group,
+            "group 'qa' does not exist\n  apvm has no group commands yet: add the group to \
+             the 'groups' list of the inventory file by hand, as {\"id\": \"<ID>\", \
+             \"sites\": []}, or from Node with SiteInventory"
+        );
+        assert!(!group.contains("apvm group"), "{group}");
+    }
+
+    #[test]
+    fn with_remedy_adds_a_line_to_a_remedied_failure() {
+        let failure = not_found(EntityKind::Site, "x")
+            .with_remedy("first".into())
+            .with_remedy("second".into());
+        assert!(
+            failure.to_string().ends_with("\n  first\n  second"),
+            "{failure}"
+        );
+        let usage = Failure::Usage("u".into()).with_remedy("r".into());
+        assert_eq!(usage.to_string(), "u", "only library refusals get one");
     }
 
     #[test]

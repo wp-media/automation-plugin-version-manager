@@ -14,6 +14,7 @@ This crate produces the `apvm` binary. All heavy logic is delegated to [`apvm-co
 | `cache`     | Inspect and maintain the artifact cache                                     |
 | `config`    | View or change configuration settings                                       |
 | `server`    | Manage the SSH servers of the site inventory (never connects to them)       |
+| `site`      | Manage the WordPress sites of the site inventory (never connects to them)   |
 | `skill`     | Install or remove the Claude Code skill for apvm (project-local or global)  |
 | `update`    | Download and install the latest APVM release                                |
 | `uninstall` | Remove the APVM binary from this system                                     |
@@ -280,7 +281,7 @@ Input values are sanitized before storage:
 - **`APVM_CACHE_DIR`** — Overrides the artifact cache directory for the current invocation. Takes precedence over the config `cache-dir` and the default `~/.apvm/cache`, and is honored by both builds and the `cache` command. Useful for CI or local testing: point it at a throwaway directory so a run never reads from or warms your real cache.
 - **`GITHUB_TOKEN`** / **`GH_TOKEN`** — Fallback GitHub token when none is in config.
 - **`RUST_LOG`** — Enables logging (`debug`, `trace`, …) on stderr. Independent of `--verbose`, which shows the build commands' own output; while logging, the build spinner is hidden.
-- **`APVM_INVENTORY`** — Uses another site inventory file instead of `~/.apvm/inventory.json` for the current invocation (see [Server Command](#server-command)). An empty value means the default.
+- **`APVM_INVENTORY`** — Uses another site inventory file instead of `~/.apvm/inventory.json` for the current invocation (see [Server Command](#server-command) and [Site Command](#site-command)). An empty value means the default.
 - **`APVM_NO_UPDATE_CHECK`** — Set to any non-empty value to disable the automatic background update check and its notice (see [Update Command](#update-command)).
 
 ```sh
@@ -349,6 +350,44 @@ Behavior:
   failures then print `{"schema": 1, "error": {"code", "message",
   "problems"}}` too, with the stable codes of `apvm-sites`
   (`invalid_input`, `inventory_invalid`, `inventory_read_only`, …).
+
+## Site Command
+
+Manages the **WordPress sites** of the site inventory: the server each one is
+on, its WordPress root, and how apvm will work on it. Like `server`, it never
+connects (no SSH), and `remove` only edits the inventory.
+
+```sh
+apvm site add shop --server eu-1 --path /var/www/shop --url https://shop.example.com
+apvm site add legacy --server eu-1 --path /srv/legacy \
+  --wp-cli "/usr/bin/php8.3 /opt/wp-cli.phar" --run-as login
+apvm site edit shop --owner ftpuser:www-data --ownership check --unset url
+apvm site list [--server <ID>]… [--group <ID>]… [--json]
+apvm site show shop [--json]     # record + effective settings and their source
+apvm site remove legacy [-y]
+```
+
+| Subcommand | Flags |
+|------------|-------|
+| `add <ID>` | `--server` and `--path` (required), the site flags, `--group <ID>` (joins existing groups; repeatable or comma-separated) |
+| `edit <ID>` | `--server`, `--path`, the site flags, `--group` (joins, never leaves), `--unset <FIELD>`; at least one change |
+| `list` | `--server`, `--group` (filters: any listed server and any listed group), `--json` |
+| `show <ID>` | `--json` |
+| `remove <ID>` | `-y`/`--yes` (it also leaves its groups) |
+
+The site flags are `--url`, `--wp-cli "<CMD>"` (split at whitespace: one
+program, or a PHP interpreter with `-n`/`-q` and the WP-CLI script),
+`--run-as auto|login|<USER>`, `--owner auto|<USER>[:<GROUP>]`,
+`--ownership mirror|mirror-root|check|off`, `--plugins-dir`, `--allow-root`
+(needed for `root` in `--run-as`/`--owner`), `--tmp-dir`, `--timeout`,
+`--name` and `--notes`. Remote paths must be absolute. Everything else
+behaves as in `server`: one locked change, refused input named by flag
+(`--wp-cli[1]: …` for a token), the `--unset` remedy for empty values, the
+`--json` documents and codes, and a removal re-checked under the lock
+(`inventory_changed` when the site or its groups change while you answer).
+The connection probe on `add` and `site test` arrive in a later release.
+`--group` needs an existing group, and apvm has no group commands yet: groups
+are added to the inventory file by hand or from Node (`SiteInventory`).
 
 ## Skill Command
 

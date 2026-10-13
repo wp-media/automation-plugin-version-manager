@@ -4,7 +4,7 @@
 use apvm_sites::{Defaults, Inventory, ResolvedSsh, Server, Setting, SshSettings};
 use serde::Serialize;
 
-use crate::commands::inventory::{Failure, json_document, table};
+use crate::commands::inventory::{Failure, destination, json_document, table};
 
 /// `server defaults`: the defaults as text, or as a `--json` document.
 ///
@@ -136,21 +136,6 @@ fn list_text(inventory: &Inventory) -> Result<String, Failure> {
         ]);
     }
     Ok(table("", &rows))
-}
-
-/// Where ssh connects: `[user@]host[:port]`, with the effective user and
-/// port; an IPv6 address is bracketed when a port follows.
-fn destination(host: &str, ssh: &ResolvedSsh) -> String {
-    let user = ssh
-        .user
-        .as_ref()
-        .map(|user| format!("{}@", user.value))
-        .unwrap_or_default();
-    match &ssh.port {
-        Some(port) if host.contains(':') => format!("{user}[{host}]:{}", port.value),
-        Some(port) => format!("{user}{host}:{}", port.value),
-        None => format!("{user}{host}"),
-    }
 }
 
 /// `server show` as text: the record, then each effective SSH setting

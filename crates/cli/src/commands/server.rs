@@ -23,11 +23,13 @@
 
 use std::path::Path;
 
+use super::inventory::field_table::{self, Change};
 use super::inventory::{
-    Console, Failure, confirm_change, count, load, name_flags, not_found, quoted_ids,
+    Console, Failure, Removal, count, load, name_flags, not_found, print_json_failure, quoted_ids,
+    remove_confirmed,
 };
 use apvm_sites::inventory::io;
-use apvm_sites::{Code, Defaults, EntityKind, Inventory, Server, ServerRemoval};
+use apvm_sites::{Defaults, EntityKind, Inventory, Server, ServerRemoval};
 use clap::{ArgGroup, Args, Subcommand};
 use fields::{Field, Record, Scope, Setting};
 
@@ -393,12 +395,7 @@ impl ServerArgs {
             ServerAction::Show(args) => show(path, args, console),
             ServerAction::Remove(args) => remove(path, args, console),
         };
-        if let Err(failure) = &result
-            && self.json()
-            && let Ok(document) = failure.to_json()
-        {
-            console.print(&document);
-        }
+        print_json_failure(&result, self.json(), console);
         result
     }
 
@@ -484,71 +481,6 @@ fn edit(path: &Path, args: &EditArgs, console: &mut Console<'_>) -> Result<(), F
     Ok(())
 }
 
-/// A checked change of one record: what the flags set and clear.
-struct Change<'a> {
-    /// Which record it changes.
-    scope: Scope,
-    /// What the flags set.
-    settings: &'a [Setting],
-    /// What `--unset` clears.
-    unset: &'a [Field],
-}
-
-impl<'a> Change<'a> {
-    /// The change, unless it sets and clears the same field.
-    ///
-    /// # Errors
-    ///
-    /// [`Failure::Usage`] from [`fields::check`].
-    fn new(scope: Scope, settings: &'a [Setting], unset: &'a [Field]) -> Result<Self, Failure> {
-        fields::check(settings, unset)?;
-        Ok(Self {
-            scope,
-            settings,
-            unset,
-        })
-    }
-
-    /// Apply the change in one `io::update`: `current` reads the record,
-    /// `store` hands the changed one to the library, which validates it
-    /// (what it returns, such as the replaced record, is not needed).
-    ///
-    /// # Returns
-    ///
-    /// The record before and after.
-    ///
-    /// # Errors
-    ///
-    /// Those of `current`, and the library's (refused input naming the
-    /// flags, with the `--unset` remedy for an empty value).
-    fn save<R: Record, T>(
-        &self,
-        path: &Path,
-        current: impl Fn(&Inventory) -> Result<R, Failure>,
-        store: impl Fn(&mut Inventory, R) -> Result<T, apvm_sites::Error>,
-    ) -> Result<(R, R), Failure> {
-        io::update(path, |inventory| {
-            let before = current(inventory)?;
-            let after = fields::apply(&before, self.settings, self.unset);
-            store(inventory, after.clone()).map_err(|error| self.refused(error))?;
-            Ok((before, after))
-        })
-    }
-
-    /// The library's refusal, naming the flags; refused input with an
-    /// empty value also gets the CLI's remedy (`to clear it: --unset notes`).
-    fn refused(&self, error: apvm_sites::Error) -> Failure {
-        let remedy = (error.code() == Code::InvalidInput)
-            .then(|| fields::empty_value_remedy(self.settings, self.scope))
-            .flatten();
-        let failure = name_flags(error, &fields::flag_map(self.scope));
-        match remedy {
-            Some(remedy) => failure.with_remedy(remedy),
-            None => failure,
-        }
-    }
-}
-
 /// `apvm server list`.
 fn list(path: &Path, args: &ListArgs, console: &mut Console<'_>) -> Result<(), Failure> {
     let inventory = load(path, console)?;
@@ -576,76 +508,36 @@ fn show(path: &Path, args: &ShowArgs, console: &mut Console<'_>) -> Result<(), F
 /// `apvm server remove`: confirm what will go (unless `-y`), then remove
 /// it, refusing when it changed in between.
 fn remove(path: &Path, args: &RemoveArgs, console: &mut Console<'_>) -> Result<(), Failure> {
-    let confirmed = match confirm_removal(path, args, console)? {
-        Confirmation::Declined => {
-            console.print("Aborted. Nothing changed.\n");
-            return Ok(());
-        }
-        Confirmation::Skipped => None,
-        Confirmation::Confirmed(scope) => Some(*scope),
-    };
-    let removal = remove_as_confirmed(path, args, confirmed.as_ref())?;
-    console.print(&removed_text(&removal));
+    if let Some(removal) = remove_confirmed(path, args, args.yes, console)? {
+        console.print(&removed_text(&removal));
+    }
     Ok(())
 }
 
-/// Remove the server in one `io::update`, unless what would go differs
-/// from the `confirmed` scope (`None`: nothing was asked).
-///
-/// # Errors
-///
-/// The library's refusal, or [`Failure::Changed`] when the scope differs
-/// (nothing is written then).
-fn remove_as_confirmed(
-    path: &Path,
-    args: &RemoveArgs,
-    confirmed: Option<&RemovalScope>,
-) -> Result<ServerRemoval, Failure> {
-    io::update(path, |inventory| {
-        let removal = inventory.remove_server(&args.id, args.cascade)?;
-        match confirmed {
-            Some(scope) if *scope != RemovalScope::of(&removal) => {
-                Err(changed_since_confirmation(&args.id))
-            }
-            _ => Ok(removal),
-        }
-    })
-}
+/// The server, its sites (with `--cascade`) and their group memberships,
+/// asked about first and re-checked under the lock.
+impl Removal for RemoveArgs {
+    type Removed = ServerRemoval;
+    type Scope = RemovalScope;
 
-/// The outcome of asking before a removal.
-#[derive(Debug, PartialEq, Eq)]
-enum Confirmation {
-    /// `-y`: nothing was asked.
-    Skipped,
-    /// The user confirmed this scope (boxed: the other outcomes are empty).
-    Confirmed(Box<RemovalScope>),
-    /// The user declined.
-    Declined,
-}
-
-/// Ask before removing (unless `-y`), showing what would go. A removal the
-/// inventory refuses (unknown server, in use, read-only) fails before the
-/// question.
-///
-/// # Errors
-///
-/// The library's refusal, or those of `inventory::confirm_change`.
-fn confirm_removal(
-    path: &Path,
-    args: &RemoveArgs,
-    console: &mut Console<'_>,
-) -> Result<Confirmation, Failure> {
-    if args.yes {
-        return Ok(Confirmation::Skipped);
+    fn remove(&self, inventory: &mut Inventory) -> Result<ServerRemoval, apvm_sites::Error> {
+        inventory.remove_server(&self.id, self.cascade)
     }
-    let preview = io::load(path)?.remove_server(&args.id, args.cascade)?;
-    let question = removal_question(&preview);
-    if confirm_change(console, false, &question, || confirmation_refusal(&args.id))? {
-        Ok(Confirmation::Confirmed(Box::new(RemovalScope::of(
-            &preview,
-        ))))
-    } else {
-        Ok(Confirmation::Declined)
+
+    fn scope(removed: &ServerRemoval) -> RemovalScope {
+        RemovalScope::of(removed)
+    }
+
+    fn question(removed: &ServerRemoval) -> String {
+        removal_question(removed)
+    }
+
+    fn refusal(&self) -> String {
+        confirmation_refusal(&self.id)
+    }
+
+    fn changed(&self) -> Failure {
+        changed_since_confirmation(&self.id)
     }
 }
 
@@ -737,13 +629,10 @@ fn removed_text(removal: &ServerRemoval) -> String {
 // Reports
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `"<done>: a, b.\n"`, or `"<unchanged>\n"` when nothing changed.
+/// `"<done>: a, b.\n"`, or `"<unchanged>\n"` when nothing changed
+/// (the shared report, typed for this table).
 fn change_line(done: &str, unchanged: &str, changed: &[Field]) -> String {
-    if changed.is_empty() {
-        return format!("{unchanged}\n");
-    }
-    let names: Vec<&str> = changed.iter().map(|field| field.name()).collect();
-    format!("{done}: {}.\n", names.join(", "))
+    field_table::change_line(done, unchanged, changed)
 }
 
 /// Warn about each local path the change stored that ssh would resolve
@@ -756,7 +645,11 @@ fn change_line(done: &str, unchanged: &str, changed: &[Field]) -> String {
 /// * `before` - The record before the change (`None`: a new record)
 /// * `after` - The record as saved
 /// * `console` - Where the warnings go
-fn warn_relative<R: Record>(before: Option<&R>, after: &R, console: &mut Console<'_>) {
+fn warn_relative<R: Record<Setting = Setting>>(
+    before: Option<&R>,
+    after: &R,
+    console: &mut Console<'_>,
+) {
     for (flag, value) in fields::new_relative_paths(before, after) {
         console.warn(&format!(
             "{flag} '{value}' is a relative path, resolved from the directory apvm \

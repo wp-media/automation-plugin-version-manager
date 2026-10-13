@@ -102,13 +102,15 @@ const HOST: Word = Word {
 };
 
 /// Unix user and group names: `[A-Za-z0-9._-]`, no leading `-` (it would
-/// read as an option of ssh or sudo), at most 64 characters.
+/// read as an option of ssh or sudo), at most 64 characters. Messages say
+/// "ASCII letters": a name like `İlker` is refused, and "letters" alone
+/// would read as allowing it.
 const USER: Word = Word {
     max_len: 64,
     first: |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_'),
-    first_desc: "a letter, digit, '.' or '_'",
+    first_desc: "an ASCII letter, digit, '.' or '_'",
     any: is_name_char,
-    any_desc: "letters, digits, '.', '_' and '-'",
+    any_desc: "ASCII letters, digits, '.', '_' and '-'",
 };
 
 /// `[A-Za-z0-9._-]`: file and user names.
@@ -475,13 +477,19 @@ mod tests {
             text("a\u{1b}", 10),
             Err(format!("contains U+001B; {FORBIDDEN_CHARS}"))
         );
+        // The user message says ASCII letters (it was "letters", which
+        // read as allowing `İ`); the rule itself is unchanged.
         assert_eq!(
             user("a'b"),
-            Err("contains '\\''; only letters, digits, '.', '_' and '-' are allowed".into())
+            Err("contains '\\''; only ASCII letters, digits, '.', '_' and '-' are allowed".into())
         );
         assert_eq!(
             user("a\u{a0}b"),
-            Err("contains U+00A0; only letters, digits, '.', '_' and '-' are allowed".into())
+            Err("contains U+00A0; only ASCII letters, digits, '.', '_' and '-' are allowed".into())
+        );
+        assert_eq!(
+            user("\u{130}lker"),
+            Err("contains 'İ'; only ASCII letters, digits, '.', '_' and '-' are allowed".into())
         );
     }
 }
