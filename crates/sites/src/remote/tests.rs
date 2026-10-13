@@ -288,7 +288,7 @@ fn hostile_values(generated: usize) -> Vec<String> {
 
 /// A temporary directory whose path passes the upload allowlist (and so
 /// every path rule), for files the scripts name.
-fn safe_tempdir() -> tempfile::TempDir {
+pub(super) fn safe_tempdir() -> tempfile::TempDir {
     let system = std::env::temp_dir();
     let base = match system.to_str() {
         Some(text) if allowlist::remote_tmp_dir(text.trim_end_matches('/')).is_ok() => system,
@@ -303,7 +303,7 @@ fn safe_tempdir() -> tempfile::TempDir {
 }
 
 /// The text of `path` (which must be valid UTF-8).
-fn text(path: &Path) -> &str {
+pub(super) fn text(path: &Path) -> &str {
     path.to_str().unwrap()
 }
 
@@ -654,7 +654,8 @@ fn upload_bytes() -> Vec<u8> {
 /// * `bytes` - What was sent
 fn check_upload(label: &str, output: &Output, upload: &UploadScript, file: &Path, bytes: &[u8]) {
     assert_eq!(output.status.code(), Some(0), "{label}: {output:?}");
-    let nonce_line = format!("{}\n", upload.nonce());
+    // The nonce line starts with a newline (it ends any line noise left open).
+    let nonce_line = format!("\n{}\n", upload.nonce());
     assert_eq!(output.stdout, nonce_line.as_bytes(), "{label}");
     assert!(
         std::fs::read(file).unwrap() == bytes,
@@ -694,7 +695,7 @@ fn a_failed_upload_reports_the_tee_status_after_the_nonce() {
     let upload = UploadScript::tee(Nonce::random(), &Identity::Login, text(&missing)).unwrap();
     let output = run(&["sh", "-c", &upload.remote_command()], b"data", &[]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(output.stdout, format!("{}\n", upload.nonce()).as_bytes());
+    assert_eq!(output.stdout, format!("\n{}\n", upload.nonce()).as_bytes());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("tee"), "{stderr}");
     assert!(!missing.exists());

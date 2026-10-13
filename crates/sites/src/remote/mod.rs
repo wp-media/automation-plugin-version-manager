@@ -19,7 +19,7 @@
 //!
 //! ```text
 //! { LC_ALL=C; export LC_ALL
-//! printf '%s\n' '<nonce>'
+//! printf '\n%s\n' '<nonce>'
 //! cd / && <identity prefix> <argv…> </dev/null; rc=$?; [ "$rc" -eq 255 ] && rc=254; exit "$rc"
 //! }
 //! ```
@@ -60,6 +60,27 @@
 //! built: a refused value is an [`Error::InvalidInput`]
 //! ([`Code::InvalidInput`](crate::Code::InvalidInput)) naming the rule.
 //!
+//! **Running scripts** goes through a [`Transport`] (plan §6.1 items 3, 6
+//! and 7): a [`Request`] (a [`Script`] on stdin, or an [`UploadScript`]
+//! with its [`Payload`], and a timeout) comes back as an [`Execution`]:
+//!
+//! - [`Exit`]: the script's status ([`Exit::REMAPPED_255`] for a command
+//!   that exited 255), [`Exit::TransportFailed`] for a 255, a signal, or
+//!   [`Exit::TimedOut`];
+//! - stdout and stderr kept up to [`STDOUT_LIMIT`] and [`STDERR_LIMIT`],
+//!   with truncation flags ([`Captured`]), and read to their end so the
+//!   child never blocks;
+//! - [`Execution::payload`]: stdout after the line exactly equal to the
+//!   nonce ([`unframe`]); without that line, or past the stdout limit, a
+//!   [`PayloadError`], never "no output" or a shorter one;
+//! - whether all of stdin was written (not proof of receipt), and how long
+//!   the call ran.
+//!
+//! A call never outlives its future: dropped, or past its timeout, it
+//! kills the local process and everything it started. The crate's tests
+//! run requests through a local shell, the way sshd runs them; the SSH
+//! transport follows the same pattern.
+//!
 //! # Example
 //!
 //! ```
@@ -86,14 +107,21 @@
 //! # }
 //! ```
 
+mod capture;
+#[cfg(test)]
+pub(crate) mod fake;
 mod identity;
+mod local;
 mod quote;
 mod script;
 mod statement;
+mod transport;
 
+pub use capture::{Captured, PayloadError, STDERR_LIMIT, STDOUT_LIMIT, unframe};
 pub use identity::{AccountName, Identity, OwnerIds, PluginEntry, RootAccess, RootCommand};
 pub use quote::quote;
 pub use script::{FileMode, Nonce, Script, UploadScript, WpCli};
+pub use transport::{BoxFuture, Delivery, Execution, Exit, Payload, Request, Transport};
 
 use crate::error::Error;
 use crate::problem::Problem;

@@ -8,7 +8,8 @@ apvm-core's build-and-install path. The design and the phase plan are in
 **Status:** phase P1 (foundations): the data layer (P1.1), inventory
 persistence (P1.2), settings and targets (P1.3), the plugin hint types that
 apvm-core fills (P1.4) and local package inspection (P1.5); phase P3.1
-adds the remote script builder. It has the inventory model and its
+adds the remote script builder, and P3.2 the transport contract that runs
+scripts (with a local-shell transport). It has the inventory model and its
 validation, safe reading and writing of the inventory file, settings
 resolution and target selection, plugin hints, plugin zip inspection, the
 shared file names, and the scripts apvm will run on servers. Running them
@@ -16,9 +17,12 @@ over SSH, WP-CLI parsing and the plugin operations arrive in later phases.
 
 ## Design rules
 
-- **No `apvm-*` dependencies.** apvm-core depends on this crate, never the
-  reverse, and zip installs or `wp run` need no GitHub or build stack. A unit
-  test checks `Cargo.toml`.
+- **No `apvm-*` dependencies but `apvm-process`.** apvm-core depends on
+  this crate, never the reverse, and zip installs or `wp run` need no GitHub
+  or build stack. `apvm-process` (child processes that never outlive their
+  work, and the `ProcessScope` the Node bindings kill at exit) is a leaf
+  crate with no apvm dependencies, shared with apvm-core. A unit test checks
+  `Cargo.toml`.
 - **No default locations.** Callers pass every path. `layout` only shares
   the file names, so the CLI and the Node bindings use the same files.
 - **Allowlists live here.** Every value that may reach the `ssh` argv, a
@@ -236,6 +240,44 @@ nothing. It prints the nonce, runs its command from `/` with stdin from
 always means ssh failed). No shell ever runs under `sudo` or `runuser`.
 Refused values are `invalid_input` errors naming the rule.
 
+## Running scripts (`remote::Transport`)
+
+A `Transport` runs one `Request` (a `Script` on stdin, or an `UploadScript`
+with its `Payload`, bytes or a file streamed as it is read, plus a timeout)
+and returns an `Execution`:
+
+| Part | What it holds |
+|---|---|
+| `exit()` | `Exit::Status(n)` (never 255; 254 = a command exited 255), `Exit::TransportFailed` (255: ssh itself failed), `Exit::Killed { signal }` (on Windows a killed process exits with status 1, so it reads as `Status(1)`), or `Exit::TimedOut` |
+| `stdout()`, `stderr()` | at most 8 MiB and 1 MiB (`STDOUT_LIMIT`, `STDERR_LIMIT`), with a truncation flag; the rest is read and dropped, so the child never blocks |
+| `payload()` | stdout after the first line exactly equal to the nonce (scripts print `\n<nonce>\n`, so login noise without a final newline cannot glue onto it). Errors, never "no output" or a shorter one: `PayloadError::NonceMissing { stdout_truncated }` (a login shell's startup files ate the script, the remote `sh` or ssh failed, or noise filled the 8 MiB; after a mutation the command may still have run: re-read) and `PayloadError::Truncated` (the payload went past 8 MiB; `stdout()` keeps its beginning), and `PayloadError::Interrupted { exit }` (the call did not run to its end: a transport failure, a kill or a timeout; whatever was printed is only a beginning, kept in `stdout()`) |
+| `stdin_written()` | whether all of stdin was handed to the transport and closed (`false` when the remote side stopped reading: an upload is then incomplete). Not proof of receipt: bytes may sit unread in a buffer, so verify what matters (staging checks the upload's SHA-256) |
+| `elapsed()` | from the start to the exit or the kill |
+
+A call never outlives its future: dropped, or past its timeout, it kills
+the local process **and every process it started**, through apvm-process
+(as apvm-core does: by process ancestry, so a terminal's Ctrl+C still
+reaches them; `/proc` on Linux, `/bin/ps` elsewhere; the child only on
+Windows). Every call is recorded in the caller's `ProcessScope`, so the Node
+bindings' `kill_all` at `process.exit()` kills a running `ssh` too. After the exit,
+output gets 2 s more, so a background job left holding a pipe cannot hold
+the call. An upload file that is missing, not permitted, or not a regular
+file is `invalid_input` and runs nothing (its type is checked before and
+after opening, and on Unix it is opened with `O_NONBLOCK`, cleared once it
+is known to be a regular file, so a FIFO cannot block); a program that
+cannot start, any other failure to open the file, or a file that fails
+mid-read, is `process_failed`. Nothing is retried. The child inherits the
+environment.
+
+`Execution::new` and `Captured::new` are public, so a transport (or a fake
+in another crate's tests) can be written outside this crate;
+`Execution::new` turns `Exit::Status(255)` into `Exit::TransportFailed`.
+
+The crate's tests run requests through a local shell, the way sshd does:
+`<login shell> -c 'sh -s'` with the script on stdin, or `<login shell> -c
+"sh -c '<script>'"` with the upload on stdin. The SSH transport follows the
+same pattern. apvm itself runs nothing through a local shell.
+
 ## Errors
 
 `Error::code()` returns a stable `Code`:
@@ -254,7 +296,11 @@ Refused values are `invalid_input` errors naming the rule.
   invalid hints, or a value refused while building a remote script (an
   account name, a path, a WP-CLI token or argument, a nonce, a file mode,
   a root command's owners);
-- `package_invalid`: a plugin zip that breaks an inspection rule.
+- `package_invalid`: a plugin zip that breaks an inspection rule;
+- `process_failed`: a local program a transport runs (`ssh`, a shell)
+  could not be started, or its output read, or an upload's file could not
+  be opened or read for a reason other than the caller's path (missing,
+  not permitted or not a regular file are `invalid_input`).
 
 `Error::problems()` lists the located problems, so a front end can print
 them one per line.
@@ -308,7 +354,23 @@ cargo test -p apvm-sites
   runs nothing; uploads stream 1 MiB byte for byte through every installed
   login shell (fish, tcsh and csh too, where installed); GNU `stat` and
   `chown` accept the root commands (Linux). Every child process is killed
-  after 30 s.
+  after 30 s;
+- transports: capture limits at the exact boundary (8 MiB stdout, 1 MiB
+  stderr) with truncation flags and 20 MiB drained without blocking;
+  unframing (noise with and without a final newline, noise past the
+  limit, look-alike lines, CRLF, a cut nonce, a missing one, a cut
+  payload); 255 → 254 and 255 as a transport failure; 20 MB uploads
+  hash-equal from memory and from a file; a child that stops reading stdin
+  or closes its output early; a background job holding the output; a
+  missing program, a missing upload file, a directory or a FIFO; the
+  scripted fake transport later phases test with. A timeout, a dropped
+  call and a `ProcessScope`'s `kill_all` kill the child and its
+  descendants: the scripts record their PIDs,
+  and each must disappear (`kill(pid, 0)`; a stopped process fails). The
+  tests use no `ps`, but on macOS the code under test reads the process
+  table with `/bin/ps`: where a sandbox forbids it (`sandbox-exec`), the
+  descendant checks are skipped. Timeout tests check only what marker
+  files prove happened, so they hold under CPU load.
 
 `tests/inventory.rs` loads the example document of the plan through the
 public API; `tests/targets.rs` resolves targets and settings on it.

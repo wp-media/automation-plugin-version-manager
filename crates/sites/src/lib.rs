@@ -34,8 +34,10 @@
 //!
 //! # Design rules
 //!
-//! - **No `apvm-*` dependencies**: apvm-core depends on this crate, and zip
-//!   installs or `wp run` need no GitHub/build stack.
+//! - **No `apvm-*` dependencies but `apvm-process`**: apvm-core depends on
+//!   this crate, and zip installs or `wp run` need no GitHub/build stack.
+//!   `apvm-process` (child processes that never outlive their work) is a
+//!   leaf crate both share, so a Node.js teardown kills `ssh` too.
 //! - **No default locations**: callers pass every path; [`layout`] only
 //!   shares names.
 //! - **Allowlists live here**: every value that may reach the `ssh` argv, a
@@ -95,25 +97,86 @@ pub use problem::Problem;
 
 #[cfg(test)]
 mod tests {
+    /// The only apvm dependency lines allowed, exactly as written and only
+    /// in their section: the workspace's apvm-process, a leaf crate with no
+    /// apvm dependencies of its own, which apvm-core shares; its
+    /// test-support feature only as a dev-dependency (never in release
+    /// builds).
+    const ALLOWED: [(&str, &str); 2] = [
+        ("[dependencies]", r#"apvm-process = { workspace = true }"#),
+        (
+            "[dev-dependencies]",
+            r#"apvm-process = { workspace = true, features = ["test-support"] }"#,
+        ),
+    ];
+
     /// The lines of a Cargo manifest that would make the crate depend on
-    /// another apvm crate: any mention of `apvm-` outside comments and the
-    /// package name (a dependency key, a `[dependencies.apvm-…]` table, a
-    /// renamed `package = "apvm-…"`), and any `path = "…"` dependency.
+    /// another apvm crate: any mention of `apvm-` outside comments, the
+    /// package name and [`ALLOWED`] in its section (a dependency key, a
+    /// `[dependencies.apvm-…]` table, a renamed `package = "apvm-…"`), and
+    /// any `path = "…"` dependency.
     fn apvm_dependency_lines(manifest: &str) -> Vec<&str> {
-        manifest
-            .lines()
-            .map(|line| line.split('#').next().unwrap_or_default().trim())
-            .filter(|line| *line != r#"name = "apvm-sites""#)
-            .filter(|line| line.contains("apvm-") || line.contains("path = \""))
-            .collect()
+        let mut section = "";
+        let mut found = Vec::new();
+        for line in manifest.lines() {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if line.starts_with('[') {
+                section = line;
+            }
+            let allowed = ALLOWED.contains(&(section, line)) || line == r#"name = "apvm-sites""#;
+            if !allowed && (line.contains("apvm-") || line.contains("path = \"")) {
+                found.push(line);
+            }
+        }
+        found
     }
 
     #[test]
     fn the_crate_depends_on_no_apvm_crate() {
         // Plan D1: apvm-core depends on apvm-sites, never the reverse, and
-        // the remote layer needs no GitHub/build stack.
+        // the remote layer needs no GitHub/build stack. apvm-process (child
+        // processes) is the one shared leaf crate.
         let manifest = include_str!("../Cargo.toml");
         assert_eq!(apvm_dependency_lines(manifest), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn only_the_shared_process_crate_is_allowed_exactly_as_written() {
+        for manifest in [
+            "[dependencies]\napvm-processx = { workspace = true }",
+            "[dependencies]\napvm-process = { path = \"../process\" }",
+            "[dependencies]\napvm-process = { workspace = true, features = [\"x\"] }",
+            "[dependencies.apvm-process]\nworkspace = true",
+        ] {
+            assert!(!apvm_dependency_lines(manifest).is_empty(), "{manifest}");
+        }
+        for (section, line) in ALLOWED {
+            let manifest = format!("{section}\n{line}");
+            assert_eq!(
+                apvm_dependency_lines(&manifest),
+                Vec::<&str>::new(),
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shared_process_crate_is_refused_in_any_other_section() {
+        let (plain, support) = (ALLOWED[0].1, ALLOWED[1].1);
+        for manifest in [
+            // The test-support feature in release builds.
+            format!("[dependencies]\n{support}"),
+            format!("[target.'cfg(unix)'.dependencies]\n{support}"),
+            // The plain line anywhere but [dependencies].
+            format!("[dev-dependencies]\n{plain}"),
+            format!("[build-dependencies]\n{plain}"),
+            format!("[target.'cfg(unix)'.dependencies]\n{plain}"),
+            // Before any section, or back in another one.
+            plain.to_string(),
+            format!("[dependencies]\n[features]\n{plain}"),
+        ] {
+            assert!(!apvm_dependency_lines(&manifest).is_empty(), "{manifest}");
+        }
     }
 
     #[test]

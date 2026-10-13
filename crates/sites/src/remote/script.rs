@@ -397,14 +397,20 @@ fn umask_exec(mode: FileMode) -> String {
     format!("umask(umask() & ~0{:03o});", mode.group_bits())
 }
 
-/// The nonce line: `printf '%s\n' '<nonce>'`. Its only backslash is in
-/// `\n`, which no shell reads as an escape inside single quotes.
+/// The nonce line: `printf '\n%s\n' '<nonce>'`. The leading newline ends
+/// whatever line login noise left open (a `.bashrc` that prints `Welcome`
+/// without a newline), so the nonce always stands on a line of its own.
+/// Its only backslashes are in `\n`, which no shell reads as an escape
+/// inside single quotes.
 ///
 /// # Arguments
 ///
 /// * `nonce` - The call's nonce
 fn nonce_line(nonce: &Nonce) -> String {
-    format!(r"printf '%s\n' {}", Word::checked(nonce.as_str()).as_str())
+    format!(
+        r"printf '\n%s\n' {}",
+        Word::checked(nonce.as_str()).as_str()
+    )
 }
 
 /// How [`frame`] lays a script out.
@@ -422,7 +428,7 @@ enum Layout {
 ///
 /// ```text
 /// { LC_ALL=C; export LC_ALL
-/// printf '%s\n' '<nonce>'
+/// printf '\n%s\n' '<nonce>'
 /// cd / && <commands>; rc=$?; [ "$rc" -eq 255 ] && rc=254; exit "$rc"
 /// }
 /// ```
@@ -456,7 +462,7 @@ fn frame(nonce: &Nonce, commands: &str, layout: Layout) -> String {
 ///
 /// ```text
 /// { LC_ALL=C; export LC_ALL
-/// printf '%s\n' '<nonce>'
+/// printf '\n%s\n' '<nonce>'
 /// cd / && <prefix> <argv…> </dev/null; rc=$?; [ "$rc" -eq 255 ] && rc=254; exit "$rc"
 /// }
 /// ```
@@ -543,7 +549,7 @@ const UPLOAD_SUBJECT: &str = "upload script";
 /// characters are a subset.
 ///
 /// ```text
-/// { LC_ALL=C; export LC_ALL; printf '%s\n' '<nonce>'; cd / && <prefix> tee -- '<destination>' >/dev/null; rc=$?; …; }
+/// { LC_ALL=C; export LC_ALL; printf '\n%s\n' '<nonce>'; cd / && <prefix> tee -- '<destination>' >/dev/null; rc=$?; …; }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadScript {
@@ -931,7 +937,7 @@ mod tests {
             assert_eq!(
                 script.text(),
                 format!(
-                    "{{ LC_ALL=C; export LC_ALL\nprintf '%s\\n' '{NONCE}'\n\
+                    "{{ LC_ALL=C; export LC_ALL\nprintf '\\n%s\\n' '{NONCE}'\n\
                      cd / && {prefix}{command} {TAIL}\n}}\n"
                 )
             );
@@ -965,7 +971,7 @@ mod tests {
                 assert_eq!(
                     Script::root(nonce(), access, &command).text(),
                     format!(
-                        "{{ LC_ALL=C; export LC_ALL\nprintf '%s\\n' '{NONCE}'\n\
+                        "{{ LC_ALL=C; export LC_ALL\nprintf '\\n%s\\n' '{NONCE}'\n\
                          cd / && {prefix}{argv} {TAIL}\n}}\n"
                     )
                 );
@@ -982,7 +988,7 @@ mod tests {
         assert_eq!(
             script.text(),
             format!(
-                "{{ LC_ALL=C; export LC_ALL\nprintf '%s\\n' '{NONCE}'\n\
+                "{{ LC_ALL=C; export LC_ALL\nprintf '\\n%s\\n' '{NONCE}'\n\
                  cd / && id -u </dev/null && sudo -n -u root -- stat -c %F -- \
                  '/srv/p/akismet' {TAIL}\n}}\n"
             )
@@ -996,7 +1002,7 @@ mod tests {
             assert!(text.starts_with("{ LC_ALL=C; export LC_ALL\n"), "{text}");
             assert_eq!(
                 text.lines().nth(1),
-                Some(format!("printf '%s\\n' '{NONCE}'").as_str())
+                Some(format!("printf '\\n%s\\n' '{NONCE}'").as_str())
             );
             assert!(text.ends_with(&format!("{TAIL}\n}}\n")), "{text}");
             // The stat ownership format holds five literal newlines.
@@ -1052,7 +1058,7 @@ mod tests {
         let upload =
             UploadScript::tee(nonce(), &identity, "/tmp/apvm.Ab3dE6gH9k/package-1.zip").unwrap();
         let script = format!(
-            "{{ LC_ALL=C; export LC_ALL; printf '%s\\n' '{NONCE}'; cd / && sudo -n -u 'ftpuser' \
+            "{{ LC_ALL=C; export LC_ALL; printf '\\n%s\\n' '{NONCE}'; cd / && sudo -n -u 'ftpuser' \
              -g 'www-data' -- tee -- '/tmp/apvm.Ab3dE6gH9k/package-1.zip' >/dev/null; \
              rc=$?; [ \"$rc\" -eq 255 ] && rc=254; exit \"$rc\"; }}"
         );
@@ -1090,11 +1096,12 @@ mod tests {
             );
             assert!(!script.ends_with('\\'), "{script}");
             // Quoted as one word, every backslash in the remote command sits
-            // either in `\n` (inside quotes) or in `'\''` (outside them).
+            // either in `\n` (inside quotes: the nonce line's two, before
+            // and after the nonce) or in `'\''` (outside them).
             let command = upload.remote_command();
             let backslashes = command.matches('\\').count();
             let escaped_quotes = command.matches("'\\''").count();
-            assert_eq!(backslashes, escaped_quotes + 1, "{command}");
+            assert_eq!(backslashes, escaped_quotes + 2, "{command}");
         }
     }
 

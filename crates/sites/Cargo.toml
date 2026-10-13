@@ -6,8 +6,10 @@ rust-version.workspace = true
 description = "Site inventory and WordPress plugin management over SSH for APVM"
 license = "MIT"
 
-# No `apvm-*` dependencies (plan D1): apvm-core depends on this crate, and zip
-# installs or `wp run` need no GitHub/build stack. A unit test enforces it.
+# No `apvm-*` dependencies but apvm-process (plan D1): apvm-core depends on
+# this crate, and zip installs or `wp run` need no GitHub/build stack.
+# apvm-process is a leaf crate (no apvm dependencies) both share. A unit test
+# enforces it.
 [dependencies]
 # Serialization of the inventory document (`inventory.json`)
 serde = { workspace = true }
@@ -20,6 +22,19 @@ thiserror = { workspace = true }
 zip = { workspace = true }
 sha2 = { workspace = true }
 
+# Transports (remote/): child processes, their pipes, timeouts
+tokio = { workspace = true }
+# Every child process starts here, so a cancelled or timed-out call kills
+# its whole tree and joins the caller's ProcessScope (shared with apvm-core;
+# itself free of apvm dependencies)
+apvm-process = { workspace = true }
+
+# `O_NONBLOCK` for opening an upload's file (remote/local.rs)
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
+# PID-file and heartbeat helpers for the transport's kill tests
+apvm-process = { workspace = true, features = ["test-support"] }
 # Temporary zip files for the package tests
 tempfile = { workspace = true }

@@ -160,11 +160,14 @@ dependencies = [
 name = "apvm-sites"
 version = "3.3.0"
 dependencies = [
+ "apvm-process",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror",
+ "tokio",
  "zip",
 ]
 

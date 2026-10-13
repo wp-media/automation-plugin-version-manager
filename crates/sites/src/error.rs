@@ -44,6 +44,11 @@ pub enum Code {
     InventoryChanged,
     /// A plugin zip breaks an inspection rule (`package_invalid`).
     PackageInvalid,
+    /// A local program a transport runs (`ssh`, or a shell) could not be
+    /// started or talked to, or the file an upload streams could not be
+    /// opened or read for a reason other than the caller's path
+    /// (`process_failed`).
+    ProcessFailed,
 }
 
 impl Code {
@@ -58,6 +63,7 @@ impl Code {
             Self::InventoryLocked => "inventory_locked",
             Self::InventoryChanged => "inventory_changed",
             Self::PackageInvalid => "package_invalid",
+            Self::ProcessFailed => "process_failed",
         }
     }
 }
@@ -260,6 +266,33 @@ pub enum Error {
         #[source]
         defect: PackageDefect,
     },
+
+    /// A local program a transport runs (`ssh`, or a shell) could not be
+    /// started, or reading its output or waiting for it failed. When it
+    /// had started, it was killed along with every process it started.
+    #[error("{context} {}: {source}", quoted(program))]
+    Process {
+        /// What failed (`"cannot start"`, `"cannot read the output of"`, …).
+        context: &'static str,
+        /// The program, as given.
+        program: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The file an upload streams to the remote command could not be opened
+    /// (other than missing, not permitted, or not a regular file: those are
+    /// [`Error::InvalidInput`]), or reading it failed while it was streamed;
+    /// the command was then killed along with every process it started.
+    #[error("cannot read the upload {}: {source}", shown(path))]
+    UploadSource {
+        /// The file.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl Error {
@@ -279,6 +312,7 @@ impl Error {
             | Self::ServerInUse { .. }
             | Self::InvalidHints { .. } => Code::InvalidInput,
             Self::PackageInvalid { .. } => Code::PackageInvalid,
+            Self::Process { .. } | Self::UploadSource { .. } => Code::ProcessFailed,
         }
     }
 
@@ -605,6 +639,32 @@ mod tests {
         );
         assert!(message.contains("a\\u{1b}b"), "{message}");
         assert!(!message.contains('\u{1b}'), "{message}");
+    }
+
+    #[test]
+    fn process_errors_name_the_program_or_file_and_map_to_process_failed() {
+        assert_eq!(Code::ProcessFailed.as_str(), "process_failed");
+        let error = Error::Process {
+            context: "cannot start",
+            program: "s\u{1b}h".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        assert_eq!(error.code(), Code::ProcessFailed);
+        assert!(
+            error.to_string().starts_with("cannot start 's\\u{1b}h': "),
+            "{error}"
+        );
+        assert!(error.problems().is_empty());
+
+        let error = Error::UploadSource {
+            path: PathBuf::from("/tmp/a\u{1b}b.zip"),
+            source: std::io::Error::other("boom"),
+        };
+        assert_eq!(error.code(), Code::ProcessFailed);
+        assert_eq!(
+            error.to_string(),
+            "cannot read the upload /tmp/a\\u{1b}b.zip: boom"
+        );
     }
 
     #[test]
