@@ -61,14 +61,18 @@ pub mod error;
 pub mod git;
 pub mod github;
 pub mod maintenance;
-mod process;
 pub mod projects;
+
+// Child processes that never outlive their work (shared with apvm-sites):
+// `crate::process::{command, output}` run every program core starts.
+use apvm_process as process;
 
 // Re-export Config from apvm-config
 pub use apvm_config::Config;
 pub use error::{Error, Result};
 
 // Re-export key types for convenience
+pub use apvm_process::ProcessScope;
 pub use build::BuildContext;
 pub use build::progress::{
     BuildEvent, BuildPhase, BuildStep, ClosureReporter, NullReporter, ProgressReporter,
@@ -78,7 +82,6 @@ pub use cache_status::CacheStatus;
 pub use commands::{BuildOutput, BuildRequest, WarmRequest};
 pub use git::{BuildWorkspace, RefResolver, RefSource, ResolvedRef};
 pub use maintenance::{CacheMaintenance, CleanRequest};
-pub use process::ProcessScope;
 // What builders declare about their WordPress plugins (`Apvm::plugin_hints`),
 // so consumers read the hints without a direct apvm-sites dependency.
 pub use apvm_sites::{

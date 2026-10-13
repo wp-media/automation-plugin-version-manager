@@ -108,6 +108,7 @@ name = "apvm-core"
 version = "3.3.0"
 dependencies = [
  "apvm-config",
+ "apvm-process",
  "apvm-sites",
  "apvm-storage",
  "chrono",
@@ -116,7 +117,6 @@ dependencies = [
  "octocrab",
  "reqwest",
  "rusqlite",
- "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -143,6 +143,15 @@ dependencies = [
  "napi-derive",
  "openssl",
  "rusqlite",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "apvm-process"
+version = "3.3.0"
+dependencies = [
+ "rustix",
  "tempfile",
  "tokio",
 ]

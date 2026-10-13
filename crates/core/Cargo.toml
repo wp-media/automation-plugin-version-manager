@@ -10,6 +10,8 @@ crate-type = ["rlib"]
 [dependencies]
 # Internal crates
 apvm-config = { workspace = true }
+# Child processes that never outlive their work (git, `gh`, build steps)
+apvm-process = { workspace = true }
 # Plugin hints (slugs, variant markers, families) for site deployment
 apvm-sites = { workspace = true }
 apvm-storage = { workspace = true }
@@ -50,10 +52,8 @@ tempfile = { workspace = true }
 # HTTP client (for release asset downloads)
 reqwest = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-# `kill(2)` for stopping a cancelled command's process tree
-rustix = { workspace = true }
-
 [dev-dependencies]
+# PID-file helpers for tests that check a cancelled step's process stopped
+apvm-process = { workspace = true, features = ["test-support"] }
 # Lets cache tests checkpoint and damage a live cache database in place.
 rusqlite = { workspace = true }

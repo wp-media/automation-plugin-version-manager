@@ -44,7 +44,6 @@ apvm-core/src/
 ├── error.rs        Error types (thiserror-based)
 ├── config_io.rs    Configuration file load/save helpers
 ├── maintenance.rs  CacheMaintenance — the `apvm cache` actions, shared by every front end
-├── process.rs      Child processes: process-tree kill on cancellation, ProcessScope
 ├── build/          Build system
 │   ├── context.rs      BuildContext (shared build state)
 │   ├── runner.rs       BuildRunner (command execution)
@@ -468,7 +467,7 @@ The `apvm-config` crate itself is pure types with no I/O — this module provide
 
 ## Child Processes
 
-Every program core runs — git, `gh`, a builder's shell steps — goes through one layer (`process.rs`). Its stdout and stderr are captured and its stdin is closed (end-of-file at once), so a program asking a question nobody could see fails or goes on instead of waiting forever. If the future awaiting it is dropped (a cancelled build, a Node.js worker exiting), the child **and every process it started** are killed, best-effort. On Unix the tree is frozen (`SIGSTOP`), then killed (`SIGKILL`), through the `kill` system call and the process table (`/proc` on Linux, `/bin/ps` elsewhere), so Linux needs no `kill` or `ps` program. On Windows only the child itself is killed: `taskkill /T` matches children by a parent PID that Windows never clears, so a recycled PID would make it kill unrelated processes. The tree is found by ancestry rather than by process group, so a terminal's Ctrl+C still reaches the children. A process that outlives its own parent (e.g. a daemon) has left the tree and is not found. The workspace `clippy.toml` forbids spawning through `tokio::process::Command` directly.
+Every program core runs — git, `gh`, a builder's shell steps — goes through one layer, the [`apvm-process`](../process/README.md) crate (shared with apvm-sites, whose `ssh` calls get the same guarantees and join the same `ProcessScope`). Its stdout and stderr are captured and its stdin is closed (end-of-file at once), so a program asking a question nobody could see fails or goes on instead of waiting forever. If the future awaiting it is dropped (a cancelled build, a Node.js worker exiting), the child **and every process it started** are killed, best-effort. On Unix the tree is frozen (`SIGSTOP`), then killed (`SIGKILL`), through the `kill` system call and the process table (`/proc` on Linux, `/bin/ps` elsewhere), so Linux needs no `kill` or `ps` program. On Windows only the child itself is killed: `taskkill /T` matches children by a parent PID that Windows never clears, so a recycled PID would make it kill unrelated processes. The tree is found by ancestry rather than by process group, so a terminal's Ctrl+C still reaches the children. A process that outlives its own parent (e.g. a daemon) has left the tree and is not found. The workspace `clippy.toml` forbids spawning through `tokio::process::Command` directly.
 
 Dropping is not always possible in time: Node.js `process.exit()` drops nothing. An embedder can run calls inside a `ProcessScope`, which records every process tree started within it. `kill_all()` then kills them synchronously and refuses new ones:
 

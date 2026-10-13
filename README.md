@@ -415,6 +415,7 @@ crates/
 ├── config/     Pure configuration types (no I/O, no defaults)
 ├── core/       Core library: building, git, GitHub API, version detection
 ├── napi/       Node.js N-API bindings (napi-rs cdylib)
+├── process/    Child processes that never outlive their work (shared)
 └── storage/    SQLite-backed artifact cache (builds + release assets)
 ```
 
@@ -423,6 +424,7 @@ crates/
 - **Config** — pure `serde` types for configuration. No file I/O, no hardcoded paths.
 - **Core** — orchestrates builds (resolve ref → cache fast path → clone → checkout → detect version → build → collect artifacts), downloads from GitHub Releases, integrates the artifact cache (serve on hit, reuse partial variants, warm after builds), implements the cache-maintenance actions behind `apvm cache` (one implementation, built to be shared by every front end), git operations, and GitHub API via [octocrab](https://docs.rs/octocrab/0.54). For extended documentation, see the [Core crate README](crates/core/README.md).
 - **Storage** — the SQLite-backed artifact cache: one embedded database indexes builds (keyed by project/version/commit, per-variant artifacts) and release assets (keyed by tag/filename), with health-checked lookups, LRU-style aging, and maintenance operations (clean, gc, verify, repair) that never touch files the store did not create. For extended documentation, see the [Storage crate README](crates/storage/README.md).
+- **Process** — the one way apvm starts child processes (git, build steps, `ssh`): a cancelled call kills the child and every process it started, and a `ProcessScope` lets the Node bindings kill a whole environment's processes at exit. For extended documentation, see the [Process crate README](crates/process/README.md).
 - **NAPI** — Node.js bindings via [napi-rs](https://napi.rs/). Exposes the core library as a native addon with async support on the tokio runtime. For extended documentation, see the [NAPI crate README](crates/napi/README.md).
 - **CLI** — owns default paths (`~/.apvm`, `~/.apvm/cache`), provides progress display via [indicatif](https://docs.rs/indicatif/0.18), and delegates all logic to core. For extended documentation, see the [CLI crate README](crates/cli/README.md).
 
@@ -435,6 +437,7 @@ cargo test
 # Specific crate
 cargo test -p apvm-core
 cargo test -p apvm-storage
+cargo test -p apvm-process
 cargo test -p apvm-config
 cargo test -p apvm
 

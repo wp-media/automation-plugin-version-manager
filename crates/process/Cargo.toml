@@ -1,0 +1,26 @@
+[package]
+name = "apvm-process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Child processes that never outlive the work that started them, for APVM"
+license = "MIT"
+
+# No `apvm-*` dependencies: apvm-core and apvm-sites both build on this crate.
+# A unit test enforces it.
+[dependencies]
+# Child processes, their pipes, and the task-local process scope
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `kill(2)` without a `kill` program: stops and kills a process tree
+rustix = { workspace = true }
+
+[features]
+# Helpers for other crates' tests that check child processes stopped
+# (`test_support`); never enabled in release builds.
+test-support = []
+
+[dev-dependencies]
+# Temporary directories for PID and heartbeat files
+tempfile = { workspace = true }

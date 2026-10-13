@@ -1,18 +1,23 @@
-//! Running child processes that never outlive the work that started them.
+//! # apvm-process
 //!
-//! Every external program apvm runs (git, `gh`, a builder's shell steps) is
-//! awaited as part of a future. When that future is dropped instead of
-//! finishing — a cancelled build, a Node.js worker that exited mid-call, a
-//! runtime shutting down — what it started must stop too, or it keeps
-//! running unobserved: a `git clone` writing into a deleted workspace, a
-//! `composer install` nobody waits for.
+//! Running child processes that never outlive the work that started them,
+//! for every apvm crate that starts one: apvm-core (git, `gh`, a builder's
+//! shell steps) and apvm-sites (`ssh`, and a local shell in its tests).
 //!
-//! [`output`] is the one way core runs a [`command`]: if its future is
-//! dropped before the child exits, the child **and every process it
-//! started** are killed — git's transport helpers, the tools a shell step
-//! runs. The workspace's `clippy.toml` forbids `tokio::process::Command`'s
-//! own constructor and runners, so no async spawn bypasses this (std's
-//! blocking `Command` is left to tests and to this module's own helpers).
+//! Every such program is awaited as part of a future. When that future is
+//! dropped instead of finishing — a cancelled build, a Node.js worker that
+//! exited mid-call, a runtime shutting down — what it started must stop
+//! too, or it keeps running unobserved: a `git clone` writing into a deleted
+//! workspace, a `composer install` or an `ssh` nobody waits for.
+//!
+//! Every child starts through [`command`] and [`spawn`] (or [`output`],
+//! which runs one to completion): if the future awaiting it is dropped
+//! before the child exits, the child **and every process it started** are
+//! killed — git's transport helpers, the tools a shell step runs. The
+//! workspace's `clippy.toml` forbids `tokio::process::Command`'s own
+//! constructor and runners everywhere else, so no async spawn bypasses this
+//! (std's blocking `Command` is left to tests and to this crate's own
+//! helpers).
 //!
 //! The tree is found by process ancestry rather than by putting children in
 //! their own process group: a separate group would stop a terminal's Ctrl+C
@@ -24,16 +29,27 @@
 //! container images have neither. On Windows only the child itself is
 //! killed (`taskkill /F`): `taskkill /T` finds children by a parent PID that
 //! Windows never clears when the parent exits, so a recycled PID would make
-//! it kill unrelated processes. This runs only on that cancellation path,
-//! never when a command finishes normally.
+//! it kill unrelated processes. This runs only on the cancellation path (or
+//! an explicit [`Running::kill`], such as a timeout), never when a command
+//! finishes normally.
 //!
 //! It is best-effort. Not killed, because not found or not allowed: a
-//! process that outlives its own parent (a daemon a tool starts), which has
-//! left the tree; the descendants, when the process table cannot be read; a
-//! tree still growing after a bounded number of snapshots, beyond what they
-//! found; a descendant apvm may not signal (e.g. a setuid tool). If the host
-//! process itself ends between the stop and the kill, the stopped processes
-//! stay stopped.
+//! process that outlives its own parent (a daemon a tool starts, an ssh
+//! `ControlPersist` master), which has left the tree; the descendants, when
+//! the process table cannot be read; a tree still growing after a bounded
+//! number of snapshots, beyond what they found; a descendant apvm may not
+//! signal (e.g. a setuid tool).
+//!
+//! **Stopped, not killed:** a tree is stopped first and killed only once it
+//! is fully found (killing a parent earlier would hand its children to
+//! init, out of reach). If the killing process itself ends in between —
+//! killed with `SIGKILL`, or a Node.js `process.exit()` while another thread
+//! is in the middle of a kill — the processes stopped so far stay stopped
+//! (state `T`, parent 1), and nothing can resume them. The window is the
+//! search for the tree: a few process-table snapshots (milliseconds on
+//! Linux, one `/bin/ps` run each elsewhere). Within a [`ProcessScope`] the
+//! tree is still recorded while its guard kills it, so the scope's
+//! [`ProcessScope::kill_all`] at exit kills it as well.
 //!
 //! Dropping the future is not always possible in time: a Node.js main thread
 //! calling `process.exit()` ends the process without dropping anything. An
@@ -57,7 +73,7 @@ use rustix::process::{Pid, Signal, kill_process};
 #[cfg(target_os = "linux")]
 use rustix::process::{PidfdFlags, pidfd_open, pidfd_send_signal};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 tokio::task_local! {
     /// The scope the current task's work runs in, if any ([`ProcessScope::run`]).
@@ -107,6 +123,17 @@ impl ProcessScope {
     /// `work`'s output.
     pub async fn run<F: Future>(&self, work: F) -> F::Output {
         CURRENT_SCOPE.scope(self.clone(), work).await
+    }
+
+    /// The scope the current task runs in ([`Self::run`]), if any: work
+    /// that hands processes to a `tokio::spawn`ed task runs that task in
+    /// it too (`scope.run(…)`), so they stay recorded.
+    ///
+    /// # Returns
+    ///
+    /// The current scope (sharing its set), or `None` outside one.
+    pub fn current() -> Option<Self> {
+        CURRENT_SCOPE.try_with(Self::clone).ok()
     }
 
     /// Kill every process tree running in this scope, and close the scope:
@@ -258,9 +285,11 @@ enum Pin<'a> {
     Recorded(&'a Root),
 }
 
-/// A [`Command`] for `program`, to be run with [`output`]. It also has
-/// `kill_on_drop` set: should the tree kill not run, tokio still kills the
-/// direct child when its handle is dropped.
+/// A [`Command`] for `program`: the only constructor of tokio commands in
+/// apvm, to be started with [`spawn`] or [`output`]. It also has
+/// `kill_on_drop` set: should the guard's tree kill not run, tokio still
+/// kills the direct child when its handle is dropped (never after a failed
+/// wait: see [`Running::wait`]).
 ///
 /// # Arguments
 ///
@@ -270,11 +299,95 @@ enum Pin<'a> {
 /// # Returns
 ///
 /// The command, ready for arguments and options.
-pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
-    #[allow(clippy::disallowed_methods)] // the one sanctioned constructor
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one sanctioned constructor; spawn and output kill the tree"
+)]
+pub fn command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     command.kill_on_drop(true);
     command
+}
+
+/// The pipes of a child started by [`spawn`], as its stdio was configured
+/// (`None` for a stream that was not piped).
+#[derive(Debug)]
+pub struct Pipes {
+    /// Its stdin.
+    pub stdin: Option<ChildStdin>,
+    /// Its stdout.
+    pub stdout: Option<ChildStdout>,
+    /// Its stderr.
+    pub stderr: Option<ChildStderr>,
+}
+
+/// Start `command` (from [`command`], its stdio configured by the caller),
+/// recording the tree in the current [`ProcessScope`], if any.
+///
+/// Keep the returned [`Pipes`] alive until the [`Running`] guard is gone
+/// (bind them first: `let (pipes, running) = spawn(…)?` drops `running`
+/// first). A cancelled tree is then killed while its output pipes are still
+/// open; closed first, they could make members die of `SIGPIPE` (and free
+/// their PIDs) before the kill.
+///
+/// # Arguments
+///
+/// * `command` - A command from [`command`]
+///
+/// # Returns
+///
+/// The child's pipes, and the guard that owns it: await it with
+/// [`Running::wait`]; dropped while the child runs, it kills the tree.
+///
+/// # Errors
+///
+/// When the program cannot be started, or (`ScopeClosed`, an
+/// [`io::ErrorKind::Other`] error) when the surrounding [`ProcessScope`]
+/// was closed: the work's owner has gone away.
+pub fn spawn(command: &mut Command) -> io::Result<(Pipes, Running)> {
+    let scope = ProcessScope::current();
+    if scope.as_ref().is_some_and(ProcessScope::is_closed) {
+        return Err(scope_closed());
+    }
+    let mut child = start(command)?;
+    let pipes = Pipes {
+        stdin: child.stdin.take(),
+        stdout: child.stdout.take(),
+        stderr: child.stderr.take(),
+    };
+    let mut running = Running {
+        #[cfg(target_os = "linux")]
+        pinned: Root::pin(&child),
+        child: Some(Handle(child)),
+        scoped: None,
+    };
+    if let Some(scope) = scope
+        && let Some(root) = running.child.as_ref().and_then(|child| Root::pin(child))
+    {
+        let Some(key) = scope.register(root) else {
+            // Closed between the check and the spawn: the armed guard kills it.
+            return Err(scope_closed());
+        };
+        running.scoped = Some((scope, key));
+    }
+    Ok((pipes, running))
+}
+
+/// Start `command`: the only call of tokio's `spawn` in apvm.
+///
+/// # Arguments
+///
+/// * `command` - The command
+///
+/// # Errors
+///
+/// When the program cannot be started.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one sanctioned spawn: its only caller wraps the child in a Running guard"
+)]
+fn start(command: &mut Command) -> io::Result<Child> {
+    command.spawn()
 }
 
 /// Run `command` to completion and collect its output: stdout and stderr
@@ -285,7 +398,7 @@ pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
 /// forever.
 ///
 /// If the returned future is dropped before the child exits, the child and
-/// every process it started are killed (see the module docs). Run inside a
+/// every process it started are killed (see the crate docs). Run inside a
 /// [`ProcessScope`], the tree is also recorded there while it runs — so
 /// await it in the work's own task: a `tokio::spawn`ed task is outside the
 /// scope.
@@ -301,43 +414,19 @@ pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
 /// # Errors
 ///
 /// When the program cannot be started or its output cannot be read, or
-/// ([`ScopeClosed`]) when the surrounding [`ProcessScope`] was closed.
-pub(crate) async fn output(command: &mut Command) -> io::Result<Output> {
-    let scope = CURRENT_SCOPE.try_with(ProcessScope::clone).ok();
-    if scope.as_ref().is_some_and(ProcessScope::is_closed) {
-        return Err(scope_closed());
-    }
+/// (`ScopeClosed`) when the surrounding [`ProcessScope`] was closed.
+pub async fn output(command: &mut Command) -> io::Result<Output> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[allow(clippy::disallowed_methods)] // spawned under a `TreeGuard`
-    let mut child = command.spawn()?;
-    // Declared before the guard, so dropped after it: a cancelled tree is
-    // killed while its output pipes are still open. Closed first, they could
-    // make members die of SIGPIPE (and free their PIDs) before the kill.
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let mut guard = TreeGuard {
-        child: Some(child),
-        scoped: None,
-    };
-    if let Some(scope) = scope
-        && let Some(root) = guard.child.as_ref().and_then(Root::pin)
-    {
-        let Some(key) = scope.register(root) else {
-            // Closed between the check and the spawn: the armed guard kills it.
-            return Err(scope_closed());
-        };
-        guard.scoped = Some((scope, key));
-    }
-
+    // Pipes before the guard: dropped after it (see `spawn`).
+    let (mut pipes, mut running) = spawn(command)?;
     let (status, out, err) = tokio::try_join!(
-        guard.wait(),
-        read_all(stdout.as_mut()),
-        read_all(stderr.as_mut())
+        running.wait(),
+        read_all(pipes.stdout.as_mut()),
+        read_all(pipes.stderr.as_mut())
     )?;
-    guard.disarm();
     Ok(Output {
         status,
         stdout: out,
@@ -388,24 +477,81 @@ async fn read_all(stream: Option<impl AsyncRead + Unpin>) -> io::Result<Vec<u8>>
     Ok(bytes)
 }
 
-/// Owns a running child; dropped while armed (the future awaiting the child
-/// was dropped), it kills the child's whole process tree.
-struct TreeGuard {
-    /// The child, until the command completed ([`Self::disarm`]).
-    child: Option<Child>,
+/// Owns a started child until it is reaped; dropped earlier (the future
+/// awaiting the child was dropped), it kills the child's whole process
+/// tree. From [`spawn`].
+#[derive(Debug)]
+pub struct Running {
+    /// The child, until it is reaped (or let go after a failed wait).
+    child: Option<Handle>,
     /// The scope the tree is recorded in, with its registration key, until
     /// the child is reaped.
     scoped: Option<(ProcessScope, u64)>,
+    /// The child's pidfd (Linux 5.3+): it keeps naming this very process,
+    /// so a kill never reaches another process that got its PID after
+    /// something else reaped the child.
+    #[cfg(target_os = "linux")]
+    pinned: Option<Root>,
 }
 
-impl TreeGuard {
-    /// Wait for the child to exit, and reap it.
+/// A started child's tokio handle. Dropping it while the child is not
+/// reaped makes tokio `SIGKILL` the PID (`kill_on_drop`), so after a failed
+/// wait it is forgotten, never dropped ([`Running::wait`]).
+#[derive(Debug)]
+struct Handle(Child);
+
+impl std::ops::Deref for Handle {
+    type Target = Child;
+
+    /// The tokio handle.
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Handle {
+    /// The tokio handle.
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Handle {
+    /// Counts drops in tests (`hooks::HANDLE_DROPS`); nothing else.
+    fn drop(&mut self) {
+        #[cfg(test)]
+        hooks::HANDLE_DROPS.with(|drops| drops.set(drops.get() + 1));
+    }
+}
+
+/// Observation points for this crate's tests: contracts no outcome shows
+/// (a signal that never reaches a reused PID, the order of a drop's steps).
+#[cfg(test)]
+mod hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// How many child handles were dropped on this thread.
+        pub(super) static HANDLE_DROPS: Cell<usize> = const { Cell::new(0) };
+        /// Whether the last tree killed on this thread was still recorded
+        /// in its scope while it was killed (`None`: no scoped kill yet).
+        pub(super) static RECORDED_AT_KILL: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+}
+
+impl Running {
+    /// Wait for the child to exit, and reap it. Cancel-safe.
     ///
     /// A reaped child leaves its scope at once: the call may go on reading
     /// output that a process it left behind holds open, while its PID is
-    /// already free for reuse. If waiting fails, the child's state is
-    /// unknown (e.g. something else reaped it): it is let go, so no tree
-    /// kill or [`ProcessScope::kill_all`] ever targets its PID.
+    /// already free for reuse; and nothing is left to kill.
+    ///
+    /// If waiting fails, the child's state is unknown (e.g. something else
+    /// reaped it, so its PID may already name another process): it is let
+    /// go without ever being signalled again — neither by the tree kill nor
+    /// by tokio's `kill_on_drop`, which would `SIGKILL` that PID when the
+    /// handle drops, so the handle is forgotten (a small, one-off leak on
+    /// an error path that should never happen).
     ///
     /// # Returns
     ///
@@ -413,23 +559,52 @@ impl TreeGuard {
     ///
     /// # Errors
     ///
-    /// When waiting fails, or the guard was already disarmed.
-    async fn wait(&mut self) -> io::Result<ExitStatus> {
+    /// When waiting fails, or the child was already reaped.
+    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         let Some(child) = self.child.as_mut() else {
             return Err(io::Error::other("the child was already reaped"));
         };
         let waited = child.wait().await;
+        let child = self.child.take();
         if waited.is_err() {
-            self.child = None;
+            std::mem::forget(child);
         }
         self.leave_scope();
         waited
     }
 
-    /// The command completed: nothing is left to kill.
-    fn disarm(&mut self) {
-        self.child = None;
-        self.leave_scope();
+    /// Kill the child and every process it started now (a timeout), if it
+    /// was not reaped; [`Self::wait`] then reaps it.
+    ///
+    /// The child is signalled through its pidfd on Linux, so a child that
+    /// something else reaped behind tokio's back (its PID free for reuse)
+    /// is never mistaken for the process that gets that PID. Elsewhere it is
+    /// signalled by PID while tokio has not reaped it: that is only wrong if
+    /// another part of the host process reaps children it does not own
+    /// (`waitpid(-1)`, `SIGCHLD` ignored) and the PID is reused meanwhile.
+    pub fn kill(&mut self) {
+        // `Child::id` is `None` once reaped: a freed PID is never signalled.
+        let Some(pid) = self.child.as_ref().and_then(|child| child.id()) else {
+            return;
+        };
+        #[cfg(test)]
+        hooks::RECORDED_AT_KILL.with(|recorded| recorded.set(Some(self.scoped.is_some())));
+        kill_tree(pid, self.pin());
+    }
+
+    /// How the child's PID is known to still name it.
+    fn pin(&self) -> Pin<'_> {
+        #[cfg(target_os = "linux")]
+        if let Some(root) = self.pinned.as_ref().filter(|root| root.pidfd.is_some()) {
+            return Pin::Recorded(root);
+        }
+        Pin::Held
+    }
+
+    /// Whether the guard still holds a child it may signal.
+    #[cfg(all(test, unix))]
+    fn holds_child(&self) -> bool {
+        self.child.is_some()
     }
 
     /// Forget the tree in its scope, if still recorded there.
@@ -440,14 +615,11 @@ impl TreeGuard {
     }
 }
 
-impl Drop for TreeGuard {
-    /// Still armed: the awaiting future was dropped mid-command, so the
+impl Drop for Running {
+    /// Still running: the awaiting future was dropped mid-command, so the
     /// child's tree is killed.
     fn drop(&mut self) {
-        // `Child::id` is `None` once reaped: a freed PID is never signalled.
-        if let Some(pid) = self.child.as_ref().and_then(Child::id) {
-            kill_tree(pid, Pin::Held);
-        }
+        self.kill();
         self.leave_scope();
         // Dropping the child afterwards is harmless: `kill_on_drop` only
         // re-sends a kill to a process that is already gone.
@@ -801,18 +973,147 @@ fn descendants(root: u32, table: &[(u32, u32)]) -> Vec<u32> {
     found
 }
 
-/// Helpers for tests that check child processes stopped (Unix: `ps`).
-#[cfg(all(test, unix))]
-pub(crate) mod testutil {
+/// Helpers for tests that check child processes stopped (Unix), for this
+/// crate's tests and, with the `test-support` feature, other crates' (as a
+/// dev-dependency only).
+///
+/// Prefer [`heartbeat`](test_support::heartbeat) and
+/// [`assert_all_gone`](test_support::assert_all_gone): test scripts record
+/// their PIDs, and each must disappear (`kill(pid, 0)`; no `ps`). A stopped
+/// (`SIGSTOP`) process still exists, so a tree that was only frozen fails.
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod test_support {
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+
+    /// How long a check waits for a process to start or to disappear.
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    /// Whether this machine's process table can be read here: not under a
+    /// sandbox that forbids `/bin/ps` (macOS `sandbox-exec`), where only a
+    /// child itself can be killed. Linux reads `/proc`, always.
+    pub fn tree_visible() -> bool {
+        let visible = !super::process_table().is_empty();
+        if !visible {
+            eprintln!("skipped: the process table cannot be read here");
+        }
+        visible
+    }
+
+    /// Shell code that records its own PID in `pids`, then starts a
+    /// heartbeat in the background (a subshell appending a line to `beats`
+    /// every 50 ms, starting a `sleep` each time, for at most 60 s),
+    /// records the heartbeat's PID too, and waits for it.
+    ///
+    /// # Arguments
+    ///
+    /// * `beats` - The heartbeat file (a path without `'`)
+    /// * `pids` - Where the PIDs go, one per line (a path without `'`)
+    pub fn heartbeat(beats: &Path, pids: &Path) -> String {
+        let (beats, pids) = (beats.display(), pids.display());
+        format!(
+            "echo $$ >> '{pids}'; \
+             ( i=0; while [ $i -lt 1200 ]; do echo beat >> '{beats}'; sleep 0.05; i=$((i + 1)); done ) & \
+             echo $! >> '{pids}'; wait"
+        )
+    }
+
+    /// The complete lines of `file` (none when it does not exist yet).
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - A file test processes append to
+    pub fn lines(file: &Path) -> Vec<String> {
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        let complete = text.rsplit_once('\n').map_or("", |(lines, _)| lines);
+        complete.lines().map(str::to_string).collect()
+    }
+
+    /// Wait until `file` has at least `count` complete lines; panics after
+    /// 20 s.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - A file test processes append to
+    /// * `count` - Lines to wait for
+    pub fn wait_for_lines(file: &Path, count: usize) {
+        let deadline = Instant::now() + PATIENCE;
+        while lines(file).len() < count {
+            assert!(Instant::now() < deadline, "{} never grew", file.display());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The PIDs recorded in `file`, one per line.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - One PID per line
+    pub fn recorded_pids(file: &Path) -> Vec<Pid> {
+        lines(file)
+            .iter()
+            .filter_map(|line| line.trim().parse().ok().and_then(Pid::from_raw))
+            .collect()
+    }
+
+    /// Whether process `pid` still exists (running, stopped, or a zombie
+    /// not reaped yet).
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - The process
+    pub fn exists(pid: Pid) -> bool {
+        test_kill_process(pid).is_ok()
+    }
+
+    /// Assert that every process in `pids` disappears within 20 s
+    /// ([`assert_gone_within`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `pids` - The processes that must be gone
+    /// * `what` - What they are, for the message
+    pub fn assert_all_gone(pids: &[Pid], what: &str) {
+        assert_gone_within(pids, what, PATIENCE);
+    }
+
+    /// Assert that every process in `pids` disappears within `patience`.
+    /// Any that is left (a stopped process never disappears) is killed
+    /// before the assertion fails, so a failing test leaves nothing behind.
+    ///
+    /// # Arguments
+    ///
+    /// * `pids` - The processes that must be gone
+    /// * `what` - What they are, for the message
+    /// * `patience` - How long to wait
+    pub fn assert_gone_within(pids: &[Pid], what: &str, patience: Duration) {
+        let deadline = Instant::now() + patience;
+        let mut left: Vec<Pid> = pids.to_vec();
+        loop {
+            left.retain(|&pid| exists(pid));
+            if left.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for &pid in &left {
+            let _ = kill_process(pid, Signal::KILL);
+        }
+        assert!(left.is_empty(), "{what} survived the kill: {left:?}");
+    }
 
     /// Whether `pid` is still running: listed in `/proc` and neither a
     /// zombie nor dead. A killed child stays a zombie until tokio reaps it in
     /// the background, so "exists" (`kill -0`) would report a killed child
     /// as alive. Needs no `ps`, like the code under test.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - The process ID, as text
     #[cfg(target_os = "linux")]
-    pub(crate) fn running(pid: &str) -> bool {
+    pub fn running(pid: &str) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
             .as_deref()
@@ -822,8 +1123,12 @@ pub(crate) mod testutil {
 
     /// Whether `pid` is still running: listed by `ps` and not a zombie (see
     /// the Linux variant).
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - The process ID, as text
     #[cfg(not(target_os = "linux"))]
-    pub(crate) fn running(pid: &str) -> bool {
+    pub fn running(pid: &str) -> bool {
         std::process::Command::new("ps")
             .args(["-o", "stat=", "-p", pid])
             .output()
@@ -835,7 +1140,11 @@ pub(crate) mod testutil {
     }
 
     /// Read the PID written to `file`, waiting until it is there.
-    pub(crate) fn wait_for_pid(file: &Path) -> String {
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - The PID file
+    pub fn wait_for_pid(file: &Path) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(pid) = std::fs::read_to_string(file)
@@ -849,7 +1158,11 @@ pub(crate) mod testutil {
     }
 
     /// Whether `pid` stops running within a few seconds.
-    pub(crate) fn stops_soon(pid: &str) -> bool {
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - The process ID, as text
+    pub fn stops_soon(pid: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if !running(pid) {
@@ -862,8 +1175,53 @@ pub(crate) mod testutil {
 
     /// A shell script that records its PID in `file`, then becomes (via
     /// `exec`) a 30-second `sleep` — a long-running direct child.
-    pub(crate) fn sleeper_script(file: &Path) -> String {
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - The PID file
+    pub fn sleeper_script(file: &Path) -> String {
         format!("echo $$ > '{}'; exec sleep 30", file.display())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn complete_lines_and_pids_only() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("pids");
+            assert!(lines(&file).is_empty(), "missing file");
+            std::fs::write(&file, "12\n34\n5").unwrap();
+            assert_eq!(lines(&file), ["12", "34"]);
+            std::fs::write(&file, "12\nx\n0\n").unwrap();
+            // `x` is no number, and 0 is no process.
+            assert_eq!(recorded_pids(&file), [Pid::from_raw(12).unwrap()]);
+        }
+
+        #[test]
+        fn a_stopped_process_fails_the_check_and_is_killed() {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+            kill_process(pid, Signal::STOP).unwrap();
+            let checked = std::panic::catch_unwind(|| {
+                assert_gone_within(&[pid], "the sleeper", Duration::from_millis(300));
+            });
+            assert!(checked.is_err(), "a stopped process passed the check");
+            let status = child.wait().unwrap();
+            assert_eq!(status.code(), None, "the check killed it");
+        }
+
+        #[test]
+        fn a_reaped_process_is_gone() {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+            child.wait().unwrap();
+            assert_all_gone(&[pid], "a finished child");
+        }
     }
 }
 
@@ -971,7 +1329,7 @@ mod tests {
 
     #[cfg(unix)]
     mod unix {
-        use super::super::testutil::{running, sleeper_script, stops_soon, wait_for_pid};
+        use super::super::test_support::{running, sleeper_script, stops_soon, wait_for_pid};
         use super::super::*;
 
         #[tokio::test]
@@ -1324,5 +1682,229 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::NotFound);
         }
+
+        /// Start `sh -c <code>` with its stdio piped.
+        ///
+        /// # Arguments
+        ///
+        /// * `code` - Shell code
+        fn sh(code: &str) -> (Pipes, Running) {
+            let mut command = command("sh");
+            command
+                .args(["-c", code])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            spawn(&mut command).unwrap()
+        }
+
+        /// Wait (off the runtime) until `pids` lists the heartbeat's two
+        /// PIDs and `beats` shows it running.
+        ///
+        /// # Arguments
+        ///
+        /// * `beats` - The heartbeat file
+        /// * `pids` - The PID file
+        async fn heartbeat_started(beats: &std::path::Path, pids: &std::path::Path) {
+            let (beats, pids) = (beats.to_path_buf(), pids.to_path_buf());
+            tokio::task::spawn_blocking(move || {
+                test_support::wait_for_lines(&pids, 2);
+                test_support::wait_for_lines(&beats, 2);
+            })
+            .await
+            .unwrap();
+        }
+
+        /// Assert (off the runtime) that every PID in `pids` disappears.
+        ///
+        /// # Arguments
+        ///
+        /// * `pids` - The PID file
+        async fn all_gone(pids: &std::path::Path) {
+            let pids = test_support::recorded_pids(pids);
+            assert_eq!(pids.len(), 2, "the shell and its heartbeat");
+            tokio::task::spawn_blocking(move || {
+                test_support::assert_all_gone(&pids, "a descendant")
+            })
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn dropping_a_running_guard_kills_every_descendant_not_just_stops_it() {
+            if !test_support::tree_visible() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let (beats, pids) = (dir.path().join("beats"), dir.path().join("pids"));
+            let (_pipes, running) = sh(&test_support::heartbeat(&beats, &pids));
+            heartbeat_started(&beats, &pids).await;
+
+            drop(running);
+
+            all_gone(&pids).await;
+        }
+
+        #[tokio::test]
+        async fn an_explicit_kill_kills_a_growing_tree_and_wait_reaps_the_child() {
+            if !test_support::tree_visible() {
+                return;
+            }
+            // The heartbeat starts a `sleep` every 50 ms: the tree grows
+            // while it is being killed.
+            let dir = tempfile::tempdir().unwrap();
+            let (beats, pids) = (dir.path().join("beats"), dir.path().join("pids"));
+            let (_pipes, mut running) = sh(&test_support::heartbeat(&beats, &pids));
+            heartbeat_started(&beats, &pids).await;
+
+            running.kill();
+            let status = running.wait().await.unwrap();
+
+            assert_eq!(status.code(), None, "killed, not exited");
+            assert!(!running.holds_child(), "reaped: nothing left to kill");
+            all_gone(&pids).await;
+        }
+
+        #[tokio::test]
+        async fn a_scope_kills_spawned_trees_while_their_guards_wait() {
+            if !test_support::tree_visible() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let (beats, pids) = (dir.path().join("beats"), dir.path().join("pids"));
+            let code = test_support::heartbeat(&beats, &pids);
+            let scope = ProcessScope::new();
+            let task = {
+                let scope = scope.clone();
+                tokio::spawn(async move {
+                    scope
+                        .run(async {
+                            assert!(ProcessScope::current().is_some());
+                            let (_pipes, mut running) = sh(&code);
+                            running.wait().await
+                        })
+                        .await
+                })
+            };
+            heartbeat_started(&beats, &pids).await;
+            assert_eq!(scope.running_count(), 1, "spawn records the tree");
+
+            let killer = scope.clone();
+            tokio::task::spawn_blocking(move || killer.kill_all())
+                .await
+                .unwrap();
+
+            all_gone(&pids).await;
+            let status = task.await.unwrap().unwrap();
+            assert_eq!(status.code(), None, "ended by the kill");
+            assert_eq!(scope.running_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn the_current_scope_is_the_one_the_task_runs_in() {
+            assert!(ProcessScope::current().is_none(), "outside any scope");
+            let scope = ProcessScope::new();
+            let inner = scope.run(async { ProcessScope::current() }).await.unwrap();
+            // The same set: closing one closes the other.
+            inner.kill_all();
+            assert!(scope.is_closed());
+        }
+
+        #[tokio::test]
+        async fn a_failed_wait_lets_the_child_go_without_signalling_it_again() {
+            // Something else reaps the child first (here, a direct
+            // `waitpid`): its PID may already name another process, so the
+            // guard must never signal it — neither by a tree kill nor by
+            // tokio's `kill_on_drop`, which fires when the tokio handle is
+            // dropped. A reused PID cannot be produced on demand, so the
+            // test counts handle drops instead: there must be none.
+            let (_pipes, mut running) = sh("exit 0");
+            let pid = running.child.as_ref().and_then(|child| child.id()).unwrap();
+            let pid = Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+            let reaped = tokio::task::spawn_blocking(move || {
+                rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(reaped.is_some(), "precondition: reaped behind tokio's back");
+            let drops_before = hooks::HANDLE_DROPS.with(std::cell::Cell::get);
+
+            assert!(running.wait().await.is_err(), "nothing left to wait for");
+            assert!(!running.holds_child(), "let go");
+            running.kill(); // a no-op now
+            drop(running);
+
+            let drops = hooks::HANDLE_DROPS.with(std::cell::Cell::get) - drops_before;
+            assert_eq!(
+                drops, 0,
+                "the tokio handle was dropped: kill_on_drop could fire"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_held_child_is_signalled_through_its_pidfd_where_the_kernel_has_one() {
+            // Then a child reaped behind tokio's back is never mistaken for
+            // the process that gets its PID.
+            let supported = pidfd_open(rustix::process::getpid(), PidfdFlags::empty()).is_ok();
+            let (_pipes, mut running) = sh("sleep 30");
+            let pinned = matches!(running.pin(), Pin::Recorded(Root { pidfd: Some(_), .. }));
+            assert_eq!(pinned, supported, "pidfd support: {supported}");
+            running.kill();
+            assert_eq!(running.wait().await.unwrap().code(), None, "killed");
+        }
+
+        #[tokio::test]
+        async fn a_dropped_guard_kills_its_tree_while_still_recorded_in_its_scope() {
+            // Its scope's `kill_all` (a Node.js `process.exit()` on another
+            // thread) must still find a tree whose guard is killing it, or
+            // a host that exits mid-kill leaves the tree stopped.
+            let dir = tempfile::tempdir().unwrap();
+            let pid_file = dir.path().join("pid");
+            let scope = ProcessScope::new();
+            let script = sleeper_script(&pid_file);
+            let running = scope.run(async { sh(&script).1 }).await;
+            let file = pid_file.clone();
+            let pid = tokio::task::spawn_blocking(move || wait_for_pid(&file))
+                .await
+                .unwrap();
+            hooks::RECORDED_AT_KILL.with(|recorded| recorded.set(None));
+
+            drop(running);
+
+            let recorded = hooks::RECORDED_AT_KILL.with(std::cell::Cell::get);
+            assert_eq!(recorded, Some(true), "left the scope before the kill");
+            assert_eq!(scope.running_count(), 0, "and left it after");
+            assert!(stops_soon(&pid));
+        }
+    }
+}
+
+#[cfg(test)]
+mod manifest {
+    /// The lines of a Cargo manifest that would make the crate depend on
+    /// another apvm crate (outside comments and the package name).
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - The manifest's text
+    fn apvm_dependency_lines(manifest: &str) -> Vec<&str> {
+        manifest
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or_default().trim())
+            .filter(|line| *line != r#"name = "apvm-process""#)
+            .filter(|line| line.contains("apvm-") || line.contains("path = \""))
+            .collect()
+    }
+
+    #[test]
+    fn the_crate_depends_on_no_apvm_crate() {
+        // apvm-core and apvm-sites both depend on this crate.
+        let manifest = include_str!("../Cargo.toml");
+        assert_eq!(apvm_dependency_lines(manifest), Vec::<&str>::new());
+        assert!(
+            !apvm_dependency_lines("[dependencies]\napvm-sites = { workspace = true }").is_empty()
+        );
     }
 }

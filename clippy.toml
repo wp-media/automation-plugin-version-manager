@@ -3,11 +3,12 @@
 
 disallowed-methods = [
   # A child process — and everything it starts — must stop when the future
-  # awaiting it is dropped (a cancelled build, a Node.js worker exiting).
-  # Core spawns only through `process::command` + `process::output`, which
-  # kill the whole process tree in that case; see crates/core/src/process.rs.
-  { path = "tokio::process::Command::new", reason = "use crate::process::command so cancelled work stops its child processes" },
-  { path = "tokio::process::Command::output", reason = "use crate::process::output so cancelled work stops the whole process tree" },
-  { path = "tokio::process::Command::spawn", reason = "use crate::process::output so cancelled work stops the whole process tree" },
-  { path = "tokio::process::Command::status", reason = "use crate::process::output so cancelled work stops the whole process tree" },
+  # awaiting it is dropped (a cancelled build or ssh call, a Node.js worker
+  # exiting), and join the caller's ProcessScope. Every crate spawns only
+  # through apvm_process::{command, spawn, output}, which kill the whole
+  # process tree in that case; see crates/process/src/lib.rs.
+  { path = "tokio::process::Command::new", reason = "use apvm_process::command so cancelled work stops its child processes" },
+  { path = "tokio::process::Command::output", reason = "use apvm_process::output so cancelled work stops the whole process tree" },
+  { path = "tokio::process::Command::spawn", reason = "use apvm_process::spawn so cancelled work stops the whole process tree" },
+  { path = "tokio::process::Command::status", reason = "use apvm_process::output so cancelled work stops the whole process tree" },
 ]

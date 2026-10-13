@@ -1115,7 +1115,7 @@ mod tests {
     async fn dropping_a_running_step_kills_its_process() {
         // A cancelled build (e.g. its Node.js worker exited) must not leave
         // the current build step running.
-        use crate::process::testutil::{running, sleeper_script, stops_soon, wait_for_pid};
+        use crate::process::test_support::{running, sleeper_script, stops_soon, wait_for_pid};
         let (ws, context) = workspace();
         let pid_file = ws.path().join("pid");
         let runner = BuildRunner::new(context);
