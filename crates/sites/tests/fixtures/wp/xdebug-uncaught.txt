@@ -1,0 +1,8 @@
+
+Fatal error: Uncaught RuntimeException: boom in Command line code on line 1
+
+RuntimeException: boom in Command line code on line 1
+
+Call Stack:
+    0.0000     388128   1. {main}() Command line code:0
+

@@ -1,0 +1,11 @@
+PHP Warning:  apvm warning in /xd/t.php on line 2
+PHP Stack trace:
+PHP   1. {main}() /xd/t.php:0
+PHP   2. apvm_warn() /xd/t.php:4
+PHP   3. trigger_error($message = 'apvm warning', $error_level = 512) /xd/t.php:2
+PHP Warning:  first line
+second line in /xd/t.php on line 3
+PHP Stack trace:
+PHP   1. {main}() /xd/t.php:0
+PHP   2. apvm_multi() /xd/t.php:5
+PHP   3. trigger_error($message = 'first line\nsecond line', $error_level = 512) /xd/t.php:3

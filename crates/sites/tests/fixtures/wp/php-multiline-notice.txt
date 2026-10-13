@@ -1,0 +1,6 @@
+
+Warning: apvm warning in /xd/t.php on line 2
+
+Warning: first line
+second line in /xd/t.php on line 3
+[]

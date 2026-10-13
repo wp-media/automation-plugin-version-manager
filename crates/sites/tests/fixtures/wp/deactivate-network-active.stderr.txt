@@ -1,0 +1,2 @@
+Warning: Plugin 'basic' is network active and must be deactivated with --network flag.
+Error: No plugins deactivated.

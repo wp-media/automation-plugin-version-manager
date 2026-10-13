@@ -8,12 +8,13 @@ apvm-core's build-and-install path. The design and the phase plan are in
 **Status:** phase P1 (foundations): the data layer (P1.1), inventory
 persistence (P1.2), settings and targets (P1.3), the plugin hint types that
 apvm-core fills (P1.4) and local package inspection (P1.5); phase P3.1
-adds the remote script builder, and P3.2 the transport contract that runs
-scripts (with a local-shell transport). It has the inventory model and its
+adds the remote script builder, P3.2 the transport contract that runs
+scripts (with a local-shell transport), and P4.1 the WP-CLI commands and
+parsers. It has the inventory model and its
 validation, safe reading and writing of the inventory file, settings
 resolution and target selection, plugin hints, plugin zip inspection, the
 shared file names, and the scripts apvm will run on servers. Running them
-over SSH, WP-CLI parsing and the plugin operations arrive in later phases.
+over SSH and the plugin operations arrive in later phases.
 
 ## Design rules
 
@@ -278,6 +279,19 @@ The crate's tests run requests through a local shell, the way sshd does:
 "sh -c '<script>'"` with the upload on stdin. The SSH transport follows the
 same pattern. apvm itself runs nothing through a local shell.
 
+## WP-CLI commands and parsing (`wp`)
+
+Pure, no I/O: the commands apvm runs, and strict parsers for what they print
+(plan §6.2, §6.4, §9).
+
+| Type | What it is |
+|---|---|
+| `WpCommand` | every command the lifecycle needs, built from typed values only (`Slug`, `StagedZip`): `plugin list --format=json --fields=name,status,version,file,title --skip-update-check --skip-plugins --skip-themes`, `cli version`, `eval` of the constant `snippets::SITE_FACTS`, `option get siteurl` (boot check), `plugin activate`/`deactivate` (`--network`, `--skip-plugins=<slug>`), `plugin uninstall [--skip-delete]` (`reset`: plugin files kept, translations deleted), `plugin delete`, `plugin install <staged zip> [--force]`, `plugin get <slug> --fields=name,requires_plugins`, `eval` of the constant `snippets::REGULAR_PLUGINS`. One slug per process; never `--all`, `--exclude`, `--deactivate`, `--uninstall` or `--activate`. `CommandKind` says which are reads (retried, no lock: plugins skipped), which load plugins (the boot check and mutations) and which change files |
+| `StagedZip` | `<remote_tmp_dir>/apvm.XXXXXXXXXX/package-<n>.zip`, built from the site's `remote_tmp_dir`, the `mktemp` name and the package number |
+| `WpSite` | a site's hermetic `WpCli` base (no arguments); `command()` appends a `WpCommand` |
+| `parse::{plugin_list, regular_plugins, cli_version, site_facts, requires_plugins, boot_check}` | read a `CommandOutput` (exit status, stdout after the nonce, stderr). PHP notices before or after the one-line payload (the PHP 8.5 `Deprecated:` line, shutdown warnings, `PHP Warning:  …`, multi-line messages, PHP and Xdebug stack traces) and byte-order marks are skipped and returned as `Notices`; a non-zero exit, empty output, only notices, an HTML page, any other line, two payloads, truncated or invalid JSON, missing, unknown, duplicate or mistyped fields, and rows whose name does not match their file are refused. Site facts are observations: absolute paths and non-empty URLs without control characters, canonical or not (the `*_realpath` facts are canonical). The boot check passes when `option get siteurl` exits 0 and prints one `http(s)://` line (a plugin can print a page and `exit` with status 0); a different siteurl is a warning. It catches fatals, `die()`, HTML and empty output, not a plugin faking a boot. `Requires Plugins` is read as WordPress reads it |
+| `PluginList`, `PluginRow`, `PluginStatus` | the rows, with unknown statuses kept as `Unknown`; lookups by slug follow WP-CLI's plugin fetcher (file `<slug>.php` or `<slug>`, or folder `<slug>`; names are display only, since WP-CLI renames plugins that share one) and return `Absent`, `Found`, `Ambiguous`, `Shadowed` (WP-CLI hides a regular plugin behind a must-use plugin or drop-in at `<slug>.php` or `<slug>`) or `Unreadable` (a file name that is not valid UTF-8 may match); `regular_plugins` + `find_regular` resolve the last two. Lifecycle commands and `requires_plugins` take a `Resolved` plugin (`PluginList::resolve`: `Found` only), so no command names a slug WP-CLI could take for another plugin, and `--no-load` skips by WP-CLI's own plugin name; rows WP-CLI prints with a `null` name (not valid UTF-8) are counted, never matched |
+
 ## Errors
 
 `Error::code()` returns a stable `Code`:
@@ -301,6 +315,8 @@ same pattern. apvm itself runs nothing through a local shell.
   could not be started, or its output read, or an upload's file could not
   be opened or read for a reason other than the caller's path (missing,
   not permitted or not a regular file are `invalid_input`).
+- `wp_command_failed`: a WP-CLI command failed, or printed output a parser
+  refuses (`Error::WpOutput` with its `OutputDefect`).
 
 `Error::problems()` lists the located problems, so a front end can print
 them one per line.
@@ -371,6 +387,12 @@ cargo test -p apvm-sites
   table with `/bin/ps`: where a sandbox forbids it (`sandbox-exec`), the
   descendant checks are skipped. Timeout tests check only what marker
   files prove happened, so they hold under CPU load.
+- WP-CLI commands: argv goldens per command, banned flags never present,
+  apvm's global options set exactly once, every command's argv delivered
+  verbatim through `sh` (Unix); parsers on real outputs captured from the
+  E2E harness (`tests/fixtures/wp/`, provenance in `wp/parse/tests.rs`) and
+  on synthetic ones (truncated, unknown status, wrong types, extra or
+  duplicate fields, large lists).
 
 `tests/inventory.rs` loads the example document of the plan through the
 public API; `tests/targets.rs` resolves targets and settings on it.

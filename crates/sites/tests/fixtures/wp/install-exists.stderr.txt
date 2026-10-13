@@ -1,0 +1,3 @@
+Warning: Destination folder already exists. "/var/www/single/wp-content/plugins/basic/"
+Warning: The '/tmp/apvm.Ab3dE6gH9k/package-1.zip' plugin could not be found.
+Error: No plugins installed.

@@ -12,6 +12,7 @@ use crate::inventory::EntityKind;
 use crate::inventory::io::FileKind;
 use crate::package::PackageDefect;
 use crate::problem::{Problem, printable, quoted};
+use crate::wp::OutputDefect;
 
 /// Convenient result alias used across the crate.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -49,6 +50,9 @@ pub enum Code {
     /// opened or read for a reason other than the caller's path
     /// (`process_failed`).
     ProcessFailed,
+    /// A WP-CLI command failed, or printed output apvm cannot read with
+    /// certainty (`wp_command_failed`).
+    WpCommandFailed,
 }
 
 impl Code {
@@ -64,6 +68,7 @@ impl Code {
             Self::InventoryChanged => "inventory_changed",
             Self::PackageInvalid => "package_invalid",
             Self::ProcessFailed => "process_failed",
+            Self::WpCommandFailed => "wp_command_failed",
         }
     }
 }
@@ -293,6 +298,18 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    /// A WP-CLI command failed, or its output breaks a parser rule (plan
+    /// §9): never read as a guess, so noise never reads as "not
+    /// installed".
+    #[error("'wp {command}' {defect}")]
+    WpOutput {
+        /// The WP-CLI command, such as `plugin list`.
+        command: &'static str,
+        /// What was wrong with its output.
+        #[source]
+        defect: OutputDefect,
+    },
 }
 
 impl Error {
@@ -313,6 +330,7 @@ impl Error {
             | Self::InvalidHints { .. } => Code::InvalidInput,
             Self::PackageInvalid { .. } => Code::PackageInvalid,
             Self::Process { .. } | Self::UploadSource { .. } => Code::ProcessFailed,
+            Self::WpOutput { .. } => Code::WpCommandFailed,
         }
     }
 
@@ -384,6 +402,7 @@ mod tests {
         assert_eq!(Code::InventoryIo.as_str(), "inventory_io");
         assert_eq!(Code::InventoryLocked.as_str(), "inventory_locked");
         assert_eq!(Code::InventoryChanged.as_str(), "inventory_changed");
+        assert_eq!(Code::WpCommandFailed.as_str(), "wp_command_failed");
     }
 
     #[test]

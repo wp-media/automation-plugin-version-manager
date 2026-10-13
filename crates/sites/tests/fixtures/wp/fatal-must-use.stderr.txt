@@ -1,0 +1,13 @@
+Fatal error: Uncaught RuntimeException: apvm-e2e in /var/www/single/wp-content/mu-plugins/zz-noise.php:2
+Stack trace:
+#0 /var/www/single/wp-settings.php(508): include_once()
+#1 phar:///usr/local/bin/wp/vendor/wp-cli/wp-cli/php/WP_CLI/Runner.php(1374): require('/var/www/single...')
+#2 phar:///usr/local/bin/wp/vendor/wp-cli/wp-cli/php/WP_CLI/Runner.php(1293): WP_CLI\Runner->load_wordpress()
+#3 phar:///usr/local/bin/wp/vendor/wp-cli/wp-cli/php/WP_CLI/Bootstrap/LaunchRunner.php(28): WP_CLI\Runner->start()
+#4 phar:///usr/local/bin/wp/vendor/wp-cli/wp-cli/php/bootstrap.php(84): WP_CLI\Bootstrap\LaunchRunner->process(Object(WP_CLI\Bootstrap\BootstrapState))
+#5 phar:///usr/local/bin/wp/vendor/wp-cli/wp-cli/php/wp-cli.php(35): WP_CLI\bootstrap()
+#6 phar:///usr/local/bin/wp/php/boot-phar.php(20): include('phar:///usr/loc...')
+#7 /usr/local/bin/wp(4): include('phar:///usr/loc...')
+#8 {main}
+  thrown in /var/www/single/wp-content/mu-plugins/zz-noise.php on line 2
+Error: There has been a critical error on this website.Learn more about troubleshooting WordPress. There has been a critical error on this website.
