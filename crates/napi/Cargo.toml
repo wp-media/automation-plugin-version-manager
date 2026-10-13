@@ -21,6 +21,7 @@ vendored-openssl = ["dep:openssl"]
 apvm-core = { workspace = true }
 apvm-config = { workspace = true }
 apvm-storage = { workspace = true }
+apvm-sites = { workspace = true }
 
 # N-API bindings
 napi = { workspace = true }
@@ -43,3 +44,5 @@ napi-build = { workspace = true }
 chrono = { workspace = true }
 # Builds the SQLite errors the cache error-code tests classify.
 rusqlite = { workspace = true }
+# Temp inventory files for the site-inventory unit tests.
+tempfile = { workspace = true }

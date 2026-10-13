@@ -134,6 +134,7 @@ version = "3.3.0"
 dependencies = [
  "apvm-config",
  "apvm-core",
+ "apvm-sites",
  "apvm-storage",
  "chrono",
  "directories",
@@ -142,6 +143,7 @@ dependencies = [
  "napi-derive",
  "openssl",
  "rusqlite",
+ "tempfile",
  "tokio",
 ]
 

@@ -8,7 +8,8 @@
 //! directly. Instead, we provide conversion functions that are used at call sites
 //! via `.map_err()`.
 
-use napi::{Env, Status};
+use napi::bindgen_prelude::{JsObjectValue, JsValue};
+use napi::{Env, Property, Status};
 
 /// Whether a JS exception is pending in `env`.
 ///
@@ -45,6 +46,95 @@ pub(crate) fn clear_pending_exception(env: &Env) {
     unsafe {
         napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception);
     }
+}
+
+/// A JS `Error` with `message` and a custom `code`, as a `napi::Error` that
+/// throws (or rejects a promise with) that very object, so `code` survives.
+///
+/// `code` is defined as an own property, not assigned, so an accessor or a
+/// read-only `code` on `Error.prototype` cannot swallow it.
+///
+/// # Arguments
+///
+/// * `env` - The env of the current JS thread
+/// * `code` - The machine-readable `err.code` (e.g. `CacheCorrupted`)
+/// * `message` - The human-readable `err.message`
+pub(crate) fn js_error(env: &Env, code: &str, message: &str) -> napi::Error {
+    let build = || -> napi::Result<napi::Error> {
+        let mut error = env.create_error(napi::Error::new(Status::GenericFailure, message))?;
+        let code = env.create_string(code)?;
+        error.define_properties(&[Property::new().with_utf8_name("code")?.with_value(&code)])?;
+        Ok(napi::Error::from(error.to_unknown()))
+    };
+    // Creating the object can only fail if the VM is shutting down; keep the
+    // message and the closest status code then.
+    build().unwrap_or_else(|_| napi::Error::new(Status::GenericFailure, message.to_string()))
+}
+
+/// An `InvalidArg` JS `Error` with `message`: the error of every argument
+/// the bindings read themselves.
+///
+/// # Arguments
+///
+/// * `env` - The env of the current JS thread
+/// * `message` - The human-readable `err.message`
+pub(crate) fn invalid_arg(env: &Env, message: &str) -> napi::Error {
+    js_error(env, Status::InvalidArg.as_ref(), message)
+}
+
+/// `.or_invalid_arg(env)` on the result of reading a JS argument, whose
+/// error is a message: the message becomes an `InvalidArg` JS `Error`.
+pub(crate) trait OrInvalidArg<T> {
+    /// The value, or an `InvalidArg` JS `Error` with the message.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The env of the current JS thread
+    ///
+    /// # Errors
+    ///
+    /// The `InvalidArg` error when `self` is an error.
+    fn or_invalid_arg(self, env: &Env) -> napi::Result<T>;
+}
+
+impl<T> OrInvalidArg<T> for Result<T, String> {
+    fn or_invalid_arg(self, env: &Env) -> napi::Result<T> {
+        self.map_err(|message| invalid_arg(env, &message))
+    }
+}
+
+/// The `err.code` of an `apvm-sites` error code: `InvalidArg` for bad
+/// input, like every other binding; otherwise the code in PascalCase
+/// (`inventory_changed` → `InventoryChanged`), so later library codes map
+/// without changes here (plan §11: rejection codes are PascalCase).
+///
+/// # Arguments
+///
+/// * `code` - The library's stable code
+///
+/// # Returns
+///
+/// The JS `err.code`.
+pub(crate) fn sites_error_code(code: apvm_sites::Code) -> String {
+    if code == apvm_sites::Code::InvalidInput {
+        return Status::InvalidArg.as_ref().to_string();
+    }
+    pascal_case(code.as_str())
+}
+
+/// `snake_case` → `PascalCase` (`inventory_read_only` →
+/// `InventoryReadOnly`); empty words vanish (`a__b` → `AB`).
+pub(crate) fn pascal_case(snake: &str) -> String {
+    snake
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// Convert an [`apvm_core::Error`] into a [`napi::Error`].
@@ -122,6 +212,33 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn sites_codes_map_to_pascal_case_js_codes() {
+        use apvm_sites::Code;
+        let cases = [
+            (Code::InvalidInput, "InvalidArg"),
+            (Code::InventoryInvalid, "InventoryInvalid"),
+            (Code::InventoryUnsupported, "InventoryUnsupported"),
+            (Code::InventoryReadOnly, "InventoryReadOnly"),
+            (Code::InventoryIo, "InventoryIo"),
+            (Code::InventoryLocked, "InventoryLocked"),
+            (Code::InventoryChanged, "InventoryChanged"),
+            (Code::PackageInvalid, "PackageInvalid"),
+        ];
+        for (code, js) in cases {
+            assert_eq!(sites_error_code(code), js, "{code}");
+        }
+    }
+
+    #[test]
+    fn pascal_case_capitalizes_each_word() {
+        assert_eq!(pascal_case("inventory_read_only"), "InventoryReadOnly");
+        assert_eq!(pascal_case("ssh_missing"), "SshMissing");
+        assert_eq!(pascal_case("word"), "Word");
+        assert_eq!(pascal_case(""), "");
+        assert_eq!(pascal_case("a__b"), "AB");
+    }
 
     /// Errors the caller fixes by changing an argument: a JS `InvalidArg`.
     fn caller_errors() -> Vec<apvm_core::Error> {

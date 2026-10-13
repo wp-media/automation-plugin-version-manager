@@ -16,6 +16,12 @@
 //!   `ApvmCache.open()`) inspects, cleans, verifies, garbage-collects and
 //!   repairs the artifact cache, at parity with `apvm cache`; its rejections
 //!   carry an `err.code` (`CacheCorrupted`, `InvalidArg`, `GenericFailure`).
+//! - **Site inventory**: `SiteInventory` reads and edits the servers, sites
+//!   and groups of `~/.apvm/inventory.json` (or `APVM_INVENTORY`), the
+//!   CLI's file. It is synchronous; `save()` never overwrites another
+//!   process's edit (`InventoryChanged`), and `SiteInventory.update(fn)`
+//!   edits the file in one locked step. Errors carry an `err.code`
+//!   (`InvalidArg`, `InventoryChanged`, `InventoryLocked`, …).
 //!
 //! # Supported Projects
 //!
@@ -26,7 +32,7 @@
 //! # Quick Start (JavaScript/TypeScript)
 //!
 //! ```typescript
-//! import { Apvm, JsCleanTarget } from 'apvm-napi';
+//! import { Apvm, JsCleanTarget, SiteInventory } from 'apvm-napi';
 //!
 //! // All config fields are optional — cacheDir defaults to ~/.apvm/cache
 //! const apvm = await Apvm.create({});
@@ -48,6 +54,12 @@
 //! const cache = apvm.cache();
 //! await cache.clean({ olderThan: '30d', target: JsCleanTarget.Builds });
 //! const issues = await cache.verify(); // [] = healthy
+//!
+//! // Edit the site inventory in one locked step (never conflicts).
+//! SiteInventory.update((inventory) => {
+//!   inventory.upsertServer({ id: 'eu-1', host: '203.0.113.10' });
+//!   inventory.upsertSite({ id: 'shop', server: 'eu-1', path: '/var/www/shop' });
+//! });
 //! ```
 
 mod apvm;
@@ -56,7 +68,33 @@ mod cache_input;
 mod cache_types;
 mod config;
 mod error;
+mod intrinsics;
 mod progress;
 mod single_copy;
+mod sites_input;
+mod sites_inventory;
+mod sites_types;
 mod teardown;
 mod types;
+
+use napi::Env;
+use napi::bindgen_prelude::Object;
+use napi_derive::napi;
+
+/// Runs when the addon is loaded into a JS environment (the main thread or
+/// a worker): captures the built-ins the `intrinsics` module relies on, before later
+/// user code can replace them. A failure must not stop the addon from
+/// loading: its exception is cleared, and only what the capture serves
+/// (handling the rejection of a promise `SiteInventory.update()` refuses)
+/// becomes best effort.
+///
+/// # Errors
+///
+/// None: always `Ok`.
+#[napi(module_exports)]
+pub fn init(_exports: Object<'_>, env: Env) -> napi::Result<()> {
+    if intrinsics::capture(&env).is_err() {
+        error::clear_pending_exception(&env);
+    }
+    Ok(())
+}

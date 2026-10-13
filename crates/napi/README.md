@@ -246,6 +246,68 @@ const status = await apvm.cacheStatus(); // { state: 'active' | 'disabled' | 'co
 
 While caching is on but the cache is `corrupted` or `unavailable`, every build still succeeds, uncached, and emits one `warning` progress event with the reason.
 
+### Site Inventory
+
+`SiteInventory` reads and edits the site inventory — servers, the WordPress sites on them, groups of sites, default SSH settings — in the CLI's file, `~/.apvm/inventory.json`. `APVM_INVENTORY` (read from `process.env` at each call; set and non-empty) points it elsewhere, e.g. at a temp file in tests. The rules (allowlists, references, locking, atomic `0600` writes) are `apvm-sites`', shared with the CLI.
+
+```ts
+import { JsOwnershipPolicy, SiteInventory } from 'apvm-napi';
+
+// One locked step: load → fn → save. Concurrent updates (threads, workers,
+// processes, the CLI) all land; it never conflicts.
+SiteInventory.update((inventory) => {
+  inventory.upsertServer({ id: 'eu-1', host: '203.0.113.10', ssh: { user: 'ubuntu' } });
+  inventory.upsertSite({ id: 'shop', server: 'eu-1', path: '/var/www/shop', ownership: JsOwnershipPolicy.Check });
+  inventory.upsertGroup({ id: 'qa', sites: ['shop'] });
+});
+
+// Or keep it in memory: save() refuses to overwrite another process's edit.
+const inventory = SiteInventory.load();
+inventory.upsertServer({ ...inventory.servers()[0], notes: 'primary' });
+try {
+  inventory.save();
+} catch (e) {
+  if ((e as { code?: string }).code !== 'InventoryChanged') throw e;
+  // Someone saved meanwhile: load again, reapply the change, save.
+}
+```
+
+| Member | Does |
+|---|---|
+| `SiteInventory.load(path?)` | Load `path`, else `APVM_INVENTORY`, else `~/.apvm/inventory.json`. A missing file is empty; nothing is created |
+| `SiteInventory.empty()` | An empty inventory tied to no file |
+| `SiteInventory.update(fn, path?)` | Load, call `fn(inventory)`, save what it left, all under the file's lock; returns the object `fn` got, tracking the file |
+| `inventory.path` | The file it was loaded from or last saved to (absolute), or `null` |
+| `inventory.readOnly` | Written by a newer apvm: readable, never changed or saved |
+| `defaults()` / `setDefaults(d)` | Settings every server inherits (`{}` clears them) |
+| `servers()` / `upsertServer(s)` / `removeServer(id, cascade?)` | Servers; a server with sites is removed only with `cascade` (its sites go too) |
+| `sites()` / `upsertSite(s)` / `removeSite(id)` | Sites; a removed site leaves its groups |
+| `groups()` / `upsertGroup(g)` / `removeGroup(id)` | Groups; their sites stay |
+| `save(path?, { force? })` | Write the file; returns the absolute path. Without `force: true` (absent, `undefined`, `null` or `false`), the save is guarded |
+
+**Behavior**
+
+- **Records** are plain objects in the camelCase form of `inventory.json` (`identityFile`, `wpCli`, `commandTimeoutSecs`, …); unset settings are absent. `upsert…()` replaces the whole record: spread the current one to change a field. The accessors return copies. `remove…()` returns `false` when there is no such record.
+- **Strict input:** a record must be a plain object; an unknown key (a typo such as `owenrship`), a non-enumerable own key (`Object.defineProperty` without `enumerable: true`), a wrong type, or a number that is not a whole number in the field's range (`port: 70000`, `22.5`) throws `InvalidArg` instead of being ignored or truncated. Symbol keys are ignored. A list field (`wpCli`, a group's `sites`) must be a plain array: an own property other than its items (`Object.assign(['wp'], { extra: 1 })`) throws `InvalidArg`. `undefined` / `null` leave an optional field unset. Then the library's rules apply (ids, hosts, paths, `wpCli` shape, …): `InvalidArg`, with every problem listed. A refused edit changes nothing.
+- **Strings** are converted to UTF-8 as Node-API does: a lone UTF-16 surrogate (`'\uD800'`) becomes U+FFFD (`�`). Fields limited to ASCII (ids, hosts, users, SSH paths, …) then refuse it; names, notes, remote paths, and an inventory path argument keep U+FFFD in its place.
+- **No lost edits:** an object remembers what its file held when it was loaded or last saved. `save()` writes only if the file still holds exactly that, or, for any other file (including `empty()`'s first save), only if it does not exist: otherwise it throws `InventoryChanged`, the file is left as it is, and the object keeps its changes: load again, reapply them, save. After a save the object tracks what it wrote, so saves chain. `save(path, { force: true })` replaces the file whatever it holds (restoring a backup over a damaged file), **discarding** any change another process made; it never replaces an inventory written by a newer apvm, with the code `update()` gives for that file (`InventoryReadOnly` when this apvm reads it, else `InventoryUnsupported`): to restore a backup over one, move the file aside by hand first. To check that, a forced save reads the file first: one this process cannot read (no read permission) is refused with `InventoryIo` (make it readable or move it aside). A `version` that is not a whole number up to 4294967295 (`"2"`, `2.0`, `-2`) makes the file damaged, so it is replaced; with duplicate `version` keys the last one counts. Paths are compared once made absolute, not resolved, so the same file through a symbolic link (`/tmp` vs `/private/tmp` on macOS) counts as another file: refused, never overwritten.
+- **`update(fn)`** must be synchronous: a function returning a promise, or any other thenable (an object or function with a callable `then`), throws `InvalidArg`; the promise's rejection is handled, so an `async` `fn` that throws never becomes an unhandled rejection. The handler is attached with the `Promise.prototype.then` captured when the addon was loaded (in each thread), so a promise subclass that overrides `then` or `catch`, or code that replaces `Promise.prototype.then` later, cannot prevent it; only a subclass whose constructor (`Symbol.species`) throws can, and a replacement made *before* the addon loaded is what gets captured. If `fn` throws, its exception propagates unchanged. The file is written only when `fn` returns, is not refused, and changed something; `update()` never throws `InventoryChanged` (it reads and writes under one lock). When `update()` writes nothing, the object `fn` received still holds `fn`'s edits and tracks the file as `update()` read it: if `fn` kept it, its `save()` is guarded like any save. Keep `fn` quick: other writers wait for it. Inside `fn`, saving or updating the **same** file waits for the lock `update()` holds and throws `InventoryLocked` after 10 s (never a deadlock; the message says why); other files are fine.
+- **Synchronous, by design:** `update(fn)` has to call `fn` on the JS thread while it holds the lock, and the file is a few kilobytes. A writer blocks the event loop while another process holds the lock: at most 10 s, which only a stuck process reaches.
+- **Paths** (an argument or `APVM_INVENTORY`) must name a file: empty, or ending with a separator, `.` or `..`, is refused (`InventoryIo`), checked as given, like the CLI. So is a file name ending with `.` or a space, on every platform: Windows drops those when opening the file but not from the lock file's name, so two spellings would lock different files. Relative paths are then made absolute, so a later `process.chdir()` changes nothing. Links are never resolved. On Unix, `.` components and doubled separators are dropped and `..` stays as written; on Windows the path is normalized (`.` and `..` resolved, `/` turned into `\`, and the current drive added to a path rooted without one). `~` is not expanded. A worker thread's `process.env` is its own: setting `APVM_INVENTORY` there affects that worker only.
+- **Files:** written atomically, `0600`, in directories created `0700`, under a lock file `inventory.json.lock` that is never removed. A symbolic link, a directory or a special file at the path, or a path that names no file, is refused (`InventoryIo`) before anything is created. Any other refused write leaves the inventory's content untouched, but the lock file and missing directories may already exist (a busy lock, or a change seen only once the lock is held).
+
+**Error codes** (thrown synchronously, as `Error`s with a `code`; an exception thrown by an argument itself while it is read, e.g. a getter, propagates unchanged):
+
+| `err.code` | When |
+|---|---|
+| `InvalidArg` | A bad argument or record, a value the inventory rules refuse, or a server still holding sites (without `cascade`) |
+| `InventoryChanged` | `save()`: the file changed since this object loaded or saved it; the file is left as it is |
+| `InventoryLocked` | Another writer held the lock for 10 s (or a same-file save/update inside an `update()` callback) |
+| `InventoryReadOnly` | A change to, or save of, an inventory written by a newer apvm, or a forced save over one |
+| `InventoryInvalid` | The file is not a valid inventory (each problem is listed with its location, e.g. `sites[0].server`) |
+| `InventoryUnsupported` | The file was written by a newer apvm in a form this one cannot read (also refusing a forced save over it): upgrade |
+| `InventoryIo` | The file, its lock or its directory cannot be read, written or created, or is not a regular file |
+
 ### Release Download Methods
 
 These methods download pre-built assets directly from GitHub Releases, bypassing the clone → build pipeline entirely. The version is always derived from the release tag — there is no `version` parameter.
@@ -520,7 +582,7 @@ All errors from the Rust core are converted to JavaScript `Error` objects via N-
 | `Config`                          | `InvalidArg`      | Invalid configuration             |
 | `GitHub`, `Git`, `Build`, `Io`   | `GenericFailure`  | API, git, build, or I/O errors    |
 
-Errors are thrown as Promise rejections — they never crash the Node.js process. For the build methods, napi's own argument conversion is the exception: an argument of the wrong type, or an unknown enum value, throws synchronously. The cache maintenance methods read their arguments themselves and always reject, with their own codes (see [Cache Maintenance](#cache-maintenance)).
+Errors are thrown as Promise rejections — they never crash the Node.js process. For the build methods, napi's own argument conversion is the exception: an argument of the wrong type, or an unknown enum value, throws synchronously. The cache maintenance methods read their arguments themselves and always reject, with their own codes (see [Cache Maintenance](#cache-maintenance)). `SiteInventory` is synchronous: it reads its arguments itself and throws, with its own codes (see [Site Inventory](#site-inventory)).
 
 ```ts
 try {
@@ -611,6 +673,8 @@ main().catch(console.error);
 - **`types.rs`** — All JS-compatible types: `JsBuildOutput`, `JsBuildEvent`, `JsBuildPhase`, etc.
 - **`progress.rs`** — Bridges `ProgressReporter` trait to a JS callback via `ThreadsafeFunction`.
 - **`error.rs`** — Converts `apvm_core::Error` to `napi::Error` with appropriate status codes.
+- **`sites_inventory.rs`** — `SiteInventory`, over `apvm_sites::inventory::io` (tracked loads, guarded saves, locked updates).
+- **`sites_types.rs`** / **`sites_input.rs`** — The inventory's JS records, and the strict reading of JS arguments into them.
 
 ## Dependencies
 
@@ -623,6 +687,7 @@ main().catch(console.error);
 | [apvm-core](../core/README.md)              | workspace | Core build and git logic          |
 | [apvm-config](../config/)                    | workspace | Configuration types               |
 | [apvm-storage](../storage/)                  | workspace | Artifact storage                  |
+| [apvm-sites](../sites/README.md)            | workspace | Site inventory                    |
 
 ## Building
 

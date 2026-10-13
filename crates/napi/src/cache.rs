@@ -26,15 +26,15 @@
 use std::sync::OnceLock;
 
 use apvm_core::CacheMaintenance;
-use napi::bindgen_prelude::{JsObjectValue, JsValue, PromiseRaw, ToNapiValue, Unknown};
-use napi::{Env, Property, Status};
+use napi::bindgen_prelude::{PromiseRaw, ToNapiValue, Unknown};
+use napi::{Env, Status};
 use napi_derive::napi;
 use tokio::sync::Semaphore;
 
 use crate::cache_input;
 use crate::cache_types::{JsCacheUsage, JsCleanReport, JsGcReport, JsRepairReport, JsVerifyIssue};
 use crate::config::{ApvmConfig, resolve_config};
-use crate::error::core_error_status;
+use crate::error::{core_error_status, js_error};
 use crate::single_copy::ensure_single_copy;
 
 /// Maintenance handle for one artifact cache directory.
@@ -317,23 +317,6 @@ async fn limited<T: Send + 'static>(
     // The semaphore is never closed, so acquiring cannot fail.
     let _permit = slots.acquire().await.ok();
     tokio::task::spawn_blocking(work).await
-}
-
-/// A JS `Error` with `message` and a custom `code`, as a `napi::Error` that
-/// rejects the promise with that very object (so `code` survives).
-///
-/// `code` is defined as an own property, not assigned, so an accessor or a
-/// read-only `code` on `Error.prototype` cannot swallow it.
-fn js_error(env: &Env, code: &str, message: &str) -> napi::Error {
-    let build = || -> napi::Result<napi::Error> {
-        let mut error = env.create_error(napi::Error::new(Status::GenericFailure, message))?;
-        let code = env.create_string(code)?;
-        error.define_properties(&[Property::new().with_utf8_name("code")?.with_value(&code)])?;
-        Ok(napi::Error::from(error.to_unknown()))
-    };
-    // Creating the object can only fail if the VM is shutting down; keep the
-    // message and the closest status code then.
-    build().unwrap_or_else(|_| napi::Error::new(Status::GenericFailure, message.to_string()))
 }
 
 /// The `err.code` for a failed action (see the [module docs](self)): pure,

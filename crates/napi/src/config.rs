@@ -144,7 +144,7 @@ fn js_cache_dir_override(env: &Env) -> Option<PathBuf> {
 /// # Errors
 ///
 /// When `process` or `process.env` is not an object.
-fn read_process_env(env: &Env, name: &str) -> napi::Result<Option<String>> {
+pub(crate) fn read_process_env(env: &Env, name: &str) -> napi::Result<Option<String>> {
     let process: Unknown<'_> = env.get_global()?.get_named_property("process")?;
     let process = object(process, "process")?;
     let variables = object(process.get_named_property("env")?, "process.env")?;

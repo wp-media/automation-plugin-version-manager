@@ -22,6 +22,9 @@
 //! Reading ([`read_object`], [`read_string`], [`read_bool`]) touches JS
 //! values; deciding ([`check_object_type`], [`check_plain`], [`check_keys`],
 //! [`clean_request`], …) is pure and unit-tested.
+//!
+//! The site inventory bindings ([`crate::sites_input`]) reuse the reading
+//! helpers for their records.
 
 use apvm_core::CleanRequest;
 use apvm_core::maintenance::{CleanTarget, VerifyMode};
@@ -105,10 +108,18 @@ pub fn read_object<'env>(
 /// from. Never inherited ones: an enumerable property someone added to
 /// `Object.prototype` is not an option of every call (and `Object::keys`,
 /// which walks the prototype chain, would report it as an unknown one).
-fn own_keys(object: &Object<'_>) -> napi::Result<Vec<String>> {
+pub fn own_keys(object: &Object<'_>) -> napi::Result<Vec<String>> {
+    own_string_keys(object, KeyFilter::Enumerable)
+}
+
+/// The own string keys of `object` that pass `filter` (symbol keys are
+/// never options or record fields): [`own_keys`] with `Enumerable`; the
+/// site inventory's records also look at every own key
+/// (`AllProperties`), to refuse non-enumerable ones.
+pub fn own_string_keys(object: &Object<'_>, filter: KeyFilter) -> napi::Result<Vec<String>> {
     let names = object.get_all_property_names(
         KeyCollectionMode::OwnOnly,
-        KeyFilter::Enumerable,
+        filter,
         KeyConversion::NumbersToStrings,
     )?;
     let mut keys = Vec::new();
@@ -124,7 +135,7 @@ fn own_keys(object: &Object<'_>) -> napi::Result<Vec<String>> {
 
 /// The types of `object`'s prototype and of that prototype's own prototype
 /// (`Null` when the first is `null`), for [`check_plain`].
-fn prototype_kinds(object: &Object<'_>) -> napi::Result<(ValueType, ValueType)> {
+pub fn prototype_kinds(object: &Object<'_>) -> napi::Result<(ValueType, ValueType)> {
     let prototype = object.get_prototype()?;
     let kind = prototype.get_type()?;
     let grandparent = match kind {
@@ -138,7 +149,7 @@ fn prototype_kinds(object: &Object<'_>) -> napi::Result<(ValueType, ValueType)> 
 
 /// `key` of `object`: absent, empty (`undefined` / `null`), or its value
 /// with its JS type.
-fn raw_field<'env>(
+pub fn raw_field<'env>(
     object: &Object<'env>,
     key: &str,
 ) -> Result<Field<(Unknown<'env>, ValueType)>, String> {
@@ -266,13 +277,20 @@ pub fn check_object_type(kind: ValueType, is_array: bool, what: &str) -> Result<
 ///
 /// A message naming `what` and the fix.
 pub fn check_plain(prototype: ValueType, grandparent: ValueType, what: &str) -> Result<(), String> {
-    if prototype == ValueType::Null || grandparent == ValueType::Null {
+    if is_plain(prototype, grandparent) {
         return Ok(());
     }
     Err(format!(
         "{what} must be a plain object, got one with a prototype of its own (a class \
          instance, a Map, Object.create(...)); copy its options into an object literal"
     ))
+}
+
+/// Whether an object whose prototype has type `prototype`, and that
+/// prototype's own prototype type `grandparent`, is plain (see
+/// [`check_plain`]).
+pub fn is_plain(prototype: ValueType, grandparent: ValueType) -> bool {
+    prototype == ValueType::Null || grandparent == ValueType::Null
 }
 
 /// Refuse any key outside `allowed`.
@@ -358,12 +376,12 @@ fn required<T>(field: Field<T>, key: &str, what: &str) -> Result<Option<T>, Stri
 }
 
 /// The message for a field of the wrong type.
-fn wrong_type(what: &str, key: &str, expected: &str, got: ValueType) -> String {
+pub fn wrong_type(what: &str, key: &str, expected: &str, got: ValueType) -> String {
     format!("{what}: `{key}` must be {expected}, got {}", type_name(got))
 }
 
 /// The JS `typeof`-style name of `kind`.
-fn type_name(kind: ValueType) -> &'static str {
+pub fn type_name(kind: ValueType) -> &'static str {
     match kind {
         ValueType::Undefined => "undefined",
         ValueType::Null => "null",

@@ -20,7 +20,14 @@
 //!   in between is never silently lost. [`save`] overwrites blindly: it is
 //!   only for a deliberate "force". [`save`], [`save_if_unchanged`] and
 //!   [`update_tracked`] return the fingerprint of what the file holds
-//!   afterwards, so such a caller keeps tracking the file.
+//!   afterwards, so such a caller keeps tracking the file;
+//!   [`update_tracked_with`] also hands the change the fingerprint of what
+//!   it was loaded from.
+//! - A write refuses a target it cannot use (a path that names no file, a
+//!   symbolic link, a directory or a special file) before taking the lock,
+//!   so the refusal creates neither the lock file nor a directory. [`check_path`] is that first check alone,
+//!   for front ends that change a path (e.g. make it absolute) before
+//!   passing it on.
 //! - **Symbolic links are refused**: the inventory file and its lock file
 //!   must be regular files (or missing), so apvm never reads, locks or
 //!   replaces a file elsewhere. Only the last component is checked:
@@ -69,7 +76,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use super::Inventory;
-use crate::error::{Error, Result};
+use crate::error::{Code, Error, Result};
 use crate::problem::Problem;
 
 /// The environment variable that points front ends at another inventory
@@ -104,6 +111,13 @@ const LOCK_SUFFIX: &str = ".lock";
 
 /// Context of errors reading the inventory.
 const READ_CONTEXT: &str = "cannot read the inventory";
+
+/// The context of an [`Error::InventoryIo`] from a forced [`save`] that
+/// cannot read the file it would replace: it must, to make sure no newer
+/// apvm wrote it, so it refuses. Front ends match it to add their remedy
+/// (make the file readable, or move it aside).
+pub const VERSION_CHECK_CONTEXT: &str =
+    "cannot check the format version (before a forced save) of the inventory";
 
 /// Context of errors writing the inventory.
 const WRITE_CONTEXT: &str = "cannot write the inventory";
@@ -308,9 +322,15 @@ fn parse_file(bytes: Option<&[u8]>, path: &Path) -> Result<Inventory> {
 /// Save the inventory, replacing the file atomically under the lock.
 /// Missing directories above it are created (`0700` on Unix).
 ///
-/// Replaces the whole document, whatever the file holds now: to change
-/// what is on disk, prefer [`update`]; to save an inventory kept in memory,
-/// [`save_if_unchanged`]. Neither can lose another process's edit.
+/// Replaces the whole document, whatever the file holds now (a damaged
+/// file included: restoring a backup), except an inventory with a newer
+/// format version, readable here or not: that one is never replaced (as
+/// [`update`] never replaces it); move it aside first to restore a backup
+/// over it. The file is read first, under the lock, to check that version
+/// (see `refuse_newer` for how it is read), so a file that cannot be read
+/// is refused too. To change what is on disk, prefer
+/// [`update`]; to save an inventory kept in memory, [`save_if_unchanged`].
+/// Neither can lose another process's edit.
 ///
 /// # Arguments
 ///
@@ -326,14 +346,23 @@ fn parse_file(bytes: Option<&[u8]>, path: &Path) -> Result<Inventory> {
 /// # Errors
 ///
 /// - [`Error::InventoryReadOnly`]: the inventory has a newer format version
-///   (nothing is touched).
+///   (nothing is touched), or the file holds a valid inventory with a
+///   newer one (checked under the lock; nothing is written).
+/// - [`Error::InventoryFile`] wrapping [`Error::InventoryUnsupported`]: the
+///   file holds a newer inventory this build cannot read (checked under the
+///   lock; nothing is written). A damaged file is replaced.
+/// - [`Error::InventoryIo`] with the context [`VERSION_CHECK_CONTEXT`]: the
+///   file cannot be read to check its version (e.g. no read permission;
+///   nothing is written).
 /// - [`Error::InventoryFile`] wrapping [`Error::InventoryInvalid`]: the
 ///   document is larger than [`MAX_INVENTORY_BYTES`], so [`load`] would
 ///   refuse it (nothing is touched).
 /// - [`Error::InventoryNotAFile`]: the path or the lock file is a symbolic
-///   link, a directory or a special file.
+///   link, a directory or a special file (seen before the lock is taken,
+///   nothing is created).
 /// - [`Error::InventoryLocked`]: another process held the lock for
-///   [`LOCK_WAIT`] (nothing is written).
+///   [`LOCK_WAIT`] (nothing is written; the lock file and missing
+///   directories are created).
 /// - [`Error::InventoryIo`]: a directory, the lock or the file cannot be
 ///   created, taken or written, or the path names no file. The previous
 ///   file is left whole.
@@ -349,8 +378,58 @@ pub fn save(path: &Path, inventory: &Inventory) -> Result<Fingerprint> {
 fn save_within(path: &Path, inventory: &Inventory, wait: Duration) -> Result<Fingerprint> {
     let text = inventory.to_json()?;
     check_size(text.len(), path)?;
+    check_target(path)?;
     let _lock = InventoryLock::acquire(path, wait)?;
+    refuse_newer(path)?;
     write_atomic(path, &text)
+}
+
+/// Refuse to replace a file holding an inventory with a newer format
+/// version, whether this build reads it (read-only) or not: writing over
+/// it would drop what the newer version means. The codes are those
+/// [`update`] gives for the same file. A missing file, or one that is
+/// damaged (not an inventory, invalid, empty, over
+/// [`MAX_INVENTORY_BYTES`]) or has this build's version or an older one,
+/// may be replaced: that is what a forced save is for (restoring a
+/// backup). To restore one over a newer file, move that file aside first.
+///
+/// The version is the JSON object's `version` read as a whole number of
+/// at most `u32::MAX` (with duplicate keys, the last one, as serde_json
+/// reads them). Any other value (`"2"`, `2.0`, `-2`, larger) makes no
+/// newer version, and the document, which then fails to parse, is
+/// damaged. A file that cannot be read at all is refused: it might be a
+/// newer inventory.
+///
+/// # Errors
+///
+/// [`Error::InventoryReadOnly`] (a newer inventory this build reads);
+/// [`Error::InventoryFile`] wrapping [`Error::InventoryUnsupported`] (one
+/// it cannot read); [`Error::InventoryIo`] with [`VERSION_CHECK_CONTEXT`]
+/// when the file cannot be read; [`Error::InventoryNotAFile`].
+fn refuse_newer(path: &Path) -> Result<()> {
+    let bytes = match read_file(path) {
+        Ok(Some(bytes)) => bytes,
+        // Missing, or over the size cap (`read_file`'s only content error).
+        Ok(None) | Err(Error::InventoryFile { .. }) => return Ok(()),
+        Err(Error::InventoryIo {
+            context: READ_CONTEXT,
+            path,
+            source,
+        }) => {
+            return Err(Error::InventoryIo {
+                context: VERSION_CHECK_CONTEXT,
+                path,
+                source,
+            });
+        }
+        Err(err) => return Err(err),
+    };
+    match parse_file(Some(&bytes), path) {
+        Ok(current) => current.ensure_writable(),
+        Err(err) if err.code() == Code::InventoryUnsupported => Err(err),
+        // Damaged: replaceable.
+        Err(_) => Ok(()),
+    }
 }
 
 /// Save an inventory loaded earlier, only if the file still holds what it
@@ -470,7 +549,11 @@ fn read_unchanged(path: &Path, expected: &Fingerprint) -> Result<Option<Vec<u8>>
 /// when the file has a newer format version and `change` changed it, even
 /// by replacing the whole inventory; [`Error::InventoryLocked`] when
 /// another process held the lock for [`LOCK_WAIT`] (`change` never runs);
-/// otherwise the errors of [`load`] and [`save`], converted into `E`.
+/// [`Error::InventoryNotAFile`] and a path that names no file are refused
+/// before the lock is taken (nothing is created); otherwise the errors of
+/// [`load`] and [`save`], converted into `E`. Except for those refusals,
+/// the lock file and missing directories exist afterwards, even when
+/// nothing was written.
 ///
 /// # Example
 ///
@@ -493,7 +576,7 @@ pub fn update<T, E>(
 where
     E: From<Error>,
 {
-    update_within(path, change, LOCK_WAIT).map(|updated| updated.value)
+    update_within(path, |inventory, _| change(inventory), LOCK_WAIT).map(|updated| updated.value)
 }
 
 /// What [`update_tracked`] returns: the change's result, and the inventory
@@ -532,43 +615,105 @@ pub fn update_tracked<T, E>(
 where
     E: From<Error>,
 {
+    update_within(path, |inventory, _| change(inventory), LOCK_WAIT)
+}
+
+/// [`update_tracked`] whose `change` also receives the [`Fingerprint`] of
+/// the bytes the inventory was loaded from (under the lock, so no apvm
+/// writer changes them while `change` runs). A caller that hands the
+/// loaded copy to code that may keep it (the Node bindings give it to a
+/// JS callback, which can stash the object) tracks that copy with this
+/// fingerprint, without reading the file again.
+///
+/// # Arguments
+///
+/// * `path` - The inventory file
+/// * `change` - Edits the loaded inventory, given the fingerprint of what
+///   it was loaded from; its error aborts the update
+///
+/// # Errors
+///
+/// Those of [`update`].
+///
+/// # Example
+///
+/// ```
+/// use apvm_sites::Server;
+/// use apvm_sites::inventory::io;
+///
+/// # fn main() -> apvm_sites::Result<()> {
+/// # let dir = std::env::temp_dir().join(format!("apvm-sites-io-with-doc-{}", std::process::id()));
+/// # std::fs::remove_dir_all(&dir).ok(); // a leftover of a run with this pid
+/// let path = dir.join("inventory.json");
+/// let updated = io::update_tracked_with(&path, |inventory, loaded| {
+///     assert!(loaded.is_missing()); // no file yet
+///     inventory.add_server(Server::new("eu-1", "203.0.113.10"))
+/// })?;
+/// assert!(!updated.fingerprint.is_missing()); // what was written
+/// # std::fs::remove_dir_all(&dir).ok();
+/// # Ok(())
+/// # }
+/// ```
+pub fn update_tracked_with<T, E>(
+    path: &Path,
+    change: impl FnOnce(&mut Inventory, &Fingerprint) -> std::result::Result<T, E>,
+) -> std::result::Result<TrackedUpdate<T>, E>
+where
+    E: From<Error>,
+{
     update_within(path, change, LOCK_WAIT)
 }
 
-/// [`update_tracked`], waiting at most `wait` for the lock.
+/// [`update_tracked_with`], waiting at most `wait` for the lock.
 ///
 /// # Errors
 ///
 /// Those of [`update`].
 fn update_within<T, E>(
     path: &Path,
-    change: impl FnOnce(&mut Inventory) -> std::result::Result<T, E>,
+    change: impl FnOnce(&mut Inventory, &Fingerprint) -> std::result::Result<T, E>,
     wait: Duration,
 ) -> std::result::Result<TrackedUpdate<T>, E>
 where
     E: From<Error>,
 {
+    check_target(path)?;
     let _lock = InventoryLock::acquire(path, wait)?;
     let bytes = read_file(path)?;
     let original = parse_file(bytes.as_deref(), path)?;
+    let loaded = Fingerprint::of(bytes.as_deref());
     let mut inventory = original.clone();
-    let value = change(&mut inventory)?;
+    let value = change(&mut inventory, &loaded)?;
     let fingerprint = if inventory == original {
-        Fingerprint::of(bytes.as_deref())
+        loaded
     } else {
-        // The edit methods refuse a read-only inventory, but `change` may
-        // replace it whole (`*inventory = …`): that must not overwrite a
-        // newer document with an older format.
-        original.ensure_writable()?;
-        let text = inventory.to_json()?;
-        check_size(text.len(), path)?;
-        write_atomic(path, &text)?
+        write_changed(path, &original, &inventory)?
     };
     Ok(TrackedUpdate {
         value,
         inventory,
         fingerprint,
     })
+}
+
+/// Write an update's result over the `original` it was loaded from; the
+/// caller holds the lock.
+///
+/// # Returns
+///
+/// The fingerprint of what was written.
+///
+/// # Errors
+///
+/// [`Error::InventoryReadOnly`] when `original` is: the edit methods refuse
+/// a read-only inventory, but a change may replace it whole
+/// (`*inventory = …`), which must not overwrite a newer document with an
+/// older format. Otherwise the errors of [`save`].
+fn write_changed(path: &Path, original: &Inventory, inventory: &Inventory) -> Result<Fingerprint> {
+    original.ensure_writable()?;
+    let text = inventory.to_json()?;
+    check_size(text.len(), path)?;
+    write_atomic(path, &text)
 }
 
 /// Read at most [`MAX_INVENTORY_BYTES`] of the inventory.
@@ -994,6 +1139,59 @@ fn sibling(path: &Path, suffix: &str) -> Result<PathBuf> {
     Ok(path.with_file_name(name))
 }
 
+/// Refuse a path that names no file, as [`load`], [`save`] and [`update`]
+/// do: an empty one, `/`, `..`, or one ending with a separator, `/.` or
+/// `/..`; and a file name ending with `.` or a space (Windows would drop
+/// it when opening the file, but not from the lock file's name). Takes no
+/// lock and touches nothing.
+///
+/// For front ends that change a path before passing it on: making a path
+/// absolute (`std::path::absolute`) drops a trailing `.` (and on Windows
+/// resolves `..`), so `dir/x/.` would become `dir/x`, a file. Check the
+/// path as the user gave it first, so every front end refuses it alike.
+///
+/// # Arguments
+///
+/// * `path` - The inventory path as given
+///
+/// # Errors
+///
+/// [`Error::InventoryIo`] (invalid input) carrying `path`.
+///
+/// # Example
+///
+/// ```
+/// use std::path::Path;
+/// use apvm_sites::inventory::io;
+///
+/// assert!(io::check_path(Path::new("dir/inventory.json")).is_ok());
+/// assert!(io::check_path(Path::new("dir/inventory.json/.")).is_err());
+/// assert!(io::check_path(Path::new("dir/..")).is_err());
+/// ```
+pub fn check_path(path: &Path) -> Result<()> {
+    file_name(path).map(drop)
+}
+
+/// Refuse, before the lock is taken, a write target no write can use: a
+/// path that names no file, or a symbolic link, a directory or a special
+/// file at the path. The refusal then creates neither the lock file nor a
+/// directory. (A lock file that is not a regular file is refused when it
+/// is opened, which creates nothing either: its directory exists.) Other
+/// problems (an unreadable entry, a file in place of a directory) surface
+/// where the entry is used, as do entries swapped in after this look.
+///
+/// # Errors
+///
+/// [`Error::InventoryIo`] (the path names no file);
+/// [`Error::InventoryNotAFile`].
+fn check_target(path: &Path) -> Result<()> {
+    check_path(path)?;
+    match regular_file_metadata(path, WRITE_CONTEXT) {
+        Err(err @ Error::InventoryNotAFile { .. }) => Err(err),
+        _ => Ok(()),
+    }
+}
+
 /// The file name `path` ends with.
 ///
 /// # Errors
@@ -1001,19 +1199,36 @@ fn sibling(path: &Path, suffix: &str) -> Result<PathBuf> {
 /// [`Error::InventoryIo`] (invalid input) when it ends with no name (an
 /// empty path, `/`, `..`), or the name is not its last text: [`Path::file_name`]
 /// skips a trailing separator or `.` (`inventory.json/`,
-/// `inventory.json/.`), which name a directory.
+/// `inventory.json/.`), which name a directory. Also when the name ends
+/// with `.` or a space (see [`portable_name`]).
 fn file_name(path: &Path) -> Result<&OsStr> {
     let ends_with = |name: &OsStr| {
         path.as_os_str()
             .as_encoded_bytes()
             .ends_with(name.as_encoded_bytes())
     };
-    path.file_name()
+    let invalid = |reason: &'static str| {
+        let source = io::Error::new(io::ErrorKind::InvalidInput, reason);
+        io_error("invalid inventory path", path, source)
+    };
+    let name = path
+        .file_name()
         .filter(|name| ends_with(name))
-        .ok_or_else(|| {
-            let source = io::Error::new(io::ErrorKind::InvalidInput, "the path names no file");
-            io_error("invalid inventory path", path, source)
-        })
+        .ok_or_else(|| invalid("the path names no file"))?;
+    if !portable_name(name) {
+        return Err(invalid("the file name ends with '.' or a space"));
+    }
+    Ok(name)
+}
+
+/// Whether a file name ends with neither `.` nor a space. Windows drops
+/// those when it opens a file (`inventory.json.` opens `inventory.json`)
+/// but not inside the lock file's name (`inventory.json..lock`), so two
+/// writers spelling the path differently would lock different files and
+/// both get in. Refused on every platform: no inventory needs such a name,
+/// and one path then behaves alike everywhere.
+fn portable_name(name: &OsStr) -> bool {
+    !name.as_encoded_bytes().ends_with(b".") && !name.as_encoded_bytes().ends_with(b" ")
 }
 
 /// The directory holding `path` (`.` for a bare file name).

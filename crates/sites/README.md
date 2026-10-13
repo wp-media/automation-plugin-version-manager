@@ -100,6 +100,12 @@ The caller passes the path: front ends use `~/.apvm/inventory.json`, or
   change fails or changes nothing (the lock file and missing directories
   are still created). A change to a newer, read-only inventory is refused,
   even one that replaces it whole.
+- **Refused targets create nothing:** every write (`save`, `update`, the
+  tracked forms) refuses a path that names no file, or a symbolic link, a
+  directory or a special file at the path, before taking the lock, so the
+  refusal leaves neither a lock file nor a directory behind.
+  `io::check_path` is that path check alone, for front ends that change a
+  path (making it absolute drops a trailing `/.`) before passing it on.
 - **`load_tracked` + `save_if_unchanged`**: for callers that keep an
   inventory in memory between loading and saving it (the Node bindings).
   `load_tracked` also returns a `Fingerprint` (the SHA-256 of the exact
@@ -112,11 +118,29 @@ The caller passes the path: front ends use `~/.apvm/inventory.json`, or
   compared once before taking the lock, so a refusal usually creates no lock
   file or directory. `Fingerprint::missing()` expects no file, so an empty
   inventory never wipes an existing one.
-- **`save`** overwrites blindly (use it only to force) and returns the
-  fingerprint of what it wrote; **`update_tracked`** is `update` that also
-  returns the resulting inventory and its fingerprint. Both let a caller
-  keep tracking the file without loading it again, which could pair its
+- **`save`** overwrites blindly (use it only to force: a damaged file is
+  replaced, a backup restored) and returns the fingerprint of what it
+  wrote. It never replaces an inventory with a newer format version
+  (checked under the lock), with the codes `update` gives for that file:
+  `inventory_read_only` when this build reads it, `inventory_unsupported`
+  when not. Damaged files (not an inventory, invalid, empty, over 16 MiB)
+  and older or same-version ones are replaced; to restore a backup over a
+  newer file, move it aside first. The version is the JSON `version` read
+  as a whole number up to `u32::MAX`, the last one when the key is
+  repeated; any other value (`"2"`, `2.0`, `-2`, larger) makes the file
+  damaged. A file that cannot be read (no read permission) is refused
+  (`inventory_io`, context `io::VERSION_CHECK_CONTEXT`): it might be a
+  newer inventory. **`update_tracked`**
+  is `update` that also returns the resulting inventory and its
+  fingerprint; **`update_tracked_with`** also hands the change the
+  fingerprint of the bytes it loaded, for a caller that lets the loaded
+  copy escape (the Node bindings' `update(fn)`). They let a caller keep
+  tracking the file without loading it again, which could pair its
   inventory with another process's later edit.
+- File names ending with `.` or a space are refused on every platform:
+  Windows drops them when opening a file but not from the lock file's
+  name (`inventory.json.` opens `inventory.json` but locks
+  `inventory.json..lock`), so two writers could both get in.
 - Documents over 16 MiB are never written (`load` would refuse them), and
   paths that name no file (empty, `/`, `..`, or ending with a separator or
   `/.`) are refused.
@@ -254,7 +278,8 @@ cargo test -p apvm-sites
 - the inventory file: missing = empty, located errors, `0600`, no partial
   file after a failed write or a panicking change, concurrent updates from
   threads, refused symbolic links (including one swapped in while the file
-  is opened), a newer inventory never overwritten, the bounded lock wait
+  is opened), a newer inventory never overwritten (by a forced save
+  either), refused targets leaving no lock file, the bounded lock wait
   (a busy lock times out, a released one is taken), the size cap on reads
   and writes, and tracked saves (a file changed, deleted or created since
   the load is refused and left untouched, fingerprints chain from tracked

@@ -15,6 +15,12 @@ import { removeBestEffort } from './cleanup.js';
 const cacheDir = mkdtempSync(join(tmpdir(), 'apvm-test-cache-'));
 process.env.APVM_CACHE_DIR = cacheDir;
 
+// Likewise for the site inventory: `SiteInventory` without a path reads
+// APVM_INVENTORY (from `process.env`, at each call) before falling back to
+// the developer's real ~/.apvm/inventory.json.
+const inventoryDir = mkdtempSync(join(tmpdir(), 'apvm-test-inventory-'));
+process.env.APVM_INVENTORY = join(inventoryDir, 'inventory.json');
+
 afterAll(async () => {
   // Best-effort removal of the throwaway cache dir.
   //
@@ -30,4 +36,5 @@ afterAll(async () => {
   // unlinks the files immediately, so this path effectively never triggers
   // off Windows.)
   await removeBestEffort(cacheDir, 'apvm test setup');
+  await removeBestEffort(inventoryDir, 'apvm test setup');
 });

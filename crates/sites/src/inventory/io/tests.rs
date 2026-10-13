@@ -856,7 +856,7 @@ fn a_lock_held_past_the_wait_fails_with_inventory_locked_and_writes_nothing() {
     let started = Instant::now();
     let err = update_within(
         &path,
-        |inventory| {
+        |inventory, _| {
             ran = true;
             inventory.add_server(Server::new("us-1", "h"))
         },
@@ -901,7 +901,7 @@ fn a_lock_released_within_the_wait_is_taken() {
     });
     update_within(
         &path,
-        |inventory| inventory.add_server(Server::new("eu-1", "h")),
+        |inventory, _| inventory.add_server(Server::new("eu-1", "h")),
         Duration::from_secs(5),
     )
     .unwrap();
@@ -940,7 +940,7 @@ fn a_wait_too_long_for_a_deadline_still_works() {
     });
     update_within(
         &path,
-        |inventory| inventory.add_server(Server::new("us-1", "h")),
+        |inventory, _| inventory.add_server(Server::new("us-1", "h")),
         Duration::MAX,
     )
     .unwrap();
@@ -1464,6 +1464,311 @@ fn a_failed_update_tracked_writes_nothing() {
     assert_eq!(fs::read(&path).unwrap(), before);
 }
 
+#[test]
+fn update_tracked_with_hands_the_change_the_fingerprint_it_loaded() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    // Missing: the change sees "missing"; the result is what was written.
+    let updated = update_tracked_with(&path, |inventory, loaded| {
+        assert!(loaded.is_missing());
+        inventory.add_server(Server::new("eu-1", "h"))?;
+        Ok::<_, Error>(loaded.clone())
+    })
+    .unwrap();
+    assert!(updated.value.is_missing());
+    let (on_disk, written) = load_tracked(&path).unwrap();
+    assert_eq!(
+        (updated.inventory, updated.fingerprint),
+        (on_disk, written.clone())
+    );
+
+    // Existing: the change sees exactly what `load_tracked` reports, and a
+    // no-op returns that same fingerprint.
+    let updated = update_tracked_with(&path, |_, loaded| Ok::<_, Error>(loaded.clone())).unwrap();
+    assert_eq!(updated.value, written);
+    assert_eq!(updated.fingerprint, written);
+
+    // The fingerprint handed over chains into a tracked save made after
+    // the update wrote: that save is refused, as the file changed since.
+    let mut kept = None;
+    update_tracked_with(&path, |inventory, loaded| {
+        kept = Some((inventory.clone(), loaded.clone()));
+        inventory.add_server(Server::new("us-1", "h"))
+    })
+    .unwrap();
+    let (mut stale, loaded) = kept.unwrap();
+    assert_eq!(loaded, written);
+    stale.add_server(Server::new("mine", "h")).unwrap();
+    assert_changed(
+        &save_if_unchanged(&path, &stale, &loaded).unwrap_err(),
+        &path,
+    );
+}
+
+#[test]
+fn a_failed_update_tracked_with_writes_nothing() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    let before = fs::read(&path).unwrap();
+    let err = update_tracked_with(&path, |inventory, _| {
+        inventory.add_server(Server::new("us-1", "h"))?;
+        Err::<(), _>(Error::InventoryChanged {
+            path: PathBuf::new(),
+        })
+    })
+    .unwrap_err();
+    assert_eq!(err.code(), Code::InventoryChanged);
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn a_directory_target_is_refused_before_the_lock_is_taken() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    fs::create_dir(&path).unwrap();
+    let refusals = [
+        save(&path, &one_server("eu-1")).unwrap_err(),
+        add_server(&path, "eu-1").unwrap_err(),
+        update_tracked(&path, |_| Ok::<_, Error>(())).unwrap_err(),
+        update_tracked_with(&path, |_, _| Ok::<_, Error>(())).unwrap_err(),
+    ];
+    for err in refusals {
+        assert!(
+            matches!(&err, Error::InventoryNotAFile { found: FileKind::Directory, path: at } if at == &path),
+            "{err:?}"
+        );
+    }
+    // No lock file next to the refused target.
+    assert_eq!(dir.names(), ["inventory.json"]);
+}
+
+#[test]
+fn a_directory_lock_file_is_refused_before_anything_is_created() {
+    let dir = TempDir::new();
+    let path = dir.0.join("sub").join("inventory.json");
+    fs::create_dir_all(sibling(&path, LOCK_SUFFIX).unwrap()).unwrap();
+    for err in [
+        save(&path, &one_server("eu-1")).unwrap_err(),
+        add_server(&path, "eu-1").unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                &err,
+                Error::InventoryNotAFile {
+                    found: FileKind::Directory,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+    assert_eq!(names_in(&dir.0.join("sub")), ["inventory.json.lock"]);
+}
+
+#[test]
+fn a_path_naming_no_file_creates_no_directory() {
+    let dir = TempDir::new();
+    for path in [
+        dir.0.join("new").join("x").join("."),
+        dir.0.join("new").join(".."),
+    ] {
+        let err = save(&path, &one_server("eu-1")).unwrap_err();
+        assert!(err.to_string().contains("the path names no file"), "{err}");
+        let err = add_server(&path, "eu-1").unwrap_err();
+        assert!(err.to_string().contains("the path names no file"), "{err}");
+    }
+    assert_eq!(dir.names(), Vec::<String>::new());
+}
+
+#[test]
+fn check_path_refuses_what_the_writers_refuse() {
+    for path in ["", "/", "..", "x/", "x/.", "x/..", "./", "a/b/../"] {
+        let err = check_path(Path::new(path)).unwrap_err();
+        assert_eq!(err.code(), Code::InventoryIo, "{path:?}");
+        assert!(err.to_string().contains("the path names no file"), "{err}");
+        assert!(
+            save(Path::new(path), &Inventory::new()).is_err(),
+            "{path:?}"
+        );
+    }
+    for path in ["x", "./x", "a/../x", "/a/x.json", ".x"] {
+        assert!(check_path(Path::new(path)).is_ok(), "{path:?}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn check_path_refuses_windows_spellings_that_name_no_file() {
+    for path in [r"x\", r"x\.", r"x\..", r"C:\", "C:"] {
+        assert!(check_path(Path::new(path)).is_err(), "{path:?}");
+    }
+    assert!(check_path(Path::new(r"C:\a\x.json")).is_ok());
+}
+
+#[test]
+fn a_forced_save_never_replaces_a_readable_newer_inventory() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    fs::write(&path, newer_document()).unwrap();
+    let err = save(&path, &one_server("eu-1")).unwrap_err();
+    assert_eq!(err.code(), Code::InventoryReadOnly);
+    assert_eq!(fs::read_to_string(&path).unwrap(), newer_document());
+}
+
+#[test]
+fn a_forced_save_never_replaces_an_unreadable_newer_inventory() {
+    // The code `update` gives for the same file.
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    let unsupported = format!(r#"{{"version":{},"future":true}}"#, INVENTORY_VERSION + 1);
+    fs::write(&path, &unsupported).unwrap();
+    let err = save(&path, &one_server("eu-1")).unwrap_err();
+    assert_eq!(err.code(), Code::InventoryUnsupported);
+    assert!(
+        matches!(&err, Error::InventoryFile { path: at, .. } if at == &path),
+        "{err:?}"
+    );
+    assert_eq!(
+        add_server(&path, "eu-1").unwrap_err().code(),
+        Code::InventoryUnsupported
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), unsupported);
+}
+
+#[test]
+fn a_forced_save_replaces_damaged_and_older_files() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    let cap = usize::try_from(MAX_INVENTORY_BYTES).unwrap();
+    let older = r#"{"version":1,"servers":[{"id":"old","host":"h"}]}"#.to_string();
+    let contents = [
+        "{ not json".to_string(),
+        String::new(),
+        " ".repeat(cap + 1),
+        // Invalid at this build's version: damaged.
+        r#"{"version":1,"sites":[{"id":"s","server":"nope","path":"/p"}]}"#.to_string(),
+        // No version at all: damaged.
+        r#"{"servers":[]}"#.to_string(),
+        older,
+    ];
+    for content in contents {
+        fs::write(&path, &content).unwrap();
+        let written = save(&path, &one_server("eu-1")).unwrap();
+        assert_eq!(load_tracked(&path).unwrap(), (one_server("eu-1"), written));
+    }
+}
+
+#[test]
+fn a_forced_save_reads_versions_as_whole_numbers_and_the_last_duplicate() {
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    // Not a whole number up to u32::MAX: no newer version, and the document
+    // fails to parse, so it is damaged and replaced.
+    let damaged = [
+        r#"{"version":"2"}"#,
+        r#"{"version":2.0}"#,
+        r#"{"version":-2}"#,
+        r#"{"version":4294967296}"#,
+        // Duplicate keys: serde_json keeps the last (here 1), and the strict
+        // parse refuses the duplicate.
+        r#"{"version":2,"version":1}"#,
+    ];
+    for content in damaged {
+        fs::write(&path, content).unwrap();
+        save(&path, &one_server("eu-1")).unwrap_or_else(|err| panic!("{content}: {err}"));
+        assert_eq!(load(&path).unwrap(), one_server("eu-1"), "{content}");
+    }
+    // The last duplicate is newer: refused, as `update` refuses it.
+    let newer_last = r#"{"version":1,"version":2}"#;
+    fs::write(&path, newer_last).unwrap();
+    let err = save(&path, &one_server("eu-1")).unwrap_err();
+    assert_eq!(err.code(), Code::InventoryUnsupported);
+    assert_eq!(
+        add_server(&path, "x").unwrap_err().code(),
+        Code::InventoryUnsupported
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), newer_last);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_forced_save_refuses_a_file_it_cannot_read() {
+    // It might hold a newer inventory: refused, never replaced unseen.
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    save(&path, &one_server("eu-1")).unwrap();
+    set_mode(&path, 0o000);
+    if File::open(&path).is_ok() {
+        eprintln!("skipped: permissions are not enforced (running as root?)");
+        return;
+    }
+    let err = save(&path, &one_server("us-1")).unwrap_err();
+    assert!(
+        matches!(&err, Error::InventoryIo { context: VERSION_CHECK_CONTEXT, path: at, .. } if at == &path),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(&format!(
+            "cannot check the format version (before a forced save) of the inventory {}: ",
+            path.display()
+        )),
+        "{err}"
+    );
+    set_mode(&path, 0o600);
+    assert_eq!(load(&path).unwrap(), one_server("eu-1"));
+}
+
+#[test]
+fn the_checks_under_the_lock_refuse_a_directory_themselves() {
+    // `check_target` refuses it earlier; these must not rely on that.
+    let dir = TempDir::new();
+    let path = dir.inventory();
+    fs::create_dir(&path).unwrap();
+    let directory = |err: Error| {
+        assert!(
+            matches!(&err, Error::InventoryNotAFile { found: FileKind::Directory, path: at } if at == &path),
+            "{err:?}"
+        );
+    };
+    directory(refuse_newer(&path).unwrap_err());
+    directory(replace_file(&path, |file| file.write_all(b"{}")).unwrap_err());
+    assert!(path.is_dir());
+}
+
+#[test]
+fn file_names_ending_with_a_dot_or_a_space_are_refused() {
+    assert!(portable_name(OsStr::new("inventory.json")));
+    assert!(portable_name(OsStr::new(".inventory")));
+    assert!(portable_name(OsStr::new("a b")));
+    for name in ["inventory.json.", "inventory.json ", "x..", "x. ", " "] {
+        assert!(!portable_name(OsStr::new(name)), "{name:?}");
+        let path = Path::new("dir").join(name);
+        let err = check_path(&path).unwrap_err();
+        assert_eq!(err.code(), Code::InventoryIo);
+        assert!(
+            err.to_string()
+                .contains("the file name ends with '.' or a space"),
+            "{err}"
+        );
+    }
+    // Every operation refuses them, before touching anything.
+    let dir = TempDir::new();
+    let path = dir.0.join("inventory.json.");
+    assert!(load(&path).is_err());
+    assert!(save(&path, &one_server("eu-1")).is_err());
+    assert!(add_server(&path, "eu-1").is_err());
+    assert_eq!(dir.names(), Vec::<String>::new());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_spellings_with_a_trailing_dot_or_space_are_refused() {
+    for path in [r"C:\x\inv.json.", r"C:\x\inv.json ", r"x\inv.json.. "] {
+        assert!(check_path(Path::new(path)).is_err(), "{path:?}");
+    }
+}
+
 // ---- symbolic links (Unix: Windows needs a privilege to create them) ----
 
 #[cfg(unix)]
@@ -1518,6 +1823,35 @@ mod symlinks {
         let err = save_if_unchanged(&path, &one_server("us-1"), &fingerprint).unwrap_err();
         assert_refused(&err, &path);
         assert_eq!(fs::read(&target).unwrap(), before);
+    }
+
+    #[test]
+    fn a_symlinked_target_is_refused_before_the_lock_is_taken() {
+        let dir = TempDir::new();
+        let target = dir.0.join("elsewhere.json");
+        let path = dir.inventory();
+        symlink(&target, &path).unwrap();
+        assert_refused(&save(&path, &one_server("eu-1")).unwrap_err(), &path);
+        assert_refused(&add_server(&path, "eu-1").unwrap_err(), &path);
+        let err = update_tracked_with(&path, |_, _| Ok::<_, Error>(())).unwrap_err();
+        assert_refused(&err, &path);
+        assert_eq!(dir.names(), ["inventory.json"]);
+    }
+
+    #[test]
+    fn the_checks_under_the_lock_refuse_a_symlink_themselves() {
+        // `check_target` refuses it earlier; these must not rely on that.
+        let dir = TempDir::new();
+        let target = dir.0.join("elsewhere.json");
+        save(&target, &one_server("eu-1")).unwrap();
+        let before = fs::read(&target).unwrap();
+        let path = dir.inventory();
+        symlink(&target, &path).unwrap();
+        assert_refused(&refuse_newer(&path).unwrap_err(), &path);
+        let err = replace_file(&path, |file| file.write_all(b"{}")).unwrap_err();
+        assert_refused(&err, &path);
+        assert_eq!(fs::read(&target).unwrap(), before);
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
     }
 
     #[test]
