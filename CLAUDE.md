@@ -71,6 +71,19 @@ which is undesirable during development and testing.
   caller that passes an explicit `Config` gets exactly that. Apply
   `config_io::apply_env_overrides` yourself if you want the same behavior.
 
+**The same applies to the site inventory: set `APVM_INVENTORY` to a throwaway
+file** (default `~/.apvm/inventory.json`) whenever you run `apvm server …` or
+the napi `SiteInventory`. The CLI integration tests pass their own path, and
+`__tests__/setup.ts` points `APVM_INVENTORY` at a temp file for every test file.
+
+- Put the env assignments **directly on each command**
+  (`APVM_CACHE_DIR=$t/cache APVM_INVENTORY=$t/inv.json apvm …`), never behind
+  an `&&` chain that can stop before them: in zsh an unmatched glob such as
+  `rm -f inv.json*` aborts the line, and the commands that follow then edit
+  the real `~/.apvm`.
+- Overriding `HOME` also hides the Rust toolchain; keep
+  `RUSTUP_HOME`/`CARGO_HOME` pointing at the real ones when you do.
+
 ## Project Overview
 Automation Plugin Version Manager (APVM) is a Rust-based CLI tool and library for managing multiple versions of WordPress plugins in development and testing environments. It allows developers and QA Engineers to easily build plugins from a specific PR, branch, tag, commit, etc and switch between plugin versions, test compatibility, and automate version management tasks.
 
@@ -82,6 +95,7 @@ Automation Plugin Version Manager (APVM) is a Rust-based CLI tool and library fo
 - **CLI**: Command-line interface built using Clap for user interaction
 - **Config**: Configuration management using Serde for serialization/deserialization of settings
 - **Storage**: Handles local storage of plugin versions and metadata with a specific directory structure
+- **Sites** (`crates/sites`, `apvm-sites`): remote WordPress plugin management over SSH — the site inventory (`inventory.json`), value allowlists, local zip inspection, and typed remote scripts. It has no `apvm-*` dependencies; the CLI (`apvm server`), napi (`SiteInventory`) and core use it. Design and phase plan: `docs/plans/site-deployment.md`
 
 ### NAPI Generated Artifacts
 
@@ -89,16 +103,16 @@ The napi crate's `.node` binaries, `index.js`, and `.d.ts` files are build outpu
 
 ## APVM CLI Skill Maintenance
 
-`.claude/skills/apvm-cli/SKILL.md` (plus `references/git-refs.md`) mirrors the CLI surface and **must be updated in the same change as the code** whenever any of the following change:
+`.claude/skills/apvm-cli/SKILL.md` (plus `references/git-refs.md` and `references/sites.md`) mirrors the CLI surface and **must be updated in the same change as the code** whenever any of the following change:
 
-- A subcommand is added/removed/renamed: `build`, `list`, `info`, `cache` (+ its `info|clean|gc|verify|repair|clear` sub-commands), `config` (+ `get|set|unset|path`), `skill` (+ `install|uninstall`), `update`, `uninstall`.
-- An argument/flag is added/removed/renamed (e.g., `--ver`/`-v`, `--variants`, `--no-cache`, `--warm-cache`, `--older-than`, `--project`, `--dry-run`, `--builds`, `--releases`, `--checksum`, `-y`/`--yes`, `-g`/`--global`, `--verbose`).
-- Behavior, defaults, error messages, sanitization, or output format of any command change (e.g., cache `info` layout, build `Source:` summary, `Reference:` line, config masking rules, `skill install` source-resolution order or destination paths).
-- A new env var is introduced (`APVM_CACHE_DIR`, `GITHUB_TOKEN`, `GH_TOKEN`, `RUST_LOG`, `NO_COLOR`, …) or an existing one's precedence/scope changes.
+- A subcommand is added/removed/renamed: `build`, `list`, `info`, `cache` (+ its `info|clean|gc|verify|repair|clear` sub-commands), `config` (+ `get|set|unset|path`), `server` (+ `defaults|add|edit|list|show|remove`), `skill` (+ `install|uninstall`), `update`, `uninstall`.
+- An argument/flag is added/removed/renamed (e.g., `--ver`/`-v`, `--variants`, `--no-cache`, `--warm-cache`, `--older-than`, `--project`, `--dry-run`, `--builds`, `--releases`, `--checksum`, `-y`/`--yes`, `-g`/`--global`, `--verbose`, and for `server`: `--cascade`, `--unset <FIELD>` (its accepted fields), `--json`, the SSH flags `--user`/`--port`/`--key`/`--connect-timeout`/`--jump`/`--known-hosts`/`--ssh-config`/`--multiplex`/`--no-multiplex`, `--ssh-binary`, `--host`/`--name`/`--notes`).
+- Behavior, defaults, error messages, sanitization, or output format of any command change (e.g., cache `info` layout, build `Source:` summary, `Reference:` line, config masking rules, `skill install` source-resolution order or destination paths, `server` output/`--json` shapes, inventory error codes and remedies, the relative-path warning).
+- A new env var is introduced (`APVM_CACHE_DIR`, `APVM_INVENTORY`, `GITHUB_TOKEN`, `GH_TOKEN`, `RUST_LOG`, `NO_COLOR`, …) or an existing one's precedence/scope changes.
 - A new plugin or a plugin's `version_requirement` / `default_variants` / tool dependencies change (see the plugin-specific quick-reference table).
 - A new `ConfigKey` is added in `crates/config` (currently `token`, `cache-dir`, `cache`).
 - Project versioning changes (e.g., `3.0.0` → `3.1.0`) or a new release is cut.
 
 Source of truth is always the binary itself: re-run `apvm <command> --help` (or read `crates/cli/src/commands/*.rs` + `crates/cli/README.md`) and reconcile the skill against it. Note the skill's `name` is `apvm-cli` (project-scoped, lives under `.claude/skills/`).
 
-The skill files are **embedded into the CLI binary at compile time** (`crates/cli/src/commands/skill/embedded.rs`, used by `apvm skill install`). When a file is added to or removed from `.claude/skills/apvm-cli/`, update the `SKILL_FILES` list there — the `embedded_list_matches_repo_directory` unit test fails otherwise. Content-only edits need no action. A companion test also requires `SKILL.md` to mention the current crate version, so version bumps force the skill's version line to be updated.
+The skill files are **embedded into the CLI binary at compile time** (`crates/cli/src/commands/skill/embedded.rs`, used by `apvm skill install`). When a file is added to or removed from `.claude/skills/apvm-cli/`, update the `SKILL_FILES` list there — the `embedded_list_matches_repo_directory` unit test fails otherwise — and the `SKILL_FILES` list of `crates/cli/tests/cli_lifecycle.rs` (which checks every installed file). Content-only edits need no action. A companion test also requires `SKILL.md` to mention the current crate version, so version bumps force the skill's version line to be updated.
