@@ -32,6 +32,10 @@
 #                            running nothing: auth, host-key-unknown,
 #                            host-key-changed, refused, dns, timeout; `lost`
 #                            runs the command, then reports a dropped connection
+#   #fake-ssh: path DIR      run the remote command with PATH=DIR only, as a server's
+#                            login environment would give it (DIR holds the
+#                            programs a test lets the server have: fake-sudo as
+#                            `sudo`, fake-wp as `wp`, links to real tools)
 #   #fake-ssh: host-key new  the host key is new: with `StrictHostKeyChecking
 #                            accept-new` it is recorded in the first
 #                            UserKnownHostsFile (with OpenSSH's notice), else
@@ -152,7 +156,11 @@ if [ "$(directive host-key)" = new ]; then
 	fi
 fi
 
-case $(directive fail) in
+remote_path=$(directive path)
+fail_class=$(directive fail)
+[ -n "$remote_path" ] && PATH=$remote_path && export PATH
+
+case $fail_class in
 "") ;;
 auth) say "${user:-$(id -un)}@$host: Permission denied (publickey)."; exit 255 ;;
 host-key-unknown)

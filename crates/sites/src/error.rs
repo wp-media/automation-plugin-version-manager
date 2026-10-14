@@ -12,8 +12,8 @@ use crate::inventory::EntityKind;
 use crate::inventory::io::FileKind;
 use crate::package::PackageDefect;
 use crate::problem::{Problem, printable, quoted, quoted_path};
-use crate::remote::SshFailure;
-use crate::wp::OutputDefect;
+use crate::remote::{Exit, SshFailure};
+use crate::wp::{OutputDefect, ProbeFailure};
 
 /// Convenient result alias used across the crate.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -76,6 +76,37 @@ pub enum Code {
     /// key for a reason no other code names (an invalid host certificate;
     /// `ssh_failed`).
     SshFailed,
+    /// Running as the site's identity needs sudo, and the server has none
+    /// (`sudo_missing`).
+    SudoMissing,
+    /// sudo wants a password for a command apvm needs (`sudo_password_required`).
+    SudoPasswordRequired,
+    /// No sudo rule lets the login user run a command apvm needs
+    /// (`sudo_not_allowed`).
+    SudoNotAllowed,
+    /// sudo requires a terminal, and apvm runs without one (`sudo_requiretty`).
+    SudoRequiretty,
+    /// Root would own the plugin files or run WP-CLI, and the site does not
+    /// allow it (`owner_is_root`).
+    OwnerIsRoot,
+    /// The plugins directory WordPress uses is not the one apvm measured,
+    /// or not the site's explicit owner's (`plugins_dir_mismatch`).
+    PluginsDirMismatch,
+    /// The site's `wp_cli` cannot be run, or is not WP-CLI (`wp_cli_missing`).
+    WpCliMissing,
+    /// The site's path holds no WordPress (`not_wordpress`).
+    NotWordpress,
+    /// WordPress is there but not installed: no `wp-config.php`, or no
+    /// tables (`wp_not_installed`).
+    WpNotInstalled,
+    /// The identity cannot write the plugins directory
+    /// (`plugins_dir_not_writable`).
+    PluginsDirNotWritable,
+    /// A remote command ran past its timeout and was killed (`timeout`).
+    Timeout,
+    /// A probe step printed something apvm cannot read with certainty
+    /// (`probe_failed`).
+    ProbeFailed,
 }
 
 impl Code {
@@ -100,6 +131,18 @@ impl Code {
             Self::SshTimeout => "ssh_timeout",
             Self::SshConnectionLost => "ssh_connection_lost",
             Self::SshFailed => "ssh_failed",
+            Self::SudoMissing => "sudo_missing",
+            Self::SudoPasswordRequired => "sudo_password_required",
+            Self::SudoNotAllowed => "sudo_not_allowed",
+            Self::SudoRequiretty => "sudo_requiretty",
+            Self::OwnerIsRoot => "owner_is_root",
+            Self::PluginsDirMismatch => "plugins_dir_mismatch",
+            Self::WpCliMissing => "wp_cli_missing",
+            Self::NotWordpress => "not_wordpress",
+            Self::WpNotInstalled => "wp_not_installed",
+            Self::PluginsDirNotWritable => "plugins_dir_not_writable",
+            Self::Timeout => "timeout",
+            Self::ProbeFailed => "probe_failed",
         }
     }
 }
@@ -385,6 +428,49 @@ pub enum Error {
     /// it. Built by callers from [`crate::remote::classify`].
     #[error("{0}")]
     Ssh(SshFailure),
+
+    /// A remote command ran past its timeout: the transport and everything
+    /// it started were killed. When the script had started, it may have run
+    /// in part (re-read the state after a mutation).
+    #[error(
+        "the remote command ran past its {} timeout and was killed{}",
+        span(*after),
+        if *started { "; it may have run in part" } else { "" }
+    )]
+    Timeout {
+        /// The timeout.
+        after: Duration,
+        /// Whether the script had started (its nonce line came back).
+        started: bool,
+    },
+
+    /// The local transport process ended without an exit status, killed by
+    /// something other than the call's timeout (a process scope's teardown,
+    /// a user's `kill`).
+    #[error("the local transport process was {exit} before the remote command ended")]
+    Killed {
+        /// How it ended.
+        exit: Exit,
+    },
+
+    /// The call ended with a status, but its stdout has no nonce line: the
+    /// server's login shell did not run apvm's script as sent (a forced
+    /// command, a `nologin` shell, startup files that ate the script).
+    #[error(
+        "the server did not run apvm's script ({exit}){}",
+        line.as_ref().map(|line| format!(": '{line}'")).unwrap_or_default()
+    )]
+    ScriptNotRun {
+        /// How the call ended.
+        exit: Exit,
+        /// stderr's last line, escaped.
+        line: Option<String>,
+    },
+
+    /// Probing a site failed (plan §6.2): the probe's failure says which
+    /// step, and the stable code.
+    #[error("{0}")]
+    Probe(Box<ProbeFailure>),
 }
 
 impl Error {
@@ -409,6 +495,10 @@ impl Error {
             Self::SshMissing { .. } | Self::SshUnusable { .. } => Code::SshMissing,
             Self::SshConfigFile { .. } => Code::ProcessFailed,
             Self::Ssh(failure) => failure.code(),
+            Self::Timeout { .. } => Code::Timeout,
+            Self::Killed { .. } => Code::ProcessFailed,
+            Self::ScriptNotRun { .. } => Code::SshFailed,
+            Self::Probe(failure) => failure.code(),
         }
     }
 
@@ -489,6 +579,24 @@ mod tests {
         assert_eq!(Code::SshTimeout.as_str(), "ssh_timeout");
         assert_eq!(Code::SshConnectionLost.as_str(), "ssh_connection_lost");
         assert_eq!(Code::SshFailed.as_str(), "ssh_failed");
+        assert_eq!(Code::SudoMissing.as_str(), "sudo_missing");
+        assert_eq!(
+            Code::SudoPasswordRequired.as_str(),
+            "sudo_password_required"
+        );
+        assert_eq!(Code::SudoNotAllowed.as_str(), "sudo_not_allowed");
+        assert_eq!(Code::SudoRequiretty.as_str(), "sudo_requiretty");
+        assert_eq!(Code::OwnerIsRoot.as_str(), "owner_is_root");
+        assert_eq!(Code::PluginsDirMismatch.as_str(), "plugins_dir_mismatch");
+        assert_eq!(Code::WpCliMissing.as_str(), "wp_cli_missing");
+        assert_eq!(Code::NotWordpress.as_str(), "not_wordpress");
+        assert_eq!(Code::WpNotInstalled.as_str(), "wp_not_installed");
+        assert_eq!(
+            Code::PluginsDirNotWritable.as_str(),
+            "plugins_dir_not_writable"
+        );
+        assert_eq!(Code::Timeout.as_str(), "timeout");
+        assert_eq!(Code::ProbeFailed.as_str(), "probe_failed");
     }
 
     #[test]
@@ -636,6 +744,57 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "refusing /tmp/a\\u{1b}[2Jb: it is a directory, not a regular file"
+        );
+    }
+
+    #[test]
+    fn remote_and_probe_errors_map_to_their_codes() {
+        let cases = [
+            (
+                Error::Timeout {
+                    after: Duration::from_secs(300),
+                    started: false,
+                },
+                Code::Timeout,
+            ),
+            (
+                Error::Killed {
+                    exit: Exit::Killed { signal: None },
+                },
+                Code::ProcessFailed,
+            ),
+            (
+                Error::ScriptNotRun {
+                    exit: Exit::Status(1),
+                    line: None,
+                },
+                Code::SshFailed,
+            ),
+            (
+                Error::Probe(Box::new(ProbeFailure::WpNotInstalled {
+                    path: "/var/www".into(),
+                    message: None,
+                })),
+                Code::WpNotInstalled,
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.code(), code, "{error}");
+        }
+        assert_eq!(
+            Error::Killed {
+                exit: Exit::Killed { signal: None }
+            }
+            .to_string(),
+            "the local transport process was killed before the remote command ended"
+        );
+        assert_eq!(
+            Error::ScriptNotRun {
+                exit: Exit::Status(1),
+                line: None
+            }
+            .to_string(),
+            "the server did not run apvm's script (exit status 1)"
         );
     }
 

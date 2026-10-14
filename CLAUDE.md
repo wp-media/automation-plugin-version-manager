@@ -96,7 +96,7 @@ Automation Plugin Version Manager (APVM) is a Rust-based CLI tool and library fo
 - **Config**: Configuration management using Serde for serialization/deserialization of settings
 - **Storage**: Handles local storage of plugin versions and metadata with a specific directory structure
 - **Process** (`crates/process`, `apvm-process`): the one way any crate starts a child process (`command`/`spawn`/`output`); a cancelled or timed-out call kills the whole process tree, and `ProcessScope` (re-exported as `apvm_core::ProcessScope`) lets napi kill an env's processes at `process.exit()`. A leaf crate: no `apvm-*` dependencies. `clippy.toml` bans raw tokio spawns everywhere else
-- **Sites** (`crates/sites`, `apvm-sites`): remote WordPress plugin management over SSH — the site inventory (`inventory.json`), value allowlists, local zip inspection, typed remote scripts, the transport layer (bounded capture, nonce framing) and typed WP-CLI commands and parsers. Its only apvm dependency is the leaf `apvm-process` (a test guards this); the CLI (`apvm server`, `apvm site`, `apvm group`), napi (`SiteInventory`) and core use it. Design and phase plan: `docs/plans/site-deployment.md`
+- **Sites** (`crates/sites`, `apvm-sites`): remote WordPress plugin management over SSH — the site inventory (`inventory.json`), value allowlists, local zip inspection, typed remote scripts, the transport layer (bounded capture, nonce framing), typed WP-CLI commands and parsers, and the site probe (identity by owner ids) and `Session`. Its only apvm dependency is the leaf `apvm-process` (a test guards this); the CLI (`apvm server`, `apvm site`, `apvm group`), napi (`SiteInventory`) and core use it. Design and phase plan: `docs/plans/site-deployment.md`
 
 ### NAPI Generated Artifacts
 

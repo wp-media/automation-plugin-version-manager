@@ -10,6 +10,7 @@ use super::identity::{Identity, RootAccess, RootCommand};
 use super::invalid;
 use super::quote::Word;
 use super::statement::{Body, Statement};
+use super::steps::Steps;
 use crate::allowlist;
 use crate::error::{Error, Result};
 use crate::problem::Scope;
@@ -503,6 +504,19 @@ impl Script {
     /// * `command` - The root command
     pub fn root(nonce: Nonce, access: RootAccess, command: &RootCommand) -> Self {
         Self::framed(nonce, &Body::new(command.statement(access), []))
+    }
+
+    /// Run independent statements, each whatever the others did, with
+    /// every statement's status and output kept apart (plan §6.2: the
+    /// probe's steps; [`Steps`] describes the markers).
+    ///
+    /// # Arguments
+    ///
+    /// * `nonce` - The call's nonce
+    /// * `steps` - The statements
+    pub(crate) fn steps(nonce: Nonce, steps: &Steps) -> Self {
+        let text = frame(&nonce, &steps.render(&nonce), Layout::Lines);
+        Self { nonce, text }
     }
 
     /// Frame a body of one or more statements: the constructor every

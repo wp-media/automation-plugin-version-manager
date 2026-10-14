@@ -23,7 +23,7 @@ pub(crate) use net::{proxy_jump, url};
 pub(crate) use paths::upload_value;
 pub(crate) use paths::{
     known_hosts_file, marker_path, needle, remote_path, remote_tmp_dir, ssh_path, wp_cli,
-    wp_cli_arg,
+    wp_cli_arg, wp_cli_program,
 };
 
 /// A rule's verdict: `Err` holds the reason the value is refused.

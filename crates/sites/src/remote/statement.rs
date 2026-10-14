@@ -68,8 +68,9 @@ impl Statement {
 /// The statements of a stdin script: one or more, run in order. Each gets
 /// `</dev/null`, so none can read the rest of the script, and they are
 /// chained with `&&`: the first failure stops the script and its status
-/// becomes the script's (255 mapped to 254). Reading every statement's own
-/// status (the probe's independent steps) is a later phase's addition.
+/// becomes the script's (255 mapped to 254). Statements that must each
+/// run and report their own status (the probe's steps) form a
+/// [`Steps`](super::steps::Steps) instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Body(Vec<Statement>);
 

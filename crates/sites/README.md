@@ -430,6 +430,43 @@ Pure, no I/O: the commands apvm runs, and strict parsers for what they print
 | `parse::{plugin_list, regular_plugins, cli_version, site_facts, requires_plugins, boot_check}` | read a `CommandOutput` (exit status, stdout after the nonce, stderr). PHP notices before or after the one-line payload (the PHP 8.5 `Deprecated:` line, shutdown warnings, `PHP Warning:  …`, multi-line messages, PHP and Xdebug stack traces) and byte-order marks are skipped and returned as `Notices`; a non-zero exit, empty output, only notices, an HTML page, any other line, two payloads, truncated or invalid JSON, missing, unknown, duplicate or mistyped fields, and rows whose name does not match their file are refused. Site facts are observations: absolute paths and non-empty URLs without control characters, canonical or not (the `*_realpath` facts are canonical). The boot check passes when `option get siteurl` exits 0 and prints one `http(s)://` line (a plugin can print a page and `exit` with status 0); a different siteurl is a warning. It catches fatals, `die()`, HTML and empty output, not a plugin faking a boot. `Requires Plugins` is read as WordPress reads it |
 | `PluginList`, `PluginRow`, `PluginStatus` | the rows, with unknown statuses kept as `Unknown`; lookups by slug follow WP-CLI's plugin fetcher (file `<slug>.php` or `<slug>`, or folder `<slug>`; names are display only, since WP-CLI renames plugins that share one) and return `Absent`, `Found`, `Ambiguous`, `Shadowed` (WP-CLI hides a regular plugin behind a must-use plugin or drop-in at `<slug>.php` or `<slug>`) or `Unreadable` (a file name that is not valid UTF-8 may match); `regular_plugins` + `find_regular` resolve the last two. Lifecycle commands and `requires_plugins` take a `Resolved` plugin (`PluginList::resolve`: `Found` only), so no command names a slug WP-CLI could take for another plugin, and `--no-load` skips by WP-CLI's own plugin name; rows WP-CLI prints with a `null` name (not valid UTF-8) are counted, never matched |
 
+## Probe, identity and sessions (`wp::probe`, `Session`)
+
+`wp::probe::probe(transport, site)` runs plan §6.2 read-only, one round trip
+per step, each step's commands reporting their own status:
+
+- **H (login user):** `id`, `$SHELL`, `command -v` of sudo, runuser, the
+  checksum tools and `wp_cli`; the **walk** of the plugins directory: one
+  `sh` process enters it component by component, then prints `pwd -P` and
+  `stat .`, so the physical path and the owner describe the same directory.
+  It follows a symbolic link only when the link and the directory holding
+  it belong to root or the login user and neither group nor others may
+  write that directory (a release layout's `current -> releases/<n>`), and
+  checks every component of the link's target the same way; anything else
+  is `plugins_dir_mismatch`. A directory the login user cannot enter is
+  read by root's `stat` (`sudo -n -u root`), and the identity's own walk
+  must then find the same owner and group right before WordPress loads.
+- **I (identity):** the identity table (`remote::plan_identity`): by the
+  plugins directory's owner and group **ids**, never names; `sudo -n -u U
+  -g G`, `sudo -n -u U`, `runuser -u U -g G` for a root login, or no prefix;
+  root only with the site's `allow_root` (`--allow-root` exactly when the
+  identity's uid is 0). Each candidate runs `cli version` in the exact
+  hermetic shape; sudo's refusals (sudo 1.9 and sudo-rs wording) are
+  classified with a targeted `sudo -n -l`, and the message names the
+  sudoers line to add.
+- **W (WordPress):** the constant site facts snippet; WP-CLI's own "not a
+  WordPress installation" and "not installed" errors become
+  `not_wordpress` / `wp_not_installed`; `WP_CLI_VERSION` must match `cli
+  version`.
+- **O:** `realpath(WP_PLUGIN_DIR)` must be step H's directory.
+- **C:** `test -w`, `df -Pk`: warnings (`ProbeWarning`), never failures.
+
+`Session::open(transport, site)` probes, then runs `WpCommand`s as the
+identity (`run`), with the transport's truncation flag passed to the
+parsers. Plugin lists read in a session are bound to it (`SitePlugins`), and
+commands that name a plugin run only through `run_on(&SiteTarget, TargetOp)`
+with a target of that session.
+
 ## Errors
 
 `Error::code()` returns a stable `Code`:
@@ -461,7 +498,18 @@ Pure, no I/O: the commands apvm runs, and strict parsers for what they print
   (`Error::SshConfigFile`);
 - `ssh_auth_failed`, `ssh_host_key_unknown`, `ssh_host_key_changed`,
   `ssh_unreachable`, `ssh_timeout`, `ssh_connection_lost`, `ssh_failed`:
-  ssh itself failed (`Error::Ssh`, from `remote::classify`).
+  ssh itself failed (`Error::Ssh`, from `remote::classify`); `ssh_failed`
+  also when the server's login shell did not run apvm's script
+  (`Error::ScriptNotRun`);
+- `timeout`: a remote command ran past its timeout (`Error::Timeout`, which
+  says whether the script had started);
+- `sudo_missing`, `sudo_password_required`, `sudo_not_allowed`,
+  `sudo_requiretty`, `owner_is_root`, `plugins_dir_mismatch`,
+  `wp_cli_missing`, `not_wordpress`, `wp_not_installed`, `probe_failed`: the
+  probe's failures (`Error::Probe` with its `ProbeFailure`);
+  `plugins_dir_not_writable` is a probe warning's code
+  (`ProbeWarning::code`); a killed local transport is `process_failed`
+  (`Error::Killed`).
 
 `Error::problems()` lists the located problems, so a front end can print
 them one per line.
@@ -574,6 +622,17 @@ ssh_config with `SessionType none`, `StdinNull yes`,
 nothing, and a timed-out call
 through a jump host that leaves no ssh process behind. It never touches
 the user's own `~/.ssh`.
+
+`tests/probe_e2e.rs` runs the probe against the same harness (same gate;
+CI runs it too): each harness user's identity on each site, every sudo
+refusal, a moved `WP_PLUGIN_DIR` (pinned and not), an explicit owner, a
+hostile WP-CLI config and package, links the site planted (refused before
+WordPress loads), a root-owned release link (followed), a 0750 plugins
+directory read through root's `stat`, and the unusual login shells. Tests
+that change a site restore it, even when they fail. The probe also runs
+hermetically (Unix) through `fake-ssh`, `fake-sudo` and `fake-wp`
+(`tests/support/fake-remote/`) and this machine's real `sh`, `id`, `stat`
+and `readlink`.
 
 `tests/inventory.rs` loads the example document of the plan through the
 public API; `tests/targets.rs` resolves targets and settings on it.

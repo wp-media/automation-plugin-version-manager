@@ -163,6 +163,21 @@ impl CommandKind {
         !self.is_read() && self != Self::BootCheck
     }
 
+    /// Whether the command names a plugin resolved in a read
+    /// ([`Resolved`]): a [`Session`](crate::Session) runs these only for a
+    /// target bound to it ([`Session::run_on`](crate::Session::run_on)).
+    pub fn targets_plugin(self) -> bool {
+        matches!(
+            self,
+            Self::RequiresPlugins
+                | Self::Activate
+                | Self::Deactivate
+                | Self::Uninstall
+                | Self::Reset
+                | Self::Delete
+        )
+    }
+
     /// Whether the command creates or deletes files: `install`,
     /// `uninstall`, `delete`, and `reset`, which keeps the plugin's files
     /// but deletes its translations (`languages/plugins/<slug>-*.po`, `.mo`,

@@ -43,10 +43,15 @@
 //!
 //! **Who runs a command** is an [`Identity`]: the login user, `sudo -n -u U
 //! [-g G] --`, or `runuser -u U -g G --` for a root login without sudo.
-//! What follows the prefix is never a shell. Commands that run as root are a
+//! What follows the prefix is never a shell parsing data (the probe's
+//! constant directory walk takes its data as positional parameters; identity
+//! rules are `NOPASSWD: ALL` already, since apvm runs `env` there). Commands that run as root are a
 //! closed set, [`RootCommand`] (the probe's `stat` fallback and the opt-in
 //! guarded `chown`, with numeric `+uid:+gid` owners), run through
-//! [`RootAccess`] (`sudo -n -u root --`, or a root login).
+//! [`RootAccess`] (`sudo -n -u root --`, or a root login). Which identity a
+//! site gets is the identity table's answer ([`plan_identity`], by owner
+//! and group ids, never names), and why sudo refused one is
+//! [`SudoRefusal`]'s (plan §6.2).
 //!
 //! **WP-CLI is hermetic** ([`WpCli`]): `env -u PHPRC … -u WP_CONFIG_PATH
 //! WP_CLI_CONFIG_PATH=/dev/null PAGER=cat <wp_cli> --skip-packages
@@ -116,21 +121,28 @@
 //! # }
 //! ```
 
+pub(crate) mod call;
 mod capture;
 mod classify;
 #[cfg(test)]
 pub(crate) mod fake;
-mod identity;
+pub(crate) mod identity;
+pub(crate) mod inspect;
 mod local;
 mod quote;
 mod script;
 mod ssh;
 mod statement;
+pub(crate) mod steps;
 mod transport;
 
 pub use capture::{Captured, PayloadError, STDERR_LIMIT, STDOUT_LIMIT, unframe};
 pub use classify::{HostKeyNotices, SshFailure, SshFailureKind, classify, host_key_notices};
-pub use identity::{AccountName, Identity, OwnerIds, PluginEntry, RootAccess, RootCommand};
+pub use identity::{
+    Account, AccountName, Candidate, Creation, DirOwnership, Identity, IdentityFacts, IdentityPlan,
+    IdentityRefusal, LoginAccount, NamedRole, OwnerIds, PluginEntry, Reference, RootAccess,
+    RootCommand, RootRole, SudoRefusal, SudoRefusalKind, SwitchTools, plan_identity,
+};
 pub use quote::quote;
 pub use script::{FileMode, Nonce, Script, UploadScript, WpCli};
 pub use ssh::{HostKeyPolicy, SshOptions, SshTransport};

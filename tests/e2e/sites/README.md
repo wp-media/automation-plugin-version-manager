@@ -129,6 +129,12 @@ eval "$(tests/e2e/sites/harness.sh env)" && cargo test -p apvm-sites --test ssh_
 
 Every transport there gets a temporary home, its own empty ssh_config file and temporary known_hosts files; each test checks that the generated configuration names them before ssh runs. CI's `e2e-sites` job runs these tests after `verify.sh`.
 
+`crates/sites/tests/probe_e2e.rs` runs the probe (plan P4.2) the same way: `deploy` → `www-data` through `sudo -u -g`, `deploy` on `ftpsite` through root's `stat`, `ftpuser` without a prefix, `root` through `runuser`, the sudo refusals of `plain`, `pwsudo`, `mixed`, `ttyreq` and of a `run_as` user outside `deploy`'s rules, a `WP_PLUGIN_DIR` moved in wp-config.php (pinned and not), an explicit owner, a hostile `~/.wp-cli` config and package (with a control run that proves they work), missing tables, a path without WordPress, a missing `wp_cli`, and the unusual login shells. Tests that change a site reset it with `harness.sh reset`; they run one at a time:
+
+```sh
+eval "$(tests/e2e/sites/harness.sh env)" && cargo test -p apvm-sites --test probe_e2e
+```
+
 **Adding a check:**
 1. Write a `check_*` function. It returns 0 (PASS), 1 (FAIL), 2 (INFO: recorded, no expectation) or 3 (SKIP). It asserts with `expect_eq`, `expect_match` and `expect_ran`, and records observations with `note`.
 2. Register it in the file's `group_*` function.

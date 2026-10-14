@@ -4,8 +4,8 @@
 //! `apvm server|site|group` and `apvm wp`, the Node bindings, and apvm-core's
 //! build-and-install path (design: `docs/plans/site-deployment.md`).
 //!
-//! This version holds the data layer, the remote script builder and the
-//! SSH transport:
+//! This version holds the data layer, the remote script builder, the
+//! SSH transport and the probe:
 //!
 //! - [`Inventory`]: servers, the WordPress sites on them, groups of sites,
 //!   and default SSH settings, read from and written to the
@@ -34,9 +34,13 @@
 //!   ssh_config, so jump hosts get them too), and the classification of
 //!   ssh's own failures into stable codes.
 //! - [`wp`]: the typed WP-CLI commands apvm runs on a site (no caller can
-//!   add a flag), and strict parsers for their output (PHP notices
+//!   add a flag), strict parsers for their output (PHP notices
 //!   skipped and reported; HTML pages, truncated or ambiguous output
-//!   refused).
+//!   refused), and the probe ([`wp::probe`]): who WP-CLI runs as on a site
+//!   (decided by the plugins directory's owner and group ids), whether it
+//!   is really WP-CLI, and what WordPress and the identity can do.
+//! - [`Session`]: a probed site, whose commands run as its identity and
+//!   whose plugin lists are bound to it.
 //! - [`Error`] with stable [`Code`]s for the CLI's `--json` and the Node
 //!   bindings.
 //!
@@ -89,6 +93,7 @@ pub mod layout;
 pub mod package;
 mod problem;
 pub mod remote;
+pub mod session;
 pub mod wp;
 
 pub use error::{Code, Error, Result};
@@ -103,6 +108,7 @@ pub use inventory::{
 };
 pub use package::{PackageDefect, PackageWarning, PluginHeaders, PluginPackage, VariantDetection};
 pub use problem::Problem;
+pub use session::{CommandRun, Session, SitePlugins, SiteTarget, TargetOp};
 
 #[cfg(test)]
 mod tests {

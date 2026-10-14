@@ -35,6 +35,9 @@ pub(crate) enum Reply {
         /// Its stderr.
         stderr: Vec<u8>,
     },
+    /// A [`Steps`](super::steps::Steps) script ran: each step's output,
+    /// framed with the request's nonce and the step markers, exit 0.
+    Steps(Vec<FakeStep>),
     /// The call failed before or while starting.
     Fails(Box<dyn FnOnce() -> Error + Send>),
     /// The call never ends (its caller's timeout or cancellation must).
@@ -107,6 +110,11 @@ impl Reply {
                 stdout,
                 stderr,
             } => (exit, stdout, stderr),
+            Self::Steps(steps) => (
+                Exit::Status(0),
+                steps_stdout(request, &steps),
+                steps_stderr(request, &steps),
+            ),
             Self::Fails(error) => return Err(error()),
             Self::Hangs => std::future::pending().await,
         };
@@ -119,6 +127,81 @@ impl Reply {
             ELAPSED,
         ))
     }
+}
+
+/// One statement's answer in a [`Reply::Steps`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FakeStep {
+    /// Its exit status.
+    pub(crate) status: i32,
+    /// Its stdout.
+    pub(crate) stdout: Vec<u8>,
+    /// Its stderr.
+    pub(crate) stderr: Vec<u8>,
+}
+
+impl FakeStep {
+    /// Exit 0 with `stdout`.
+    ///
+    /// # Arguments
+    ///
+    /// * `stdout` - What it printed
+    pub(crate) fn ok(stdout: impl Into<Vec<u8>>) -> Self {
+        Self::status(0, stdout, Vec::new())
+    }
+
+    /// Exit `status` with `stdout` and `stderr`.
+    ///
+    /// # Arguments
+    ///
+    /// * `status` - Its exit status
+    /// * `stdout` - What it printed
+    /// * `stderr` - Its messages
+    pub(crate) fn status(
+        status: i32,
+        stdout: impl Into<Vec<u8>>,
+        stderr: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+}
+
+/// The stdout of a [`Reply::Steps`]: the nonce line, then each step's
+/// output and marker, as [`Steps`](super::steps::Steps) prints them.
+///
+/// # Arguments
+///
+/// * `request` - The call
+/// * `steps` - The steps' answers
+fn steps_stdout(request: &Request, steps: &[FakeStep]) -> Vec<u8> {
+    let nonce = request.nonce();
+    let mut stdout = format!("\n{nonce}\n").into_bytes();
+    for (index, step) in steps.iter().enumerate() {
+        stdout.extend(&step.stdout);
+        stdout.extend(format!("\n{nonce} {index} {}\n", step.status).bytes());
+    }
+    stdout
+}
+
+/// The stderr of a [`Reply::Steps`]: the start line, then each step's
+/// messages and marker.
+///
+/// # Arguments
+///
+/// * `request` - The call
+/// * `steps` - The steps' answers
+fn steps_stderr(request: &Request, steps: &[FakeStep]) -> Vec<u8> {
+    let nonce = request.nonce();
+    let mut stderr = format!("login noise\n\n{nonce}\n").into_bytes();
+    for (index, step) in steps.iter().enumerate() {
+        stderr.extend(&step.stderr);
+        stderr.extend(format!("\n{nonce} {index}\n").bytes());
+    }
+    stderr
 }
 
 /// Answers calls with canned [`Reply`]s, in order, and records them.

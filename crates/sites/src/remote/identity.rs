@@ -1,15 +1,31 @@
-//! Who runs a remote command: the identity prefixes, and the closed set of
-//! commands that run as root (plan §6.1 item 4, §6.2, §6.8).
+//! Who runs a remote command: the identity prefixes, the closed set of
+//! commands that run as root (plan §6.1 item 4, §6.2, §6.8), the identity
+//! table that picks a site's prefix ([`plan_identity`]), and the
+//! classification of sudo's refusals ([`SudoRefusal`]).
 //!
-//! No shell ever runs under `sudo` or `runuser`: the prefixes are followed
-//! by a fixed program (`env` for WP-CLI, `tee` for uploads, `stat` or
-//! `chown` for root), never by `sh -c`.
+//! No shell parses data under `sudo` or `runuser`: the prefixes are
+//! followed by a fixed program (`env` for WP-CLI, `tee` for uploads, `stat`
+//! or `chown` for root). The one shell is the probe's directory walk
+//! (`env -u BASH_ENV -u ENV -u CDPATH sh -c '<constant>' sh <params…>`,
+//! [`inspect`](super::inspect)): constant code, data only as positional
+//! parameters, like a constant `wp eval` snippet. It runs as root only when
+//! the site's `allow_root` makes root the identity (whose sudo rule is
+//! then `(root) NOPASSWD: ALL` anyway), never through [`RootCommand`].
+
+mod decision;
+pub(crate) mod sudo;
 
 use super::invalid;
 use super::quote::Word;
 use super::statement::Statement;
 use crate::allowlist;
 use crate::error::Result;
+
+pub use decision::{
+    Account, Candidate, Creation, DirOwnership, IdentityFacts, IdentityPlan, IdentityRefusal,
+    LoginAccount, NamedRole, Reference, RootRole, SwitchTools, plan_identity,
+};
+pub use sudo::{SudoRefusal, SudoRefusalKind};
 
 /// A Unix user or group name that may appear in a remote command:
 /// `[A-Za-z0-9._-]`, no leading `-`, at most 64 characters, not made only

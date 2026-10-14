@@ -34,8 +34,11 @@
 //!   its `Requires Plugins` header.
 //! - [`snippets`]: the constant PHP snippets apvm runs with `wp eval`
 //!   (plan §6.2 step W, §10: `wp eval` only with compile-time constants).
+//! - [`probe`]: plan §6.2 end to end through a
+//!   [`Transport`](crate::remote::Transport): the site's identity, whether
+//!   `wp_cli` is WP-CLI, WordPress's facts, and what the identity can do.
 //!
-//! Everything here is pure: no I/O, no transport.
+//! Everything here but [`probe`] is pure: no I/O, no transport.
 //!
 //! # Example
 //!
@@ -69,6 +72,7 @@
 
 mod command;
 pub mod parse;
+pub mod probe;
 pub mod snippets;
 mod state;
 
@@ -79,4 +83,5 @@ pub use parse::{
     BootCheck, CommandOutput, Notices, OutputDefect, Parsed, RequiresPlugins, SiteFacts,
     WpCliVersion,
 };
+pub use probe::{ProbeFailure, ProbeWarning, SiteProbe};
 pub use state::{Lookup, PluginList, PluginRow, PluginStatus, Resolved, Slug};

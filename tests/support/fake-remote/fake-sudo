@@ -1,0 +1,82 @@
+#!/bin/sh
+#
+# fake-sudo — a stand-in for sudo in apvm's hermetic tests
+# (docs/plans/site-deployment.md §12, P4.2). Link it as `sudo` into the directory a
+# test puts on the remote command's PATH (fake-ssh's `path` directive).
+#
+#   sudo -n [-l] -u USER [-g GROUP] [--] COMMAND [ARG...]
+#
+# It never switches users: an allowed COMMAND runs as the caller, with the caller's
+# PATH. What is allowed comes from `sudo-policy` next to the link (one rule per line;
+# no file: nothing allowed):
+#
+#   allow USER           password-less, without -g
+#   allow USER:GROUP     password-less, with -g GROUP (GROUP `*`: any group, or none)
+#   password USER        a rule that needs a password (`sudo -n` refuses it, `-l`
+#                        lists it, as sudo's listpw=any does)
+#   requiretty           every call fails as sudo does without a terminal
+#
+# Messages and statuses are sudo 1.9's under `-n` (plan §3.5): every refusal is
+# `sudo: a password is required` (exit 1) but requiretty's; `-l` prints the command's
+# path (exit 0) when a rule matches, nothing (exit 1) when the user has other
+# password-less rules, and the password message otherwise. Each call's argv is
+# appended to `sudo.log` next to the link. POSIX sh only; never edited by tests.
+set -u
+
+caller_path=$PATH
+PATH=/usr/bin:/bin
+here=$(dirname -- "$0")
+policy="$here/sudo-policy"
+
+printf '%s\n' "$*" >>"$here/sudo.log"
+
+list=0 user="" group=""
+while [ $# -gt 0 ]; do
+	case $1 in
+	-n) shift ;;
+	-l) list=1; shift ;;
+	-u) user=$2; shift 2 ;;
+	-g) group=$2; shift 2 ;;
+	--) shift; break ;;
+	-*) echo "sudo: unknown option $1" >&2; exit 1 ;;
+	*) break ;;
+	esac
+done
+
+# rule KIND VALUE — whether the policy has the line `KIND VALUE`.
+rule() {
+	[ -f "$policy" ] && grep -Fqx -- "$1 $2" "$policy"
+}
+
+# allowed — whether USER (with GROUP, if any) may run commands without a password.
+allowed() {
+	if [ -z "$group" ]; then
+		rule allow "$user" || rule allow "$user:*"
+	else
+		rule allow "$user:$group" || rule allow "$user:*"
+	fi
+}
+
+if [ -f "$policy" ] && grep -Fqx requiretty "$policy"; then
+	echo "sudo: sorry, you must have a tty to run sudo" >&2
+	exit 1
+fi
+
+if [ "$list" = 1 ]; then
+	if allowed || rule password "$user"; then
+		printf '/usr/bin/%s\n' "${1:-true}"
+		exit 0
+	fi
+	if [ -f "$policy" ] && grep -q '^allow ' "$policy"; then
+		exit 1
+	fi
+	echo "sudo: a password is required" >&2
+	exit 1
+fi
+
+if ! allowed; then
+	echo "sudo: a password is required" >&2
+	exit 1
+fi
+PATH=$caller_path
+exec "$@"

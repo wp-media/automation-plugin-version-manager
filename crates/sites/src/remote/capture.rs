@@ -183,7 +183,7 @@ pub fn unframe<'a>(stdout: &'a Captured, nonce: &Nonce) -> Result<&'a [u8], Payl
 ///
 /// * `stdout` - Output bytes
 /// * `nonce` - The call's nonce
-fn after_nonce_line<'a>(stdout: &'a [u8], nonce: &Nonce) -> Option<&'a [u8]> {
+pub(crate) fn after_nonce_line<'a>(stdout: &'a [u8], nonce: &Nonce) -> Option<&'a [u8]> {
     let wanted = nonce.as_str().as_bytes();
     let mut end = 0;
     for line in stdout.split_inclusive(|&byte| byte == b'\n') {

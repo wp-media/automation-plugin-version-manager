@@ -1,0 +1,82 @@
+#!/bin/sh
+#
+# fake-wp — a stand-in for WP-CLI in apvm's hermetic tests
+# (docs/plans/site-deployment.md §12, P4.2), over a state directory in the site.
+# Link it as `wp` into the directory a test puts on the remote command's PATH
+# (fake-ssh's `path` directive).
+#
+#   wp [--skip-packages] [--exec=CODE] [--allow-root] --path=ROOT [--url=URL] ARGS...
+#
+# State lives in ROOT/.fake-wp/:
+#
+#   facts.json        what `eval` prints (the site facts snippet's JSON, no newline)
+#   not-installed     `eval` fails as WP-CLI does without database tables
+#   version           the version `cli version` prints (default 2.12.0)
+#   log               every call's arguments are appended here, one `arg: …` line
+#                     each, then `env: WP_CLI_CONFIG_PATH=… WP_CLI_REQUIRE=…` and `end`
+#
+# Commands (WP-CLI 2.12.0's messages and statuses, plan §3.5):
+#
+#   cli version       `WP-CLI <version>`
+#   eval CODE …       ROOT without wp-includes/version.php: "This does not seem to be a
+#                     WordPress installation." (exit 1); `not-installed`: "The site you
+#                     have requested is not installed." (exit 1); else facts.json
+#   anything else     "'<command>' is not a registered wp command." (exit 1)
+#
+# As uid 0 without --allow-root it refuses to run, as WP-CLI does. POSIX sh only;
+# never edited by tests.
+set -u
+
+PATH=/usr/bin:/bin
+root="" allow_root=0
+while [ $# -gt 0 ]; do
+	case $1 in
+	--skip-packages | --exec=*) shift ;;
+	--allow-root) allow_root=1; shift ;;
+	--path=*) root=${1#--path=}; shift ;;
+	--url=*) shift ;;
+	*) break ;;
+	esac
+done
+
+state="$root/.fake-wp"
+if [ -d "$state" ]; then
+	{
+		for arg in "$@"; do printf 'arg: %s\n' "$arg"; done
+		printf 'allow-root: %s\n' "$allow_root"
+		printf 'env: WP_CLI_CONFIG_PATH=%s WP_CLI_REQUIRE=%s\n' \
+			"${WP_CLI_CONFIG_PATH-unset}" "${WP_CLI_REQUIRE-unset}"
+		echo end
+	} >>"$state/log"
+fi
+
+if [ "$(id -u)" = 0 ] && [ "$allow_root" = 0 ]; then
+	echo "Error: YIKES! It looks like you're running this as root." >&2
+	exit 1
+fi
+
+case "${1:-} ${2:-}" in
+"cli version")
+	version=2.12.0
+	[ -f "$state/version" ] && version=$(cat "$state/version")
+	printf 'WP-CLI %s\n' "$version"
+	;;
+eval\ *)
+	if [ ! -f "$root/wp-includes/version.php" ]; then
+		printf '%s\n' "Error: This does not seem to be a WordPress installation." \
+			"The used path is: $root/" \
+			"Pass --path=\`path/to/wordpress\` or run \`wp core download\`." >&2
+		exit 1
+	fi
+	if [ -f "$state/not-installed" ]; then
+		printf '%s\n' "Error: The site you have requested is not installed." \
+			"Run \`wp core install\` to create database tables." >&2
+		exit 1
+	fi
+	cat "$state/facts.json"
+	;;
+*)
+	echo "Error: '${1:-}' is not a registered wp command. See 'wp help' for available commands." >&2
+	exit 1
+	;;
+esac
