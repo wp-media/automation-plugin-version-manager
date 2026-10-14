@@ -305,8 +305,9 @@ that call, next to the file it writes there:
   yes` (`IdentityFile` adds up: an ssh_config's keys are offered after
   it); `ConnectTimeout`; `ServerAliveInterval 15`,
   `ServerAliveCountMax 4`; `LogLevel INFO`; no pseudo-terminal, no remote
-  command from ssh_config, no reused connection (`ControlMaster no`,
-  `ControlPath none`; P3.4 adds apvm's own), no forwarding, no local
+  command from ssh_config, no connection the user opened (`ControlMaster
+  no`, `ControlPath none`, or apvm's own, see "Multiplexing"), no
+  forwarding, no local
   command, the key kept out of the user's agent (`AddKeysToAgent no`: from
   an ssh_config, `yes` added it there and `ask` would open ssh-askpass,
   verified); when the client knows them, `SessionType default`, `StdinNull
@@ -377,6 +378,59 @@ that call, next to the file it writes there:
   `SSH_ASKPASS_REQUIRE=never` (no ssh-askpass dialog from an ssh that a
   ProxyCommand of the user's starts, OpenSSH 8.4+; such an ssh can still
   ask on apvm's terminal, which ssh shares so that Ctrl+C reaches it).
+- **Multiplexing** (`remote/mux.rs`, Unix): with a control directory
+  (`SshOptions::with_control_dir`; the library has no default, the CLI's
+  is `~/.apvm/ssh-mux`), the server's `multiplex` on, and the server
+  reached directly (no `proxyjump` or `proxycommand` in what `ssh -G`
+  resolves for a call, with `sh -s`, and for a master, with `-N`, and the
+  same host, user, port and socket in both: OpenSSH 10's `Match command`
+  can tell them apart; with `ControlPersist`, ssh hides a proxy's
+  messages, so a jump host's refusal would lose its reason), a call's file
+  says `ControlMaster no` and `ControlPath "<dir>/<tag>%C"`: it rides a
+  live master, else opens its own connection, and never becomes a master.
+  Before a call, apvm connects to the socket and waits up to 3 s for a
+  master's hello (not `ssh -O check`, which first reads the whole
+  ssh_config: a slow `Match exec` made a live master look stuck); with no
+  master there, a starter of its own (`ssh -F … -N …` with `ControlMaster
+  auto`, `ControlPersist 15s`) authenticates, forks the master into the
+  background and exits, so no call's process tree holds the shared
+  connection; a starter that lost the race to another process's master is
+  stopped on ssh's `already exists` line. One gate per configuration in the
+  process: calls that waited while a start failed share that result
+  (without its host key notices). A starter that cannot connect is the
+  call's failure (its stderr, classified), unless ssh's reason is one
+  `classify` does not know (`ssh_failed`, such as a master that could not
+  link its socket): the call then runs on its own connection. Host keys a
+  starter recorded are in the call's stderr. Shared connections check the
+  server every 10 s, 3 unanswered ending them. A master whose network
+  connection died stalls the calls that reach it until its checks give up
+  (30 to 40 s) or the call times out; a call that timed out before its
+  script started runs `ssh -O stop`, so the next call starts a new master.
+  A stopped or wedged master says no hello (and a call that met it would
+  hang before OpenSSH 9.6): its socket is removed (only one of this
+  configuration's, in the control directory) and the call runs on its own
+  connection with `ControlPath none`; once resumed, such a master removes
+  its successor's socket as it exits, which costs one more master.
+  `<tag>` is 8 base32 characters of a
+  SHA-256 of the program, the file and the destination, so only calls with
+  identical options share a master (`%C`, 40 hex digits, completes the
+  name).
+  The directory is created `0700` and used only when it is this user's,
+  not a link, not writable by others, with every directory above it this
+  user's or root's and not writable by others unless sticky, and holds a
+  socket and a hard link to it (a test bind and link, also on
+  `config_text()`). Off, never an
+  error (`SshTransport::multiplexing()` says why): without a directory, on
+  Windows (no `ControlMaster` in Win32-OpenSSH), with `multiplex: false`,
+  through a proxy, when a call and a master resolve differently, when
+  `ssh -G` fails, for an unusable directory, or when the socket path would pass 86 bytes
+  (macOS) or 90 (Linux), past which ssh fails the call (verified with
+  7.6p1–10.3p1); for that case a caller can opt in to `/tmp/apvm-mux-<uid>`
+  (`SshOptions::with_tmp_control_fallback`).
+- **Per-server limit:** `ServerLimits` (shared by clones of `SshOptions`)
+  lets 4 calls per inventory server run at once, below sshd's
+  `MaxSessions` 10; the others wait, in order, before their timeout starts
+  and without a bound of their own (a caller sets its own deadline).
 - **A missing ssh** is `ssh_missing` (a program that cannot report its
   defaults with `-G` too). An exit 255 is a result, not an error.
 
@@ -404,7 +458,8 @@ trusting new keys nor forgetting the known one fixes them). Noise (the
 `accept-new` notice, a remote locale warning, OpenSSH 10.1's warning
 about a key exchange that is not post-quantum, an ssh_config option the
 build lacks, a missing ssh_config key file, the lines ssh prints after a
-jump host failed) is skipped. `SshFailure::line()` keeps the telling
+jump host failed, a multiplexed call that goes on over its own connection)
+is skipped. `SshFailure::line()` keeps the telling
 line, escaped: for a refused login, why ssh could not use the key file
 (`Permissions 0644 for '…' are too open.`, `Load key "…": invalid
 format`); for a jump host that opened no channel, its refusal; for

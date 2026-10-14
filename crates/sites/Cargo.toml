@@ -32,7 +32,8 @@ apvm-process = { workspace = true }
 tempfile = { workspace = true }
 
 # `O_NONBLOCK` for opening an upload's file (remote/local.rs); `access(2)`
-# for the known_hosts check (remote/ssh/files.rs)
+# for the known_hosts check (remote/ssh/files.rs); `geteuid(2)` for the
+# control directory's owner and the `/tmp/apvm-mux-<uid>` name (remote/mux.rs)
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 

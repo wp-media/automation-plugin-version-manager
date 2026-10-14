@@ -7,6 +7,7 @@
 //! cannot hit Linux's "Text file busy" race. Its behavior comes from
 //! `#fake-ssh:` lines in each test's own ssh_config file.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +23,8 @@ use super::*;
 use crate::Code;
 use crate::inventory::{Defaults, Inventory, Server, SshSettings};
 use crate::remote::{
-    Exit, Identity, Nonce, Payload, Script, SshFailureKind, UploadScript, classify,
-    host_key_notices,
+    Exit, Identity, Multiplexing, NoMultiplexing, Nonce, Payload, Script, ServerLimits,
+    SshFailureKind, UploadScript, classify, host_key_notices,
 };
 
 /// A timeout no test reaches unless something hangs.
@@ -901,4 +902,850 @@ async fn concurrent_calls_get_directories_of_their_own() {
     dirs.dedup();
     assert_eq!(dirs.len(), 8, "every call had its own directory: {log}");
     assert!(sandbox.generated_files().is_empty());
+}
+
+/// A short private directory under `/tmp` for control sockets: the
+/// sandbox's own path can be too long for one (`mux.rs`).
+fn short_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("apvm-mux-")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
+/// [`Sandbox::strict`]'s transport with `options` changed by `change`.
+///
+/// # Arguments
+///
+/// * `sandbox` - The sandbox
+/// * `settings` - The SSH defaults
+/// * `change` - What to add to the options
+fn transport_with(
+    sandbox: &Sandbox,
+    settings: SshSettings,
+    change: impl FnOnce(SshOptions) -> SshOptions,
+) -> SshTransport {
+    let base = sandbox.transport(settings, HostKeyPolicy::Strict);
+    let options = change(base.options().clone());
+    SshTransport::new(base.server().clone(), options)
+}
+
+/// The `ControlPath` value of a generated file, unquoted.
+///
+/// # Arguments
+///
+/// * `config` - The file's text
+fn control_path_of(config: &str) -> String {
+    let line = config
+        .lines()
+        .find_map(|line| line.strip_prefix("ControlPath "));
+    line.unwrap().trim_matches('"').to_string()
+}
+
+/// Every `config:` … `end` block of a fake-ssh log, in order.
+///
+/// # Arguments
+///
+/// * `log` - The log's text
+fn logged_configs(log: &str) -> Vec<String> {
+    log.split("config:\n")
+        .skip(1)
+        .filter_map(|block| block.split_once("end\n").map(|(text, _)| text.to_string()))
+        .collect()
+}
+
+/// The `run:` lines of a fake-ssh log: each run's remote command, `-N`
+/// for a master's starter (control commands left out).
+///
+/// # Arguments
+///
+/// * `log` - The log's text
+fn logged_commands(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter_map(|line| line.strip_prefix("run: "))
+        .collect()
+}
+
+#[tokio::test]
+async fn with_a_control_directory_a_starter_makes_the_master_and_calls_ride_it() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let control = short.path().join("mux");
+    let ssh = logged_shared(&sandbox, &control, 4);
+    let done = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    // The directory was made private.
+    let mode = std::fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    // No master behind the socket, so the starter ran (`-N`: no remote
+    // command), then the call.
+    let log = sandbox.read("log");
+    assert!(logged_controls(&log).is_empty(), "{log}");
+    assert_eq!(logged_commands(&log), ["-N", "sh -s"], "{log}");
+    let configs = logged_configs(&log);
+    let [master, call] = configs.as_slice() else {
+        panic!("{log}");
+    };
+    let path = control_path_of(call);
+    let tag = path
+        .strip_prefix(&format!("{}/", control.display()))
+        .and_then(|name| name.strip_suffix("%C"))
+        .unwrap();
+    assert_eq!(tag.len(), 8, "{call}");
+    // The starter becomes the master; the call never does.
+    assert!(
+        master.contains(&format!(
+            "RemoteCommand none\nControlMaster auto\nControlPath \"{path}\"\n\
+             ControlPersist 15s\nForwardAgent no\n"
+        )),
+        "{master}"
+    );
+    assert!(
+        call.contains(&format!(
+            "RemoteCommand none\nControlMaster no\nControlPath \"{path}\"\nForwardAgent no\n"
+        )),
+        "{call}"
+    );
+    assert_eq!(*call, ssh.config_text().await.unwrap());
+    // Shared connections give a dead master up sooner.
+    for text in [master, call] {
+        assert!(
+            text.contains("\nServerAliveInterval 10\nServerAliveCountMax 3\n"),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        ssh.multiplexing().await.unwrap(),
+        Multiplexing::On {
+            control_path: PathBuf::from(&path)
+        }
+    );
+    // Other options (a new host key trusted), another socket.
+    let trusting = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(&control)
+            .with_host_keys(HostKeyPolicy::AcceptNew)
+    });
+    let other = control_path_of(&trusting.config_text().await.unwrap());
+    assert_ne!(other, path);
+    assert!(other.starts_with(&format!("{}/", control.display())));
+    assert!(sandbox.generated_files().is_empty());
+}
+
+#[tokio::test]
+async fn a_live_master_is_used_without_a_starter() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = logged_shared(&sandbox, &short.path().join("mux"), 4);
+    let _master = live_master(&ssh).await;
+    let done = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    let log = sandbox.read("log");
+    assert!(logged_controls(&log).is_empty(), "{log}");
+    assert_eq!(logged_commands(&log), ["sh -s"], "{log}");
+}
+
+#[tokio::test]
+async fn a_starter_that_cannot_connect_is_the_calls_failure() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = logged_shared(&sandbox, &short.path().join("mux"), 4);
+    let log = sandbox.text("log");
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n#fake-ssh: fail auth\n"),
+    );
+    let done = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    // The call did not run a second, doomed connection.
+    assert_eq!(done.exit(), Exit::TransportFailed);
+    assert!(!done.script_started());
+    assert!(!done.stdin_written());
+    assert_eq!(classify(&done).unwrap().kind(), SshFailureKind::AuthFailed);
+    let log = sandbox.read("log");
+    assert_eq!(logged_commands(&log), ["-N"], "{log}");
+    assert!(sandbox.generated_files().is_empty());
+}
+
+#[tokio::test]
+async fn host_keys_the_starter_recorded_are_in_the_calls_stderr() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    write_private(&sandbox.path("ssh_config"), "#fake-ssh: host-key new\n");
+    let ssh = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(short.path().join("mux"))
+            .with_host_keys(HostKeyPolicy::AcceptNew)
+    });
+    let done = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    // A direct connection's starter prints the server's key notice before
+    // its master forks (verified on 10.3p1), so the caller sees it; fake-ssh
+    // records the key on each run: the starter's notice first, then the
+    // call's. (Through a jump host connections are not shared: ssh hides a
+    // proxy's messages once `ControlPersist` is set.)
+    let stderr = String::from_utf8_lossy(done.stderr().bytes()).into_owned();
+    assert_eq!(stderr.matches("Permanently added").count(), 2, "{stderr}");
+    assert_eq!(
+        host_key_notices(done.stderr()).recorded,
+        ["[example.com]:2222", "[example.com]:2222"]
+    );
+}
+
+#[tokio::test]
+async fn without_multiplexing_no_connection_is_shared_and_the_reason_is_told() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let control = short.path().join("mux");
+    let not_shared = "RemoteCommand none\nControlMaster no\nControlPath none\nForwardAgent no\n";
+    // No control directory (the library's default).
+    let ssh = sandbox.strict();
+    let text = ssh.config_text().await.unwrap();
+    assert!(text.contains(not_shared));
+    assert!(text.contains("\nServerAliveInterval 15\nServerAliveCountMax 4\n"));
+    assert_eq!(
+        ssh.multiplexing().await.unwrap(),
+        Multiplexing::Off(NoMultiplexing::NoControlDir)
+    );
+    // The server's setting is off.
+    let settings = SshSettings {
+        multiplex: Some(false),
+        ..sandbox.settings()
+    };
+    let off = transport_with(&sandbox, settings, |o| o.with_control_dir(&control));
+    assert!(off.config_text().await.unwrap().contains(not_shared));
+    assert_eq!(
+        off.multiplexing().await.unwrap(),
+        Multiplexing::Off(NoMultiplexing::Disabled)
+    );
+    assert!(!control.exists(), "nothing is made when it is off");
+    // A directory too long for a socket path: the call still runs.
+    let long = short
+        .path()
+        .join("x".repeat(super::super::mux::SOCKET_PATH_LIMIT));
+    let too_long = transport_with(&sandbox, sandbox.settings(), |o| o.with_control_dir(&long));
+    assert!(too_long.config_text().await.unwrap().contains(not_shared));
+    assert!(matches!(
+        too_long.multiplexing().await.unwrap(),
+        Multiplexing::Off(NoMultiplexing::PathTooLong { .. })
+    ));
+    let done = too_long
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    // A directory others may write.
+    std::fs::create_dir(&control).unwrap();
+    std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let open = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(&control)
+    });
+    assert!(open.config_text().await.unwrap().contains(not_shared));
+    let Multiplexing::Off(NoMultiplexing::UnusableControlDir { reason }) =
+        open.multiplexing().await.unwrap()
+    else {
+        panic!("a directory others may write was used");
+    };
+    assert!(
+        reason.contains("may be written by its group or others"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_runs_at_most_its_limit_of_calls_at_once() {
+    let sandbox = Sandbox::new(&[]);
+    let running = sandbox.path("running");
+    std::fs::create_dir(&running).unwrap();
+    let limits = ServerLimits::new(std::num::NonZeroUsize::new(2).unwrap());
+    let ssh = Arc::new(transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_server_limits(limits)
+    }));
+    // Each call marks itself running, counts the marks, then leaves.
+    let dir = running.to_str().unwrap();
+    let calls: Vec<_> = (0..5)
+        .map(|i| {
+            let ssh = Arc::clone(&ssh);
+            let code =
+                format!("touch {dir}/{i}; sleep 0.4; ls {dir} | wc -l | tr -d ' '; rm {dir}/{i}");
+            tokio::spawn(async move { ssh.execute(&Request::script(framed(&code), LONG)).await })
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let mut most = 0;
+    for call in calls {
+        let done = call.await.unwrap().unwrap();
+        let payload = done.payload().unwrap();
+        let seen: usize = String::from_utf8_lossy(payload).trim().parse().unwrap();
+        most = most.max(seen);
+    }
+    // Never more than 2 at once (the count is a lower bound of what ran,
+    // so it cannot pass wrongly) and, however the scheduler spreads them,
+    // 5 calls of 0.4 s two at a time take at least 3 rounds.
+    assert!((1..=2).contains(&most), "{most}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1200),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// A transport like [`Sandbox::strict`] that logs to the sandbox's `log`,
+/// shares connections through a short directory, and allows `per_server`
+/// calls at once.
+///
+/// # Arguments
+///
+/// * `sandbox` - The sandbox
+/// * `control` - The control directory
+/// * `per_server` - The calls per server
+fn logged_shared(sandbox: &Sandbox, control: &Path, per_server: usize) -> SshTransport {
+    let log = sandbox.text("log");
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n"),
+    );
+    let limits = ServerLimits::new(std::num::NonZeroUsize::new(per_server).unwrap());
+    transport_with(sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(control).with_server_limits(limits)
+    })
+}
+
+/// The `control:` lines of a fake-ssh log: the `-O` commands ssh got.
+///
+/// # Arguments
+///
+/// * `log` - The log's text
+fn logged_controls(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter_map(|line| line.strip_prefix("control: "))
+        .collect()
+}
+
+/// Directives for a fake-ssh that logs to `log` and, with `stall`, waits
+/// 30 s before running anything, as a call stalled on a dead master does.
+///
+/// # Arguments
+///
+/// * `sandbox` - The sandbox
+/// * `stall` - Whether calls stall
+fn set_directives(sandbox: &Sandbox, stall: bool) {
+    let log = sandbox.text("log");
+    let stall = if stall { "#fake-ssh: stall 30\n" } else { "" };
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n{stall}"),
+    );
+}
+
+#[tokio::test]
+async fn a_shared_call_that_timed_out_before_its_script_stops_the_master() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(short.path().join("mux"))
+    });
+    set_directives(&sandbox, true);
+    let _master = live_master(&ssh).await;
+    let request = Request::script(framed("echo x"), Duration::from_millis(400));
+    let done = ssh.execute(&request).await.unwrap();
+    assert_eq!(done.exit(), Exit::TimedOut);
+    assert!(!done.script_started());
+    let log = sandbox.read("log");
+    assert_eq!(logged_controls(&log), ["stop"], "{log}");
+    // With the call's file and its whole destination, as ssh got them.
+    let control = log.split("control: stop\n").nth(1).unwrap();
+    let args = logged_args(control);
+    assert_eq!(&args[2..4], ["-O", "stop"], "{args:?}");
+    assert_eq!(
+        &args[4..],
+        ["-l", "deploy", "-p", "2222", "--", "example.com"]
+    );
+    assert_eq!(args[0], "-F");
+    assert!(args[1].ends_with("/apvm-ssh.conf"), "{args:?}");
+    assert!(sandbox.generated_files().is_empty());
+}
+
+#[tokio::test]
+async fn the_master_is_left_alone_after_a_started_call_or_without_sharing() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    // Timed out after its script started: the master answered.
+    let ssh = logged_shared(&sandbox, &short.path().join("mux"), 4);
+    set_directives(&sandbox, false);
+    let _master = live_master(&ssh).await;
+    // Long enough for the nonce to come back on a slow machine.
+    let request = Request::script(framed("sleep 30"), Duration::from_secs(3));
+    let done = ssh.execute(&request).await.unwrap();
+    assert_eq!(done.exit(), Exit::TimedOut);
+    assert!(done.script_started());
+    // Stalled, but not shared: there is no master.
+    set_directives(&sandbox, true);
+    let own = sandbox.strict();
+    let stalled = Request::script(framed("echo x"), Duration::from_millis(400));
+    let done = own.execute(&stalled).await.unwrap();
+    assert_eq!(done.exit(), Exit::TimedOut);
+    assert!(!done.script_started());
+    let log = sandbox.read("log");
+    assert!(logged_controls(&log).is_empty(), "{log}");
+}
+
+#[tokio::test]
+async fn a_timed_out_or_dropped_call_frees_its_slot() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = Arc::new(logged_shared(&sandbox, &short.path().join("mux"), 1));
+    // Timed out.
+    let slow = Request::script(framed("sleep 30"), Duration::from_millis(300));
+    assert_eq!(ssh.execute(&slow).await.unwrap().exit(), Exit::TimedOut);
+    let quick = Request::script(framed("echo ok"), LONG);
+    let next = tokio::time::timeout(Duration::from_secs(20), ssh.execute(&quick));
+    assert_eq!(next.await.unwrap().unwrap().payload(), Ok(&b"ok\n"[..]));
+    // Dropped while it runs.
+    let running = {
+        let ssh = Arc::clone(&ssh);
+        tokio::spawn(async move {
+            let slow = Request::script(framed("sleep 30"), LONG);
+            ssh.execute(&slow).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    let next = tokio::time::timeout(Duration::from_secs(20), ssh.execute(&quick));
+    assert_eq!(next.await.unwrap().unwrap().payload(), Ok(&b"ok\n"[..]));
+}
+
+#[tokio::test]
+async fn an_opt_in_short_directory_replaces_one_too_long_for_a_socket() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let long = short
+        .path()
+        .join("x".repeat(super::super::mux::SOCKET_PATH_LIMIT));
+    // A private stand-in for `/tmp` (production uses `/tmp` itself).
+    let tmp = short_dir();
+    let ssh = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(&long)
+            .with_tmp_control_fallback()
+            .with_fallback_tmp(tmp.path())
+    });
+    assert!(ssh.options().tmp_control_fallback());
+    let uid = rustix::process::geteuid().as_raw();
+    let expected = tmp.path().join(format!("apvm-mux-{uid}"));
+    let Multiplexing::On { control_path } = ssh.multiplexing().await.unwrap() else {
+        panic!("the short directory was not used");
+    };
+    assert_eq!(control_path.parent(), Some(expected.as_path()));
+    let mode = std::fs::metadata(&expected).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    // A directory that fits is used as it is.
+    let fits = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(short.path().join("mux"))
+            .with_tmp_control_fallback()
+            .with_fallback_tmp(tmp.path())
+    });
+    let Multiplexing::On { control_path } = fits.multiplexing().await.unwrap() else {
+        panic!("off");
+    };
+    assert!(control_path.starts_with(short.path()));
+    // Without the opt-in, a long directory turns multiplexing off.
+    let off = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(&long).with_fallback_tmp(tmp.path())
+    });
+    assert!(matches!(
+        off.multiplexing().await.unwrap(),
+        Multiplexing::Off(NoMultiplexing::PathTooLong { .. })
+    ));
+}
+
+/// `n` concurrent calls of `echo ok` on `ssh`, each with `timeout`.
+///
+/// # Arguments
+///
+/// * `ssh` - The transport
+/// * `n` - How many
+/// * `timeout` - Each call's timeout
+async fn concurrently(ssh: &Arc<SshTransport>, n: usize, timeout: Duration) -> Vec<Execution> {
+    let calls: Vec<_> = (0..n)
+        .map(|_| {
+            let ssh = Arc::clone(ssh);
+            tokio::spawn(async move {
+                let request = Request::script(framed("echo ok"), timeout);
+                ssh.execute(&request).await
+            })
+        })
+        .collect();
+    let mut done = Vec::new();
+    for call in calls {
+        done.push(call.await.unwrap().unwrap());
+    }
+    done
+}
+
+#[tokio::test]
+async fn concurrent_calls_start_exactly_one_master() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = Arc::new(logged_shared(&sandbox, &short.path().join("mux"), 4));
+    for done in concurrently(&ssh, 4, LONG).await {
+        assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    }
+    let log = sandbox.read("log");
+    let runs = logged_commands(&log);
+    assert_eq!(runs.iter().filter(|run| **run == "-N").count(), 1, "{log}");
+    assert_eq!(
+        runs.iter().filter(|run| **run == "sh -s").count(),
+        4,
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn calls_waiting_on_an_unreachable_server_share_its_failure() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = Arc::new(logged_shared(&sandbox, &short.path().join("mux"), 4));
+    let log = sandbox.text("log");
+    // Each connection takes 2 s to fail, as one to a server that drops
+    // packets does until its connect timeout.
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n#fake-ssh: stall 2\n#fake-ssh: fail refused\n"),
+    );
+    let started = std::time::Instant::now();
+    let results = concurrently(&ssh, 4, LONG).await;
+    let took = started.elapsed();
+    for done in &results {
+        assert_eq!(done.exit(), Exit::TransportFailed);
+        assert!(!done.script_started());
+        assert_eq!(
+            classify(done).map(|failure| failure.kind()),
+            Some(SshFailureKind::Unreachable)
+        );
+    }
+    // One starter met it (two, on a machine so slow that a call arrived
+    // after the first had failed); one after another, four take 8 s.
+    let log = sandbox.read("log");
+    let starters = logged_commands(&log).len();
+    assert!((1..=2).contains(&starters), "{log}");
+    assert!(took < Duration::from_millis(7500), "{took:?}");
+    // A later call tries again (the server may be back).
+    let again = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(again.exit(), Exit::TransportFailed);
+    assert_eq!(logged_commands(&sandbox.read("log")).len(), starters + 1);
+}
+
+/// The socket fake-ssh's `-G` names for `control_path` (`%C` expanded as
+/// fake-ssh does).
+///
+/// # Arguments
+///
+/// * `control_path` - The pattern [`Multiplexing::On`] reports
+fn fake_socket(control_path: &Path) -> PathBuf {
+    let pattern = control_path.to_str().unwrap();
+    PathBuf::from(pattern.replace("%C", "0123456789abcdef0123456789abcdef01234567"))
+}
+
+/// Whether `path` is a Unix socket.
+///
+/// # Arguments
+///
+/// * `path` - An existing path
+fn socket_at(path: &Path) -> bool {
+    let kind = std::fs::symlink_metadata(path).unwrap().file_type();
+    std::os::unix::fs::FileTypeExt::is_socket(&kind)
+}
+
+#[tokio::test]
+async fn a_stuck_masters_socket_is_removed_and_the_call_runs_on_its_own() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = logged_shared(&sandbox, &short.path().join("mux"), 4);
+    let log = sandbox.text("log");
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n#fake-ssh: master stuck\n"),
+    );
+    let Multiplexing::On { control_path } = ssh.multiplexing().await.unwrap() else {
+        panic!("off");
+    };
+    let socket = fake_socket(&control_path);
+    let _stuck = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let done = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    // Nothing said hello behind the socket (3 s): its socket is gone, no
+    // starter ran, and the call ran on its own (`ControlPath none`, so
+    // fake-ssh prints no hello failure).
+    assert!(!socket.exists());
+    assert_eq!(logged_commands(&sandbox.read("log")), ["sh -s"]);
+}
+
+#[tokio::test]
+async fn a_socket_that_is_not_this_configurations_is_never_removed() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let log = sandbox.text("log");
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n#fake-ssh: master stuck\n"),
+    );
+    // Another configuration's (another host key policy, another tag).
+    let other = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(short.path().join("mux"))
+            .with_host_keys(HostKeyPolicy::AcceptNew)
+    });
+    let Multiplexing::On { control_path } = other.multiplexing().await.unwrap() else {
+        panic!("off");
+    };
+    let theirs = fake_socket(&control_path);
+    let _theirs = std::os::unix::net::UnixListener::bind(&theirs).unwrap();
+    let ssh = logged_shared(&sandbox, &short.path().join("mux"), 4);
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n#fake-ssh: master stuck\n"),
+    );
+    let done = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    assert!(socket_at(&theirs));
+}
+
+#[tokio::test]
+async fn a_jump_host_or_a_proxy_command_turns_multiplexing_off() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let not_shared = "RemoteCommand none\nControlMaster no\nControlPath none\nForwardAgent no\n";
+    // A jump host from the inventory.
+    let settings = SshSettings {
+        proxy_jump: Some("hop.example".into()),
+        ..sandbox.settings()
+    };
+    let jumped = transport_with(&sandbox, settings, |o| {
+        o.with_control_dir(short.path().join("mux"))
+    });
+    assert_eq!(
+        jumped.multiplexing().await.unwrap(),
+        Multiplexing::Off(NoMultiplexing::Proxied)
+    );
+    assert!(jumped.config_text().await.unwrap().contains(not_shared));
+    // A ProxyCommand from the user's ssh_config (as `ssh -G` resolves it).
+    let log = sandbox.text("log");
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n#fake-ssh: proxy-command nc %h %p\n"),
+    );
+    let proxied = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(short.path().join("mux"))
+    });
+    assert_eq!(
+        proxied.multiplexing().await.unwrap(),
+        Multiplexing::Off(NoMultiplexing::Proxied)
+    );
+    let done = proxied
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    // No master, no check: the call alone.
+    let log = sandbox.read("log");
+    assert!(logged_controls(&log).is_empty(), "{log}");
+    assert_eq!(logged_commands(&log), ["sh -s"], "{log}");
+}
+
+#[tokio::test]
+async fn a_master_an_old_client_hangs_on_is_bypassed_and_its_socket_removed() {
+    // OpenSSH before 9.6 prints no hello failure: a call that meets a
+    // stopped master hangs (verified on 8.9p1 and 9.2p1 by the audit).
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = logged_shared(&sandbox, &short.path().join("mux"), 4);
+    let log = sandbox.text("log");
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n#fake-ssh: master hang\n"),
+    );
+    let Multiplexing::On { control_path } = ssh.multiplexing().await.unwrap() else {
+        panic!("off");
+    };
+    let socket = fake_socket(&control_path);
+    let _stuck = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let started = std::time::Instant::now();
+    let done = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    // Nothing said hello (3 s): the call ran away from the socket.
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert!(!socket.exists());
+    let log = sandbox.read("log");
+    assert_eq!(logged_commands(&log), ["sh -s"], "{log}");
+    let configs = logged_configs(&log);
+    assert!(
+        configs[0].contains("\nControlPath none\n"),
+        "{}",
+        configs[0]
+    );
+}
+
+#[tokio::test]
+async fn a_starter_that_lost_the_race_is_stopped_and_the_winners_master_used() {
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = logged_shared(&sandbox, &short.path().join("mux"), 4);
+    let log = sandbox.text("log");
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n#fake-ssh: race yes\n"),
+    );
+    let started = std::time::Instant::now();
+    let done = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    // Not the 30 s the losing starter would wait as a plain `ssh -N`.
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let log = sandbox.read("log");
+    assert!(logged_controls(&log).is_empty(), "{log}");
+    assert_eq!(logged_commands(&log), ["-N", "sh -s"], "{log}");
+}
+
+#[tokio::test]
+async fn a_call_resolved_elsewhere_than_its_master_turns_multiplexing_off() {
+    // OpenSSH 10's `Match command`: a call goes to another host than `-N`.
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    write_private(
+        &sandbox.path("ssh_config"),
+        "#fake-ssh: command-host elsewhere.example\n",
+    );
+    let ssh = transport_with(&sandbox, sandbox.settings(), |o| {
+        o.with_control_dir(short.path().join("mux"))
+    });
+    assert_eq!(
+        ssh.multiplexing().await.unwrap(),
+        Multiplexing::Off(NoMultiplexing::SessionDependent)
+    );
+}
+
+/// A stand-in for a live master on a Unix socket: says hello to every
+/// connection, as OpenSSH's does, until dropped.
+struct LiveMaster {
+    /// Set to end the thread.
+    done: Arc<std::sync::atomic::AtomicBool>,
+    /// The thread that accepts.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LiveMaster {
+    /// Listen on `path` (nonblocking, polled every 20 ms).
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The socket
+    fn start(path: &Path) -> Self {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::clone(&done);
+        let thread = std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut client, _)) => {
+                        let _ = std::io::Write::write_all(&mut client, b"\0\0\0\x15");
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+        Self {
+            done,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for LiveMaster {
+    /// End the thread.
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A live stand-in master where `ssh`'s calls look for theirs.
+///
+/// # Arguments
+///
+/// * `ssh` - A transport that shares connections
+async fn live_master(ssh: &SshTransport) -> LiveMaster {
+    let found = ssh.multiplexing().await.unwrap();
+    let Multiplexing::On { control_path } = found else {
+        panic!("{found:?}");
+    };
+    LiveMaster::start(&fake_socket(&control_path))
+}
+
+#[tokio::test]
+async fn a_call_that_meets_a_stuck_master_itself_has_its_socket_removed() {
+    // The master said hello, then stopped before the call reached it: the
+    // call prints ssh's own hello failure (9.6+) and runs on its own.
+    let sandbox = Sandbox::new(&[]);
+    let short = short_dir();
+    let ssh = logged_shared(&sandbox, &short.path().join("mux"), 4);
+    let master = live_master(&ssh).await;
+    let log = sandbox.text("log");
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n#fake-ssh: master stuck\n"),
+    );
+    let Multiplexing::On { control_path } = ssh.multiplexing().await.unwrap() else {
+        panic!("off");
+    };
+    let socket = fake_socket(&control_path);
+    let done = ssh
+        .execute(&Request::script(framed("echo ok"), LONG))
+        .await
+        .unwrap();
+    assert_eq!(done.payload(), Ok(&b"ok\n"[..]));
+    let stderr = String::from_utf8_lossy(done.stderr().bytes()).into_owned();
+    assert!(stderr.contains("master hello exchange failed"), "{stderr}");
+    assert!(!socket.exists());
+    drop(master);
+    // A remote program's copy of the line (no `\r`) removes nothing.
+    let _again = LiveMaster::start(&socket);
+    write_private(
+        &sandbox.path("ssh_config"),
+        format!("#fake-ssh: log {log}\n"),
+    );
+    let echoed = ssh
+        .execute(&Request::script(
+            framed("echo 'muxclient: master hello exchange failed' >&2"),
+            LONG,
+        ))
+        .await
+        .unwrap();
+    assert!(echoed.exit().success());
+    assert!(socket.exists());
 }

@@ -25,7 +25,8 @@
 //! named; `IdentityFile` adds up, so an ssh_config's own keys are offered
 //! after it) and never added to the user's agent (`AddKeysToAgent no`),
 //! the connect timeout, keep-alives, no pseudo-terminal, no forwarding, no
-//! reused connection (P3.4 adds apvm's own), and, when the client knows them, a
+//! connection the user opened (apvm's own shared one when multiplexing is
+//! on, see below), and, when the client knows them, a
 //! session that is apvm's command fed by apvm's stdin in the foreground,
 //! never closed for being quiet (`SessionType default`, `StdinNull no`,
 //! `ForkAfterAuthentication no` from OpenSSH 8.7, `ChannelTimeout none`
@@ -96,31 +97,55 @@
 //! so that Ctrl+C reaches it (`apvm-process`), and `/dev/tty` stays open
 //! to it.
 //!
+//! **Multiplexing** (`mux.rs`, P3.4): with a control directory
+//! ([`SshOptions::with_control_dir`]) and the server's `multiplex` setting
+//! on, calls with identical options to a server reached directly share one
+//! connection through a `ControlPersist` master that a starter of its own
+//! makes, outside every call's process tree (`ssh/master.rs`), and that
+//! outlives the calls by up to 15 s of idleness (a call that timed out
+//! before its script started stops it, as it may be dead). It is off
+//! through a jump host or a ProxyCommand (ssh hides their messages from a
+//! shared connection's start), on Windows, and when the socket path would
+//! be too long (unless the caller opted in to `/tmp/apvm-mux-<uid>`) or the
+//! directory unusable ([`SshTransport::multiplexing`] tells why). At most
+//! [`ServerLimits::per_server`] calls run at once per inventory server,
+//! below sshd's `MaxSessions` (`limits.rs`).
+//!
 //! **Errors:** a missing ssh program is [`Error::SshMissing`]
 //! (`ssh_missing`). An exit 255 is a result ([`Exit::TransportFailed`]):
 //! [`classify`](super::classify()) tells why.
 //!
 //! [`Exit::TransportFailed`]: super::Exit::TransportFailed
 
-mod config;
+mod command;
+pub(super) mod config;
 mod files;
+mod master;
+mod resolve;
+mod socket;
 #[cfg(all(test, unix))]
 mod tests;
 
 use std::borrow::Cow;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::OnceCell;
 
-use self::config::{ConfigInputs, Platform};
+use self::command::Commands;
+use self::config::{ConfigInputs, Platform, ServerAlive};
 use self::files::{ConfigSource, LocalFiles};
+use self::master::{Ready, Shared};
+use self::resolve::{Resolution, Verdict};
+use super::capture::{Captured, STDERR_LIMIT};
 use super::classify::is_noise;
+use super::limits::ServerLimits;
 use super::local::{self, CANNOT_START, EnvChange, Launch};
-use super::transport::{BoxFuture, Execution, Request, Transport};
+use super::mux::{self, Multiplexing, MuxInputs, NOT_SHARED};
+use super::transport::{BoxFuture, Execution, Exit, Request, Transport};
 use crate::error::{Error, Result};
 use crate::inventory::ResolvedServer;
 use crate::problem::{Problem, printable, quoted};
@@ -178,7 +203,8 @@ impl HostKeyPolicy {
 }
 
 /// How an [`SshTransport`] runs ssh, beyond the inventory's settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Clones share their [`ServerLimits`].
+#[derive(Debug, Clone, Default)]
 pub struct SshOptions {
     /// What ssh does with an unknown host key.
     host_keys: HostKeyPolicy,
@@ -189,11 +215,23 @@ pub struct SshOptions {
     /// goes; `None`: the system's temporary directory (or `/tmp`, see the
     /// module docs).
     config_dir: Option<PathBuf>,
+    /// Where the multiplexing sockets go; `None`: no multiplexing.
+    control_dir: Option<PathBuf>,
+    /// Whether `/tmp/apvm-mux-<uid>` replaces a control directory too long
+    /// for a socket path.
+    tmp_control_fallback: bool,
+    /// The tests' stand-in for `/tmp` in [`Self::with_tmp_control_fallback`],
+    /// so they never write the real one.
+    #[cfg(test)]
+    fallback_tmp: Option<PathBuf>,
+    /// The calls each server may run at once, shared by clones.
+    limits: ServerLimits,
 }
 
 impl SshOptions {
     /// Strict host keys, the `HOME` apvm runs with, the system's temporary
-    /// directory.
+    /// directory, no multiplexing, and limits of their own
+    /// ([`ServerLimits::DEFAULT_PER_SERVER`] calls per server).
     pub fn new() -> Self {
         Self::default()
     }
@@ -237,9 +275,78 @@ impl SshOptions {
         self
     }
 
+    /// Set where multiplexing sockets go, which turns multiplexing on for
+    /// servers whose `multiplex` setting is on (a library has no default
+    /// location; the CLI's is `~/.apvm/ssh-mux`, [`crate::layout`]). An
+    /// absolute path, short enough for a socket path (37 bytes on macOS, 41
+    /// on Linux; see [`Multiplexing`]), created `0700` when missing, and
+    /// used only when private to this user (see `mux.rs`). Calls never fail
+    /// for it: an unusable one turns multiplexing off.
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - The control directory
+    pub fn with_control_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.control_dir = Some(dir.into());
+        self
+    }
+
+    /// Use `/tmp/apvm-mux-<uid>` when the control directory
+    /// ([`Self::with_control_dir`]) is too long for a socket path (a macOS
+    /// user name over 16 characters makes `~/.apvm/ssh-mux` one), when
+    /// `/tmp` is root's and sticky; that directory gets the same checks
+    /// (this user's, private, not a link). Off by default: a library picks
+    /// no location on its own.
+    pub fn with_tmp_control_fallback(mut self) -> Self {
+        self.tmp_control_fallback = true;
+        self
+    }
+
+    /// Set the calls each server may run at once. Give every transport the
+    /// same limits (or clones of these options), so calls to one server
+    /// count together. A call waits for a slot as long as it takes (its
+    /// timeout starts once it has one): give the whole run a deadline of
+    /// its own if it must end by then.
+    ///
+    /// # Arguments
+    ///
+    /// * `limits` - The limits, shared with their clones
+    pub fn with_server_limits(mut self, limits: ServerLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     /// What ssh does with an unknown host key.
     pub fn host_keys(&self) -> HostKeyPolicy {
         self.host_keys
+    }
+
+    /// Where multiplexing sockets go, if anywhere.
+    pub fn control_dir(&self) -> Option<&Path> {
+        self.control_dir.as_deref()
+    }
+
+    /// Whether `/tmp/apvm-mux-<uid>` replaces a control directory too long
+    /// for a socket path ([`Self::with_tmp_control_fallback`]).
+    pub fn tmp_control_fallback(&self) -> bool {
+        self.tmp_control_fallback
+    }
+
+    /// Use `tmp` in place of `/tmp` for [`Self::with_tmp_control_fallback`]
+    /// (tests only).
+    ///
+    /// # Arguments
+    ///
+    /// * `tmp` - A private directory standing in for `/tmp`
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_fallback_tmp(mut self, tmp: impl Into<PathBuf>) -> Self {
+        self.fallback_tmp = Some(tmp.into());
+        self
+    }
+
+    /// The calls each server may run at once.
+    pub fn server_limits(&self) -> &ServerLimits {
+        &self.limits
     }
 }
 
@@ -281,7 +388,14 @@ pub struct SshTransport {
     /// ssh's compiled-in defaults, once read, and the program they are
     /// of.
     defaults: OnceCell<(PathBuf, SshDefaults)>,
+    /// What `ssh -G` last told about a configuration (its text without
+    /// sharing lines), and when: reused for [`RESOLVED_FOR`].
+    resolved: std::sync::Mutex<Option<CachedResolution>>,
 }
+
+/// A configuration's text, when `ssh -G` resolved it, and what it found
+/// (or why it could not tell).
+type CachedResolution = (String, Instant, std::result::Result<Resolution, String>);
 
 /// What `ssh -T -F none -G` tells about the client (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +418,10 @@ struct Prepared {
     program: PathBuf,
     /// The generated ssh_config.
     config: String,
+    /// Whether it shares a connection.
+    multiplexing: Multiplexing,
+    /// Its master's configuration, when it shares one.
+    shared: Option<Shared>,
 }
 
 impl SshTransport {
@@ -320,6 +438,7 @@ impl SshTransport {
             server,
             options,
             defaults: OnceCell::new(),
+            resolved: std::sync::Mutex::new(None),
         }
     }
 
@@ -334,13 +453,25 @@ impl SshTransport {
     }
 
     /// The ssh_config text the next call writes, for logs and diagnostics:
-    /// the same checks run first.
+    /// the same checks run first, so with a control directory it is created
+    /// when missing and a test socket is bound and removed in it.
     ///
     /// # Errors
     ///
     /// As [`Transport::execute`] before it starts ssh.
     pub async fn config_text(&self) -> Result<String> {
         Ok(self.prepare().await?.config)
+    }
+
+    /// Whether the next call shares a connection, and through which socket
+    /// pattern, or why not: the same checks run first, and the control
+    /// directory is created when missing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Transport::execute`] before it starts ssh.
+    pub async fn multiplexing(&self) -> Result<Multiplexing> {
+        Ok(self.prepare().await?.multiplexing)
     }
 
     /// Resolve and check the local files, find the system ssh_config when
@@ -373,14 +504,19 @@ impl SshTransport {
         files::check(&files, self.options.host_keys).map_err(|problems| self.refused(problems))?;
         config::shell_literal(&files.program.path, Platform::CURRENT)
             .map_err(|reason| self.refused(vec![Problem::new("binary", reason)]))?;
-        let config = self.render(&files).await?;
+        let (config, multiplexing, shared) = self.render(&files).await?;
         Ok(Prepared {
             program: files.program.path,
             config,
+            multiplexing,
+            shared,
         })
     }
 
-    /// The generated file's text for `files`.
+    /// The generated file's text for `files`, and whether it shares a
+    /// connection: the file is rendered without sharing first, its tag
+    /// taken from that text ([`mux::connection_tag`]), then rendered again
+    /// with the sharing lines when multiplexing is on.
     ///
     /// # Arguments
     ///
@@ -389,7 +525,7 @@ impl SshTransport {
     /// # Errors
     ///
     /// As [`Self::prepare`].
-    async fn render(&self, files: &LocalFiles) -> Result<String> {
+    async fn render(&self, files: &LocalFiles) -> Result<(String, Multiplexing, Option<Shared>)> {
         let defaults = self.defaults(&files.program.path).await?;
         let includes = self.includes(files, &defaults)?;
         let known_hosts: Vec<&Path> = files.known_hosts.iter().map(|f| f.path.as_path()).collect();
@@ -399,14 +535,238 @@ impl SshTransport {
             known_hosts: &known_hosts,
             identity: files.identity.as_ref().map(|key| key.path.as_path()),
             connect_timeout_secs: self.server.ssh.connect_timeout_secs.value,
+            server_alive: ServerAlive::OWN,
+            control: NOT_SHARED,
             pinned: &defaults.pinned,
             includes: &includes,
             // ssh's own files, so ssh's own default (see `config.rs`).
             update_host_keys: defaults.updates_host_keys
                 && self.server.ssh.known_hosts_file.is_none(),
         };
-        config::render(&inputs, Platform::CURRENT)
+        self.render_shared(&inputs, &files.program.path).await
+    }
+
+    /// The text for `inputs` (which share no connection), whether it shares
+    /// one, and the master's configuration: rendered as it is when
+    /// connections are not shared, else again with a call's lines and with
+    /// the starter's (see [`Self::render`], `mux.rs`).
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - What the file says, with [`NOT_SHARED`]
+    /// * `program` - The ssh program
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::render_inputs`].
+    async fn render_shared(
+        &self,
+        inputs: &ConfigInputs<'_>,
+        program: &Path,
+    ) -> Result<(String, Multiplexing, Option<Shared>)> {
+        let unshared = self.render_inputs(inputs)?;
+        let socket = match self.control_socket(program, &unshared) {
+            Ok(socket) => socket,
+            Err(why) => return Ok((unshared, Multiplexing::Off(why), None)),
+        };
+        let client = self.render_with(inputs, &socket.client_lines())?;
+        let path = match self.shareable(program, &client, &socket).await? {
+            Ok(path) => path,
+            Err(why) => return Ok((unshared, Multiplexing::Off(why), None)),
+        };
+        let shared = Shared {
+            master_config: self.render_with(inputs, &socket.master_lines())?,
+            own_config: unshared.clone(),
+            control_dir: socket.dir().to_path_buf(),
+            tag: socket.tag().to_string(),
+            socket: path,
+        };
+        Ok((client, socket.multiplexing(), Some(shared)))
+    }
+
+    /// The control socket a call uses when connections can be shared, as
+    /// `ssh -G` resolves a call's file (see `mux.rs`, `ssh/resolve.rs`), else
+    /// why not. What `-G` found, or why it could not tell, is kept for
+    /// [`RESOLVED_FOR`].
+    ///
+    /// # Arguments
+    ///
+    /// * `program` - The ssh program
+    /// * a call's file - The generated file without sharing lines
+    /// * `planned` - The socket the configuration names
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SshConfigFile`] when the file cannot be written for `-G`.
+    async fn shareable(
+        &self,
+        program: &Path,
+        client: &str,
+        planned: &mux::ControlSocket,
+    ) -> Result<std::result::Result<PathBuf, mux::NoMultiplexing>> {
+        let resolution = match self.cached_resolution(client) {
+            Some(found) => found,
+            None => {
+                let found = self.ask_verdict(program, client).await?;
+                *self.resolved_cache() = Some((client.to_string(), Instant::now(), found.clone()));
+                found
+            }
+        };
+        Ok(socket_of(resolution, planned))
+    }
+
+    /// What `ssh -G` found for a call's file less than [`RESOLVED_FOR`] ago, if
+    /// anything.
+    ///
+    /// # Arguments
+    ///
+    /// * a call's file - The generated file without sharing lines
+    fn cached_resolution(&self, client: &str) -> Option<std::result::Result<Resolution, String>> {
+        let cache = self.resolved_cache();
+        let (text, at, found) = cache.as_ref()?;
+        (text == client && at.elapsed() < RESOLVED_FOR).then(|| found.clone())
+    }
+
+    /// The cached `ssh -G` result (a poisoned lock is still a valid cache:
+    /// it holds whole values).
+    fn resolved_cache(&self) -> std::sync::MutexGuard<'_, Option<CachedResolution>> {
+        self.resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Run `ssh -G` (for a call and for a master) with a call's file written to
+    /// a private directory of its own ([`resolve::verdict`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `program` - The ssh program
+    /// * a call's file - The generated file without sharing lines
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SshConfigFile`] when the file cannot be written; inside,
+    /// why `-G` could not tell.
+    async fn ask_verdict(
+        &self,
+        program: &Path,
+        client: &str,
+    ) -> Result<std::result::Result<Resolution, String>> {
+        let dir = self.config_dir();
+        let private = write_config(&dir, client).map_err(|source| config_file(&dir, source))?;
+        let file = config_argument(&private.path().join(CONFIG_NAME));
+        let destination = config::destination(&self.server);
+        let commands = self.commands(program, &file, private.path(), &destination);
+        Ok(resolve::verdict(&commands).await)
+    }
+
+    /// The commands around a call with `file`, run in `dir`.
+    ///
+    /// # Arguments
+    ///
+    /// * `program` - The ssh program
+    /// * `file` - The generated file, as ssh gets it
+    /// * `dir` - Its private directory
+    /// * `destination` - [`config::destination`]
+    fn commands<'a>(
+        &self,
+        program: &'a Path,
+        file: &'a Path,
+        dir: &'a Path,
+        destination: &'a [OsString],
+    ) -> Commands<'a> {
+        Commands {
+            program,
+            file,
+            dir,
+            destination,
+            connect_timeout: Duration::from_secs(u64::from(
+                self.server.ssh.connect_timeout_secs.value,
+            )),
+        }
+    }
+
+    /// `inputs` rendered with the sharing `lines` and the shared
+    /// connection's keep-alives.
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - What the file says
+    /// * `lines` - The connection sharing lines
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::render_inputs`].
+    fn render_with(&self, inputs: &ConfigInputs<'_>, lines: &[String]) -> Result<String> {
+        let control: Vec<&str> = lines.iter().map(String::as_str).collect();
+        self.render_inputs(&ConfigInputs {
+            server_alive: ServerAlive::SHARED,
+            control: &control,
+            ..*inputs
+        })
+    }
+
+    /// Render `inputs` for this platform.
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - What the file says
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] naming the field whose path cannot be
+    /// written.
+    fn render_inputs(&self, inputs: &ConfigInputs<'_>) -> Result<String> {
+        config::render(inputs, Platform::CURRENT)
             .map_err(|(field, reason)| self.refused(vec![Problem::new(field, reason)]))
+    }
+
+    /// The socket the calls share their connection through, its directory
+    /// made and checked, or why they do not.
+    ///
+    /// # Arguments
+    ///
+    /// * `program` - The ssh program
+    /// * `unshared` - The generated file without sharing lines
+    ///
+    /// # Errors
+    ///
+    /// Why connections are not shared.
+    fn control_socket(
+        &self,
+        program: &Path,
+        unshared: &str,
+    ) -> std::result::Result<mux::ControlSocket, mux::NoMultiplexing> {
+        let tag = mux::connection_tag(program, unshared, &config::destination(&self.server));
+        let inputs = |control_dir| MuxInputs {
+            enabled: self.server.ssh.multiplex.value,
+            control_dir,
+            platform: Platform::CURRENT,
+            tag: &tag,
+            limit: mux::SOCKET_PATH_LIMIT,
+        };
+        let socket = match mux::control_socket(&inputs(self.options.control_dir.as_deref())) {
+            Err(too_long @ mux::NoMultiplexing::PathTooLong { .. }) => {
+                let fallback = self.fallback_dir().ok_or(too_long)?;
+                mux::control_socket(&inputs(Some(&fallback)))?
+            }
+            other => other?,
+        };
+        mux::usable_dir(&socket)?;
+        Ok(socket)
+    }
+
+    /// The short control directory, when the caller opted in and `/tmp` is
+    /// root's and sticky ([`SshOptions::with_tmp_control_fallback`]).
+    fn fallback_dir(&self) -> Option<PathBuf> {
+        if !self.options.tmp_control_fallback {
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(tmp) = &self.options.fallback_tmp {
+            return mux::fallback_here(Some(tmp.clone()));
+        }
+        mux::fallback_here(shared_tmp())
     }
 
     /// The ssh_config files the generated file includes: the inventory's
@@ -495,23 +855,284 @@ impl SshTransport {
     ///
     /// As [`Transport::execute`].
     async fn call(&self, request: &Request) -> Result<Execution> {
+        // Held until ssh is gone (plan §6.1 item 10).
+        let _slot = self.options.limits.acquire(&self.server.id).await;
         let prepared = self.prepare().await?;
         let dir = self.config_dir();
         let private =
             write_config(&dir, &prepared.config).map_err(|source| config_file(&dir, source))?;
         let file = config_argument(&private.path().join(CONFIG_NAME));
-        let args = config::arguments(&file, &self.server, &request.remote_command());
-        let launch = Launch {
-            program: prepared.program.as_os_str(),
-            args: &args,
-            env: &SSH_ENV,
-            dir: Some(private.path()),
+        let destination = config::destination(&self.server);
+        let commands = self.commands(&prepared.program, &file, private.path(), &destination);
+        let outcome = match &prepared.shared {
+            Some(shared) => self.shared_call(request, &commands, shared, &dir).await,
+            None => self.run_call(request, &commands).await,
         };
-        let outcome = local::run(&launch, request).await;
         // Deleted once ssh and every jump host it started are gone.
         drop(private);
         outcome.map_err(|error| ssh_missing(error, &prepared.program))
     }
+
+    /// Run `request` over a shared connection: get a master ready, run the
+    /// call (a client of it, or on its own connection), then deal with a
+    /// master it stalled on or found stuck (`ssh/master.rs`).
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The call
+    /// * `commands` - The call's commands
+    /// * `shared` - The master's configuration
+    /// * `dir` - Where private directories go
+    ///
+    /// # Errors
+    ///
+    /// As [`Transport::execute`].
+    async fn shared_call(
+        &self,
+        request: &Request,
+        commands: &Commands<'_>,
+        shared: &Shared,
+        dir: &Path,
+    ) -> Result<Execution> {
+        let ready = self.ready(commands, shared, dir).await?;
+        if ready == Ready::Stuck {
+            return self.own_call(request, commands, shared, dir).await;
+        }
+        let notices = match notices_or_failure(request, ready) {
+            Ok(notices) => notices,
+            Err(failed) => return Ok(failed),
+        };
+        let done = self.run_call(request, commands).await?;
+        let stalled = done.exit() == Exit::TimedOut && !done.script_started();
+        master::after(commands, shared, stalled, done.stderr().bytes()).await;
+        Ok(with_stderr_before(request, done, &notices))
+    }
+
+    /// Run `request` on a connection of its own, away from a stuck master's
+    /// socket: with the file that shares nothing (`ControlPath none`).
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The call
+    /// * `commands` - The call's commands
+    /// * `shared` - The master's configuration
+    /// * `dir` - Where private directories go
+    ///
+    /// # Errors
+    ///
+    /// As [`Transport::execute`].
+    async fn own_call(
+        &self,
+        request: &Request,
+        commands: &Commands<'_>,
+        shared: &Shared,
+        dir: &Path,
+    ) -> Result<Execution> {
+        let private =
+            write_config(dir, &shared.own_config).map_err(|source| config_file(dir, source))?;
+        let file = config_argument(&private.path().join(CONFIG_NAME));
+        let own = Commands {
+            file: &file,
+            dir: private.path(),
+            ..*commands
+        };
+        let done = self.run_call(request, &own).await;
+        drop(private);
+        done
+    }
+
+    /// Run `request` with `commands`' file, in its private directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The call
+    /// * `commands` - The call's commands
+    ///
+    /// # Errors
+    ///
+    /// As [`local::run`].
+    async fn run_call(&self, request: &Request, commands: &Commands<'_>) -> Result<Execution> {
+        let args = config::arguments(commands.file, &self.server, &request.remote_command());
+        let launch = Launch {
+            program: commands.program.as_os_str(),
+            args: &args,
+            env: &SSH_ENV,
+            dir: Some(commands.dir),
+        };
+        local::run(&launch, request).await
+    }
+
+    /// Get a master ready for a call that shares connections: under its
+    /// configuration's process-wide gate, check for one and start one
+    /// (`ssh/master.rs`), with the starter's file in a private directory of
+    /// its own. A call that waited while another's start failed
+    /// (unreachable, no answer in time, a stuck master) takes that result
+    /// instead of trying again. The starter's time (up to the connect
+    /// timeout and [`STARTER_MARGIN`]), and the wait for the gate, come
+    /// before the call's own timeout starts.
+    ///
+    /// # Arguments
+    ///
+    /// * `commands` - The call's commands
+    /// * `shared` - The master's configuration
+    /// * `dir` - Where private directories go
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SshConfigFile`] when the starter's file cannot be written.
+    async fn ready(&self, commands: &Commands<'_>, shared: &Shared, dir: &Path) -> Result<Ready> {
+        let cell = master::gate_for(&shared.gate_key());
+        let ticket = cell.ticket();
+        let mut gate = cell.gate.lock().await;
+        if let Some(found) = gate.shared_since(ticket) {
+            return Ok(found);
+        }
+        let private =
+            write_config(dir, &shared.master_config).map_err(|source| config_file(dir, source))?;
+        let master_file = config_argument(&private.path().join(CONFIG_NAME));
+        let starter = Commands {
+            dir: private.path(),
+            ..*commands
+        };
+        let timeout = commands.connect_timeout + STARTER_MARGIN;
+        let ready = master::ensure(&starter, shared, &master_file, timeout).await;
+        cell.record(&mut gate, &ready);
+        Ok(ready)
+    }
+}
+
+/// How long an `ssh -G` verdict is reused for one configuration: `-G` reads
+/// the user's included files and evaluates `Match exec` and `Match
+/// localnetwork` each time, which may change without the generated text
+/// changing; a short reuse bounds that staleness while sparing two
+/// processes per call during a run.
+const RESOLVED_FOR: Duration = Duration::from_secs(30);
+
+/// The time a master's starter gets beyond the connect timeout: to
+/// authenticate and fork the master.
+const STARTER_MARGIN: Duration = Duration::from_secs(15);
+
+/// The result of a call that did not run because the master's starter
+/// could not connect (ssh exited 255): its stderr, as the call's, so
+/// [`classify`](super::classify()) tells why; nothing started.
+///
+/// # Arguments
+///
+/// * `request` - The call
+/// * `stderr` - The starter's stderr
+/// * `elapsed` - How long it took
+fn unreachable(request: &Request, stderr: Vec<u8>, elapsed: Duration) -> Execution {
+    Execution::new(
+        request.nonce().clone(),
+        Exit::TransportFailed,
+        Captured::whole(Vec::new()),
+        capped_stderr(stderr),
+        false,
+        elapsed,
+    )
+}
+
+/// The control socket a call uses, from what `ssh -G` found, or why
+/// connections cannot be shared: through a proxy, resolved differently for
+/// a call and a master, unresolved, or expanded to a socket that is not
+/// `planned`'s (never expected; apvm then never touches it).
+///
+/// # Arguments
+///
+/// * `resolution` - What `-G` found, or why it could not tell
+/// * `planned` - The socket the configuration names
+fn socket_of(
+    resolution: std::result::Result<Resolution, String>,
+    planned: &mux::ControlSocket,
+) -> std::result::Result<PathBuf, mux::NoMultiplexing> {
+    let resolution = resolution.map_err(|reason| mux::NoMultiplexing::Unresolved { reason })?;
+    match resolution.verdict {
+        Verdict::Shareable => {}
+        Verdict::Proxied => return Err(mux::NoMultiplexing::Proxied),
+        Verdict::SessionDependent => return Err(mux::NoMultiplexing::SessionDependent),
+    }
+    resolution
+        .control_path
+        .filter(|path| socket::ours(path, planned.dir(), planned.tag()))
+        .ok_or_else(|| mux::NoMultiplexing::Unresolved {
+            reason: "ssh expands ControlPath to no socket of apvm's".into(),
+        })
+}
+
+/// What a call that rides (or falls back from) a master carries over from
+/// getting it ready: the starter's stderr (host key notices), or the
+/// call's result when the starter could not connect and the call would not
+/// either. A starter's 255 for a reason that is not the server's (a master
+/// that could not set up its socket) lets the call run.
+///
+/// # Arguments
+///
+/// * `request` - The call
+/// * `ready` - What getting the master ready found (not [`Ready::Stuck`])
+fn notices_or_failure(request: &Request, ready: Ready) -> std::result::Result<Vec<u8>, Execution> {
+    match ready {
+        Ready::Unreachable { stderr, elapsed } => {
+            let failed = unreachable(request, stderr, elapsed);
+            if is_connection_failure(&failed) {
+                return Err(failed);
+            }
+            Ok(failed.stderr().bytes().to_vec())
+        }
+        Ready::Started(stderr) | Ready::Unknown(stderr) => Ok(stderr),
+        Ready::Live | Ready::Stuck => Ok(Vec::new()),
+    }
+}
+
+/// Whether `execution` (a starter's exit 255) failed for a reason of the
+/// server's or the network's, as [`classify`](super::classify()) tells: then
+/// the call would fail the same way. An unrecognized one (`ssh_failed`,
+/// such as a master that could not link its socket) is not.
+///
+/// # Arguments
+///
+/// * `execution` - The starter's result as a call's
+fn is_connection_failure(execution: &Execution) -> bool {
+    super::classify(execution)
+        .is_some_and(|failure| failure.kind() != super::SshFailureKind::Unrecognized)
+}
+
+/// `done` with `before` (the starter's stderr: host keys it recorded)
+/// ahead of its own stderr, kept within [`STDERR_LIMIT`].
+///
+/// # Arguments
+///
+/// * `request` - The call
+/// * `done` - The call's result
+/// * `before` - What to put first
+fn with_stderr_before(request: &Request, done: Execution, before: &[u8]) -> Execution {
+    if before.is_empty() {
+        return done;
+    }
+    let mut bytes = before.to_vec();
+    bytes.extend_from_slice(done.stderr().bytes());
+    let mut stderr = capped_stderr(bytes);
+    if done.stderr().is_truncated() {
+        stderr = Captured::new(stderr.bytes().to_vec(), true);
+    }
+    Execution::new(
+        request.nonce().clone(),
+        done.exit(),
+        done.stdout().clone(),
+        stderr,
+        done.stdin_written(),
+        done.elapsed(),
+    )
+}
+
+/// `bytes` as captured stderr, cut at [`STDERR_LIMIT`].
+///
+/// # Arguments
+///
+/// * `bytes` - The stderr
+fn capped_stderr(mut bytes: Vec<u8>) -> Captured {
+    let truncated = bytes.len() > STDERR_LIMIT;
+    bytes.truncate(STDERR_LIMIT);
+    Captured::new(bytes, truncated)
 }
 
 impl Transport for SshTransport {

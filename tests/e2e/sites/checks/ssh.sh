@@ -380,6 +380,38 @@ check_system_config_include() {
 	return $ok
 }
 
+# check_multiplexing — the target's client (OpenSSH 10.0p2, Linux), with a home of its own
+# (lib/client_mux.sh): the P3.4 transport's facts. A control socket path of 90 bytes binds
+# and one of 91 fails the call; the first call ends with its output while its master lives
+# on (`-O check`); later calls share its connection; a stopped master makes a call wait
+# and fall back; after `-O stop` the next call starts a new master; past MaxSessions a call
+# opens its own connection after two lines the classifier skips; a `-N` starter leaves a
+# live master; with `ControlPersist`, a jump host's failure loses its reason.
+check_multiplexing() {
+	local ok=0
+	in_target_client "$E2E_DIR/lib/client_mux.sh" || return 1
+	expect_result "a 90-byte socket path binds" socket-path-90-exit 0 || ok=1
+	expect_result "a 91-byte socket path fails the call" socket-path-91-exit 255 || ok=1
+	expect_result "… saying it is too long" socket-path-91-says-too-long yes || ok=1
+	expect_result "the first call ends with its output" first-call-exit 0 || ok=1
+	expect_result "its master is live after it" master-live yes || ok=1
+	expect_result "a later call shares its connection" same-connection yes || ok=1
+	expect_result "a stopped master: the call still runs" stopped-master-exit 0 || ok=1
+	expect_result "… after 'master hello exchange failed'" stopped-master-line yes || ok=1
+	expect_result "-O stop is accepted" stop-exit 0 || ok=1
+	expect_result "after -O stop, a new connection" after-stop-new-connection yes || ok=1
+	expect_result "eleven calls at once all run" max-sessions-failed 0 || ok=1
+	expect_result "the refused session's line" max-sessions-refused-line yes || ok=1
+	expect_result "the fallback's line" max-sessions-fallback-line yes || ok=1
+	expect_result "a -N starter exits 0" starter-exit 0 || ok=1
+	expect_result "… and leaves its master live" starter-master-live yes || ok=1
+	expect_result "unknown jump host key, plain: fails" jump-plain-exit 255 || ok=1
+	expect_result "… and says why" jump-plain-says-why yes || ok=1
+	expect_result "unknown jump host key, ControlPersist: fails" jump-shared-exit 255 || ok=1
+	expect_result "… and the reason is lost" jump-shared-hides-why yes || ok=1
+	return $ok
+}
+
 group_ssh() {
 	check ssh.failure-samples "OpenSSH stderr per failure class (auth, host key, network)" check_failure_samples
 	check ssh.connect-timeout "Connect timeout to an unroutable address (network-dependent)" check_connect_timeout
@@ -392,4 +424,5 @@ group_ssh() {
 	check ssh.generated-config-rules "Generated ssh_config: precedence, quoting, defaults" check_generated_config_rules
 	check ssh.agent-isolation "An ssh_config's AddKeysToAgent cannot add apvm's key" check_agent_isolation
 	check ssh.system-config-include "The system ssh_config: unchecked alone, checked once included" check_system_config_include
+	check ssh.multiplexing "Multiplexing: socket path limit, a live master, MaxSessions, proxies" check_multiplexing
 }

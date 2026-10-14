@@ -637,6 +637,66 @@ fn noise_lines_around_a_failure_change_nothing() {
     }
 }
 
+/// What a multiplexed call prints when it goes on over a connection of its
+/// own (real, 10.3p1): a master at sshd's `MaxSessions`, then the line of a
+/// call that could not become the master (alone when another call became
+/// it first); a master whose network connection died (after its keep-alive
+/// checks gave up); a stopped master (after the connect timeout).
+const MUX_FALLBACKS: [&str; 3] = [
+    "mux_client_request_session: session request failed: Session open refused by peer\r\n\
+     ControlSocket /tmp/claude-501/mx/mux/24b95b452d45b637cea6bcd02cba7dce6b61a64e already \
+     exists, disabling multiplexing\r\n",
+    "mux_client_request_session: read from master failed: Broken pipe\r\n",
+    "muxclient: master hello exchange failed\r\n\
+     ControlSocket /tmp/claude-501/mx2/mux/24b95b452d45b637cea6bcd02cba7dce6b61a64e already \
+     exists, disabling multiplexing\r\n",
+];
+
+/// Every fallback sample, one after the other.
+fn mux_fallback() -> String {
+    MUX_FALLBACKS.concat()
+}
+
+#[test]
+fn a_multiplexed_call_that_opens_its_own_connection_prints_noise() {
+    let fallback = mux_fallback();
+    for line in fallback.lines() {
+        assert!(is_noise(line.trim()), "{line}");
+    }
+    for sample in MUX_FALLBACKS {
+        // Alone (the call then ran, or failed without a message).
+        let failure = classify(&failed(sample)).unwrap();
+        assert_eq!(
+            (failure.kind(), failure.line()),
+            (SshFailureKind::Unrecognized, None)
+        );
+    }
+    for (name, stderr, kind, line) in samples() {
+        let failure = classify(&failed(&format!("{fallback}{stderr}"))).unwrap();
+        assert_eq!(
+            (failure.kind(), failure.line()),
+            (kind, Some(line)),
+            "{name}"
+        );
+    }
+    // Alone after the nonce (the master died during the call: ssh prints
+    // nothing, verified on 10.3p1), it is a lost connection.
+    let stdout = format!("{}\n", nonce());
+    let lost = execution(Exit::TransportFailed, &stdout, &mux_fallback());
+    let failure = classify(&lost).unwrap();
+    assert_eq!(
+        (failure.kind(), failure.line()),
+        (SshFailureKind::ConnectionLost, None)
+    );
+    // Remote text that merely mentions multiplexing is not noise.
+    assert!(!is_noise("mux_client_request_session"));
+    // Only the verified fallbacks: another mux line keeps its diagnosis.
+    assert!(!is_noise(
+        "mux_client_request_session: unexpected response from master 0x1"
+    ));
+    assert!(!is_noise("note: muxclient: master hello exchange failed"));
+}
+
 #[test]
 fn noise_alone_is_unrecognized_with_no_line() {
     let stderr = "Warning: Permanently added 'target' (ED25519) to the list of known hosts.\r\n\

@@ -63,7 +63,10 @@
 //! shell's locale warning, the pseudo-terminal notice, OpenSSH 10.1's
 //! warning about a key exchange that is not post-quantum, an ssh_config
 //! option this ssh lacks (`Unsupported option "gssapiauthentication"`) or
-//! key file it misses (`no such identity`), and what ssh prints after its
+//! key file it misses (`no such identity`), a multiplexed call that goes
+//! on over a connection of its own (a master's refused session, a master
+//! whose connection died or that is stopped, a lost race to become the
+//! master), and what ssh prints after its
 //! jump host or ProxyCommand ended: `Connection closed by UNKNOWN port
 //! 65535`, and before 9.5 `kex_exchange_identification: Connection closed by
 //! remote host` (`ssh_exchange_identification:` before 8.0) as the last of
@@ -136,6 +139,18 @@ const NOISE: &[Phrase] = &[
     // /home/u/.ssh/id_work: No such file or directory`): ssh tries the
     // next key. apvm's own key is checked before ssh runs.
     Starts("no such identity: "),
+    // Multiplexing (P3.4, verified on 10.3p1; the first and last on 7.6p1,
+    // 8.2p1 and 9.6p1 too): a call that found a master at sshd's
+    // `MaxSessions` (`mux_client_request_session: session request failed:
+    // Session open refused by peer`), one whose network connection died
+    // (`mux_client_request_session: read from master failed: Broken pipe`),
+    // or a stopped master (`muxclient: master hello exchange failed`), or
+    // that lost the race to become the master (`ControlSocket <path> already
+    // exists, disabling multiplexing`), goes on over a connection of its own.
+    Starts("mux_client_request_session: session request failed: "),
+    Starts("mux_client_request_session: read from master failed: "),
+    Is("muxclient: master hello exchange failed"),
+    In(" already exists, disabling multiplexing"),
 ];
 
 /// What ssh prints, as the last of several lines, when its jump host or

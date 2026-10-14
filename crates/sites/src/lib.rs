@@ -31,8 +31,9 @@
 //!   prefixes (`sudo -n -u U -g G`, `runuser`), the closed set of root
 //!   commands, and the hermetic WP-CLI command; the transport contract and
 //!   the SSH transport that runs them (every option in a private generated
-//!   ssh_config, so jump hosts get them too), and the classification of
-//!   ssh's own failures into stable codes.
+//!   ssh_config, so jump hosts get them too; one shared connection per
+//!   server and configuration, and a limit of calls per server), and the
+//!   classification of ssh's own failures into stable codes.
 //! - [`wp`]: the typed WP-CLI commands apvm runs on a site (no caller can
 //!   add a flag), strict parsers for their output (PHP notices
 //!   skipped and reported; HTML pages, truncated or ambiguous output

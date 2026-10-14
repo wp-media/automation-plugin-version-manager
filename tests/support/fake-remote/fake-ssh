@@ -8,6 +8,26 @@
 # stdin, stdout and stderr pass through, and the exit status is the command's.
 #
 #   fake-ssh -F CONFIG [-l USER] [-p PORT] [-J HOPS] -- HOST COMMAND
+#   fake-ssh -F CONFIG -N [-l USER] [-p PORT] [-J HOPS] -- HOST
+#                                a master's starter: with `ControlMaster auto`, starts a
+#                                stand-in master (python3) on CONFIG's expanded
+#                                `ControlPath` (`%C` read as FAKE_HASH), which says
+#                                hello to every connection as OpenSSH's does and ends
+#                                after 5 s without one, then exits 0; directives apply
+#                                as to a call (`fail`, `stall`, …)
+#   fake-ssh -F CONFIG -O CTL [-l USER] [-p PORT] [-J HOPS] -- HOST
+#                                a control command (`check`, `stop`, …) to a master:
+#                                with `log`, appends `control: CTL` and the argv as
+#                                received (`arg:` lines) to the log; `check` exits 0
+#                                when the master is marked live or `master live` is
+#                                set, never answers with `master stuck` (as OpenSSH
+#                                with a stopped master), else exits 255 (no master)
+#   fake-ssh -F CONFIG [-N] -G [-l USER] [-p PORT] [-J HOPS] -- HOST [COMMAND]
+#                                prints `user`, `hostname`, `port`, `controlpath`
+#                                (expanded as above), and `proxyjump HOPS` with `-J`,
+#                                `proxycommand CMD` with `#fake-ssh: proxy-command
+#                                CMD`; with a COMMAND and `#fake-ssh: command-host H`
+#                                (OpenSSH 10's `Match command`), `hostname H`
 #   fake-ssh [-T] -F none -G HOST
 #                                prints ssh's compiled-in defaults, as OpenSSH does:
 #                                those of 10.3p1, or, when run through a link whose
@@ -36,6 +56,19 @@
 #                            login environment would give it (DIR holds the
 #                            programs a test lets the server have: fake-sudo as
 #                            `sudo`, fake-wp as `wp`, links to real tools)
+#   #fake-ssh: stall SECS    wait SECS seconds before anything runs, as a call
+#                            stalled on a dead master does
+#   #fake-ssh: master live   `-O check` finds a live master (exit 0)
+#   #fake-ssh: master stuck  a stopped master as 9.6+ meets it: `-O check` hangs,
+#                            and a call whose `ControlPath` is not `none` first
+#                            prints `muxclient: master hello exchange failed`
+#   #fake-ssh: master hang   a stopped master as OpenSSH before 9.6 meets it:
+#                            `-O check` hangs, and so does a call whose
+#                            `ControlPath` is not `none`
+#   #fake-ssh: race yes      a starter loses the race to another process's
+#                            master: prints OpenSSH's `ControlSocket … already
+#                            exists, disabling multiplexing`, marks the master
+#                            live and waits as a plain `ssh -N` would
 #   #fake-ssh: host-key new  the host key is new: with `StrictHostKeyChecking
 #                            accept-new` it is recorded in the first
 #                            UserKnownHostsFile (with OpenSSH's notice), else
@@ -46,15 +79,18 @@
 # written fails with ETXTBSY on Linux).
 set -u
 
-config="" user="" port="" print_defaults=0 no_tty=0
+received=$(for arg in "$@"; do printf 'arg: %s\n' "$arg"; done)
+config="" user="" port="" jump="" print_defaults=0 no_tty=0 control="" no_command=0
 while [ $# -gt 0 ]; do
 	case $1 in
 	-T) no_tty=1; shift ;;
 	-F) config=$2; shift 2 ;;
 	-l) user=$2; shift 2 ;;
 	-p) port=$2; shift 2 ;;
-	-J) shift 2 ;;
+	-J) jump=$2; shift 2 ;;
+	-N) no_command=1; shift ;;
 	-o) shift 2 ;;
+	-O) control=$2; shift 2 ;;
 	-G) print_defaults=1; shift ;;
 	--) shift; break ;;
 	-*) printf 'fake-ssh: unknown option %s\r\n' "$1" >&2; exit 255 ;;
@@ -70,7 +106,7 @@ say() {
 	for line in "$@"; do printf '%s\r\n' "$line" >&2; done
 }
 
-if [ "$print_defaults" = 1 ]; then
+if [ "$print_defaults" = 1 ] && [ "$config" = none ]; then
 	[ "$no_tty" = 1 ] || say "Pseudo-terminal will not be allocated because stdin is not a terminal."
 	printf 'user %s\nport 22\n' "$(id -un)"
 	case $0 in
@@ -123,12 +159,48 @@ entries() {
 	done
 }
 
+# The `%C` fake-ssh expands: 40 hex digits, like OpenSSH's SHA-1.
+FAKE_HASH=0123456789abcdef0123456789abcdef01234567
+
+# control_path — CONFIG's `ControlPath`, unquoted and expanded (`%%`, `%C`).
+control_path() {
+	option ControlPath | sed 's/^"\(.*\)"$/\1/; s/%C/'"$FAKE_HASH"'/; s/%%/%/g'
+}
+
+if [ "$print_defaults" = 1 ]; then
+	shown=$host
+	[ -n "$command" ] && [ -n "$(directive command-host)" ] && shown=$(directive command-host)
+	printf 'user %s\nhostname %s\nport %s\n' "${user:-$(id -un)}" "$shown" "${port:-22}"
+	printf 'controlpath %s\n' "$(control_path)"
+	[ -n "$jump" ] && printf 'proxyjump %s\n' "$jump"
+	proxy=$(directive proxy-command)
+	[ -n "$proxy" ] && printf 'proxycommand %s\n' "$proxy"
+	exit 0
+fi
+
+if [ -n "$control" ]; then
+	log=$(directive log)
+	[ -n "$log" ] && printf 'control: %s\n%s\n' "$control" "$received" >>"$log"
+	[ "$control" != check ] && exit 0
+	case $(directive master) in
+	live) exit 0 ;;
+	stuck | hang) sleep 30; exit 255 ;;
+	esac
+	if [ -e "$(control_path)" ]; then
+		say "Master running (pid=1)"
+		exit 0
+	fi
+	say "Control socket connect($(control_path)): No such file or directory"
+	exit 255
+fi
+
 shown_host=$host
 [ -n "$port" ] && [ "$port" != 22 ] && shown_host="[$host]:$port"
 
 log=$(directive log)
 if [ -n "$log" ]; then
 	{
+		if [ "$no_command" = 1 ]; then printf 'run: -N\n'; else printf 'run: %s\n' "$command"; fi
 		for arg in -F "$config" ${user:+-l "$user"} ${port:+-p "$port"} -- "$host" "$command"; do
 			printf 'arg: %s\n' "$arg"
 		done
@@ -156,9 +228,17 @@ if [ "$(directive host-key)" = new ]; then
 	fi
 fi
 
+stall=$(directive stall)
+[ -n "$stall" ] && sleep "$stall"
 remote_path=$(directive path)
 fail_class=$(directive fail)
-[ -n "$remote_path" ] && PATH=$remote_path && export PATH
+
+# run_remote — runs the remote command, with PATH=DIR only under `path DIR` (set here,
+# not earlier, so the fake itself keeps its own tools).
+run_remote() {
+	[ -n "$remote_path" ] && PATH=$remote_path && export PATH
+	sh -c "$command"
+}
 
 case $fail_class in
 "") ;;
@@ -181,11 +261,53 @@ refused) say "ssh: connect to host $host port ${port:-22}: Connection refused"; 
 dns) say "ssh: Could not resolve hostname $host: Name or service not known"; exit 255 ;;
 timeout) say "ssh: connect to host $host port ${port:-22}: Connection timed out"; exit 255 ;;
 lost)
-	sh -c "$command"
+	run_remote
 	say "Connection to $host closed by remote host."
 	exit 255
 	;;
 *) say "fake-ssh: unknown failure class"; exit 255 ;;
 esac
 
+# serve_master PATH — a stand-in master on the Unix socket PATH, in the background: it
+# says hello (OpenSSH's first 4 bytes) to every connection, and ends, removing PATH,
+# after 5 s without one. Returns once PATH is a socket (or after 2 s).
+serve_master() {
+	python3 -I -c '
+import os, socket, sys
+path = sys.argv[1]
+server = socket.socket(socket.AF_UNIX)
+server.bind(path)
+server.listen(16)
+server.settimeout(5)
+while True:
+    try:
+        client, _ = server.accept()
+    except socket.timeout:
+        break
+    client.sendall(b"\0\0\0\x15")
+    client.close()
+os.unlink(path)' "$1" </dev/null >/dev/null 2>&1 &
+	tries=0
+	while [ ! -S "$1" ] && [ "$tries" -lt 100 ]; do
+		sleep 0.02
+		tries=$((tries + 1))
+	done
+}
+
+if [ "$no_command" = 1 ]; then
+	if [ "$(option ControlMaster)" = auto ]; then
+		rm -f "$(control_path)"
+		serve_master "$(control_path)"
+	fi
+	if [ "$(directive race)" = yes ]; then
+		say "ControlSocket $(control_path) already exists, disabling multiplexing"
+		sleep 30
+	fi
+	exit 0
+fi
+if [ "$(option ControlPath)" != none ]; then
+	[ "$(directive master)" = stuck ] && say "muxclient: master hello exchange failed"
+	[ "$(directive master)" = hang ] && sleep 30
+fi
+[ -n "$remote_path" ] && PATH=$remote_path && export PATH
 exec sh -c "$command"

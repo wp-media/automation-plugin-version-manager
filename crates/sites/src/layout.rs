@@ -9,7 +9,8 @@
 pub const INVENTORY_FILE_NAME: &str = "inventory.json";
 
 /// The directory of OpenSSH multiplexing sockets: `~/.apvm/ssh-mux`. Kept
-/// short because a socket path must fit in about 100 bytes.
+/// short because a socket path in it may hold at most 86 bytes on macOS and
+/// 90 on Linux, 49 of them past the directory (`remote/mux.rs`).
 pub const SSH_CONTROL_DIR_NAME: &str = "ssh-mux";
 
 /// The run-log directory, as path components: `~/.apvm/logs/sites`.
@@ -40,8 +41,8 @@ mod tests {
 
     #[test]
     fn the_control_dir_name_is_short() {
-        // `<home>/.apvm/<dir>/<40-hex %C>` must stay well under the ~100-byte
-        // socket path limit for ordinary home directories.
+        // `<home>/.apvm/<dir>/<8-character tag><40-hex %C>` must stay within
+        // macOS's 86-byte socket path limit for ordinary home directories.
         assert!(SSH_CONTROL_DIR_NAME.len() <= 8);
     }
 }

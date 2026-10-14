@@ -28,8 +28,10 @@
 //! (ssh 8.4 and later expand `%` tokens there, older ones read `%%`
 //! literally: verified on 7.6p1 and 8.2p1, so no spelling works for both).
 //! `%` in the key path is doubled (every version expands `%` tokens there;
-//! `%%` is a literal `%`, verified on 7.6p1–10.3p1). On Windows `\` becomes
-//! `/`, which Win32-OpenSSH also reads as a separator.
+//! `%%` is a literal `%`, verified on 7.6p1–10.3p1), and so is it in the
+//! control directory of a `ControlPath` (`remote/mux.rs`), where `${` is
+//! refused too and the socket name's `%C` stays a token. On Windows `\`
+//! becomes `/`, which Win32-OpenSSH also reads as a separator.
 //!
 //! **What ssh pastes into a shell command** for a jump host, the program
 //! and the `-F` value, must be shell-literal ([`shell_literal`]): ssh
@@ -45,16 +47,42 @@ use crate::allowlist::is_forbidden;
 use crate::inventory::ResolvedServer;
 use crate::problem::quoted_path;
 
-/// `ServerAliveInterval` (plan §6.1 item 7): seconds without data before
-/// ssh asks the server whether it is still there.
-pub(crate) const SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
-/// `ServerAliveCountMax` (plan §6.1 item 7): unanswered checks before ssh
-/// gives the connection up (one minute with the interval).
-pub(crate) const SERVER_ALIVE_COUNT_MAX: u32 = 4;
+/// How ssh notices a server that stopped answering: `ServerAliveInterval`
+/// (seconds without data before ssh asks the server whether it is still
+/// there) and `ServerAliveCountMax` (unanswered checks before ssh gives the
+/// connection up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServerAlive {
+    /// `ServerAliveInterval`, in seconds.
+    pub(crate) interval_secs: u32,
+    /// `ServerAliveCountMax`.
+    pub(crate) count_max: u32,
+}
+
+impl ServerAlive {
+    /// A call's own connection (plan §6.1 item 7): given up after about a
+    /// minute of silence from the server.
+    pub(crate) const OWN: Self = Self {
+        interval_secs: 15,
+        count_max: 4,
+    };
+
+    /// A shared connection (P3.4, `remote/mux.rs`): a dead master is given
+    /// up after 30 to 40 s rather than a minute and more (5 s × 3 gave 19.6 s
+    /// on 10.3p1 through a relay that drops a live connection), while a
+    /// blip shorter than that (a Wi-Fi roam, a VPN reconnect) does not cut
+    /// the long calls riding it (audit round 2: 5 s × 3 cut a 900 s install
+    /// on a 15 s blip). `ssh -O stop` after a stalled call bounds the rest.
+    pub(crate) const SHARED: Self = Self {
+        interval_secs: 10,
+        count_max: 3,
+    };
+}
 
 /// The options every call sets after the host key, key and timeout lines,
-/// each with why (they win over the user's ssh_config, for jump hosts too).
-const FIXED_OPTIONS: &[&str] = &[
+/// before the connection sharing lines ([`ConfigInputs::control`]), each
+/// with why (they win over the user's ssh_config, for jump hosts too).
+const SESSION_OPTIONS: &[&str] = &[
     // The P3.3 classifier reads ssh's messages: `QUIET` would hide them,
     // `DEBUG` flood stderr.
     "LogLevel INFO",
@@ -63,10 +91,11 @@ const FIXED_OPTIONS: &[&str] = &[
     "RequestTTY no",
     // The remote command is apvm's (`sh -s` or an upload's `sh -c`).
     "RemoteCommand none",
-    // No connection the user opened with other options is reused (that
-    // would skip apvm's host key checks); P3.4 adds apvm's own.
-    "ControlMaster no",
-    "ControlPath none",
+];
+
+/// The options every call sets after the connection sharing lines, each
+/// with why.
+const FORWARDING_OPTIONS: &[&str] = &[
     // Nothing else is forwarded to the server or run locally per call.
     "ForwardAgent no",
     "ForwardX11 no",
@@ -150,6 +179,13 @@ pub(crate) struct ConfigInputs<'a> {
     pub(crate) identity: Option<&'a Path>,
     /// `ConnectTimeout`, in seconds.
     pub(crate) connect_timeout_secs: u32,
+    /// The keep-alive checks.
+    pub(crate) server_alive: ServerAlive,
+    /// The connection sharing lines (`remote/mux.rs`): apvm's own
+    /// `ControlMaster`/`ControlPath`/`ControlPersist`, or none shared at
+    /// all, so no connection the user opened with other options is reused
+    /// (that would skip apvm's host key checks).
+    pub(crate) control: &'a [&'a str],
     /// The [`PINNED_IF_KNOWN`] lines this ssh knows ([`pinned_options`]).
     pub(crate) pinned: &'a [&'static str],
     /// The ssh_config files to include, in order.
@@ -205,9 +241,17 @@ pub(crate) fn render(
         lines.push("IdentitiesOnly yes".to_string());
     }
     lines.push(format!("ConnectTimeout {}", inputs.connect_timeout_secs));
-    lines.push(format!("ServerAliveInterval {SERVER_ALIVE_INTERVAL_SECS}"));
-    lines.push(format!("ServerAliveCountMax {SERVER_ALIVE_COUNT_MAX}"));
-    lines.extend(FIXED_OPTIONS.iter().map(|option| option.to_string()));
+    lines.push(format!(
+        "ServerAliveInterval {}",
+        inputs.server_alive.interval_secs
+    ));
+    lines.push(format!(
+        "ServerAliveCountMax {}",
+        inputs.server_alive.count_max
+    ));
+    lines.extend(SESSION_OPTIONS.iter().map(|option| option.to_string()));
+    lines.extend(inputs.control.iter().map(|option| option.to_string()));
+    lines.extend(FORWARDING_OPTIONS.iter().map(|option| option.to_string()));
     lines.extend(inputs.pinned.iter().map(|option| option.to_string()));
     for include in inputs.includes {
         let path =
@@ -256,6 +300,9 @@ enum PathUse {
     KnownHosts,
     /// `Include`: patterns are expanded.
     Include,
+    /// The directory of a `ControlPath`: `%` tokens and `${VAR}` are
+    /// expanded by every version (`${VAR}` from 8.4; verified on 10.3p1).
+    Control,
 }
 
 /// `path` as one double-quoted ssh_config argument (see the module docs).
@@ -270,6 +317,40 @@ enum PathUse {
 ///
 /// Why it cannot be written, phrased to follow the path.
 fn config_path(path: &Path, usage: PathUse, platform: Platform) -> PathRule {
+    Ok(format!("\"{}\"", escaped(path, usage, platform)?))
+}
+
+/// The `ControlPath` value for the sockets named `name` in `dir`, one
+/// double-quoted argument: `dir` escaped like any path ssh expands `%`
+/// tokens in (`%%`, verified with a directory holding a space and a `%` on
+/// 10.3p1), `name` as it is, so the `%C` it holds stays a token.
+///
+/// # Arguments
+///
+/// * `dir` - The control directory, an absolute local path
+/// * `name` - The socket name pattern (`[a-z2-7]` and `%C`)
+/// * `platform` - Whose path conventions apply
+///
+/// # Errors
+///
+/// Why `dir` cannot be written, phrased to follow it.
+pub(crate) fn control_path(dir: &Path, name: &str, platform: Platform) -> PathRule {
+    let dir = escaped(dir, PathUse::Control, platform)?;
+    Ok(format!("\"{}/{name}\"", dir.trim_end_matches('/')))
+}
+
+/// `path` as ssh_config text, before quoting (see [`config_path`]).
+///
+/// # Arguments
+///
+/// * `path` - An absolute local path
+/// * `usage` - How ssh reads it
+/// * `platform` - Whose path conventions apply
+///
+/// # Errors
+///
+/// Why it cannot be written, phrased to follow the path.
+fn escaped(path: &Path, usage: PathUse, platform: Platform) -> PathRule {
     let text = utf8(path)?;
     if let Some(bad) = text
         .chars()
@@ -288,7 +369,7 @@ fn config_path(path: &Path, usage: PathUse, platform: Platform) -> PathRule {
         Platform::Windows => text.replace('\\', "/"),
     };
     let text = match usage {
-        PathUse::Identity | PathUse::KnownHosts if text.contains("${") => {
+        PathUse::Identity | PathUse::KnownHosts | PathUse::Control if text.contains("${") => {
             return Err(refusal(&text, "holds '${', which ssh would expand"));
         }
         PathUse::KnownHosts if text.contains('%') => {
@@ -297,7 +378,7 @@ fn config_path(path: &Path, usage: PathUse, platform: Platform) -> PathRule {
                 "holds '%', which ssh 8.4 and later expand and older versions do not",
             ));
         }
-        PathUse::Identity => text.replace('%', "%%"),
+        PathUse::Identity | PathUse::Control => text.replace('%', "%%"),
         PathUse::KnownHosts => text,
         PathUse::Include if text.contains(['*', '?', '[']) => {
             return Err(refusal(
@@ -307,7 +388,7 @@ fn config_path(path: &Path, usage: PathUse, platform: Platform) -> PathRule {
         }
         PathUse::Include => text,
     };
-    Ok(format!("\"{text}\""))
+    Ok(text)
 }
 
 /// `path` as text, refused when it is not valid UTF-8 (ssh_config holds
@@ -401,8 +482,21 @@ pub(crate) fn arguments(
     server: &ResolvedServer,
     remote_command: &str,
 ) -> Vec<OsString> {
-    let ssh = &server.ssh;
     let mut args: Vec<OsString> = vec!["-F".into(), config.into()];
+    args.extend(destination(server));
+    args.push(remote_command.into());
+    args
+}
+
+/// The part of the argv that names where ssh connects: `[-l <user>] [-p
+/// <port>] [-J <hops>] -- <host>` (the same for every call to `server`).
+///
+/// # Arguments
+///
+/// * `server` - The server and its effective SSH settings
+pub(crate) fn destination(server: &ResolvedServer) -> Vec<OsString> {
+    let ssh = &server.ssh;
+    let mut args: Vec<OsString> = Vec::new();
     if let Some(user) = &ssh.user {
         args.extend(["-l".into(), user.value.clone().into()]);
     }
@@ -412,17 +506,14 @@ pub(crate) fn arguments(
     if let Some(hops) = &ssh.proxy_jump {
         args.extend(["-J".into(), hops.value.clone().into()]);
     }
-    args.extend([
-        "--".into(),
-        server.host.clone().into(),
-        remote_command.into(),
-    ]);
+    args.extend(["--".into(), server.host.clone().into()]);
     args
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::mux::NOT_SHARED;
 
     /// Inputs with one known_hosts file, no key and no include.
     fn minimal<'a>(known_hosts: &'a [&'a Path]) -> ConfigInputs<'a> {
@@ -431,6 +522,8 @@ mod tests {
             known_hosts,
             identity: None,
             connect_timeout_secs: 15,
+            server_alive: ServerAlive::OWN,
+            control: NOT_SHARED,
             pinned: &[],
             includes: &[],
             update_host_keys: false,
@@ -475,6 +568,8 @@ mod tests {
             known_hosts: &known,
             identity: Some(Path::new("/home/u/.ssh/id_ed25519")),
             connect_timeout_secs: 15,
+            server_alive: ServerAlive::OWN,
+            control: NOT_SHARED,
             pinned: &ALL_PINNED,
             includes: &includes,
             update_host_keys: true,
@@ -499,6 +594,8 @@ mod tests {
             known_hosts: &known,
             identity: None,
             connect_timeout_secs: 3600,
+            server_alive: ServerAlive::OWN,
+            control: NOT_SHARED,
             pinned: &[],
             includes: &includes,
             update_host_keys: false,
@@ -523,6 +620,8 @@ mod tests {
             known_hosts: &known,
             identity: Some(Path::new(r"C:\Users\Jane Doe\.ssh\id_ed25519")),
             connect_timeout_secs: 15,
+            server_alive: ServerAlive::OWN,
+            control: NOT_SHARED,
             pinned: &[],
             includes: &includes,
             update_host_keys: false,
@@ -575,6 +674,7 @@ mod tests {
             assert!(!old.contains(option), "{option}");
         }
         let inputs = ConfigInputs {
+            control: NOT_SHARED,
             pinned: &ALL_PINNED,
             ..minimal(&known)
         };

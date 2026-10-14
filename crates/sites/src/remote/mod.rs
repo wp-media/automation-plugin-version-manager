@@ -93,7 +93,9 @@
 //! caller trusts new ones for the call ([`HostKeyPolicy`]). When ssh itself
 //! fails (exit 255), [`classify`] tells why ([`SshFailureKind`], with the
 //! plan §4.5 `ssh_*` codes) from its stderr; a remote command's stderr is
-//! never read that way.
+//! never read that way. Given a control directory, calls with identical
+//! options share one connection per server ([`Multiplexing`], Unix only),
+//! and at most [`ServerLimits`] calls run at once per server.
 //!
 //! # Example
 //!
@@ -128,7 +130,9 @@ mod classify;
 pub(crate) mod fake;
 pub(crate) mod identity;
 pub(crate) mod inspect;
+mod limits;
 mod local;
+mod mux;
 mod quote;
 mod script;
 mod ssh;
@@ -143,6 +147,8 @@ pub use identity::{
     IdentityRefusal, LoginAccount, NamedRole, OwnerIds, PluginEntry, Reference, RootAccess,
     RootCommand, RootRole, SudoRefusal, SudoRefusalKind, SwitchTools, plan_identity,
 };
+pub use limits::ServerLimits;
+pub use mux::{CONTROL_PERSIST_SECS, Multiplexing, NoMultiplexing};
 pub use quote::quote;
 pub use script::{FileMode, Nonce, Script, UploadScript, WpCli};
 pub use ssh::{HostKeyPolicy, SshOptions, SshTransport};
