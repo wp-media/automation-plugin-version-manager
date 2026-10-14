@@ -577,7 +577,7 @@ fn ancestor_rule(owner: u32, mode: u32, me: u32) -> Result<(), String> {
 ///
 /// * `tmp` - A sticky directory of root's (`/tmp`)
 /// * `uid` - This process's effective user
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub(crate) fn fallback_dir(tmp: &Path, uid: u32) -> PathBuf {
     tmp.join(format!("apvm-mux-{uid}"))
 }

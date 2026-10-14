@@ -240,6 +240,9 @@ fn reasons_read_as_clauses() {
     }
 }
 
+// The fallback is Unix-only, like multiplexing itself: on Windows, `join`
+// would build `/tmp\apvm-mux-501`, which no Unix rule accepts.
+#[cfg(unix)]
 #[test]
 fn the_fallback_directory_is_short_and_this_users() {
     let dir = fallback_dir(Path::new("/tmp"), 501);
@@ -247,7 +250,10 @@ fn the_fallback_directory_is_short_and_this_users() {
     // Fits with room to spare: 17 + 49 bytes.
     assert!(expanded_length(&dir, TAG) <= 86);
     assert!(control_socket(&on(&dir, 86)).is_ok());
-    // Without a shared `/tmp` there is none.
+}
+
+#[test]
+fn without_a_shared_tmp_there_is_no_fallback() {
     assert_eq!(fallback_here(None), None);
 }
 
