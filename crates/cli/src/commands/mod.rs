@@ -9,6 +9,7 @@ mod group;
 mod info;
 mod inventory;
 pub mod list;
+mod remote;
 mod server;
 mod site;
 mod skill;

@@ -70,9 +70,9 @@ enum Commands {
     Cache(CacheArgs),
     /// View or change configuration settings
     Config(ConfigArgs),
-    /// Manage the SSH servers of the site inventory (never connects to them)
+    /// Manage the SSH servers of the site inventory, and test SSH to them
     Server(ServerArgs),
-    /// Manage the WordPress sites of the site inventory (never connects to them)
+    /// Manage the WordPress sites of the site inventory, and probe them over SSH
     Site(SiteArgs),
     /// Manage the groups of sites of the site inventory (never connects to them)
     Group(GroupArgs),
@@ -197,13 +197,15 @@ async fn dispatch(cli: Cli, paths: &Paths) -> std::result::Result<(), CommandErr
         return Ok(commands::uninstall::execute(*yes)?);
     }
 
-    // Inventory commands never connect to the servers (no SSH) and need
-    // neither the config file nor a GitHub client. APVM_INVENTORY (when set and not empty) replaces the
-    // default ~/.apvm/inventory.json.
+    // Inventory commands need neither the config file nor a GitHub client;
+    // only `server test|add` and `site test|add` connect (SSH, with shared
+    // connections in ~/.apvm/ssh-mux). APVM_INVENTORY (when set and not
+    // empty) replaces the default ~/.apvm/inventory.json.
     let inventory = || paths.inventory_file(inventory_io::env_override());
+    let control_dir = paths.ssh_control_dir();
     match &cli.command {
-        Commands::Server(args) => return Ok(args.execute(&inventory())?),
-        Commands::Site(args) => return Ok(args.execute(&inventory())?),
+        Commands::Server(args) => return Ok(args.execute(&inventory(), control_dir).await?),
+        Commands::Site(args) => return Ok(args.execute(&inventory(), control_dir).await?),
         Commands::Group(args) => return Ok(args.execute(&inventory())?),
         _ => {}
     }

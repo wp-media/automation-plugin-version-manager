@@ -1,13 +1,17 @@
-//! `apvm site` — the WordPress sites of the site inventory (plan §5.2). It
-//! never connects to them (no SSH): it reads or edits the inventory only,
-//! and removing a site changes nothing on its server.
+//! `apvm site` — the WordPress sites of the site inventory (plan §5.2).
+//! `list`, `show`, `edit` and `remove` read or edit the inventory only (no
+//! SSH; removing a site changes nothing on its server); `test` and `add`
+//! probe sites over SSH, read-only (plan §6.2, P4.3).
 //!
 //! ```text
 //! apvm site add <ID> --server <ID> --path <WP_ROOT> [site flags] [--group <ID>]…
+//!               [--no-test | --trust-new-host-key]
 //! apvm site edit <ID> [--server …] [--path …] [site flags] [--group <ID>]… [--unset <FIELD>]…
 //! apvm site list [--server <ID>]… [--group <ID>]… [--json]
 //! apvm site show <ID> [--json]
 //! apvm site remove <ID> [-y]
+//! apvm site test [<ID>…] [-s <ID>]… [-g <ID>]… [--server <ID>]… [--all-sites]
+//!                [--trust-new-host-key] [--json] [-j <N>]
 //!
 //! site flags: --url --wp-cli --run-as --owner --ownership --plugins-dir
 //!             --allow-root --tmp-dir --timeout --name --notes
@@ -18,20 +22,28 @@
 //! change → save), so concurrent edits all land; a refused change writes
 //! nothing. Refused input names the flag the user typed (`--run-as: …`).
 //! `--group` joins existing groups and never leaves one (`apvm group edit
-//! <GROUP> --remove <SITE>` does). The probe on `add` and `site test`
-//! arrive with the probe (plan P4.3): `add` builds the record
-//! ([`AddArgs::to_site`]) before saving it, which is where the probe will
-//! run.
+//! <GROUP> --remove <SITE>` does).
+//!
+//! `add` checks the record against the inventory, probes the site it
+//! describes (unless `--no-test`), then saves it; when the probe fails it
+//! asks whether to save anyway, and without a terminal to ask on it saves
+//! nothing. `test` probes the selected sites (a union of ids, groups and
+//! servers, like every command that takes targets), at most `-j` at a time
+//! and 4 per server, and exits 1 when any probe failed.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use super::inventory::field_table::{self, Change, TableField};
 use super::inventory::{
-    Console, Failure, Removal, count, load, name_flags, not_found, print_json_failure, quoted_ids,
-    remove_confirmed,
+    Console, Failure, Removal, Terminal, count, load, name_flags, not_found, print_json_failure,
+    quoted_ids, remove_confirmed,
 };
+use super::remote;
+use super::remote::render::{SiteResult, sites_json, sites_text};
+use super::remote::{LocalFuture, Remote, SshRemote, bounded, host_keys, save_anyway, writable};
 use apvm_sites::inventory::io;
-use apvm_sites::{EntityKind, Inventory, OwnershipPolicy, Site, SiteRemoval};
+use apvm_sites::{EntityKind, Inventory, OwnershipPolicy, Problem, Site, SiteRemoval, Targets};
 use clap::{ArgGroup, Args, Subcommand};
 use fields::{Field, Scope, Setting};
 
@@ -63,6 +75,8 @@ enum SiteAction {
     Show(ShowArgs),
     /// Remove a site from the inventory (nothing on its server changes)
     Remove(RemoveArgs),
+    /// Probe sites over SSH, read-only: login, identity, WP-CLI, WordPress
+    Test(TestArgs),
 }
 
 /// The optional site settings, shared by `site add` and `site edit`.
@@ -159,6 +173,138 @@ struct AddArgs {
     /// Add the site to an existing group (repeatable, or comma-separated)
     #[arg(long = "group", value_name = "ID", value_delimiter = ',')]
     groups: Vec<String>,
+    /// Save the site without probing it first
+    #[arg(long, conflicts_with = "trust_new_host_key")]
+    no_test: bool,
+    /// Trust and record the server's host key if ssh does not know it yet
+    /// (check its fingerprint first)
+    #[arg(long)]
+    trust_new_host_key: bool,
+}
+
+/// Arguments for `apvm site test`: at least one target.
+#[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("targets")
+        .required(true)
+        .multiple(true)
+        .args(["ids", "sites", "groups", "servers", "all_sites"])
+))]
+struct TestArgs {
+    /// Ids of the sites to test
+    #[arg(value_name = "ID")]
+    ids: Vec<String>,
+    /// Also test these sites (repeatable, or comma-separated)
+    #[arg(short = 's', long = "site", value_name = "ID", value_delimiter = ',')]
+    sites: Vec<String>,
+    /// Test every site of these groups (repeatable, or comma-separated)
+    #[arg(short = 'g', long = "group", value_name = "ID", value_delimiter = ',')]
+    groups: Vec<String>,
+    /// Test every site on these servers (repeatable, or comma-separated)
+    #[arg(long = "server", value_name = "ID", value_delimiter = ',')]
+    servers: Vec<String>,
+    /// Test every site in the inventory
+    #[arg(long)]
+    all_sites: bool,
+    /// Trust and record a server's host key if ssh does not know it yet
+    /// (check its fingerprint first)
+    #[arg(long)]
+    trust_new_host_key: bool,
+    /// Print the results as JSON
+    #[arg(long)]
+    json: bool,
+    /// Sites probed at once (at most 4 per server)
+    #[arg(
+        short = 'j',
+        long,
+        value_name = "N",
+        default_value_t = NonZeroUsize::new(super::remote::DEFAULT_JOBS).unwrap_or(NonZeroUsize::MIN),
+        value_parser = jobs_parser
+    )]
+    jobs: NonZeroUsize,
+}
+
+/// The most sites `site test -j` probes at once.
+const MAX_JOBS: usize = 32;
+
+/// Read `-j`: a whole number from 1 to [`MAX_JOBS`].
+///
+/// # Arguments
+///
+/// * `text` - The value typed
+///
+/// # Errors
+///
+/// A message clap shows when it is not one.
+fn jobs_parser(text: &str) -> Result<NonZeroUsize, String> {
+    text.parse::<NonZeroUsize>()
+        .ok()
+        .filter(|jobs| jobs.get() <= MAX_JOBS)
+        .ok_or_else(|| format!("must be a whole number from 1 to {MAX_JOBS}"))
+}
+
+impl TestArgs {
+    /// The selection the flags make: ids and `--site` together, then
+    /// groups, servers and `--all-sites`.
+    fn targets(&self) -> Targets {
+        Targets::new()
+            .with_sites(self.ids.iter().chain(&self.sites))
+            .with_groups(&self.groups)
+            .with_servers(&self.servers)
+            .with_all_sites(self.all_sites)
+    }
+
+    /// The library's refusal of the selection, its locations renamed after
+    /// what the user typed (`sites[2]` → `--site`, or `<ID>` for a
+    /// positional id; `all_sites` → `--all-sites`).
+    ///
+    /// # Arguments
+    ///
+    /// * `error` - What `resolve_targets` returned
+    fn refused(&self, error: apvm_sites::Error) -> Failure {
+        let apvm_sites::Error::InvalidInput { subject, problems } = error else {
+            return Failure::Sites(error);
+        };
+        let problems = problems
+            .into_iter()
+            .map(|problem| Problem {
+                location: self.target_flag(&problem.location),
+                message: problem.message,
+            })
+            .collect();
+        Failure::Sites(apvm_sites::Error::InvalidInput { subject, problems })
+    }
+
+    /// The flag behind a selection location.
+    ///
+    /// # Arguments
+    ///
+    /// * `location` - Such as `sites[1]`, `groups[0]` or `all_sites`
+    fn target_flag(&self, location: &str) -> String {
+        let index = |prefix: &str| {
+            location
+                .strip_prefix(prefix)?
+                .strip_prefix('[')?
+                .strip_suffix(']')?
+                .parse::<usize>()
+                .ok()
+        };
+        if let Some(index) = index("sites") {
+            return if index < self.ids.len() {
+                "<ID>"
+            } else {
+                "--site"
+            }
+            .to_string();
+        }
+        let flag = match location {
+            _ if index("groups").is_some() => "--group",
+            _ if index("servers").is_some() => "--server",
+            "all_sites" => "--all-sites",
+            other => return other.to_string(),
+        };
+        flag.to_string()
+    }
 }
 
 /// Arguments for `apvm site edit`: at least one change.
@@ -245,6 +391,8 @@ impl AddArgs {
             path,
             flags,
             groups: _,
+            no_test: _,
+            trust_new_host_key: _,
         } = self;
         let site = Site::new(id.clone(), server.clone(), path.clone());
         field_table::apply(&site, &flags.settings(), &[])
@@ -282,24 +430,34 @@ impl EditArgs {
 
 impl SiteArgs {
     /// Execute the command on the real terminal against the inventory file
-    /// `inventory` (`APVM_INVENTORY` or `~/.apvm/inventory.json`).
+    /// `inventory` (`APVM_INVENTORY` or `~/.apvm/inventory.json`), over
+    /// SSH with shared connections in `control_dir` (`~/.apvm/ssh-mux`).
     ///
     /// # Errors
     ///
     /// The command's [`Failure`]; with `--json` it is also printed as a
-    /// JSON document on stdout.
-    pub fn execute(&self, inventory: &Path) -> Result<(), Failure> {
-        Console::with_terminal(|console| self.run(inventory, console))
+    /// JSON document on stdout (a failed test's report already is).
+    pub async fn execute(&self, inventory: &Path, control_dir: &Path) -> Result<(), Failure> {
+        let remote = SshRemote::new(control_dir.to_path_buf());
+        let mut terminal = Terminal::new();
+        self.run(inventory, &mut terminal.console(), &remote).await
     }
 
-    /// Run the command with all I/O through `console`.
-    fn run(&self, path: &Path, console: &mut Console<'_>) -> Result<(), Failure> {
+    /// Run the command with all I/O through `console`, and every server
+    /// reached through `remote`.
+    async fn run(
+        &self,
+        path: &Path,
+        console: &mut Console<'_>,
+        remote: &dyn Remote,
+    ) -> Result<(), Failure> {
         let result = match &self.action {
-            SiteAction::Add(args) => add(path, args, console),
+            SiteAction::Add(args) => add(path, args, console, remote).await,
             SiteAction::Edit(args) => edit(path, args, console),
             SiteAction::List(args) => list(path, args, console),
             SiteAction::Show(args) => show(path, args, console),
             SiteAction::Remove(args) => remove(path, args, console),
+            SiteAction::Test(args) => test(path, args, console, remote).await,
         };
         print_json_failure(&result, self.json(), console);
         result
@@ -310,14 +468,24 @@ impl SiteArgs {
         match &self.action {
             SiteAction::List(args) => args.json,
             SiteAction::Show(args) => args.json,
+            SiteAction::Test(args) => args.json,
             SiteAction::Add(_) | SiteAction::Edit(_) | SiteAction::Remove(_) => false,
         }
     }
 }
 
-/// `apvm site add`: the site, then its groups, in one `io::update`.
-fn add(path: &Path, args: &AddArgs, console: &mut Console<'_>) -> Result<(), Failure> {
+/// `apvm site add`: probe the site (unless `--no-test`), then save it and
+/// its groups in one `io::update`.
+async fn add(
+    path: &Path,
+    args: &AddArgs,
+    console: &mut Console<'_>,
+    remote: &dyn Remote,
+) -> Result<(), Failure> {
     let site = args.to_site();
+    if !args.no_test {
+        test_new_site(path, args, &site, console, remote).await?;
+    }
     let joined = io::update(path, |inventory| {
         if let Err(error) = inventory.add_site(site.clone()) {
             return Err(refused_new_site(inventory, error, &site));
@@ -327,6 +495,116 @@ fn add(path: &Path, args: &AddArgs, console: &mut Console<'_>) -> Result<(), Fai
     console.print(&format!("Added site '{}'.\n", args.id));
     console.print(&joined_text(&joined));
     Ok(())
+}
+
+/// Probe the site `add` is about to save, as the inventory would hold it
+/// (the record and its groups are checked first, so a refusal costs no
+/// connection), print the report, and decide whether to save.
+///
+/// # Arguments
+///
+/// * `path` - The inventory file
+/// * `args` - The `add` flags
+/// * `site` - The new record
+/// * `console` - Where the report and the question go
+/// * `remote` - How the server is reached
+///
+/// # Errors
+///
+/// The record's or the inventory's refusal; [`Failure::TestFailed`] when
+/// the probe failed and the site is not to be saved.
+async fn test_new_site(
+    path: &Path,
+    args: &AddArgs,
+    site: &Site,
+    console: &mut Console<'_>,
+    remote: &dyn Remote,
+) -> Result<(), Failure> {
+    let mut inventory = writable(load(path, console)?)?;
+    if let Err(error) = inventory.add_site(site.clone()) {
+        return Err(refused_new_site(&inventory, error, site));
+    }
+    join_groups(&mut inventory, &site.id, &args.groups)?;
+    let resolved = inventory.resolve_site(&site.id)?;
+    let check = remote
+        .test_site(&resolved, host_keys(args.trust_new_host_key))
+        .await;
+    let result = SiteResult {
+        id: &site.id,
+        server: &resolved.server,
+        check: &check,
+        adding: true,
+    };
+    console.print(&sites_text(&[result]));
+    save_anyway(
+        console,
+        check.outcome.as_ref().err(),
+        EntityKind::Site,
+        &site.id,
+    )
+}
+
+/// `apvm site test`: probe the selected sites, at most `-j` at a time,
+/// and report them in inventory order.
+///
+/// # Errors
+///
+/// The selection's refusal (unknown ids, nothing selected); an unreadable
+/// inventory; [`Failure::TestFailed`] when any probe failed (after the
+/// report).
+async fn test(
+    path: &Path,
+    args: &TestArgs,
+    console: &mut Console<'_>,
+    remote: &dyn Remote,
+) -> Result<(), Failure> {
+    let inventory = load(path, console)?;
+    let selection = inventory
+        .resolve_targets(&args.targets())
+        .map_err(|error| args.refused(error))?;
+    if !args.json {
+        for warning in &selection.warnings {
+            console.warn(&warning.to_string());
+        }
+    }
+    let keys = host_keys(args.trust_new_host_key);
+    let tasks: Vec<LocalFuture<'_, _>> = selection
+        .sites
+        .iter()
+        .map(|site| remote.test_site(site, keys))
+        .collect();
+    let checks = bounded(tasks, args.jobs).await;
+    let results: Vec<SiteResult<'_>> = selection
+        .sites
+        .iter()
+        .zip(&checks)
+        .map(|(site, check)| SiteResult {
+            id: &site.id,
+            server: &site.server,
+            check,
+            adding: false,
+        })
+        .collect();
+    if args.json {
+        console.print(&sites_json(&results, &selection.warnings)?);
+    } else {
+        console.print(&sites_text(&results));
+    }
+    failed_tests(&results)
+}
+
+/// [`Failure::TestFailed`] when any site's test failed
+/// ([`remote::failed_tests`]).
+///
+/// # Arguments
+///
+/// * `results` - The tests, in the order reported
+fn failed_tests(results: &[SiteResult<'_>]) -> Result<(), Failure> {
+    let failures: Vec<(&str, &apvm_sites::Error)> = results
+        .iter()
+        .filter_map(|result| Some((result.id, result.check.outcome.as_ref().err()?)))
+        .collect();
+    remote::failed_tests(EntityKind::Site, &failures, results.len())
 }
 
 /// `apvm site edit`: the settings, then the groups, in one `io::update`.

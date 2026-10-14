@@ -78,6 +78,16 @@ pub enum Failure {
     Changed(String),
     /// A `--json` document could not be serialized (not expected).
     Json(serde_json::Error),
+    /// A connection test failed (`server test`, `site test`, or the test
+    /// `add` runs before saving): its report, `--json` included, is already
+    /// printed, so only this summary goes to stderr. `code` is the first
+    /// failed test's (plan §4.5).
+    TestFailed {
+        /// What failed, and what was not done because of it.
+        message: String,
+        /// The first failed test's stable code.
+        code: &'static str,
+    },
 }
 
 impl Failure {
@@ -89,7 +99,14 @@ impl Failure {
             Self::ConfirmationRequired(_) | Self::Prompt(_) => CONFIRMATION_REQUIRED,
             Self::Changed(_) => Code::InventoryChanged.as_str(),
             Self::Json(_) => INTERNAL_ERROR,
+            Self::TestFailed { code, .. } => code,
         }
+    }
+
+    /// Whether the command already printed its own report of this failure
+    /// (so no `--json` error document follows it).
+    fn reported(&self) -> bool {
+        matches!(self, Self::TestFailed { .. })
     }
 
     /// The located problems: the library's, else none.
@@ -137,9 +154,10 @@ impl std::fmt::Display for Failure {
         match self {
             Self::Sites(error) => f.write_str(&render(error)),
             Self::Remedied { error, remedy } => write!(f, "{}\n  {remedy}", render(error)),
-            Self::Usage(message) | Self::ConfirmationRequired(message) | Self::Changed(message) => {
-                f.write_str(message)
-            }
+            Self::Usage(message)
+            | Self::ConfirmationRequired(message)
+            | Self::Changed(message)
+            | Self::TestFailed { message, .. } => f.write_str(message),
             Self::Prompt(error) => write!(f, "cannot ask for confirmation: {error}"),
             Self::Json(error) => write!(f, "cannot write the JSON output: {error}"),
         }
@@ -347,20 +365,7 @@ impl Console<'_> {
     ///
     /// * `command` - What to run
     pub fn with_terminal<T>(command: impl FnOnce(&mut Console<'_>) -> T) -> T {
-        let mut out = |text: &str| {
-            let _ = std::io::stdout().write_all(text.as_bytes());
-        };
-        let mut err = |text: &str| {
-            let _ = std::io::stderr().write_all(text.as_bytes());
-        };
-        let mut ask = |question: &str| {
-            prompt::confirm_on_terminal(&format!("{} ", yellow(&format!("? {question}"))))
-        };
-        command(&mut Console {
-            out: &mut out,
-            err: &mut err,
-            ask: &mut ask,
-        })
+        command(&mut Terminal::new().console())
     }
 
     /// Write `text` to the output.
@@ -371,6 +376,46 @@ impl Console<'_> {
     /// Write a `warn` line to the diagnostics.
     pub fn warn(&mut self, message: &str) {
         (self.err)(&format!("{}\n", warn_line(message)));
+    }
+}
+
+/// The real terminal's I/O, owned, so an `async` command can hold a
+/// [`Console`] on it across `.await`s ([`Console::with_terminal`] runs a
+/// closure).
+pub struct Terminal {
+    /// Writes the command's output.
+    out: fn(&str),
+    /// Writes diagnostics.
+    err: fn(&str),
+    /// Asks a yes/no question on the terminal.
+    ask: fn(&str) -> io::Result<Option<bool>>,
+}
+
+impl Terminal {
+    /// The terminal: output to stdout, diagnostics to stderr (both best
+    /// effort, so a closed pipe cannot crash a change that already
+    /// happened), and prompts only when stdin is a terminal.
+    pub fn new() -> Self {
+        Self {
+            out: |text| {
+                let _ = std::io::stdout().write_all(text.as_bytes());
+            },
+            err: |text| {
+                let _ = std::io::stderr().write_all(text.as_bytes());
+            },
+            ask: |question| {
+                prompt::confirm_on_terminal(&format!("{} ", yellow(&format!("? {question}"))))
+            },
+        }
+    }
+
+    /// A console on this terminal.
+    pub fn console(&mut self) -> Console<'_> {
+        Console {
+            out: &mut self.out,
+            err: &mut self.err,
+            ask: &mut self.ask,
+        }
     }
 }
 
@@ -422,6 +467,7 @@ pub fn confirm_change(
 pub fn print_json_failure(result: &Result<(), Failure>, json: bool, console: &mut Console<'_>) {
     if let Err(failure) = result
         && json
+        && !failure.reported()
         && let Ok(document) = failure.to_json()
     {
         console.print(&document);

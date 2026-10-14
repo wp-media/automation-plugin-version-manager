@@ -102,7 +102,30 @@ pub(super) fn named_users(site: &ResolvedSite) -> Vec<AccountName> {
     names
 }
 
-/// Step H's commands, in the order [`at`] reads them.
+/// The login user's commands: its ids, names, groups and shell, the
+/// tools, and `command -v` of `wp_cli`; the start of step H, in the order
+/// [`at`] reads them, and all of a server's test
+/// ([`probe_server`](super::probe_server), which [`host_facts`] reads too).
+///
+/// # Arguments
+///
+/// * `wp_cli` - The `wp_cli` program (its first token)
+pub(super) fn login_checks(wp_cli: &str) -> Vec<Inspect<'_>> {
+    let mut checks = vec![
+        Inspect::Uid,
+        Inspect::Gid,
+        Inspect::UserName,
+        Inspect::GroupName,
+        Inspect::Groups,
+        Inspect::Shell,
+    ];
+    checks.extend(TOOLS.iter().map(|tool| Inspect::Which(tool)));
+    checks.push(Inspect::Which(wp_cli));
+    checks
+}
+
+/// Step H's commands, in the order [`at`] reads them: [`login_checks`],
+/// then the plugins directory and the named users.
 ///
 /// # Arguments
 ///
@@ -114,17 +137,8 @@ pub(super) fn checks<'a>(
     dir: &'a str,
     users: &'a [AccountName],
 ) -> Vec<Inspect<'a>> {
-    let mut checks = vec![
-        Inspect::Uid,
-        Inspect::Gid,
-        Inspect::UserName,
-        Inspect::GroupName,
-        Inspect::Groups,
-        Inspect::Shell,
-    ];
-    checks.extend(TOOLS.iter().map(|tool| Inspect::Which(tool)));
+    let mut checks = login_checks(wp_cli);
     checks.extend([
-        Inspect::Which(wp_cli),
         Inspect::Walk {
             path: dir,
             login_uid: None,

@@ -74,6 +74,7 @@ fn add_edit_show_list_remove_round_trip_in_the_default_inventory() {
         "203.0.113.10",
         "--name",
         "EU VPS",
+        "--no-test",
     ]);
     assert_exit(&out, 0);
     assert_eq!(stdout(&out), "Added server 'eu-1'.\n");
@@ -241,6 +242,7 @@ fn defaults_and_servers_take_every_ssh_setting_and_clear_it() {
         "h",
         "--connect-timeout",
         "30",
+        "--no-test",
     ]);
     assert_exit(&out, 0);
     let out = sandbox.run(&["server", "show", "eu-1"]);
@@ -299,7 +301,16 @@ fn servers_inherit_the_defaults_field_by_field() {
         0,
     );
     assert_exit(
-        &sandbox.run(&["server", "add", "a", "--host", "h", "--port", "22"]),
+        &sandbox.run(&[
+            "server",
+            "add",
+            "a",
+            "--host",
+            "h",
+            "--port",
+            "22",
+            "--no-test",
+        ]),
         0,
     );
     let out = sandbox.run(&["server", "show", "a", "--json"]);
@@ -432,6 +443,7 @@ fn control_characters_are_refused_and_escaped_and_unicode_is_kept() {
         "h",
         "--name",
         "Servidor Ñandú 🚀",
+        "--no-test",
     ]);
     assert_exit(&out, 0);
     let out = sandbox.run(&["server", "list"]);
@@ -572,7 +584,7 @@ fn apvm_inventory_points_every_command_at_another_file() {
     let other = sandbox.scratch().join("nested").join("inv.json");
     let env = [("APVM_INVENTORY", other.as_os_str())];
 
-    let out = sandbox.run_with_env(&["server", "add", "a", "--host", "h"], &env);
+    let out = sandbox.run_with_env(&["server", "add", "a", "--host", "h", "--no-test"], &env);
     assert_exit(&out, 0);
     assert_eq!(mode(&other), 0o600);
     assert!(
@@ -591,7 +603,7 @@ fn a_relative_apvm_inventory_is_relative_to_the_working_directory() {
     let sandbox = Sandbox::new();
     let env = [("APVM_INVENTORY", OsStr::new("inv/inventory.json"))];
     assert_exit(
-        &sandbox.run_with_env(&["server", "add", "a", "--host", "h"], &env),
+        &sandbox.run_with_env(&["server", "add", "a", "--host", "h", "--no-test"], &env),
         0,
     );
     assert!(sandbox.cwd().join("inv").join("inventory.json").is_file());
@@ -602,7 +614,7 @@ fn an_empty_apvm_inventory_means_the_default() {
     let sandbox = Sandbox::new();
     let env = [("APVM_INVENTORY", OsStr::new(""))];
     assert_exit(
-        &sandbox.run_with_env(&["server", "add", "a", "--host", "h"], &env),
+        &sandbox.run_with_env(&["server", "add", "a", "--host", "h", "--no-test"], &env),
         0,
     );
     assert!(sandbox.inventory_file().is_file());
@@ -721,7 +733,7 @@ fn a_locked_inventory_fails_after_the_wait_and_writes_nothing() {
         .expect("open lock");
     lock.lock().expect("hold the lock");
 
-    let out = sandbox.run(&["server", "add", "x", "--host", "h"]);
+    let out = sandbox.run(&["server", "add", "x", "--host", "h", "--no-test"]);
     assert_exit(&out, 1);
     assert!(
         stderr(&out).contains("cannot lock the inventory")
@@ -751,7 +763,7 @@ fn concurrent_adds_from_many_processes_all_land() {
             common::spawn_retrying_busy(|| {
                 sandbox
                     .command_for(Path::new(common::APVM))
-                    .args(["server", "add", id, "--host", "h"])
+                    .args(["server", "add", id, "--host", "h", "--no-test"])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -805,6 +817,7 @@ fn site_add_edit_show_list_remove_round_trip() {
         "check",
         "--group",
         "qa",
+        "--no-test",
     ]);
     assert_exit(&out, 0);
     assert_eq!(
@@ -1124,7 +1137,16 @@ fn apvm_inventory_points_site_commands_at_another_file() {
     fs::write(&other, SAMPLE).expect("write");
     let env = [("APVM_INVENTORY", other.as_os_str())];
     let out = sandbox.run_with_env(
-        &["site", "add", "x", "--server", "bare", "--path", "/srv/x"],
+        &[
+            "site",
+            "add",
+            "x",
+            "--server",
+            "bare",
+            "--path",
+            "/srv/x",
+            "--no-test",
+        ],
         &env,
     );
     assert_exit(&out, 0);
@@ -1150,7 +1172,16 @@ fn concurrent_site_adds_from_many_processes_all_land() {
                 sandbox
                     .command_for(Path::new(common::APVM))
                     .args([
-                        "site", "add", id, "--server", "bare", "--path", &path, "--group", "qa",
+                        "site",
+                        "add",
+                        id,
+                        "--server",
+                        "bare",
+                        "--path",
+                        &path,
+                        "--group",
+                        "qa",
+                        "--no-test",
                     ])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
@@ -1460,7 +1491,16 @@ fn concurrent_group_edits_from_many_processes_all_land() {
     let ids: Vec<String> = (0..8).map(|n| format!("s{n}")).collect();
     for id in &ids {
         let path = format!("/var/www/{id}");
-        let out = sandbox.run(&["site", "add", id, "--server", "bare", "--path", &path]);
+        let out = sandbox.run(&[
+            "site",
+            "add",
+            id,
+            "--server",
+            "bare",
+            "--path",
+            &path,
+            "--no-test",
+        ]);
         assert_exit(&out, 0);
     }
     let children: Vec<_> = ids

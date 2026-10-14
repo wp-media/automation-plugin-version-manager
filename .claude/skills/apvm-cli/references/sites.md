@@ -6,11 +6,12 @@ default SSH settings every server inherits. This release ships the server,
 site and group commands (`apvm server …`, `apvm site …`, `apvm group …`);
 the `wp` commands come later.
 
-No inventory command connects to your servers: it reads or edits the file
-only, and no SSH connection is made (the connection tests, `apvm server
-test`, `apvm site test` and the probe on `site add`, come with a later
-release). Removing a site, a server or a group changes nothing on the
-machine itself. Like every apvm command run on a
+Only the connection tests connect to your servers: `apvm server test`,
+`apvm site test`, and the test `server add` / `site add` run before saving
+(see [Connection tests](#connection-tests--server-test-site-test-and-add)).
+They are read-only. Every other inventory command reads or edits the file
+only. Removing a site, a server or a group changes nothing on the machine
+itself. Like every apvm command run on a
 terminal, it may check GitHub for a newer apvm in the background
 (`APVM_NO_UPDATE_CHECK=1` turns that off).
 
@@ -33,11 +34,12 @@ terminal, it may check GitHub for a newer apvm in the background
 | Command | Arguments | Notes |
 |---------|-----------|-------|
 | `apvm server defaults` | `[SSH flags] [--ssh-binary <PATH>] [--unset <FIELD>]… [--json]` | No change flags = show. `--key` is the **one main key** every server uses unless it sets its own |
-| `apvm server add <ID>` | `--host <HOST> [SSH flags] [--name <TEXT>] [--notes <TEXT>]` | `<HOST>` may be an `~/.ssh/config` alias; `--key` overrides the default key for this server |
-| `apvm server edit <ID>` | the `add` flags (`--host` optional) + `[--unset <FIELD>]…` | At least one change (else exit 2). The id cannot change |
+| `apvm server add <ID>` | `--host <HOST> [SSH flags] [--name <TEXT>] [--notes <TEXT>] [--no-test \| --trust-new-host-key]` | `<HOST>` may be an `~/.ssh/config` alias; `--key` overrides the default key for this server. Tests SSH before saving unless `--no-test` |
+| `apvm server edit <ID>` | `[--host <HOST>] [SSH flags] [--name] [--notes]` + `[--unset <FIELD>]…` | At least one change (else exit 2). The id cannot change. Never connects (`apvm server test` does) |
 | `apvm server list` | `[--json]` | Inventory order |
 | `apvm server show <ID>` | `[--json]` | The record plus the **effective** (merged) SSH settings and where each comes from |
 | `apvm server remove <ID>` | `[--cascade] [-y\|--yes]` | Refused while sites use it, unless `--cascade` (its sites are removed too and leave their groups). Asks first unless `-y` |
+| `apvm server test <ID>…` | `[--trust-new-host-key] [--json]` | Logs in to each server named (a repeat counts once; up to 4 at a time) and reports the login user, its groups and tools. Exit 1 if any failed |
 
 SSH flags (the same for `defaults`, `add` and `edit`): `[--user <USER>]
 [--port <N>] [--key <PATH>] [--connect-timeout <SECS>]
@@ -212,11 +214,12 @@ APVM_INVENTORY=/tmp/test-inventory.json apvm server list
 
 | Command | Arguments | Notes |
 |---------|-----------|-------|
-| `apvm site add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]…` | The server must exist. `--group` (repeatable or comma-separated) adds the site to **existing** groups, in the same change (create them with `apvm group add`) |
-| `apvm site edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` | At least one change (else exit 2). The id cannot change. `--server` moves the site to another server. `--group` only joins groups: it never leaves one (`apvm group edit <GROUP> --remove <SITE>` does) |
+| `apvm site add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]… [--no-test \| --trust-new-host-key]` | The server must exist. `--group` (repeatable or comma-separated) adds the site to **existing** groups, in the same change (create them with `apvm group add`). Probes the site before saving unless `--no-test` |
+| `apvm site edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` | At least one change (else exit 2). The id cannot change. `--server` moves the site to another server. `--group` only joins groups: it never leaves one (`apvm group edit <GROUP> --remove <SITE>` does). Never connects (`apvm site test` checks the edited site) |
 | `apvm site list` | `[--server <ID>]… [--group <ID>]… [--json]` | Inventory order. Filters (repeatable or comma-separated): a site is listed when it is on any listed server **and** in any listed group. An unknown server or group id is an error (exit 1), never an empty list |
 | `apvm site show <ID>` | `[--json]` | The record, its groups, where ssh connects, and the **effective** settings with where each comes from |
 | `apvm site remove <ID>` | `[-y\|--yes]` | Removes it from the inventory (and from its groups); nothing on the server changes. Asks first unless `-y` |
+| `apvm site test` | `[<ID>…] [-s\|--site <ID>]… [-g\|--group <ID>]… [--server <ID>]… [--all-sites] [--trust-new-host-key] [--json] [-j\|--jobs <N>]` | Probes the selected sites, read-only. At least one target; ids and the flags (repeatable, comma-separated) form a union in inventory order. `-j` sites at once (1–32, default 4), at most 4 per server. Exit 1 if any failed |
 
 Site flags (the same for `add` and `edit`): `[--url <URL>] [--wp-cli "<CMD>"]
 [--run-as auto|login|<USER>] [--owner auto|<USER>[:<GROUP>]]
@@ -366,6 +369,118 @@ apvm site edit shop --unset url,timeout
 apvm site list --server eu-1 --group qa --json
 apvm site show shop --json
 apvm site remove legacy -y
+```
+
+## Connection tests — `server test`, `site test` and `add`
+
+They use the system OpenSSH client with the inventory's settings (§ effective
+SSH settings): `BatchMode` (never a prompt), the key you configured, your
+`~/.ssh/config` (or `--ssh-config`), your `~/.ssh/known_hosts` (or
+`--known-hosts`), jump hosts. Connections to one server are shared
+(OpenSSH multiplexing, sockets in `~/.apvm/ssh-mux`; off through jump hosts,
+with `--no-multiplex`, and on Windows). Nothing on the server changes.
+
+| Test | What runs (as the login user unless noted) | Shown on success |
+|------|---------------------------------------------|------------------|
+| server (`server test`, `server add`) | `id`, `printenv SHELL`, `command -v` of `sudo`, `runuser`, `sha256sum`/`shasum`/`openssl`, `wp` | `✓ connected`, then `login`, `groups`, `shell`, `sudo`, `runuser`, `checksum`, `wp` (`not found` when missing) |
+| site (`site test`, `site add`) | the server's checks; a walk to the plugins directory (`<path>/wp-content/plugins`, or `--plugins-dir`) reading its owner, group and mode (root's `stat` through `sudo -n` when the login user cannot read it); the identity (the directory's owner and group: `sudo -n -u U -g G`, `runuser`, or the login user; `--run-as`/`--owner` change it) running `wp … cli version` in apvm's exact command shape; as that identity, `wp eval` of WordPress's facts and `test -w`/`df` checks | `✓ ready`, then `login`, `groups`, `plugins dir` (path, `owner:group mode`), `runs as` (prefix and uid), `new files` (owner and group at creation, or checked after), `WP-CLI` (version, path), `WordPress` (version, PHP, single site or multisite), `site URL`, `writable` (plugins and upgrade directories), `free space`, `file mods` (only when `DISALLOW_FILE_MODS` is set), then `warn` lines (e.g. the identity cannot write the plugins directory, the siteurl differs from `--url`, no checksum tool, a fallback identity) |
+
+**Host keys.** Checked strictly: ssh refuses a host it has no key for, and
+apvm never accepts one silently. `--trust-new-host-key` (`StrictHostKeyChecking
+accept-new`, this run only) records an unknown key in the known_hosts file:
+check the fingerprint first. A key ssh recorded is shown before the result
+(`host key  trusted the new key of <host> and recorded it in <file>`). A
+**changed** key is refused even with the flag. Warnings: a new key ssh could
+not save (trusted for this run only), and a host certificate ssh refused
+before trusting the plain key as new (that bypassed your certificate
+authority).
+
+**Failures** show `✗ <code>: <message>`, then remedies, one per line:
+
+| Code | Means | Remedy apvm prints |
+|------|-------|--------------------|
+| `ssh_host_key_unknown` | No key known for the server or a jump host | check the fingerprint, then rerun with `--trust-new-host-key`; a ProxyCommand in your ssh_config runs its own ssh, which the flag does not reach |
+| `ssh_host_key_changed` | The key differs from the known one (or from the one known for its address), or is revoked | possibly an attack: once the new key is confirmed, `ssh-keygen -R '<name>' [-f <known_hosts>]` (the name ssh printed, or the address for an address mismatch), then rerun with `--trust-new-host-key`; a **revoked** key: investigate, never `ssh-keygen -R` |
+| `ssh_failed` | ssh failed for another reason; the line says which | an invalid host certificate: fix it on the server, never `--trust-new-host-key`; a ProxyCommand's own refusal; `RevokedHostKeys`/`HostKeyAlgorithms` in your ssh_config; the server's login shell did not run apvm's script (forced command, nologin) |
+| `ssh_auth_failed` | Login refused | check the user, the key and `authorized_keys` (`--user`, `--key`); a key file others can read: `chmod 600`; a key ssh cannot load: convert or replace it |
+| `ssh_unreachable` | Connection refused, unknown name, no route, not an SSH server, a jump host that cannot reach it | check `--host`, `--port`, `--jump` and the network |
+| `ssh_timeout` | The connection timed out | network, firewall, or `--connect-timeout` |
+| `ssh_connection_lost` | The connection dropped during the test | run it again |
+| `ssh_missing` | No usable OpenSSH client | install one, or `apvm server defaults --ssh-binary <PATH>` |
+| `invalid_input` | A local SSH file is unusable (missing key, a group-writable ssh_config, a known_hosts path with `%`, a system ssh_config ssh would refuse to include, …) | the flag to fix, or `chmod go-w` |
+| `sudo_password_required`, `sudo_not_allowed`, `sudo_requiretty`, `sudo_missing` | sudo cannot run WP-CLI as the identity without a password | the message names the sudoers line to add (`deploy ALL=(www-data : www-data) NOPASSWD: ALL`; edit with `visudo`) |
+| `owner_is_root` | root owns the plugins directory (or would run WP-CLI) | give it to the site's user, or `--allow-root` |
+| `plugins_dir_mismatch` | WordPress uses another plugins directory, a link the site could plant, or an `--owner` that does not own it | check who owns it, then `--plugins-dir <PATH>` (or `--owner`) |
+| `wp_cli_missing` | The WP-CLI command cannot run as the identity, or is not WP-CLI | `--wp-cli "<CMD>"` |
+| `not_wordpress`, `wp_not_installed` | No WordPress at `--path`, or no tables | check `--path` (or `wp core install`) |
+| `timeout` | A probe step ran past the site's `--timeout` (default 300 s), or a server's test past 60 s plus the connect timeout of the server and each jump host | `--timeout <SECS>` for a site; for a server, try again |
+| `probe_failed` | A step printed something apvm cannot read with certainty | the message says which step |
+
+Remedies name `apvm server edit <ID> …` / `apvm site edit <ID> …` for a
+record in the inventory, and the flags to pass for one `add` is adding.
+
+**`add` and a failed test.** The record (and its `--group`s) is checked first,
+so refused input or a read-only inventory fails without connecting. After the
+report, a failed test asks `The test failed (<code>). Save <server|site>
+'<id>' anyway? [y/N]` on a terminal: `y` saves it (with a `warn` line) and
+exits 0. On `n`, or when stdin is not a terminal, nothing is written and it
+exits 1: `<kind> '<id>' was not added: its test failed (<code>)[, and stdin
+is not a terminal to ask whether to save it anyway]` + `fix the problem and
+add it again, or pass --no-test to save it without testing`. `--no-test`
+saves without connecting (it conflicts with `--trust-new-host-key`).
+
+**Exit codes.** `0` every test passed; `1` any test failed (stderr ends with
+`Error: <kind> '<id>' failed its test (<code>)`, or `Error: N of M <kind>s
+failed the test`), an unknown id, an invalid inventory; `2` invalid
+arguments (no id or target, `-j 0`).
+
+**Output.** One block per server or site (`Server '<id>' (<destination>)` /
+`Site '<id>' on server '<server>' (<destination>)`), a blank line between
+them, and `N of M sites ready; K failed.` (`servers connected` for servers)
+when there are several. `site test` warns on stderr about selected groups or
+servers without sites, and sites that are the same WordPress install.
+Unknown targets are refused before any connection, naming what you typed
+(`<ID>: unknown site 'x'`, `--site: …`, `--group: …`, `--server: …`).
+
+**`--json`** (stdout, one document even when tests fail; an argument error
+prints the usual `{"schema": 1, "error": …}` instead):
+
+```text
+apvm server test <ID>… --json →
+  {"schema": 1, "ok": bool,
+   "servers": [{"server", "destination", "ok",
+                "host_keys": {"recorded": [host…], "not_saved": bool, "refused_certificate": str | null},
+                "login": {"user": {"id", "name"}, "group": {"id", "name"}, "groups": [gid…],
+                          "shell", "sudo", "runuser", "checksum", "wp_cli"} | null,
+                "error": {"code", "message", "problems": [{"location", "message"}],
+                          "remedies": [str…]} | null}]}
+apvm site test … --json →
+  {"schema": 1, "ok": bool, "warnings": [str…],
+   "sites": [{"site", "server", "destination", "ok", "host_keys": {…},
+              "probe": {"login": {…},
+                        "plugins_dir": {"path", "owner", "group", "mode": "0755", "read_by_root"},
+                        "identity": {"switch": "login"|"sudo"|"runuser", "runs_as", "uid",
+                                     "creation": "at_creation"|"check_after", "owner", "group"},
+                        "wp_cli": {"version", "path"},
+                        "wordpress": {"version", "php_version", "multisite", "siteurl", "home",
+                                      "disallow_file_mods"},
+                        "capabilities": {"plugins_dir_writable",
+                                         "upgrade_dir": "writable"|"not_writable"|"missing"|
+                                                        "missing_not_creatable"|"unknown",
+                                         "tmp_free_kib", "content_free_kib"},
+                        "warnings": [{"code": str | null, "message"}],
+                        "php_notices": [str…]} | null,
+              "error": {…as server test…} | null}]}
+```
+
+```sh
+apvm server test eu-1                          # SSH works? who am I there?
+apvm server test eu-1 --trust-new-host-key     # first contact, fingerprint checked
+apvm site test shop
+apvm site test -g qa --server eu-1 -j 8
+apvm site test --all-sites --json | jq '.sites[] | select(.ok | not) | .error'
+apvm site add shop --server eu-1 --path /var/www/shop          # probes, then saves
+apvm site add later --server eu-1 --path /var/www/later --no-test
 ```
 
 ## `apvm group` — named lists of sites

@@ -11,13 +11,17 @@ use tempfile::TempDir;
 use super::*;
 use crate::commands::inventory::Recorder;
 use crate::commands::inventory::field_table::TableRecord;
+use crate::commands::remote::tests::{FakeRemote, block_on};
 
-/// A temporary directory holding the inventory under test.
+/// A temporary directory holding the inventory under test, and the fake
+/// servers commands connect to.
 struct Fixture {
     /// Keeps the directory alive.
     _dir: TempDir,
     /// `<dir>/inventory.json` (missing until written).
     path: PathBuf,
+    /// What `test` and `add` reach (every server healthy unless changed).
+    remote: FakeRemote,
 }
 
 impl Fixture {
@@ -25,7 +29,17 @@ impl Fixture {
     fn empty() -> Self {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("inventory.json");
-        Self { _dir: dir, path }
+        Self {
+            _dir: dir,
+            path,
+            remote: FakeRemote::healthy(),
+        }
+    }
+
+    /// This fixture, its commands reaching `remote`.
+    fn reaching(mut self, remote: FakeRemote) -> Self {
+        self.remote = remote;
+        self
     }
 
     /// A fixture whose file holds `inventory`.
@@ -61,7 +75,9 @@ impl Fixture {
     fn run(&self, args: &[&str], answer: Option<bool>) -> (Result<(), Failure>, Recorder) {
         let command = parse(args);
         let mut recorder = Recorder::new();
-        let result = recorder.run(answer, |console| command.run(&self.path, console));
+        let result = recorder.run(answer, |console| {
+            block_on(command.run(&self.path, console, &self.remote))
+        });
         (result, recorder)
     }
 
@@ -470,7 +486,15 @@ fn filters_refuse_unknown_ids() {
 #[test]
 fn add_saves_the_site_and_reports_it() {
     let fixture = Fixture::with(&sample());
-    let recorder = fixture.ok(&["add", "news", "--server", "us-1", "--path", "/srv/news"]);
+    let recorder = fixture.ok(&[
+        "add",
+        "news",
+        "--server",
+        "us-1",
+        "--path",
+        "/srv/news",
+        "--no-test",
+    ]);
     assert_eq!(recorder.out, "Added site 'news'.\n");
     assert_eq!(recorder.err, "");
     assert_eq!(fixture.site("news"), Site::new("news", "us-1", "/srv/news"));
@@ -488,6 +512,7 @@ fn add_joins_the_named_groups_in_the_same_change() {
         "/srv/news",
         "--group",
         "qa,empty",
+        "--no-test",
     ]);
     assert_eq!(
         recorder.out,
@@ -1214,7 +1239,7 @@ fn remove_blog_while(
             io::update(&fixture.path, &edit).expect("concurrent edit");
             Ok(Some(true))
         },
-        |console| command.run(&fixture.path, console),
+        |console| block_on(command.run(&fixture.path, console, &FakeRemote::healthy())),
     );
     (result, fixture.load())
 }
@@ -1289,7 +1314,15 @@ fn command_def(command: &str) -> clap::Command {
 
 /// Flags that are not settings of the site record (`--group` joins
 /// groups; `--verbose` is global).
-const NOT_SETTINGS: [&str; 5] = ["unset", "json", "yes", "group", "verbose"];
+const NOT_SETTINGS: [&str; 7] = [
+    "unset",
+    "json",
+    "yes",
+    "group",
+    "verbose",
+    "no-test",
+    "trust-new-host-key",
+];
 
 /// The flags that a site must have, so `--unset` cannot clear them.
 const REQUIRED: [&str; 2] = ["server", "path"];
@@ -1392,7 +1425,7 @@ fn every_flag_of_add_saves_its_value() {
             continue;
         }
         let fixture = Fixture::with(&sample());
-        let mut args = owned(&["add", "x", "--server", "eu-1", "--path", "/p"]);
+        let mut args = owned(&["add", "x", "--server", "eu-1", "--path", "/p", "--no-test"]);
         args.extend(flag_args(&flag, switch));
         let recorder = fixture.ok(&strs(&args));
         assert_eq!(recorder.out, "Added site 'x'.\n", "--{flag}");
@@ -1525,4 +1558,253 @@ fn relative_remote_paths_are_refused_not_warned_about() {
         assert_eq!(locations(&failure), [flag], "{flag}");
         assert_eq!(recorder.err, "", "{flag}: an error, not a warning");
     }
+}
+
+// ── probes (plan P4.3) ───────────────────────────────────────────────────
+
+use crate::commands::remote::tests::{unknown_key, unreachable};
+
+/// What the fixture's remote was asked.
+fn asked(fixture: &Fixture) -> Vec<String> {
+    fixture.remote.asked.borrow().clone()
+}
+
+#[test]
+fn add_probes_the_site_first_then_saves_it() {
+    let fixture = Fixture::with(&sample());
+    let recorder = fixture.ok(&["add", "news", "--server", "us-1", "--path", "/srv/news"]);
+    assert_eq!(asked(&fixture), ["site:news"]);
+    assert!(
+        recorder
+            .out
+            .starts_with("Site 'news' on server 'us-1' (198.51.100.7)\n  ✓ ready\n"),
+        "{}",
+        recorder.out
+    );
+    assert!(
+        recorder
+            .out
+            .contains("  runs as      sudo -u www-data -g www-data (uid 33)\n"),
+        "{}",
+        recorder.out
+    );
+    assert!(
+        recorder.out.ends_with("\nAdded site 'news'.\n"),
+        "{}",
+        recorder.out
+    );
+    assert_eq!(fixture.site("news"), Site::new("news", "us-1", "/srv/news"));
+    let trusted = Fixture::with(&sample());
+    trusted.ok(&[
+        "add",
+        "news",
+        "--server",
+        "us-1",
+        "--path",
+        "/srv/news",
+        "--trust-new-host-key",
+    ]);
+    assert_eq!(asked(&trusted), ["site:news+trust"]);
+    assert_eq!(
+        parse_error(&[
+            "add",
+            "a",
+            "--server",
+            "s",
+            "--path",
+            "/p",
+            "--no-test",
+            "--trust-new-host-key"
+        ]),
+        Some(clap::error::ErrorKind::ArgumentConflict)
+    );
+}
+
+#[test]
+fn add_refuses_bad_input_before_probing() {
+    let fixture = Fixture::with(&sample());
+    for args in [
+        &[
+            "add", "news", "--server", "us-1", "--path", "/p", "--group", "nope",
+        ][..],
+        &["add", "news", "--server", "nope", "--path", "/p"],
+        &["add", "shop", "--server", "us-1", "--path", "/p"],
+        &[
+            "add", "news", "--server", "us-1", "--path", "/p", "--run-as", "root",
+        ],
+    ] {
+        fixture.fails(args);
+    }
+    assert!(asked(&fixture).is_empty());
+    let newer = Fixture::with_text(r#"{"version": 7}"#);
+    let (failure, _) = newer.fails(&["add", "a", "--server", "s", "--path", "/p"]);
+    assert_eq!(failure.code(), "inventory_read_only");
+    assert!(asked(&newer).is_empty());
+}
+
+#[test]
+fn a_failed_probe_saves_the_site_and_its_groups_only_when_the_user_says_so() {
+    let remote = || FakeRemote::healthy().failing_site("news", unknown_key());
+    let args = [
+        "add",
+        "news",
+        "--server",
+        "us-1",
+        "--path",
+        "/srv/news",
+        "--group",
+        "qa",
+    ];
+    let fixture = Fixture::with(&sample()).reaching(remote());
+    let (result, recorder) = fixture.run(&args, Some(true));
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        recorder.asked,
+        ["The test failed (ssh_host_key_unknown). Save site 'news' anyway? [y/N]"]
+    );
+    assert!(
+        recorder.out.contains("--trust-new-host-key"),
+        "{}",
+        recorder.out
+    );
+    assert!(
+        recorder
+            .out
+            .ends_with("Added site 'news'.\nIt joined 1 group: 'qa'.\n"),
+        "{}",
+        recorder.out
+    );
+    for answer in [Some(false), None] {
+        let fixture = Fixture::with(&sample()).reaching(remote());
+        let before = fixture.bytes();
+        let (result, _) = fixture.run(&args, answer);
+        let Err(failure) = result else {
+            panic!("not saved for {answer:?}");
+        };
+        assert_eq!(failure.code(), "ssh_host_key_unknown");
+        assert!(
+            failure
+                .to_string()
+                .starts_with("site 'news' was not added: its test failed (ssh_host_key_unknown)"),
+            "{failure}"
+        );
+        assert_eq!(fixture.bytes(), before, "nothing written for {answer:?}");
+    }
+}
+
+#[test]
+fn test_probes_the_selection_in_inventory_order() {
+    let fixture = Fixture::with(&sample());
+    let recorder = fixture.ok(&["test", "api", "-s", "shop", "--group", "qa"]);
+    assert_eq!(asked(&fixture), ["site:shop", "site:api"]);
+    assert!(
+        recorder.out.ends_with("\n2 of 2 sites ready; 0 failed.\n"),
+        "{}",
+        recorder.out
+    );
+    let all = Fixture::with(&sample());
+    all.ok(&["test", "--all-sites", "-j", "1"]);
+    assert_eq!(asked(&all), ["site:shop", "site:blog", "site:api"]);
+    let server = Fixture::with(&sample());
+    server.ok(&["test", "--server", "us-1", "--trust-new-host-key"]);
+    assert_eq!(asked(&server), ["site:api+trust"]);
+}
+
+#[test]
+fn test_warns_about_parts_of_the_selection_without_sites() {
+    let fixture = Fixture::with(&sample());
+    let recorder = fixture.ok(&["test", "shop", "-g", "empty"]);
+    assert!(
+        recorder.err.contains("group 'empty' has no sites"),
+        "{}",
+        recorder.err
+    );
+    let recorder = fixture.ok(&["test", "shop", "-g", "empty", "--json"]);
+    assert_eq!(recorder.err, "", "JSON keeps warnings in the document");
+    let json: serde_json::Value = serde_json::from_str(&recorder.out).expect("JSON");
+    assert_eq!(json["warnings"][0], "group 'empty' has no sites");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["sites"][0]["site"], "shop");
+}
+
+#[test]
+fn test_fails_when_any_probe_fails_after_reporting_all() {
+    let fixture = Fixture::with(&sample())
+        .reaching(FakeRemote::healthy().failing_site("blog", unreachable()));
+    let (failure, recorder) = fixture.fails(&["test", "--server", "eu-1"]);
+    assert_eq!(failure.code(), "ssh_unreachable");
+    assert_eq!(failure.to_string(), "1 of 2 sites failed the test");
+    assert!(recorder.out.contains("Site 'shop'"), "{}", recorder.out);
+    assert!(
+        recorder.out.contains("  ✗ ssh_unreachable"),
+        "{}",
+        recorder.out
+    );
+    let (failure, _) = fixture.fails(&["test", "blog"]);
+    assert_eq!(
+        failure.to_string(),
+        "site 'blog' failed its test (ssh_unreachable)"
+    );
+    let (result, recorder) = fixture.run(&["test", "blog", "--json"], None);
+    assert!(result.is_err());
+    let json: serde_json::Value = serde_json::from_str(&recorder.out).expect("one document");
+    assert_eq!(json["sites"][0]["error"]["code"], "ssh_unreachable");
+}
+
+#[test]
+fn unknown_targets_name_the_flag_typed_and_connect_nowhere() {
+    let fixture = Fixture::with(&sample());
+    let problems = |args: &[&str]| -> Vec<String> {
+        let (failure, _) = fixture.fails(args);
+        let Failure::Sites(error) = failure else {
+            panic!("a library refusal");
+        };
+        error
+            .problems()
+            .iter()
+            .map(|problem| format!("{}: {}", problem.location, problem.message))
+            .collect()
+    };
+    let found = problems(&[
+        "test", "nope", "-s", "gone", "-g", "nogroup", "--server", "x",
+    ]);
+    assert_eq!(found.len(), 4, "{found:?}");
+    assert!(found[0].starts_with("<ID>: "), "{found:?}");
+    assert!(found[1].starts_with("--site: "), "{found:?}");
+    assert!(found[2].starts_with("--group: "), "{found:?}");
+    assert!(found[3].starts_with("--server: "), "{found:?}");
+    let empty = problems(&["test", "-g", "empty"]);
+    assert!(
+        empty.contains(&"--group: group 'empty' has no sites".to_string()),
+        "{empty:?}"
+    );
+    assert!(asked(&fixture).is_empty());
+    let (result, recorder) = fixture.run(&["test", "nope", "--json"], None);
+    assert!(result.is_err());
+    let json: serde_json::Value = serde_json::from_str(&recorder.out).expect("JSON error");
+    assert_eq!(json["error"]["problems"][0]["location"], "<ID>");
+}
+
+#[test]
+fn test_needs_a_target_and_a_sane_job_count() {
+    assert_eq!(
+        parse_error(&["test"]),
+        Some(clap::error::ErrorKind::MissingRequiredArgument)
+    );
+    for jobs in ["0", "33", "x"] {
+        assert_eq!(
+            parse_error(&["test", "shop", "-j", jobs]),
+            Some(clap::error::ErrorKind::ValueValidation),
+            "-j {jobs}"
+        );
+    }
+    let SiteAction::Test(args) = parse(&["test", "shop"]).action else {
+        panic!("test");
+    };
+    assert_eq!(args.jobs.get(), 4);
+    let SiteAction::Test(args) = parse(&["test", "--all-sites", "--jobs", "32"]).action else {
+        panic!("test");
+    };
+    assert_eq!(args.jobs.get(), 32);
+    assert!(parse(&["test", "shop", "--json"]).json());
 }

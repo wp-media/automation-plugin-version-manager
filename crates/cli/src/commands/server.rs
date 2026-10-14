@@ -1,14 +1,17 @@
-//! `apvm server` — the SSH hosts of the site inventory (plan §5.2). It
-//! never connects to them (no SSH): it reads or edits the inventory only.
+//! `apvm server` — the SSH hosts of the site inventory (plan §5.2).
+//! `defaults`, `edit`, `list`, `show` and `remove` read or edit the
+//! inventory only (no SSH); `test` and `add` connect (plan P4.3).
 //!
 //! ```text
 //! apvm server defaults [SSH flags] [--ssh-binary …] [--unset <FIELD>]… [--json]
 //!                                                   # no change flags: show
 //! apvm server add <ID> --host <HOST> [SSH flags] [--name …] [--notes …]
+//!                 [--no-test | --trust-new-host-key]
 //! apvm server edit <ID> [--host …] [SSH flags] [--name …] [--notes …] [--unset <FIELD>]…
 //! apvm server list [--json]
 //! apvm server show <ID> [--json]
 //! apvm server remove <ID> [--cascade] [-y]
+//! apvm server test <ID>… [--trust-new-host-key] [--json]
 //!
 //! SSH flags: --user --port --key --connect-timeout --jump --known-hosts
 //!            --ssh-config --multiplex|--no-multiplex
@@ -17,16 +20,26 @@
 //! Every setting is declared once, in [`fields`]; the flags only say which
 //! [`Setting`]s they carry. Each change is one `io::update` (lock → load →
 //! change → save), so concurrent edits all land; a refused change writes
-//! nothing. Refused input names the flag the user typed (`--port: …`). The
-//! connection test (`server test`, and on `add`) arrives with the probe
-//! (plan P4.3).
+//! nothing. Refused input names the flag the user typed (`--port: …`).
+//!
+//! The connection test logs in and reads the login user, its groups and
+//! the server's tools (`id`, `command -v`; nothing changes, no sudo runs).
+//! `add` runs it before saving (unless `--no-test`) and, when it fails,
+//! asks whether to save anyway; without a terminal to ask on it saves
+//! nothing. `test` exits 1 when any server failed.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use super::inventory::field_table::{self, Change};
 use super::inventory::{
-    Console, Failure, Removal, count, load, name_flags, not_found, print_json_failure, quoted_ids,
-    remove_confirmed,
+    Console, Failure, Removal, Terminal, count, load, name_flags, not_found, print_json_failure,
+    quoted_ids, remove_confirmed,
+};
+use super::remote;
+use super::remote::render::{ServerResult, servers_json, servers_text};
+use super::remote::{
+    DEFAULT_JOBS, LocalFuture, Remote, SshRemote, bounded, host_keys, save_anyway, writable,
 };
 use apvm_sites::inventory::io;
 use apvm_sites::{Defaults, EntityKind, Inventory, Server, ServerRemoval};
@@ -63,6 +76,8 @@ enum ServerAction {
     Show(ShowArgs),
     /// Remove a server (refused while sites use it, unless --cascade)
     Remove(RemoveArgs),
+    /// Test SSH to servers: log in, read the login user, its groups and tools
+    Test(TestArgs),
 }
 
 /// `--multiplex` / `--no-multiplex`.
@@ -187,6 +202,28 @@ struct AddArgs {
     /// Name and notes.
     #[command(flatten)]
     text: TextFlags,
+    /// Save the server without testing SSH first
+    #[arg(long, conflicts_with = "trust_new_host_key")]
+    no_test: bool,
+    /// Trust and record the server's host key if ssh does not know it yet
+    /// (check its fingerprint first)
+    #[arg(long)]
+    trust_new_host_key: bool,
+}
+
+/// Arguments for `apvm server test`.
+#[derive(Args, Debug)]
+struct TestArgs {
+    /// Ids of the servers to test (repeats count once)
+    #[arg(value_name = "ID", required = true)]
+    ids: Vec<String>,
+    /// Trust and record a server's host key if ssh does not know it yet
+    /// (check its fingerprint first)
+    #[arg(long)]
+    trust_new_host_key: bool,
+    /// Print the results as JSON
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `apvm server edit`: at least one change.
@@ -309,6 +346,8 @@ impl AddArgs {
             host,
             ssh,
             text,
+            no_test: _,
+            trust_new_host_key: _,
         } = self;
         let settings = [ssh.settings(), text.settings()].concat();
         fields::apply(&Server::new(id.clone(), host.clone()), &settings, &[])
@@ -375,25 +414,35 @@ impl DefaultsArgs {
 
 impl ServerArgs {
     /// Execute the command on the real terminal against the inventory file
-    /// `inventory` (`APVM_INVENTORY` or `~/.apvm/inventory.json`).
+    /// `inventory` (`APVM_INVENTORY` or `~/.apvm/inventory.json`), over
+    /// SSH with shared connections in `control_dir` (`~/.apvm/ssh-mux`).
     ///
     /// # Errors
     ///
     /// The command's [`Failure`]; with `--json` it is also printed as a
-    /// JSON document on stdout.
-    pub fn execute(&self, inventory: &Path) -> Result<(), Failure> {
-        Console::with_terminal(|console| self.run(inventory, console))
+    /// JSON document on stdout (a failed test's report already is).
+    pub async fn execute(&self, inventory: &Path, control_dir: &Path) -> Result<(), Failure> {
+        let remote = SshRemote::new(control_dir.to_path_buf());
+        let mut terminal = Terminal::new();
+        self.run(inventory, &mut terminal.console(), &remote).await
     }
 
-    /// Run the command with all I/O through `console`.
-    fn run(&self, path: &Path, console: &mut Console<'_>) -> Result<(), Failure> {
+    /// Run the command with all I/O through `console`, and every server
+    /// reached through `remote`.
+    async fn run(
+        &self,
+        path: &Path,
+        console: &mut Console<'_>,
+        remote: &dyn Remote,
+    ) -> Result<(), Failure> {
         let result = match &self.action {
             ServerAction::Defaults(args) => defaults(path, args, console),
-            ServerAction::Add(args) => add(path, args, console),
+            ServerAction::Add(args) => add(path, args, console, remote).await,
             ServerAction::Edit(args) => edit(path, args, console),
             ServerAction::List(args) => list(path, args, console),
             ServerAction::Show(args) => show(path, args, console),
             ServerAction::Remove(args) => remove(path, args, console),
+            ServerAction::Test(args) => test(path, args, console, remote).await,
         };
         print_json_failure(&result, self.json(), console);
         result
@@ -405,6 +454,7 @@ impl ServerArgs {
             ServerAction::Defaults(args) => args.json,
             ServerAction::List(args) => args.json,
             ServerAction::Show(args) => args.json,
+            ServerAction::Test(args) => args.json,
             ServerAction::Add(_) | ServerAction::Edit(_) | ServerAction::Remove(_) => false,
         }
     }
@@ -447,9 +497,18 @@ fn print_defaults(
     Ok(())
 }
 
-/// `apvm server add`.
-fn add(path: &Path, args: &AddArgs, console: &mut Console<'_>) -> Result<(), Failure> {
+/// `apvm server add`: test SSH (unless `--no-test`), then save the
+/// server.
+async fn add(
+    path: &Path,
+    args: &AddArgs,
+    console: &mut Console<'_>,
+    remote: &dyn Remote,
+) -> Result<(), Failure> {
     let server = args.to_server();
+    if !args.no_test {
+        test_new_server(path, args, &server, console, remote).await?;
+    }
     io::update(path, |inventory| {
         inventory
             .add_server(server.clone())
@@ -458,6 +517,118 @@ fn add(path: &Path, args: &AddArgs, console: &mut Console<'_>) -> Result<(), Fai
     warn_relative(None, &server, console);
     console.print(&format!("Added server '{}'.\n", args.id));
     Ok(())
+}
+
+/// Test the server `add` is about to save, as the inventory would hold it
+/// (the record is checked first, so a refusal costs no connection), print
+/// the report, and decide whether to save.
+///
+/// # Arguments
+///
+/// * `path` - The inventory file
+/// * `args` - The `add` flags
+/// * `server` - The new record
+/// * `console` - Where the report and the question go
+/// * `remote` - How the server is reached
+///
+/// # Errors
+///
+/// The record's or the inventory's refusal; [`Failure::TestFailed`] when
+/// the test failed and the server is not to be saved.
+async fn test_new_server(
+    path: &Path,
+    args: &AddArgs,
+    server: &Server,
+    console: &mut Console<'_>,
+    remote: &dyn Remote,
+) -> Result<(), Failure> {
+    let mut inventory = writable(load(path, console)?)?;
+    inventory
+        .add_server(server.clone())
+        .map_err(|error| name_flags(error, &fields::flag_map(Scope::Server)))?;
+    let resolved = inventory.resolve_server(&server.id)?;
+    let check = remote
+        .test_server(&resolved, host_keys(args.trust_new_host_key))
+        .await;
+    let result = ServerResult {
+        server: &resolved,
+        check: &check,
+        adding: true,
+    };
+    console.print(&servers_text(&[result]));
+    save_anyway(
+        console,
+        check.outcome.as_ref().err(),
+        EntityKind::Server,
+        &server.id,
+    )
+}
+
+/// `apvm server test`: test each server named (repeats once), in the
+/// order named.
+///
+/// # Errors
+///
+/// An unknown server (before any connection); an unreadable inventory;
+/// [`Failure::TestFailed`] when any test failed (after the report).
+async fn test(
+    path: &Path,
+    args: &TestArgs,
+    console: &mut Console<'_>,
+    remote: &dyn Remote,
+) -> Result<(), Failure> {
+    let inventory = load(path, console)?;
+    let mut servers = Vec::new();
+    for id in &args.ids {
+        let server = inventory.resolve_server(id)?;
+        if !servers
+            .iter()
+            .any(|known: &apvm_sites::ResolvedServer| known.id == server.id)
+        {
+            servers.push(server);
+        }
+    }
+    let keys = host_keys(args.trust_new_host_key);
+    let tasks: Vec<LocalFuture<'_, _>> = servers
+        .iter()
+        .map(|server| remote.test_server(server, keys))
+        .collect();
+    let jobs = NonZeroUsize::new(DEFAULT_JOBS).unwrap_or(NonZeroUsize::MIN);
+    let checks = bounded(tasks, jobs).await;
+    let results: Vec<ServerResult<'_>> = servers
+        .iter()
+        .zip(&checks)
+        .map(|(server, check)| ServerResult {
+            server,
+            check,
+            adding: false,
+        })
+        .collect();
+    if args.json {
+        console.print(&servers_json(&results)?);
+    } else {
+        console.print(&servers_text(&results));
+    }
+    failed_tests(&results)
+}
+
+/// [`Failure::TestFailed`] when any server's test failed
+/// ([`remote::failed_tests`]).
+///
+/// # Arguments
+///
+/// * `results` - The tests, in the order reported
+fn failed_tests(results: &[ServerResult<'_>]) -> Result<(), Failure> {
+    let failures: Vec<(&str, &apvm_sites::Error)> = results
+        .iter()
+        .filter_map(|result| {
+            Some((
+                result.server.id.as_str(),
+                result.check.outcome.as_ref().err()?,
+            ))
+        })
+        .collect();
+    remote::failed_tests(EntityKind::Server, &failures, results.len())
 }
 
 /// `apvm server edit`.

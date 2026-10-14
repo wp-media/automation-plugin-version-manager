@@ -17,6 +17,10 @@
 //!
 //! Failures are [`Error::Probe`] with a [`ProbeFailure`] and its code;
 //! transport failures keep theirs (`ssh_*`, `timeout`).
+//!
+//! [`probe_server`] runs the login part of step H alone, for a server
+//! without a site (`apvm server test`): who the login user is, and which
+//! tools the server has.
 
 mod checks;
 mod dir;
@@ -32,7 +36,7 @@ pub use host::HostFacts;
 use super::command::{WpCommand, WpSite};
 use super::parse::{self, CommandOutput, Notices, Parsed, SiteFacts, WpCliVersion};
 use crate::error::{Error, Result};
-use crate::inventory::ResolvedSite;
+use crate::inventory::{BUILTIN_WP_CLI, ResolvedSite};
 use crate::remote::call::{call, last_line};
 use crate::remote::identity::sudo::{self, SudoSignal};
 use crate::remote::inspect;
@@ -133,6 +137,73 @@ impl SiteProbe {
 /// cannot form a command.
 pub async fn probe(transport: &dyn Transport, site: &ResolvedSite) -> Result<SiteProbe> {
     Prober::new(transport, site).run().await
+}
+
+/// The login part of step H on a server, without a site: the login user's
+/// ids, names and groups, its shell, and where `sudo`, `runuser`, the
+/// checksum tools and the built-in `wp` are (one round trip, read-only, no
+/// sudo).
+///
+/// # Arguments
+///
+/// * `transport` - Where the server is
+/// * `timeout` - How long the round trip may take
+///
+/// # Errors
+///
+/// A transport failure ([`Error::Ssh`], [`Error::Timeout`], …);
+/// [`Error::Probe`] with [`ProbeFailure::Unreadable`] when an answer cannot
+/// be read.
+pub async fn probe_server(transport: &dyn Transport, timeout: Duration) -> Result<HostFacts> {
+    let checks = host::login_checks(BUILTIN_WP_CLI);
+    let steps = inspect::steps(&Identity::Login, &checks)?;
+    let outputs = readable_steps(transport, steps, timeout, "H").await?;
+    host::host_facts(&outputs).map_err(fail)
+}
+
+/// Run `steps` and split their outputs; a transport failure is the error,
+/// an output that cannot be split the inner one.
+///
+/// # Arguments
+///
+/// * `transport` - Where they run
+/// * `steps` - The statements
+/// * `timeout` - How long the call may take
+async fn run_steps(
+    transport: &dyn Transport,
+    steps: Steps,
+    timeout: Duration,
+) -> Result<std::result::Result<Vec<StepOutput>, StepsError>> {
+    let nonce = Nonce::random();
+    let count = steps.len();
+    let script = Script::steps(nonce.clone(), &steps);
+    let execution = call(transport, script, timeout).await?;
+    Ok(split(&execution, &nonce, count))
+}
+
+/// [`run_steps`], with an output that cannot be split as
+/// [`ProbeFailure::Unreadable`] of `step`.
+///
+/// # Arguments
+///
+/// * `transport` - Where they run
+/// * `steps` - The statements
+/// * `timeout` - How long the call may take
+/// * `step` - The probe step, for messages
+async fn readable_steps(
+    transport: &dyn Transport,
+    steps: Steps,
+    timeout: Duration,
+    step: &'static str,
+) -> Result<Vec<StepOutput>> {
+    run_steps(transport, steps, timeout)
+        .await?
+        .map_err(|error| {
+            fail(ProbeFailure::Unreadable {
+                step,
+                reason: error.to_string(),
+            })
+        })
 }
 
 /// Each remote command's timeout for `site`: its `command_timeout_secs`,
@@ -251,12 +322,7 @@ impl<'a> Prober<'a> {
     /// * `steps` - The statements
     /// * `step` - The probe step, for messages
     async fn steps(&self, steps: Steps, step: &'static str) -> Result<Vec<StepOutput>> {
-        self.raw_steps(steps).await?.map_err(|error| {
-            fail(ProbeFailure::Unreadable {
-                step,
-                reason: error.to_string(),
-            })
-        })
+        readable_steps(self.transport, steps, self.timeout, step).await
     }
 
     /// Run `steps`; a transport failure is the error, an output that cannot
@@ -269,11 +335,7 @@ impl<'a> Prober<'a> {
         &self,
         steps: Steps,
     ) -> Result<std::result::Result<Vec<StepOutput>, StepsError>> {
-        let nonce = Nonce::random();
-        let count = steps.len();
-        let script = Script::steps(nonce.clone(), &steps);
-        let execution = call(self.transport, script, self.timeout).await?;
-        Ok(split(&execution, &nonce, count))
+        run_steps(self.transport, steps, self.timeout).await
     }
 
     /// Run a single statement and return its output.

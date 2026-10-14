@@ -516,6 +516,11 @@ per step, each step's commands reporting their own status:
 - **O:** `realpath(WP_PLUGIN_DIR)` must be step H's directory.
 - **C:** `test -w`, `df -Pk`: warnings (`ProbeWarning`), never failures.
 
+`wp::probe::probe_server(transport, timeout)` runs step H's login part alone,
+for a server without a site (`apvm server test`): the login user's ids,
+names and groups, `$SHELL`, and where sudo, runuser, the checksum tools and
+the built-in `wp` are (`HostFacts`); no sudo, no walk.
+
 `Session::open(transport, site)` probes, then runs `WpCommand`s as the
 identity (`run`), with the transport's truncation flag passed to the
 parsers. Plugin lists read in a session are bound to it (`SitePlugins`), and

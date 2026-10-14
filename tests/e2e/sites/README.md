@@ -135,6 +135,12 @@ Every transport there gets a temporary home, its own empty ssh_config file and t
 eval "$(tests/e2e/sites/harness.sh env)" && cargo test -p apvm-sites --test probe_e2e
 ```
 
+`crates/cli/tests/cli_remote_e2e.rs` runs the CLI's connection tests (plan P4.3) through the real `apvm` binary the same way, read-only, each in a sandbox home with its own inventory, known_hosts copy and empty ssh_config file: `server test` as `deploy` and `plain`, `site test` of `single` (`sudo -u www-data -g www-data`) and `ftpsite` (`sudo -u ftpuser -g www-data`, through root's `stat`), `plain`'s missing sudoers rule, an unknown host key refused and then recorded with `--trust-new-host-key`, and the probe on `site add` (saved for `multi`, not saved for a path without WordPress):
+
+```sh
+eval "$(tests/e2e/sites/harness.sh env)" && cargo test -p apvm --test cli_remote_e2e
+```
+
 **Adding a check:**
 1. Write a `check_*` function. It returns 0 (PASS), 1 (FAIL), 2 (INFO: recorded, no expectation) or 3 (SKIP). It asserts with `expect_eq`, `expect_match` and `expect_ran`, and records observations with `note`.
 2. Register it in the file's `group_*` function.

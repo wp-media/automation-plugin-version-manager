@@ -111,10 +111,6 @@ impl Paths {
     }
 
     /// Get the directory of OpenSSH multiplexing sockets (`~/.apvm/ssh-mux`).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the SSH transport (plan P3.4)")
-    )]
     pub fn ssh_control_dir(&self) -> &Path {
         &self.ssh_control_dir
     }

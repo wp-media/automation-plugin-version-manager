@@ -10,13 +10,17 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::commands::inventory::Recorder;
+use crate::commands::remote::tests::{FakeRemote, block_on};
 
-/// A temporary directory holding the inventory under test.
+/// A temporary directory holding the inventory under test, and the fake
+/// servers commands connect to.
 struct Fixture {
     /// Keeps the directory alive.
     _dir: TempDir,
     /// `<dir>/inventory.json` (missing until written).
     path: PathBuf,
+    /// What `test` and `add` reach (every server healthy unless changed).
+    remote: FakeRemote,
 }
 
 impl Fixture {
@@ -24,7 +28,17 @@ impl Fixture {
     fn empty() -> Self {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("inventory.json");
-        Self { _dir: dir, path }
+        Self {
+            _dir: dir,
+            path,
+            remote: FakeRemote::healthy(),
+        }
+    }
+
+    /// This fixture, its commands reaching `remote`.
+    fn reaching(mut self, remote: FakeRemote) -> Self {
+        self.remote = remote;
+        self
     }
 
     /// A fixture whose file holds `inventory`.
@@ -55,7 +69,9 @@ impl Fixture {
     fn run(&self, args: &[&str], answer: Option<bool>) -> (Result<(), Failure>, Recorder) {
         let command = parse(args);
         let mut recorder = Recorder::new();
-        let result = recorder.run(answer, |console| command.run(&self.path, console));
+        let result = recorder.run(answer, |console| {
+            block_on(command.run(&self.path, console, &self.remote))
+        });
         (result, recorder)
     }
 
@@ -455,7 +471,15 @@ fn removal_messages_name_the_sites_and_groups() {
 #[test]
 fn add_creates_the_file_with_the_server() {
     let fixture = Fixture::empty();
-    let recorder = fixture.ok(&["add", "eu-1", "--host", "203.0.113.10", "--user", "ubuntu"]);
+    let recorder = fixture.ok(&[
+        "add",
+        "eu-1",
+        "--host",
+        "203.0.113.10",
+        "--user",
+        "ubuntu",
+        "--no-test",
+    ]);
     assert_eq!(recorder.out, "Added server 'eu-1'.\n");
     assert_eq!(recorder.err, "");
     let server = fixture.load().server("eu-1").cloned().expect("added");
@@ -827,7 +851,7 @@ fn remove_refuses_when_the_sites_changed_while_confirming() {
             .expect("concurrent edit");
             Ok(Some(true))
         },
-        |console| command.run(&fixture.path, console),
+        |console| block_on(command.run(&fixture.path, console, &FakeRemote::healthy())),
     );
     let Err(failure) = result else {
         panic!("the removal must be refused");
@@ -852,7 +876,7 @@ fn remove_while(
             io::update(&fixture.path, &edit).expect("concurrent edit");
             Ok(Some(true))
         },
-        |console| command.run(&fixture.path, console),
+        |console| block_on(command.run(&fixture.path, console, &FakeRemote::healthy())),
     );
     (result, fixture.load())
 }
@@ -903,7 +927,7 @@ fn remove_ignores_changes_elsewhere_while_confirming() {
             .expect("concurrent edit");
             Ok(Some(true))
         },
-        |console| command.run(&fixture.path, console),
+        |console| block_on(command.run(&fixture.path, console, &FakeRemote::healthy())),
     );
     assert!(result.is_ok(), "{result:?}");
     let inventory = fixture.load();
@@ -941,8 +965,15 @@ fn command_def(command: &str) -> clap::Command {
     server.find_subcommand(command).expect("subcommand").clone()
 }
 
-/// Flags that are not settings.
-const NOT_SETTINGS: [&str; 4] = ["unset", "json", "yes", "cascade"];
+/// Flags that are not settings (`add`'s connection test flags included).
+const NOT_SETTINGS: [&str; 6] = [
+    "unset",
+    "json",
+    "yes",
+    "cascade",
+    "no-test",
+    "trust-new-host-key",
+];
 
 /// The long names of the flags of `command` that set a value (switches
 /// included), in definition order.
@@ -1284,4 +1315,194 @@ fn an_empty_value_is_refused_with_the_unset_remedy() {
     let (failure, _) = newer.fails(&["edit", "a", "--notes", ""]);
     assert_eq!(failure.code(), "inventory_read_only");
     assert!(!failure.to_string().contains("--unset"), "{failure}");
+}
+
+// ── connection tests (plan P4.3) ─────────────────────────────────────────
+
+use crate::commands::remote::tests::{unknown_key, unreachable};
+
+/// What the fixture's remote was asked.
+fn asked(fixture: &Fixture) -> Vec<String> {
+    fixture.remote.asked.borrow().clone()
+}
+
+#[test]
+fn add_tests_the_server_first_then_saves_it() {
+    let fixture = Fixture::empty();
+    let recorder = fixture.ok(&["add", "eu-1", "--host", "h", "--user", "deploy"]);
+    assert_eq!(asked(&fixture), ["server:eu-1"]);
+    assert!(
+        recorder
+            .out
+            .starts_with("Server 'eu-1' (deploy@h)\n  ✓ connected\n  login     deploy (2001)"),
+        "{}",
+        recorder.out
+    );
+    assert!(
+        recorder.out.ends_with("\nAdded server 'eu-1'.\n"),
+        "{}",
+        recorder.out
+    );
+    assert_eq!(recorder.err, "");
+    assert!(fixture.load().server("eu-1").is_some());
+}
+
+#[test]
+fn add_trusts_a_new_host_key_only_when_asked() {
+    let fixture = Fixture::empty().reaching(FakeRemote::healthy().recording("h"));
+    let recorder = fixture.ok(&["add", "eu-1", "--host", "h", "--trust-new-host-key"]);
+    assert_eq!(asked(&fixture), ["server:eu-1+trust"]);
+    assert!(
+        recorder.out.contains(
+            "  host key  trusted the new key of h and recorded it in ~/.ssh/known_hosts\n"
+        ),
+        "{}",
+        recorder.out
+    );
+}
+
+#[test]
+fn add_without_a_test_connects_nowhere() {
+    let fixture = Fixture::empty();
+    let recorder = fixture.ok(&["add", "eu-1", "--host", "h", "--no-test"]);
+    assert_eq!(recorder.out, "Added server 'eu-1'.\n");
+    assert!(asked(&fixture).is_empty());
+    assert_eq!(
+        parse_error(&[
+            "add",
+            "a",
+            "--host",
+            "h",
+            "--no-test",
+            "--trust-new-host-key"
+        ]),
+        Some(clap::error::ErrorKind::ArgumentConflict)
+    );
+}
+
+#[test]
+fn add_refuses_bad_input_and_read_only_files_before_connecting() {
+    let fixture = Fixture::with(&sample());
+    let (failure, _) = fixture.fails(&["add", "EU", "--host", "h"]);
+    assert_eq!(failure.code(), "invalid_input");
+    let (failure, _) = fixture.fails(&["add", "eu-1", "--host", "h"]);
+    assert_eq!(failure.code(), "invalid_input");
+    assert!(asked(&fixture).is_empty());
+    let newer = Fixture::with_text(r#"{"version": 7}"#);
+    let (failure, _) = newer.fails(&["add", "a", "--host", "h"]);
+    assert_eq!(failure.code(), "inventory_read_only");
+    assert!(asked(&newer).is_empty());
+}
+
+#[test]
+fn a_failed_add_test_saves_only_when_the_user_says_so() {
+    let remote = || FakeRemote::healthy().failing_server("eu-1", unreachable());
+    // Yes: saved, with a warning.
+    let fixture = Fixture::empty().reaching(remote());
+    let (result, recorder) = fixture.run(&["add", "eu-1", "--host", "h"], Some(true));
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        recorder.asked,
+        ["The test failed (ssh_unreachable). Save server 'eu-1' anyway? [y/N]"]
+    );
+    assert!(
+        recorder.out.contains("  ✗ ssh_unreachable: "),
+        "{}",
+        recorder.out
+    );
+    assert!(
+        recorder.out.contains("    check the host name"),
+        "{}",
+        recorder.out
+    );
+    assert!(
+        recorder.out.contains("pass --host, --port or --jump"),
+        "{}",
+        recorder.out
+    );
+    assert!(
+        recorder.out.ends_with("Added server 'eu-1'.\n"),
+        "{}",
+        recorder.out
+    );
+    assert!(
+        recorder.err.contains("although its test failed"),
+        "{}",
+        recorder.err
+    );
+    assert!(fixture.load().server("eu-1").is_some());
+    // No, or nobody to ask: nothing written.
+    for answer in [Some(false), None] {
+        let fixture = Fixture::empty().reaching(remote());
+        let (result, recorder) = fixture.run(&["add", "eu-1", "--host", "h"], answer);
+        let Err(failure) = result else {
+            panic!("not saved for {answer:?}");
+        };
+        assert_eq!(failure.code(), "ssh_unreachable");
+        assert!(failure.to_string().contains("--no-test"), "{failure}");
+        assert!(!recorder.out.contains("Added"), "{}", recorder.out);
+        assert!(fixture.bytes().is_empty(), "nothing written for {answer:?}");
+    }
+}
+
+#[test]
+fn test_checks_each_server_once_in_the_order_named() {
+    let fixture = Fixture::with(&sample());
+    let recorder = fixture.ok(&["test", "bare", "eu-1", "bare"]);
+    assert_eq!(asked(&fixture), ["server:bare", "server:eu-1"]);
+    let bare = recorder.out.find("Server 'bare'").expect("bare reported");
+    let eu = recorder.out.find("Server 'eu-1'").expect("eu-1 reported");
+    assert!(bare < eu, "{}", recorder.out);
+    assert!(
+        recorder
+            .out
+            .ends_with("\n2 of 2 servers connected; 0 failed.\n"),
+        "{}",
+        recorder.out
+    );
+    let trusted = Fixture::with(&sample());
+    trusted.ok(&["test", "eu-1", "--trust-new-host-key"]);
+    assert_eq!(asked(&trusted), ["server:eu-1+trust"]);
+    assert_eq!(
+        parse_error(&["test"]),
+        Some(clap::error::ErrorKind::MissingRequiredArgument)
+    );
+}
+
+#[test]
+fn test_fails_when_any_server_fails_after_reporting_all() {
+    let fixture = Fixture::with(&sample())
+        .reaching(FakeRemote::healthy().failing_server("bare", unknown_key()));
+    let (failure, recorder) = fixture.fails(&["test", "eu-1", "bare"]);
+    assert_eq!(failure.code(), "ssh_host_key_unknown");
+    assert_eq!(failure.to_string(), "1 of 2 servers failed the test");
+    assert!(recorder.out.contains("  ✓ connected"), "{}", recorder.out);
+    assert!(
+        recorder.out.contains("  ✗ ssh_host_key_unknown"),
+        "{}",
+        recorder.out
+    );
+    let (failure, _) = fixture.fails(&["test", "bare"]);
+    assert_eq!(
+        failure.to_string(),
+        "server 'bare' failed its test (ssh_host_key_unknown)"
+    );
+}
+
+#[test]
+fn test_json_prints_one_document_whatever_the_outcome() {
+    let fixture = Fixture::with(&sample())
+        .reaching(FakeRemote::healthy().failing_server("bare", unreachable()));
+    let (result, recorder) = fixture.run(&["test", "eu-1", "bare", "--json"], None);
+    assert!(matches!(result, Err(Failure::TestFailed { .. })));
+    let json: serde_json::Value = serde_json::from_str(&recorder.out).expect("one JSON document");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["servers"][0]["ok"], true);
+    assert_eq!(json["servers"][1]["error"]["code"], "ssh_unreachable");
+    // An unknown server is refused before any connection, as a JSON error.
+    let (result, recorder) = fixture.run(&["test", "nope", "--json"], None);
+    assert!(result.is_err());
+    let json: serde_json::Value = serde_json::from_str(&recorder.out).expect("JSON error");
+    assert_eq!(json["error"]["code"], "invalid_input");
+    assert_eq!(asked(&fixture), ["server:eu-1", "server:bare"]);
 }

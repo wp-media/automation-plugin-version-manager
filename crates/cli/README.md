@@ -13,8 +13,8 @@ This crate produces the `apvm` binary. All heavy logic is delegated to [`apvm-co
 | `info`      | Show details about a plugin (repo, slugs, variants, version, tools)         |
 | `cache`     | Inspect and maintain the artifact cache                                     |
 | `config`    | View or change configuration settings                                       |
-| `server`    | Manage the SSH servers of the site inventory (never connects to them)       |
-| `site`      | Manage the WordPress sites of the site inventory (never connects to them)   |
+| `server`    | Manage the SSH servers of the site inventory, and test SSH to them          |
+| `site`      | Manage the WordPress sites of the site inventory, and probe them over SSH   |
 | `group`     | Manage the groups of sites of the site inventory (never connects to them)   |
 | `skill`     | Install or remove the Claude Code skill for apvm (project-local or global)  |
 | `update`    | Download and install the latest APVM release                                |
@@ -293,8 +293,9 @@ APVM_CACHE_DIR="$(mktemp -d)" apvm build imagify develop ./out
 ## Server Command
 
 Manages the SSH **servers** of the site inventory (`~/.apvm/inventory.json`,
-or `APVM_INVENTORY`) and the SSH **defaults** every server inherits. It never
-connects to the servers (no SSH): the file is read or edited only. The inventory
+or `APVM_INVENTORY`) and the SSH **defaults** every server inherits. Only
+`test` and `add` connect (read-only: they log in and run `id` and
+`command -v`); the other subcommands read or edit the file only. The inventory
 itself (format, validation, locking, atomic `0600` writes) lives in the
 [`apvm-sites`](../sites/README.md) library; the CLI adds the flags, the
 confirmation, and the rendering.
@@ -309,6 +310,8 @@ apvm server defaults --json
 # Servers (<HOST> may be an ~/.ssh/config alias)
 apvm server add eu-1 --host 203.0.113.10 --user ubuntu --name "EU VPS"
 apvm server add behind --host 10.0.0.5 --jump bastion.example.com
+apvm server add later --host 198.51.100.7 --no-test   # save without connecting
+apvm server test eu-1 [behind…] [--trust-new-host-key] [--json]
 apvm server edit eu-1 --port 2222 --unset name
 apvm server list [--json]
 apvm server show eu-1 [--json]     # record + effective SSH settings and their source
@@ -318,8 +321,9 @@ apvm server remove eu-1 [--cascade] [-y]
 | Subcommand | Flags |
 |------------|-------|
 | `defaults` | the SSH flags (`--key` is the one main key), `--ssh-binary`, `--unset <FIELD>` (repeatable or comma-separated), `--json` |
-| `add <ID>` | `--host` (required), the SSH flags, `--name`, `--notes` |
-| `edit <ID>` | the `add` flags (`--host` optional) and `--unset <FIELD>`; at least one change |
+| `add <ID>` | `--host` (required), the SSH flags, `--name`, `--notes`, `--no-test` or `--trust-new-host-key` |
+| `edit <ID>` | `--host`, the SSH flags, `--name`, `--notes` and `--unset <FIELD>`; at least one change; never connects |
+| `test <ID>…` | `--trust-new-host-key`, `--json` |
 | `list`, `show <ID>` | `--json` |
 | `remove <ID>` | `--cascade` (also remove its sites; they leave their groups), `-y`/`--yes` |
 
@@ -351,12 +355,24 @@ Behavior:
   failures then print `{"schema": 1, "error": {"code", "message",
   "problems"}}` too, with the stable codes of `apvm-sites`
   (`invalid_input`, `inventory_invalid`, `inventory_read_only`, …).
+- `test` (and `add`, unless `--no-test`) logs in through the system OpenSSH
+  client (`BatchMode`, strict host keys, connections shared per server in
+  `~/.apvm/ssh-mux`) and shows the login user, its groups and where `sudo`,
+  `runuser`, a checksum tool and `wp` are. A failure shows `✗ <code>:
+  <message>` (`ssh_host_key_unknown`, `ssh_auth_failed`, `ssh_unreachable`,
+  …) and what to do (`--trust-new-host-key` once the fingerprint is checked;
+  the `ssh-keygen -R` for a changed key, never for a revoked one). `test`
+  exits 1 when any server failed; `--json` prints one document (`"ok"`, and
+  per server `"login"` or `"error"` with `"remedies"`). When `add`'s test
+  fails, it asks whether to save anyway; without a terminal it saves
+  nothing (exit 1, pass `--no-test`). Details:
+  [`references/sites.md`](../../.claude/skills/apvm-cli/references/sites.md).
 
 ## Site Command
 
 Manages the **WordPress sites** of the site inventory: the server each one is
-on, its WordPress root, and how apvm will work on it. Like `server`, it never
-connects (no SSH), and `remove` only edits the inventory.
+on, its WordPress root, and how apvm will work on it. Only `test` and `add`
+connect, to probe sites read-only; `remove` only edits the inventory.
 
 ```sh
 apvm site add shop --server eu-1 --path /var/www/shop --url https://shop.example.com
@@ -366,15 +382,17 @@ apvm site edit shop --owner ftpuser:www-data --ownership check --unset url
 apvm site list [--server <ID>]… [--group <ID>]… [--json]
 apvm site show shop [--json]     # record + effective settings and their source
 apvm site remove legacy [-y]
+apvm site test shop [-s <ID>]… [-g <ID>]… [--server <ID>]… [--all-sites] [-j 8] [--json]
 ```
 
 | Subcommand | Flags |
 |------------|-------|
-| `add <ID>` | `--server` and `--path` (required), the site flags, `--group <ID>` (joins existing groups; repeatable or comma-separated) |
-| `edit <ID>` | `--server`, `--path`, the site flags, `--group` (joins, never leaves), `--unset <FIELD>`; at least one change |
+| `add <ID>` | `--server` and `--path` (required), the site flags, `--group <ID>` (joins existing groups; repeatable or comma-separated), `--no-test` or `--trust-new-host-key` |
+| `edit <ID>` | `--server`, `--path`, the site flags, `--group` (joins, never leaves), `--unset <FIELD>`; at least one change; never connects (`site test` checks the result) |
 | `list` | `--server`, `--group` (filters: any listed server and any listed group), `--json` |
 | `show <ID>` | `--json` |
 | `remove <ID>` | `-y`/`--yes` (it also leaves its groups) |
+| `test` | `[<ID>…]`, `-s`/`--site`, `-g`/`--group`, `--server`, `--all-sites` (at least one; a union in inventory order), `--trust-new-host-key`, `--json`, `-j`/`--jobs <N>` (1–32, default 4; at most 4 per server) |
 
 The site flags are `--url`, `--wp-cli "<CMD>"` (split at whitespace: one
 program, or a PHP interpreter with `-n`/`-q` and the WP-CLI script),
@@ -386,7 +404,15 @@ behaves as in `server`: one locked change, refused input named by flag
 (`--wp-cli[1]: …` for a token), the `--unset` remedy for empty values, the
 `--json` documents and codes, and a removal re-checked under the lock
 (`inventory_changed` when the site or its groups change while you answer).
-The connection probe on `add` and `site test` arrive in a later release.
+`test` (and `add`, unless `--no-test`) probes each site read-only (plan
+§6.2): the login user, the plugins directory's owner, group and mode, the
+identity WP-CLI runs as (`sudo -n -u <owner> -g <group>`, `runuser`, or the
+login user) checked with WP-CLI's exact command shape, WordPress's version,
+PHP, multisite and `siteurl`, and what the identity can write. A failure
+names its code and fix (the sudoers line to add, `--plugins-dir`,
+`--wp-cli`, `--path`, the host key steps of `server test`); host keys follow
+`server test`'s rules, and so do the exit codes, `--json` (`"sites"` with
+`"probe"` or `"error"`) and the save-anyway question on `add`.
 `--group` needs an existing group (`apvm group add`).
 
 ## Group Command

@@ -1,6 +1,6 @@
 ---
 name: apvm-cli
-description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm server` (the site inventory's SSH servers and default SSH settings, `~/.apvm/inventory.json`), `apvm site` (the WordPress sites on those servers: path, URL, WP-CLI command, identity, ownership), `apvm group` (named lists of sites), `apvm skill` (install/uninstall this skill), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
+description: Build, inspect, and manage versions of the WP-Media WordPress plugins registered in apvm (BackWPup — `free`, `pro-de`, `pro-en` variants — WP Rocket, and Imagify) with the apvm CLI (Automation Plugin Version Manager). Covers `apvm build` (from a PR, branch, tag, commit, or GitHub Release), `apvm list` / `apvm info` (registered plugins), `apvm cache` (info / clean / gc / verify / repair / clear), `apvm config` (token, cache-dir, cache), `apvm server` (SSH servers and defaults of the site inventory, `~/.apvm/inventory.json`; `test` checks SSH), `apvm site` (WordPress sites on those servers: path, URL, WP-CLI, identity, owner; `test` probes), `apvm group` (named lists of sites), `apvm skill` (install/uninstall this skill), `apvm update`, and `apvm uninstall`. Use when the user mentions apvm, asks to build BackWPup / WP Rocket / Imagify from a PR/branch/tag/commit/release, asks about or invokes any apvm subcommand, or hits an apvm-related error (token, cache, build failure).
 when_to_use: Trigger on requests like "build backwpup from PR 123", "what plugins does apvm know about", "clean the apvm cache", "set my GitHub token for apvm", "update apvm", "download the latest release of imagify", "install the apvm skill", "add a server to apvm", "set apvm's default SSH key", "add a WordPress site to apvm", "list apvm's sites", "put these sites in an apvm group", or any direct `apvm <subcommand>` invocation. Also trigger when the user references a plugin artifact path under `~/.apvm/` or asks about the WP Media plugin version manager.
 allowed-tools: Bash(apvm *)
 ---
@@ -344,9 +344,10 @@ apvm config unset token
 ### `apvm server <SUBCMD>`
 
 Manages the SSH **servers** of the site inventory (`~/.apvm/inventory.json`,
-or `APVM_INVENTORY`) and the SSH **defaults** every server inherits. It never
-connects to the servers (no SSH): it edits the file only. Full reference
-(every flag and rule, output, `--json` shapes, error codes):
+or `APVM_INVENTORY`) and the SSH **defaults** every server inherits. Only
+`test` and `add` connect (system OpenSSH, read-only: they log in and run `id`
+and `command -v`); the other subcommands edit the file only. Full reference
+(every flag and rule, output, `--json` shapes, error codes and remedies):
 [references/sites.md](references/sites.md).
 
 SSH flags (shared by `defaults`, `add`, `edit`): `[--user] [--port] [--key]
@@ -356,11 +357,23 @@ SSH flags (shared by `defaults`, `add`, `edit`): `[--user] [--port] [--key]
 | Subcommand | Arguments |
 |------------|-----------|
 | `defaults` | `[SSH flags] [--ssh-binary] [--unset <FIELD>]… [--json]` — no change flags = show; `--key` is the one main key |
-| `add <ID>` | `--host <HOST> [SSH flags] [--name] [--notes]` |
-| `edit <ID>` | the `add` flags + `[--unset <FIELD>]…` (at least one change; `<FIELD>` is the flag's name, e.g. `--unset key,jump`) |
+| `add <ID>` | `--host <HOST> [SSH flags] [--name] [--notes] [--no-test \| --trust-new-host-key]` — tests SSH first (see below) |
+| `edit <ID>` | the `add` SSH flags, `--name`, `--notes` + `[--unset <FIELD>]…` (at least one change; `<FIELD>` is the flag's name, e.g. `--unset key,jump`); never connects |
 | `list` / `show <ID>` | `[--json]` — `show` prints the effective (merged) SSH settings and where each comes from |
 | `remove <ID>` | `[--cascade] [-y\|--yes]` — refused while sites use it unless `--cascade`; asks first, and **needs `-y` when stdin is not a terminal** |
+| `test <ID>…` | `[--trust-new-host-key] [--json]` — logs in to each server (repeats once, up to 4 at a time) and shows the login user, its groups, and where `sudo`, `runuser`, a checksum tool and `wp` are; exit 1 if any failed |
 
+- **Connection tests** (`test`, and `add` unless `--no-test`): host keys are
+  checked strictly. An unknown key fails with `ssh_host_key_unknown`: check
+  its fingerprint, then rerun with `--trust-new-host-key` (records it in the
+  known_hosts file). A changed key (`ssh_host_key_changed`) is never
+  trusted: apvm prints the `ssh-keygen -R '<name>'` to run once the new key
+  is confirmed (never for a revoked key). Each failure shows
+  `✗ <code>: <message>` and remedies (codes in
+  [references/sites.md](references/sites.md)). When `add`'s test fails it
+  asks `The test failed (<code>). Save server '<id>' anyway? [y/N]`; without
+  a terminal (or on "no") nothing is saved and it exits 1 (`… was not added:
+  its test failed (<code>) …`): pass `--no-test` to save without testing.
 - Every change is one locked, atomic edit: concurrent apvm processes never
   lose each other's edits; a refused change writes nothing.
 - Refused input exits 1 and names the flag (`--port: must be between 1 and
@@ -373,7 +386,10 @@ SSH flags (shared by `defaults`, `add`, `edit`): `[--user] [--port] [--key]
 
 ```sh
 apvm server defaults --user deploy --key ~/.ssh/id_ed25519
-apvm server add eu-1 --host 203.0.113.10 --user ubuntu
+apvm server add eu-1 --host 203.0.113.10 --user ubuntu      # tests SSH first
+apvm server add eu-2 --host 198.51.100.7 --no-test          # save without connecting
+apvm server test eu-1 --trust-new-host-key                   # after checking the fingerprint
+apvm server test eu-1 eu-2 --json
 apvm server edit eu-1 --port 2222 --unset name
 apvm server list --json
 apvm server show eu-1
@@ -386,9 +402,9 @@ apvm server remove eu-1 --cascade -y
 
 Manages the **WordPress sites** of the site inventory: which server each is
 on, its WordPress root, and how apvm will work on it (WP-CLI command, who
-WP-CLI runs as, who owns the plugin files). It never connects to the sites
-(no SSH), and `remove` only edits the inventory: nothing on the server
-changes. Full reference: [references/sites.md](references/sites.md).
+WP-CLI runs as, who owns the plugin files). Only `test` and `add` connect,
+to probe sites **read-only**; `remove` only edits the inventory: nothing on
+the server changes. Full reference: [references/sites.md](references/sites.md).
 
 Site flags (shared by `add` and `edit`): `[--url <URL>] [--wp-cli "<CMD>"]
 [--run-as auto|login|<USER>] [--owner auto|<USER>[:<GROUP>]]
@@ -398,12 +414,26 @@ Site flags (shared by `add` and `edit`): `[--url <URL>] [--wp-cli "<CMD>"]
 
 | Subcommand | Arguments |
 |------------|-----------|
-| `add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]…` — `--group` adds it to existing groups (create them with `apvm group add`) |
-| `edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` (at least one change; `--group` only joins groups, never leaves one: `apvm group edit <GROUP> --remove <SITE>` does) |
+| `add <ID>` | `--server <ID> --path <WP_ROOT> [site flags] [--group <ID>]… [--no-test \| --trust-new-host-key]` — `--group` adds it to existing groups (create them with `apvm group add`); probes the site first (see below) |
+| `edit <ID>` | `[--server <ID>] [--path <WP_ROOT>] [site flags] [--group <ID>]… [--unset <FIELD>]…` (at least one change; `--group` only joins groups, never leaves one: `apvm group edit <GROUP> --remove <SITE>` does); never connects (`site test` checks the result) |
 | `list` | `[--server <ID>]… [--group <ID>]… [--json]` — filters: any listed server **and** any listed group |
 | `show <ID>` | `[--json]` — the record, its groups, and the **effective** settings with where each comes from |
 | `remove <ID>` | `[-y\|--yes]` — also leaves its groups; asks first, and **needs `-y` when stdin is not a terminal** |
+| `test` | `[<ID>…] [-s\|--site <ID>]… [-g\|--group <ID>]… [--server <ID>]… [--all-sites] [--trust-new-host-key] [--json] [-j\|--jobs <N>]` — at least one target (a union, inventory order); probes each site read-only, `-j` at a time (default 4, max 32; at most 4 per server); exit 1 if any failed |
 
+- **The probe** (`test`, and `add` unless `--no-test`) logs in, reads the
+  login user, walks to the plugins directory (owner, group, mode), picks
+  who WP-CLI runs as (the directory's owner and group through `sudo -n -u
+  U -g G`, `runuser`, or the login user), runs the exact WP-CLI command
+  shape (`cli version`), reads WordPress's facts (version, PHP, multisite,
+  `siteurl`, `DISALLOW_FILE_MODS`) and checks what the identity can write and
+  the free space. Nothing is changed. A ready site prints `✓ ready` and those
+  facts; a failure prints `✗ <code>: <message>` plus remedies (e.g. the
+  sudoers line to add, `--plugins-dir`, `--wp-cli`, `--trust-new-host-key`,
+  `ssh-keygen -R`). `add` asks `The test failed (<code>). Save site '<id>'
+  anyway? [y/N]` when the probe fails; without a terminal (or on "no")
+  nothing is saved, exit 1: pass `--no-test` to save without probing.
+  Host keys follow the same rules as `apvm server test`.
 - `--wp-cli` is one string split at spaces (and tabs): one program (`wp`, `/usr/local/bin/wp`)
   or a PHP interpreter with `-n`/`-q` and the absolute WP-CLI script
   (`"/usr/bin/php8.3 /opt/wp-cli.phar"`). Wrappers (`sudo wp`, `env …`) are
@@ -417,14 +447,16 @@ Site flags (shared by `add` and `edit`): `[--url <URL>] [--wp-cli "<CMD>"]
 - Paths (`--path`, `--plugins-dir`, `--tmp-dir`) are on the server and must be
   absolute and canonical. Refused input names the flag; an empty value
   (`--url ""`) is refused with `to clear it: --unset url`.
-- The connection probe on `add` and `apvm site test` come in a later release.
 
 ```sh
-apvm site add shop --server eu-1 --path /var/www/shop --url https://shop.example.com
+apvm site add shop --server eu-1 --path /var/www/shop --url https://shop.example.com   # probes first
 apvm site add legacy --server eu-1 --path /srv/legacy --wp-cli "/usr/bin/php8.3 /opt/wp-cli.phar" --run-as login
 apvm site edit shop --owner ftpuser:www-data --ownership check --unset url
 apvm site list --server eu-1 --json
 apvm site show shop
+apvm site test shop                       # one site
+apvm site test -g qa --server eu-1 -j 8   # a group and a server's sites
+apvm site test --all-sites --json
 apvm site remove legacy -y
 ```
 
@@ -594,6 +626,11 @@ Required for private repos and PR builds. Recommended for public repos
 | `… refusing to use <dir> as an artifact store: it is not an apvm cache, yet already contains '<entry>' …` | The cache dir holds other data: anything at all when a cache would be created there, or store-shaped dirs without apvm's `.apvm.lock` file (whatever `apvm.db` holds). Nothing was changed. Point the cache at a new or empty directory (source: `APVM_CACHE_DIR` if set, else config `cache-dir`, else `~/.apvm/cache`). |
 | `Error: IO error: cannot access cache directory '<path>': …` / `… is a symbolic link to a missing target` | `<path>` is the effective cache dir (as above). One of its components is a regular file, a parent can't be traversed, or the dir is a dangling symlink. Fix or re-point it — note `apvm config get cache-dir` shows the config/default only, not `APVM_CACHE_DIR`. On Windows such a path may just print "Cache is empty". |
 | `Error: Cache error: cannot list store directory <dir>: …`      | The cache dir exists but can't be read (permissions). apvm refuses rather than mistake it for an empty cache. Fix its permissions. |
+| `✗ ssh_host_key_unknown: the server's host key is not known: …` (`server test`/`site test`/`add`) | ssh does not know the server's host key. Check its fingerprint with the server's administrator, then rerun with `--trust-new-host-key`. A ProxyCommand's own ssh is not reached by that flag. |
+| `✗ ssh_host_key_changed: …` | The server's key differs from the known one (or is revoked): possibly an attack. Once the new key is confirmed, run the printed `ssh-keygen -R '<name>'` and rerun with `--trust-new-host-key`; never remove a revoked key. |
+| `✗ sudo_password_required` / `sudo_not_allowed` / `sudo_requiretty` | The login user cannot run WP-CLI as the site's identity without a password; the message names the sudoers line to add (`deploy ALL=(www-data : www-data) NOPASSWD: ALL`). |
+| `Error: <kind> '<id>' was not added: its test failed (<code>)…` | `server add`/`site add` tested the record, the test failed, and it was not saved (answered no, or stdin is not a terminal). Fix the problem, or pass `--no-test`. |
+| `Error: N of M sites failed the test` / `site '<id>' failed its test (<code>)` | `site test` (or `server test`) printed every result; at least one failed. Exit 1. With `--json` the report has `"ok": false`. |
 | `Error: invalid server '<id>':` + one `--flag: …` line per problem | The listed flag values break a rule (see [references/sites.md](references/sites.md)); nothing was written. |
 | `Error: <path>: invalid inventory:` + `servers[N].…` lines | The inventory file was edited by hand into an invalid state. apvm never rewrites it: fix the listed fields (or point `APVM_INVENTORY` elsewhere). |
 | `… is read-only: upgrade apvm to change it`                      | The inventory was written by a newer apvm. Reads work; run `apvm update` to edit it. |

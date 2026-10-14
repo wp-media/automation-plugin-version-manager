@@ -93,6 +93,21 @@ fn checks_come_in_the_readers_order() {
 }
 
 #[test]
+fn login_checks_are_the_start_of_step_h() {
+    let login = login_checks("/opt/wp");
+    assert_eq!(login.len(), at::WP_CLI + 1);
+    assert_eq!(login[at::WP_CLI], Inspect::Which("/opt/wp"));
+    let users = [AccountName::new("ftpuser").unwrap()];
+    assert_eq!(
+        checks("/opt/wp", "/srv/p", &users)[..login.len()],
+        login[..]
+    );
+    // A server's test reads its answers with step H's reader.
+    let facts = host_facts(&host_steps()[..=at::WP_CLI]).unwrap();
+    assert_eq!(facts, host_facts(&host_steps()).unwrap());
+}
+
+#[test]
 fn named_users_come_from_run_as_and_owner_once_each() {
     let names = |run_as, owner| -> Vec<String> {
         named_users(&site(run_as, owner))

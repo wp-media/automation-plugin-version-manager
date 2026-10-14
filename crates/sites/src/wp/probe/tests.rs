@@ -1020,3 +1020,46 @@ async fn a_sudo_target_whose_primary_group_is_root_is_refused() {
     let (result, _) = run(&site(|site| site.allow_root = Some(true)), replies).await;
     assert!(result.is_ok());
 }
+
+/// The login part of step H, as a server's test reads it.
+fn login_reply() -> Reply {
+    let Reply::Steps(steps) = Host::deploy().reply() else {
+        unreachable!("step H's reply is steps");
+    };
+    Reply::Steps(steps[..12].to_vec())
+}
+
+#[tokio::test]
+async fn a_server_probe_reads_the_login_user_and_tools_only() {
+    let fake = FakeTransport::new(vec![login_reply()]);
+    let facts = probe_server(&fake, Duration::from_secs(30)).await.unwrap();
+    assert_eq!(fake.remaining(), 0);
+    assert_eq!(facts.login.user.id, 2001);
+    assert_eq!(
+        facts.login.user.name.as_ref().map(AccountName::as_str),
+        Some("deploy")
+    );
+    assert_eq!(facts.sudo.as_deref(), Some("/usr/bin/sudo"));
+    assert_eq!(facts.runuser, None);
+    assert_eq!(facts.wp_cli_path.as_deref(), Some("/usr/local/bin/wp"));
+    let calls = fake.calls();
+    let script = text(&calls[0]);
+    // As the login user: no sudo, no walk, `command -v wp`.
+    assert!(script.contains("command -v 'wp'"), "{script}");
+    assert!(!script.contains("sudo -n"), "{script}");
+    assert!(!script.contains("cd -P"), "{script}");
+}
+
+#[tokio::test]
+async fn a_server_probe_keeps_transport_and_reading_failures() {
+    let fake = FakeTransport::new(vec![Reply::Steps(vec![FakeStep::ok("x\n")])]);
+    let error = probe_server(&fake, Duration::from_secs(30))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::ProbeFailed);
+    let fake = FakeTransport::new(vec![Reply::timed_out("")]);
+    let error = probe_server(&fake, Duration::from_secs(30))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Timeout);
+}

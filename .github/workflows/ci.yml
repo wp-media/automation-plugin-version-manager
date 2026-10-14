@@ -216,8 +216,10 @@ jobs:
         run: shellcheck -x tests/e2e/sites/*.sh tests/e2e/sites/lib/*.sh tests/e2e/sites/checks/*.sh tests/e2e/sites/target/*.sh tests/support/fake-remote/fake-ssh tests/support/fake-remote/fake-sudo tests/support/fake-remote/fake-wp
       - uses: dtolnay/rust-toolchain@stable
       # Built before the harness starts, so a compile error fails fast.
-      - name: Build the SSH transport and probe E2E tests
-        run: cargo test -p apvm-sites --locked --test ssh_e2e --test probe_e2e --no-run
+      - name: Build the SSH transport, probe and CLI E2E tests
+        run: |
+          cargo test -p apvm-sites --locked --test ssh_e2e --test probe_e2e --no-run
+          cargo test -p apvm --locked --test cli_remote_e2e --no-run
       - name: Start harness
         run: tests/e2e/sites/harness.sh up
       - name: Verify ground truth
@@ -249,6 +251,16 @@ jobs:
           eval "$harness_env"
           test "${APVM_E2E_SITES:-}" = 1
           cargo test -p apvm-sites --locked --test probe_e2e
+      # The CLI's connection tests (plan P4.3) through the real binary:
+      # `server test`, `site test` (identities, root stat, a missing sudoers
+      # rule), an unknown host key refused then recorded with
+      # --trust-new-host-key, and the probe on `site add`. Read-only.
+      - name: CLI connection tests E2E
+        run: |
+          harness_env=$(tests/e2e/sites/harness.sh env)
+          eval "$harness_env"
+          test "${APVM_E2E_SITES:-}" = 1
+          cargo test -p apvm --locked --test cli_remote_e2e
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
