@@ -331,7 +331,7 @@ export declare class Apvm {
    * * `project` - Project name (`"backwpup"` or `"wp-rocket"`)
    * * `pr_number` - Pull request number
    * * `output_dir` - Directory for build artifacts
-   * * `version` - Optional version (required for BackWPup)
+   * * `version` - Optional version (BackWPup defaults to `9.99.99`)
    * * `variants` - Optional variant filter
    * * `on_progress` - Optional progress callback
    *
@@ -359,7 +359,7 @@ export declare class Apvm {
    * * `project` - Project name (`"backwpup"` or `"wp-rocket"`)
    * * `branch` - Branch name (e.g., `"develop"`, `"feature/my-feature"`)
    * * `output_dir` - Directory for build artifacts
-   * * `version` - Optional version (required for BackWPup)
+   * * `version` - Optional version (BackWPup defaults to `9.99.99`)
    * * `variants` - Optional variant filter
    * * `on_progress` - Optional progress callback
    *
@@ -382,7 +382,7 @@ export declare class Apvm {
    * * `project` - Project name (`"backwpup"` or `"wp-rocket"`)
    * * `tag` - Tag name (e.g., `"v1.0.0"`, `"3.17.4"`)
    * * `output_dir` - Directory for build artifacts
-   * * `version` - Optional version (required for BackWPup)
+   * * `version` - Optional version (BackWPup defaults to `9.99.99`)
    * * `variants` - Optional variant filter
    * * `on_progress` - Optional progress callback
    *
@@ -405,7 +405,7 @@ export declare class Apvm {
    * * `project` - Project name (`"backwpup"` or `"wp-rocket"`)
    * * `commit` - Commit SHA (minimum 7 characters)
    * * `output_dir` - Directory for build artifacts
-   * * `version` - Optional version (required for BackWPup)
+   * * `version` - Optional version (BackWPup defaults to `9.99.99`)
    * * `variants` - Optional variant filter
    * * `on_progress` - Optional progress callback
    *
@@ -706,7 +706,7 @@ export interface ApvmConfig {
  *   outputDir: '/tmp/output',
  * });
  *
- * // Full options (BackWPup, version required), with progress events
+ * // Full options (BackWPup, explicit version instead of the 9.99.99 default), with progress events
  * await apvm.build(
  *   {
  *     project: 'backwpup',
