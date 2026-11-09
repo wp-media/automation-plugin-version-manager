@@ -88,7 +88,7 @@ Build a plugin from a git reference. This is the primary command.
 
 | Option              | Description                                                                                          |
 |---------------------|------------------------------------------------------------------------------------------------------|
-| `-v`, `--ver <VER>` | Package version. Required for BackWPup; optional for WP Rocket / Imagify (auto-detected from source). Ignored with a warning when the plugin embeds its version. |
+| `-v`, `--ver <VER>` | Package version. Optional for every plugin. BackWPup: defaults to `9.99.99` (dev version) when omitted, ignored for `release:` downloads (the release's own version is used). WP Rocket / Imagify: auto-detected from source; when given, rewritten into the source. |
 | `--variants <LIST>` | Comma-separated variants to build (BackWPup defaults: `free,pro-en`). Ignored when the plugin has no variants. |
 | `--no-cache`        | Bypass the artifact cache for this build (still warms it unless `cache` is off in config).          |
 | `--warm-cache`      | Prime the cache **without producing output** — same build, but no artifacts are written to `[OUTPUT]`. **Conflicts with `--no-cache`** (warming *is* caching). |
@@ -116,7 +116,8 @@ etc).
 Examples:
 
 ```sh
-# Branch build (BackWPup requires -v)
+# Branch build (BackWPup: version defaults to 9.99.99 without -v)
+apvm build backwpup develop
 apvm build backwpup develop -v 5.1.0
 
 # PR build
@@ -136,7 +137,7 @@ apvm build backwpup tag:latest-stable -v 5.1.0
 apvm build backwpup tag:previous-stable -v 5.1.0
 apvm build imagify tag:latest-stable
 
-# Embedded-version plugins (WP Rocket, Imagify): no -v needed
+# Source-versioned plugins (WP Rocket, Imagify): version auto-detected
 apvm build imagify develop
 apvm build imagify tag:v2.3.0
 
@@ -208,8 +209,12 @@ Tool dependencies:
 
 `Version` is one of `Required` / `Embedded` / `Optional`:
 
-- **Required** — `--ver` is mandatory (BackWPup). Omitting it errors out.
-- **Embedded** — version lives only in source; `--ver` is rejected with a warning.
+- **Required** — the build needs a version parameter (BackWPup: `gulp --packageVersion`).
+  Omitting `--ver` uses the plugin's `Default` (BackWPup: `9.99.99`); it errors only
+  for a plugin without one (none currently).
+  Note: `apvm info` still prints "must be provided via --ver" for BackWPup; that
+  label is outdated, the `Default` is what a build actually uses.
+- **Embedded** — version lives only in source; `--ver` is ignored with a warning (no current plugin).
 - **Optional** — version is auto-detected from source; passing `--ver` rewrites
   it into the plugin's source so the built artifact actually carries it (WP Rocket, Imagify).
 
@@ -605,7 +610,7 @@ Required for private repos and PR builds. Recommended for public repos
 
 | Plugin     | `--ver`        | Variants             | Default variants | WordPress slug(s) | Notes                                                   |
 |------------|---------------|----------------------|------------------|-------------------|---------------------------------------------------------|
-| `backwpup` | **Required**  | `free`, `pro-de`, `pro-en` | `free, pro-en`   | `free` → `backwpup`; `pro-de`, `pro-en` → `backwpup-pro` (marker: `inc/Pro/License/License.php`) | Private. Supports GitHub Release downloads (`release:`). Free and pro form a family (conflict when both active, shared data). |
+| `backwpup` | Required, defaults to `9.99.99` | `free`, `pro-de`, `pro-en` | `free, pro-en`   | `free` → `backwpup`; `pro-de`, `pro-en` → `backwpup-pro` (marker: `inc/Pro/License/License.php`) | Private. Supports GitHub Release downloads (`release:`). Free and pro form a family (conflict when both active, shared data). |
 | `wp-rocket`| Optional      | _(none)_             | _(all)_          | `wp-rocket`       | Public. `--ver` rewrites source version into the artifact. |
 | `imagify`  | Optional      | _(none)_             | _(all)_          | `imagify`         | Public. Imagify publishes git tags but no release assets — build from the tag instead of `release:`. |
 
@@ -643,8 +648,7 @@ Required for private repos and PR builds. Recommended for public repos
 | `Error: invalid group '<id>':` + one `<ID>: …` / `--notes: …` line per problem | The group id or notes break a rule (see [references/sites.md](references/sites.md)); nothing was written. An empty `--notes ""` in `group edit` is followed by `to clear it: --unset notes`. |
 | `group '<id>' changed while you were confirming; nothing was removed` | Another process changed the group's sites or notes during the `group remove` prompt. Run the command again. |
 | `Error: failed to determine home directory`                      | `HOME` unset on Unix / `USERPROFILE` unset on Windows. Rare; set the env var.     |
-| `Error: --ver required` (BackWPup)                               | Pass `-v 5.1.0` (or whatever version). See `apvm info backwpup` for the default. |
-| `Warning: --ver ignored for '<plugin>'`                          | Plugin has `Embedded`/`Optional` version handling but you passed `--ver`. Harmless for `Optional` (it rewrites source); for `Embedded` it's rejected. |
+| `Warning: --ver ignored for '<plugin>' (version is embedded in source)` | The plugin's version is `Embedded` (source-only) and you passed `--ver`. Harmless: the source version is used. No current plugin is `Embedded`. |
 | `Note: output directory '...' is ignored with --warm-cache`      | `--warm-cache` delivers nothing. Drop the `[OUTPUT]` arg, or use a normal build. |
 | Build succeeds but artifact missing `Version: ...` line          | The variant was served from cache with a stale version; `apvm cache clean --project <name> --builds`. |
 

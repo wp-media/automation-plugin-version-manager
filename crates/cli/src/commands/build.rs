@@ -834,7 +834,7 @@ mod tests {
 
     #[test]
     fn version_ignored_false_for_required_builder() {
-        // BackWPup requires a version — passing one is expected, not ignored.
+        // BackWPup's build uses the version — passing one is honored, not ignored.
         let mut args = build_args("develop");
         args.version = Some("5.1.0".to_string());
         assert!(!args.version_ignored(&apvm_core::build::plugins::BackWPupBuilder));

@@ -10,7 +10,7 @@
 //!
 //! The [`plugins::VersionRequirement`] enum controls how version is handled:
 //!
-//! - [`plugins::VersionRequirement::Required`] - Version must be provided
+//! - [`plugins::VersionRequirement::Required`] - Build needs a version: the caller's, else the builder's default
 //! - [`plugins::VersionRequirement::Embedded`] - Version must NOT be provided (will be ignored)
 //! - [`plugins::VersionRequirement::Optional`] - Version can be provided or auto-detected
 //!
