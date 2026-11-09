@@ -1,11 +1,11 @@
 //! BackWPup project builder.
 //!
-//! BackWPup is a WordPress backup plugin that requires the version to be passed
-//! to its build commands (`gulp --packageVersion="{version}"`).
+//! BackWPup is a WordPress backup plugin whose build commands need a version
+//! passed in (`gulp --packageVersion="{version}"`).
 //!
 //! # Version Handling
 //!
-//! This builder **requires** an explicit version because:
+//! This builder needs a version (the caller's, else the `9.99.99` default) because:
 //! - The gulp tasks embed the version into the output zip filename
 //! - The version is injected into plugin files during build
 //!
@@ -42,7 +42,7 @@ impl Builder for BackWPupBuilder {
     // Version Handling
     // =========================================================================
 
-    /// BackWPup requires version for building.
+    /// BackWPup needs a version for building (falls back to [`Self::default_version`]).
     ///
     /// The gulp tasks use `--packageVersion` to:
     /// 1. Name the output zip file (e.g., `backwpup-5.1.0-abc123.zip`)

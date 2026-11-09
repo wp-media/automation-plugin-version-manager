@@ -47,7 +47,8 @@ use super::progress::{BuildStep, ProgressReporter};
 ///   - Version can be provided to override source, or detected if not provided
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VersionRequirement {
-    /// Version **must** be provided externally.
+    /// Version comes from outside the source: the caller's, else the builder's
+    /// [`default_version`](Builder::default_version).
     ///
     /// Use this when the build process requires a version parameter:
     /// - Build commands use the version (e.g., `gulp --packageVersion`)
@@ -59,7 +60,8 @@ pub enum VersionRequirement {
     /// | `version` param | Result |
     /// |-----------------|--------|
     /// | `Some("X.Y.Z")` | ✅ Use provided version |
-    /// | `None` | ❌ Error: "version required" |
+    /// | `None`, builder has a default | ✅ Use the default (BackWPup: `9.99.99`) |
+    /// | `None`, no default | ❌ Error: "requires a version" |
     ///
     /// # Example
     ///
@@ -129,7 +131,7 @@ pub enum VersionRequirement {
 }
 
 impl VersionRequirement {
-    /// Returns `true` if version parameter must be provided.
+    /// Returns `true` if the build needs a version (caller's or builder default).
     pub fn is_required(&self) -> bool {
         matches!(self, Self::Required)
     }
@@ -336,8 +338,8 @@ pub trait Builder: Send + Sync {
     ///
     /// # Return Values
     ///
-    /// - [`Required`](VersionRequirement::Required): Version must be provided;
-    ///   error if `None` is passed. Use when build commands need version.
+    /// - [`Required`](VersionRequirement::Required): Version comes from the caller, else
+    ///   [`default_version`](Self::default_version); error only if both are `None`. Use when build commands need version.
     ///
     /// - [`Embedded`](VersionRequirement::Embedded): Version is in source files;
     ///   error if `Some(v)` is passed. Use when build ignores version parameter.

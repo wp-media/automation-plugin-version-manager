@@ -19,7 +19,7 @@
 //!
 //! # Supported Projects
 //!
-//! - **BackWPup** (`backwpup`) — Private repository, version required
+//! - **BackWPup** (`backwpup`) — Private repository, version defaults to `9.99.99`
 //! - **WP Rocket** (`wp-rocket`) — Public repository, version auto-detected
 //! - **Imagify** (`imagify`) — Public repository, version auto-detected
 //!

@@ -723,7 +723,7 @@ impl From<&apvm_core::BuildEvent> for JsBuildEvent {
 ///   outputDir: '/tmp/output',
 /// });
 ///
-/// // Full options (BackWPup, version required), with progress events
+/// // Full options (BackWPup, explicit version instead of the 9.99.99 default), with progress events
 /// await apvm.build(
 ///   {
 ///     project: 'backwpup',

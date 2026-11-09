@@ -31,7 +31,7 @@
 //! let config = Config::new(PathBuf::from("/var/lib/myapp/cache"));
 //! let apvm = Apvm::new(config)?;
 //!
-//! // BackWPup: version required, specify output directory
+//! // BackWPup: explicit version (defaults to 9.99.99 when omitted), specify output directory
 //! let request = BuildRequest::new("backwpup", "pr:123", "/output")
 //!     .version(Some("5.1.0".to_string()));
 //! let output = apvm.build(request, &NullReporter).await?;

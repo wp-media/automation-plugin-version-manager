@@ -19,7 +19,7 @@ use std::path::PathBuf;
 let config = Config::new(PathBuf::from("/var/lib/myapp/cache"));
 let apvm = Apvm::new(config)?;
 
-// BackWPup: version required, artifacts delivered to the output directory
+// BackWPup: explicit version (defaults to 9.99.99 when omitted), artifacts delivered to the output directory
 let request = BuildRequest::new("backwpup", "pr:123", "/output")
     .version(Some("5.1.0".to_string()));
 let output = apvm.build(request, &NullReporter).await?;
@@ -254,7 +254,7 @@ pub trait Builder: Send + Sync {
 
 Current implementations:
 
-- **`BackWPupBuilder`** (`bwu.rs`) — multi-variant (free, pro-de, pro-en), version required, supports GitHub Releases
+- **`BackWPupBuilder`** (`bwu.rs`) — multi-variant (free, pro-de, pro-en), version required by its build (defaults to `9.99.99`), supports GitHub Releases
 - **`WpRocketBuilder`** (`wpr.rs`) — single output, version embedded (auto-detected from PHP header)
 
 ## Git Module

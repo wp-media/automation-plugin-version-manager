@@ -362,7 +362,7 @@ interface ApvmConfig {
 interface BuildOptions {
   project: string;        // "backwpup", "wp-rocket", or "imagify" currently
   gitRef: string;         // Any git ref (see above)
-  version?: string;       // Required for BackWPup, optional and No-Op for WP Rocket / Imagify (Embedded version)
+  version?: string;       // BackWPup: defaults to 9.99.99 when omitted (ignored for release: refs); WP Rocket / Imagify: auto-detected from source, rewritten into it when given
   variants?: string[];    // e.g., ["free", "pro-en"]. No-Op for WP Rocket / Imagify (No variants)
   outputDir: string;      // Absolute path for artifacts to be stored after build
   noCache?: boolean;      // Bypass the artifact cache for this build (default false)
@@ -377,7 +377,7 @@ Passed to [`warmCache()`](#apvmwarmcacheoptions-onprogress-promisejsbuildoutput)
 interface WarmOptions {
   project: string;        // "backwpup", "wp-rocket", or "imagify" currently
   gitRef: string;         // Any git ref (see above)
-  version?: string;       // Required for BackWPup, optional for WP Rocket / Imagify (Embedded version)
+  version?: string;       // BackWPup: defaults to 9.99.99 when omitted (ignored for release: refs); WP Rocket / Imagify: auto-detected from source, rewritten into it when given
   variants?: string[];    // e.g., ["free", "pro-en"]. No-Op for WP Rocket / Imagify (No variants)
 }
 ```
