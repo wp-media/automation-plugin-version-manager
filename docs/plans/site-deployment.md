@@ -1,6 +1,6 @@
 # Site deployment — manage WordPress plugins on remote sites
 
-Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.6 (implemented and audited 2026-10-12); done 2026-10-12: P2.1, P2.2, P2.4, P3.1, P3.2, P4.1; done 2026-10-13: P2.3, P3.3, P3.4, P4.2, P4.3. Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5), 10 (P1.2–P1.5 audit), 11 (decisions after P1), 12 (no lost edits from Node) and 13 (P1.6 and its audit), 14 (P2.1, P2.4, P3.1), 15 (P2.2, P3.2, P4.1, and the shared `apvm-process` crate), 16 (P2.3, P3.3 and their audits), 17 (P3.4 and its audits; P4.2 is recorded in its phase) and 18 (P4.3). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
+Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, and in CI on 2026-10-11); P1 done: P1.1 (2026-10-11, audited 2026-10-12), P1.2–P1.6 (implemented and audited 2026-10-12); done 2026-10-12: P2.1, P2.2, P2.4, P3.1, P3.2, P4.1; done 2026-10-13: P2.3, P3.3, P3.4, P4.2, P4.3. Rewritten 2026-10-09; revisions 2 and 3 (review feedback), 4 (P0 results), 5 (adversarial audit, 2026-10-11), 6 (CI on the branch), 7 (P1.1), 8 (P1.1 audit), 9 (P1.2–P1.5), 10 (P1.2–P1.5 audit), 11 (decisions after P1), 12 (no lost edits from Node) and 13 (P1.6 and its audit), 14 (P2.1, P2.4, P3.1), 15 (P2.2, P3.2, P4.1, and the shared `apvm-process` crate), 16 (P2.3, P3.3 and their audits), 17 (P3.4 and its audits; P4.2 is recorded in its phase) 18 (P4.3) and 19 (WordPress user, OPcache note; 2026-11-23). · Target version: **3.4.0** (from 3.3.0) · Author: Sandy Figueroa
 
 ---
 
@@ -16,13 +16,24 @@ Status: **in progress**: P0 done (verified locally on macOS and Ubuntu clients, 
   - **Activating next to an active sibling** switches by default (deactivate the sibling, then activate, as separate processes); `--keep-siblings` keeps both active.
   - **pro-de and pro-en share one folder:** asking for both is an error; `--force` replaces one with the other.
 - **Ownership respects owner *and* group:** WP-CLI runs as the plugins directory's owner **and group** (`sudo -n -u <owner> -g <group>`), so `ftpuser:www-data` sites stay `ftpuser:www-data` with the group bits the web server needs. Mismatches are repaired without root (`chgrp`, `chmod g+`); a root `chown` runs only on sites that opt in, under strict preconditions.
+- **WordPress user:** lifecycle commands (and `wp run` by default) pass WP-CLI `--user=<ID>`: the site's `wp_user`, else the lowest-ID administrator (a super admin on multisite), picked fresh on every run and shown before you confirm. `--no-wp-user` opts out; reads never set a user (§6.16).
 - **Uploads:** each zip is inspected locally, streamed over SSH into a private **staging dir** (`/tmp/apvm.XXXXXXXXXX`, owned by the identity, `0700`), checksum-verified, installed from there, and always cleaned up.
 - **Transport:** system OpenSSH (your `~/.ssh/config`, agent, ProxyJump), multiplexed on Unix. Scripts travel over SSH's stdin, so the remote login shell (bash, zsh, fish, …) never parses them.
-- **Phases:** 45 small ones; libraries first, then the CLI and NAPI front ends in parallel tracks. No new crates.io dependencies.
+- **Phases:** 49 small ones; libraries first, then the CLI and NAPI front ends in parallel tracks. No new crates.io dependencies.
 
 ---
 
 ## 0. Change log
+
+### Revision 19 (WordPress user, OPcache note, 2026-11-23)
+
+| Topic | Change |
+|---|---|
+| Gap found | No WP-CLI call set a WordPress user, so every one ran as user 0. The plan only allowed `--user=…` as a `wp run` override (§6.12) |
+| WordPress user (user decision) | New site field `wp_user` (login, email or ID; `false` = none), new §6.16, decision D23, codes `wp_user_missing` / `wp_user_invalid`, phases P4.4–P4.7. If unset, apvm picks the user on every run, in the probe's step W snippet (no extra round trip), and never saves the pick |
+| OPcache (user decision) | A PHP-FPM OPcache without timestamp checks keeps serving replaced plugin code, and WP-CLI cannot clear it (its own process). apvm documents this and prints one note after file changes; it never resets caches (D24, §6.4) |
+| Verified (§3.6) | WP-CLI 2.12.0 `Fetchers\User`, `Runner.php`; WordPress 7.1.3 `map_meta_cap`, `WP_User::get_role_caps`, `kses_init`; the activation code of BackWPup 5.7.9, WP Rocket 3.24.3, Imagify 2.3.6 |
+| Downstream | P5.4 (Node probe result), P6.2 (passes the user, blocks on `wp_user_missing`, `files_changed`), P7.1 (OPcache note), P9.1 (`wp run` default user), P10.1 (super admin), P11 (docs) |
 
 ### Revision 18 (P4.3 implementation, 2026-10-13)
 
@@ -291,6 +302,8 @@ Arbitrary slugs and zips are in scope; inventory with defaults/servers/sites/gro
 | D20 | WP-CLI passthrough | `apvm wp run`: argv-only, identity-run, classified (read-only allowlist; else confirmation / `allowWrites`), refuses target-changing params and interactive/unsafe commands | Power without shell injection or silent writes | A shell passthrough; no passthrough |
 | D21 | Site lock | `mkdir`-based lock in the remote tmp dir, holder info, 30 min TTL; `apvm site unlock` | Atomic on POSIX, no DB writes, no WP boot | `wp option add` lock (writes the site DB) |
 | D22 | Status queries | `apvm wp status` (assertions via `--expect`/`--version`/`--variant`) + `is-installed`/`is-active`; exit 0 met · 1 not met · 3 undetermined | Scripts and CI can assert deployment state; an unreachable site never reads as "not active" | Using `list` for checks; exit 0/1 only |
+| D23 | WordPress user | Lifecycle steps and `wp run` pass `--user=<ID>`: the site's `wp_user`, else the lowest-ID eligible administrator (super admin on multisite), resolved in every probe and never saved; `wp_user: false` = none; reads set no user (§6.16) | Plugin code that runs during activation sees a real admin, as in the dashboard; a fresh pick never goes stale; the inventory stays user-written | Running as user 0; saving the pick; refusing sites without `wp_user` |
+| D24 | OPcache | Document it; after file changes, print one note (§6.4). Never reset a cache | WP-CLI cannot clear PHP-FPM's OPcache (separate process); clearing it means a web-reachable PHP file or a root `php-fpm` reload with a per-host service name, both against §10 | An HTTP reset endpoint; a root reload |
 
 ---
 
@@ -530,6 +543,18 @@ Exit 255 unless noted. P3.3 matches on these phrases, never on whole lines, beca
 
 ssh's `Host key verification failed.` ends every host key refusal (`fatal()`, so nothing of ssh's follows it but noise). A server's login banner or a remote startup file's stderr decides nothing: only ssh's own `\r\n` lines do (audit 6; a server that writes `\r\n` itself can still pass for ssh, as it controls what it sends once its host key passed). Without any line of ssh's (a remote shell that printed and exited 255 before the nonce line) the call is `ssh_failed`, its last line shown as text.
 
+### 3.6 WordPress user facts (revision 19, from source)
+
+| Fact | Source | Consequence |
+|---|---|---|
+| `--user=<v>`: digits → `get_user_by('id')` (if a login made of the same digits also exists: `Warning: Ambiguous user match …`, the ID wins); an email → by email, then by login; else by login. `WP_CLI_FORCE_USER_LOGIN` (unset by apvm, §6.1) forces a login lookup | WP-CLI 2.12.0 `Fetchers/User.php` | apvm passes the numeric ID it resolved, so the match is unambiguous; a login made of digits cannot be chosen by login (documented) |
+| An unknown user ends the command: `Error: Invalid user ID, email or login: '<v>'`, exit 1 | `Fetchers/Base.php` `get_check` | Step W classifies it as `wp_user_invalid` |
+| `--user` is applied on `init` at priority 0 (`wp_set_current_user`); without it WP-CLI adds `kses_remove_filters` on `init` | `Runner.php` | Plugin files and `plugins_loaded` still run as user 0; activation, deactivation and uninstall (after WordPress loads) run as the user |
+| `kses_init` filters content when the user lacks `unfiltered_html` (admins have it, except under `DISALLOW_UNFILTERED_HTML`; on multisite only super admins) | WordPress 7.1.3 `kses.php`, `map_meta_cap` | With the picked user, `wp run post create` keeps raw HTML as before, except on `DISALLOW_UNFILTERED_HTML` sites (documented in §6.12) |
+| `map_meta_cap` turns `install_plugins`/`delete_plugins`/`update_plugins` into `do_not_allow` under `DISALLOW_FILE_MODS`, and on multisite for anyone but a super admin | `capabilities.php` | Eligibility must not use `user_can()`: it would find no admin on those sites |
+| `WP_User->allcaps` = role grants overlaid with the user's own grants, unmapped; `is_super_admin()` on multisite = login listed by `get_super_admins()` | `class-wp-user.php` `get_role_caps`, `capabilities.php` | Eligibility reads `allcaps` (single site) or the super admin list (multisite) |
+| Activation code: BackWPup 5.7.9 has no activation hook (§3.1); Imagify 2.3.6 stores `get_current_user_id()` in the `imagify_activation` transient and passes it to `do_action( 'imagify_activation' )`, whose five listeners take no argument; WP Rocket 3.24.3's activation checks `WP_CLI \|\| current_user_can( 'rocket_manage_options' )`, so it already works without a user | cached builds in `~/.apvm/cache` | No current apvm plugin breaks as user 0. D23 matches the dashboard for third-party plugins and `wp run` |
+
 ---
 
 ## 4. Concepts
@@ -595,7 +620,7 @@ Stable codes (CLI `--json`, NAPI `code`):
 |---|---|
 | SSH | `ssh_missing` (also: a program that cannot report OpenSSH's `-G` defaults), `ssh_auth_failed`, `ssh_host_key_unknown`, `ssh_host_key_changed`, `ssh_unreachable`, `ssh_timeout`, `ssh_connection_lost` (rev 16: exit 255 after the script started; the command may have run in part), `ssh_failed` (rev 16: exit 255 for a reason apvm does not recognize, or a host key refused for a reason neither trusting new keys nor removing the known one fixes: an invalid host certificate, an unreadable `RevokedHostKeys` file, a ProxyCommand's own ssh; the kept line says which) |
 | sudo / identity | `sudo_missing`, `sudo_password_required`, `sudo_not_allowed`, `sudo_requiretty`, `owner_is_root`, `plugins_dir_mismatch`, `probe_failed` (P4.2: a probe step printed what apvm cannot read with certainty, or `runuser` failed) |
-| WordPress | `wp_cli_missing`, `not_wordpress`, `wp_not_installed`, `plugins_dir_not_writable`, `multisite_unsupported` |
+| WordPress | `wp_cli_missing`, `not_wordpress`, `wp_not_installed`, `plugins_dir_not_writable`, `multisite_unsupported`, `wp_user_missing` (no eligible administrator, §6.16), `wp_user_invalid` (the site's `wp_user` does not exist or is not eligible) |
 | Execution | `site_locked`, `insufficient_space`, `upload_corrupted`, `wp_command_failed`, `verification_failed`, `state_drifted`, `outcome_unknown`, `health_check_failed`, `timeout`, `file_mods_disallowed` |
 | Ownership / variants | `ownership_unfixable`, `variant_conflict` (two variants of one slug, or two siblings activated together without `--keep-siblings`) |
 | Input | `package_invalid`, `refused_command`, `confirmation_required`, `invalid_input`, `inventory_invalid`, `inventory_unsupported` (a newer inventory this build cannot read), `inventory_read_only` (a change to a newer inventory), `inventory_io` (the inventory file, its lock or its directory cannot be read, written, locked or created, or is not a regular file), `inventory_locked` (another process held the inventory lock for the whole 10 s wait), `inventory_changed` (the file changed since it was loaded; a guarded save wrote nothing; or a `server remove` whose server, sites or their groups changed during the confirmation), `internal_error` (a JSON document could not be built; not expected to happen, it replaces a panic) |
@@ -655,12 +680,12 @@ Every command below is a thin front end over an `apvm-sites` API (§8.1); §11 l
 
 | Command | Arguments | Notes |
 |---|---|---|
-| `site add <ID>` | `--server <ID> --path <WP_ROOT> [--url <URL>] [--wp-cli "<CMD>"] [--run-as auto\|login\|<USER>] [--owner auto\|<USER>[:<GROUP>]] [--ownership mirror\|mirror-root\|check\|off] [--plugins-dir <PATH>] [--allow-root] [--tmp-dir <PATH>] [--timeout <SECS>] [--group <ID>]… [--name <TEXT>] [--notes <TEXT>] [--no-test] [--trust-new-host-key]` | Probes the site by default (§6.2) |
+| `site add <ID>` | `--server <ID> --path <WP_ROOT> [--url <URL>] [--wp-cli "<CMD>"] [--run-as auto\|login\|<USER>] [--owner auto\|<USER>[:<GROUP>]] [--ownership mirror\|mirror-root\|check\|off] [--plugins-dir <PATH>] [--allow-root] [--tmp-dir <PATH>] [--timeout <SECS>] [--wp-user <LOGIN\|EMAIL\|ID> \| --no-wp-user] [--group <ID>]… [--name <TEXT>] [--notes <TEXT>] [--no-test] [--trust-new-host-key]` | Probes the site by default (§6.2) |
 | `site edit <ID>` | the `add` flags (except `--no-test` and `--trust-new-host-key`: an edit never connects, rev 18) + `[--unset <FIELD>]…` | |
 | `site list` | `[--server <ID>] [--group <ID>] [--json]` | |
 | `site show <ID>` | `[--json]` | |
 | `site remove <ID>` | `[-y]` | Also leaves its groups |
-| `site test` | `[<ID>…] [TARGETS] [--trust-new-host-key] [--json] [-j <N>]` | Full read-only probe |
+| `site test` | `[<ID>…] [TARGETS] [--trust-new-host-key] [--json] [-j <N>]` | Full read-only probe, including the WordPress user apvm would act as (§6.16) |
 | `site unlock <ID>` | `[-y]` | Removes a stuck site lock after showing its holder |
 
 **`apvm group` — named lists of sites**
@@ -798,7 +823,7 @@ Run `wp cache flush` on 3 sites (may write)? [y/N]
 |---|---|---|
 | H — host | login user | `id -u`, `id -g`, `id -un`, `id -gn`, `id -G`, `printenv SHELL`; `command -v` of sudo, runuser, sha256sum, shasum, openssl and `<wp_cli>` (one statement each); the **walk** of `<path>/wp-content/plugins` (or the pinned `plugins_dir`): one `sh` process `cd -P`s into it one component at a time, then prints `pwd -P` and `stat -c '%u⏎%g⏎%a⏎%F⏎%U⏎%G' .` (names last; `UNKNOWN` = no name), so path and ownership describe the same directory (P4.2 audits: a separate `realpath` and `stat` let the site swap a link between them). A non-link component must land at the expected physical path; a symbolic link is followed only when it and its directory belong to root or the login user and that directory is writable by neither group nor others (release layouts' `current -> releases/<n>`, `/var/www -> /srv/www`); anything else is `plugins_dir_mismatch`. A diagnostic `stat -L` says why a failed walk failed; BSD `stat -f` is retried only when `-c` is refused as an option. On EACCES root `sudo -n -u root -- stat` of the same path (describes a symlink rather than following it, so anything but `directory` is refused), then, immediately before step W, the identity walks the path itself and must find the owner and group root read; `id -u` of the users `run_as` and `owner` name → reference `(U, G, P)`. No generic `sudo -n -l`: the targeted listing runs only after a refusal |
 | I — identity | — (pure) | the table below; then a probe of the exact command shape: `<prefix> env -u … WP_CLI_CONFIG_PATH=/dev/null PAGER=cat <wp_cli> --skip-packages --exec='umask(…);' --path=… cli version` (built with `WpCli`) |
-| W — WordPress | identity | `wp eval` of a constant snippet (`--skip-plugins --skip-themes`): `WP_CLI_VERSION`, `PHP_VERSION`, WP version, `is_multisite()`, `WP_PLUGIN_DIR`, `WP_CONTENT_DIR`, `siteurl`, `home`, `DISALLOW_FILE_MODS`; failures classified |
+| W — WordPress | identity | `wp eval` of a constant snippet (`--skip-plugins --skip-themes`): `WP_CLI_VERSION`, `PHP_VERSION`, WP version, `is_multisite()`, `WP_PLUGIN_DIR`, `WP_CONTENT_DIR`, `siteurl`, `home`, `DISALLOW_FILE_MODS`, the WordPress user (§6.16; with a set `wp_user`, W runs with `--user=<wp_user>`); failures classified |
 | O — consistency | identity | `realpath(WP_PLUGIN_DIR)` (from W) must equal the step-H path, else `blocked: plugins_dir_mismatch` until the site pins `plugins_dir`. The identity is never switched to what WordPress reports, because wp-config.php and must-use plugins are under the site's control |
 | C — capabilities | identity | `test -w` on the plugins dir and `<content>/upgrade`; `df -Pk` of `remote_tmp_dir` and `WP_CONTENT_DIR`; checksum tool; multisite flag; `siteurl` ≠ `url` → warning |
 
@@ -874,6 +899,8 @@ Rules:
   - `Boots` via `wp option get siteurl` with plugins loaded. Any non-zero exit fails it. WordPress's default fatal handler gives exit 1 with `Error: There has been a critical error on this website.` (§3.5). The message is shown, never relied on: a `fatal-error-handler.php` drop-in or `WP_DISABLE_FATAL_ERROR_HANDLER` changes it.
 - **Drift:** the read verifying step *i* is also step *i+1*'s precondition; a mismatch with the plan → `state_drifted`.
 - **State decides the outcome:** the expected state → `done`, with a warning when the exit code was non-zero or stderr had `^Error:`; an unexpected state → `failed`, whatever the exit code.
+- **WordPress user:** every step that activates, deactivates, installs, uninstalls or deletes runs with `--user=<ID>` from the probe (§6.16); with none resolved (`wp_user_missing`), those items are `blocked` before anything runs. Verification reads never set a user.
+- **Files changed:** each site's report says whether a file-changing step ran (`files_changed`: install, replace, reinstall, uninstall, reset, delete). The CLI then prints once per run: `Note: if PHP-FPM on these servers runs OPcache without timestamp checks (opcache.validate_timestamps=0), reload PHP-FPM to serve the new plugin code.` (D24).
 - **Always-run:** lock release and staging cleanup run on every path.
 - **Events:** each command, exit code and capped output is emitted as an event; `LogFileReporter` writes the run log.
 
@@ -1048,7 +1075,7 @@ Family "backwpup"
 
 | Aspect | Design |
 |---|---|
-| Execution | The arguments become `wp` argv elements, quoted, in a stdin-delivered script: no shell interpretation of `; \| & $() * ~`, any byte but NUL allowed. Runs as the site identity (owner:group), hermetic and with the umask relaxation (§6.1), with apvm's `--path` and the site's `--url` |
+| Execution | The arguments become `wp` argv elements, quoted, in a stdin-delivered script: no shell interpretation of `; \| & $() * ~`, any byte but NUL allowed. Runs as the site identity (owner:group), hermetic and with the umask relaxation (§6.1), with apvm's `--path`, the site's `--url` and the site's WordPress user (`--user=<ID>`, §6.16) unless the arguments carry their own `--user=…`, or `wp_user` is `false`. No user resolved: the command runs without one, with a warning (reads must not need an admin). With a user, content commands follow `kses` as in the dashboard (§3.6) |
 | Allowed overrides | `--url=…` (subsite targeting; must be a valid site URL), `--skip-plugins[=…]`, `--skip-themes[=…]`, `--user=…` (WP user), `--format=…` (not a global), `--debug[=…]`, `--quiet` |
 | Refused params | Every WP-CLI global parameter except the allowed overrides. Notably: `--exec` and `--require` (they run arbitrary PHP and would bypass the classification); `--path` (apvm owns it); `--ssh` and `--http` (would hop elsewhere); `--allow-root` (identity policy); `--prompt` (interactive); `--skip-packages` and `--context` (apvm sets them); `--blog`, `--color`; the bare and `--no-…` forms of every global (`--no-skip-packages` would undo apvm's own); a leading `@alias`. WP-CLI matches names exactly (`--req=`, `--REQUIRE=` are not globals), anywhere in the arguments, after `--` too. Enforced by `WpCli::arg` (`allowlist::wp_cli_arg`) for every caller, not only `wp run` |
 | Refused commands | `shell`, `db cli` (interactive); `server` (long-running); `cli update`, `package …` (WP-CLI itself, not the site); `plugin uninstall … --deactivate` and `plugin deactivate … --uninstall` (break two-phase removal: the error points to `apvm wp uninstall`) |
@@ -1094,6 +1121,24 @@ Family "backwpup"
 - **Per row:** met / not met / undetermined. **Exit:** 1 if any row is not met, else 3 if any is undetermined, else 0 (§5.5). An unreachable site is never reported as "not installed".
 - **Output:** a table, `--json` rows `{site, plugin, status, version, variant, file, check, code}`; `is-*` with `--quiet` print nothing (for `&&` in scripts).
 
+### 6.16 WordPress user (revision 19)
+
+Which WordPress user WP-CLI acts as (`--user`, global parameter). Facts: §3.6.
+
+| `wp_user` | Step W | Result |
+|---|---|---|
+| unset (default) | runs without `--user`; the snippet picks the user | the pick, or none (`wp_user_missing`) |
+| `"<login\|email\|ID>"` | runs with `--user=<value>`; the snippet checks the current user | that user, or the probe fails with `wp_user_invalid` (unknown: WP-CLI's `Invalid user …` error; or not eligible) |
+| `false` | runs without `--user` | none, on purpose (no error) |
+
+- **Eligible:** single site: `WP_User->allcaps` grants `activate_plugins`, `install_plugins` and `delete_plugins` (unmapped, so `DISALLOW_FILE_MODS` does not hide every admin). Multisite: a super admin (`get_super_admins()`). Never `user_can()` (§3.6).
+- **Pick (unset):** single site: users whose roles grant all three capabilities (`get_users`: `role__in`, `orderby ID ASC`, `number 100`), the first one whose `allcaps` is eligible (a user's own `false` grant can override the role). Multisite: the lowest-ID super admin (logins with no user are skipped). Users eligible only through their own grants are not picked (set `wp_user`).
+- **Snippet:** a constant (§10 T1), so no value reaches it: it prints `wp_user` = `{"current": <id or 0>, "current_login": …, "current_eligible": bool, "pick": <id or null>, "pick_login": …}` inside `SITE_FACTS`. Logins are data: validated (≤ 60 characters, no control character) and escaped when shown.
+- **Use:** the resolved numeric ID, `--user=<ID>` (§3.6: unambiguous), on activate, deactivate, install, uninstall, reset, delete (§6.4) and `wp run` (§6.12). Never on reads, step I (`cli version`) or the `Boots` health check, which must work for anyone.
+- **Shown:** `site test` (`WordPress user: admin (#1, picked)` / `(#7, wp_user)` / `none (wp_user: false)` / warning `wp_user_missing`), the confirmation plan header, `--json` (`"wp_user": {"id", "login", "source": "picked"|"configured"} | null`).
+- **Fresh every run:** the probe runs per operation (`Session::open`), so a deleted or demoted admin is never reused, and apvm never writes the pick to the inventory.
+- **`wp_user_missing`** blocks only lifecycle items (fix: `apvm site edit <ID> --wp-user <LOGIN>`, or `--no-wp-user`); `wp run` then runs without a user, with a warning (§6.12); `site test` reports it as a warning, since reads work.
+
 ---
 
 ## 7. Data model — `~/.apvm/inventory.json`
@@ -1126,7 +1171,7 @@ Family "backwpup"
 |---|---|
 | `SshSettings` (defaults / server) | `user`, `port`, `identity_file`, `connect_timeout_secs`, `known_hosts_file`, `ssh_config_file`, `proxy_jump`, `multiplex`; defaults only: `binary` |
 | `Server` | **`id`**, **`host`**, `name`, `ssh`, `notes` |
-| `Site` | **`id`**, **`server`**, **`path`**, `url`, `wp_cli` (`["wp"]`), `run_as` (`auto`), `owner` (`auto` = owner:group of the plugins dir, §6.2), `ownership` (`mirror`; `mirror-root` allows the root rung), `plugins_dir` (pins a non-standard `WP_PLUGIN_DIR`), `allow_root` (`false`), `remote_tmp_dir` (`/tmp`), `command_timeout_secs`, `name`, `notes` |
+| `Site` | **`id`**, **`server`**, **`path`**, `url`, `wp_cli` (`["wp"]`), `run_as` (`auto`), `owner` (`auto` = owner:group of the plugins dir, §6.2), `ownership` (`mirror`; `mirror-root` allows the root rung), `plugins_dir` (pins a non-standard `WP_PLUGIN_DIR`), `allow_root` (`false`), `remote_tmp_dir` (`/tmp`), `command_timeout_secs`, `wp_user` (unset = picked; a login, email or ID; `false` = none, §6.16), `name`, `notes` |
 | `Group` | **`id`**, **`sites`**, `notes` |
 
 | Value | Allowlist | Goes to |
@@ -1142,6 +1187,7 @@ Family "backwpup"
 | `url` | `http(s)://host[:port][/path]`: lowercase scheme; a DNS name (labels 1–63 characters, no leading or trailing `-`), an IPv4 address or `[IPv6]`; path `[A-Za-z0-9._~/-]` and `%`-escapes, with no `.` or `..` segment; no user info, query or fragment; ≤ 2048 bytes | remote |
 | `wp_cli` | `[program]` (a command name, or an absolute canonical path), or `[PHP interpreter, -n/-q…, absolute WP-CLI script]`, at most 4 tokens; tokens of `[A-Za-z0-9._/+-]`, none starting with `-` except the options (the command follows `env`, §6.1) | remote |
 | SSH local paths (`identity_file`, `known_hosts_file`, `ssh_config_file`, `binary`) | `[A-Za-z0-9._/\:+-]`, `~` only as a leading `~/`, no leading `-`, canonical (no empty, `.` or `..` component), ≤ 4096 bytes; `known_hosts_file` is not `none`, `NUL` or `/dev/…`; `binary` only in `defaults.ssh`; `~` expanded and existence checked at use | ssh argv / ssh's shell |
+| `wp_user` | a string of 1–100 characters (`user_email` allows 100, `user_login` 60), no control or invisible formatting character, no leading or trailing space, no leading `-`; or `false` (`true` is refused) | remote (`--user=`, quoted) |
 | `name` / `notes` | 1–128 / 1–1024 characters, no control or invisible formatting (Unicode Cf, Zl, Zp) character | local |
 | slug | `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` | remote |
 | variant marker path / needle (hints, §6.9) | relative, canonical, ≤ 1024 bytes, `[A-Za-z0-9._-]` components ≤ 255 / printable ASCII, ≤ 256 bytes (it may hold `'` and `\`, so it is always quoted) | remote |
@@ -1632,6 +1678,39 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
   - **Audit (rev 18, 2026-10-13; no high or medium finding):** fixed (low): **a host named `revoked…`** whose key changed got the revoked-key remedy: `changed_key` took any line holding "revoked" for a revocation; now only the classifier's two phrases (` was revoked and you have requested strict checking`, ` revoked by file `) do (test `a_host_named_revoked_whose_key_changed_gets_the_removal`, the name and the `CheckHostIP` forms; fails with the old check); **`server test`'s timeout** was 60 s for the whole call, the connection included when it is not shared: with `--no-multiplex --connect-timeout 70` to an unroutable address the test ended as `timeout` at 61 s, remedy "try again", where ssh would have given `ssh_timeout` at 70 s; now `remote::server_test_timeout` = 60 s + connect timeout × (1 + jump hosts) (re-run: `ssh_timeout` at 70 s; unit test of the sum); the duplicated failed-tests summary of `server.rs`/`site.rs` is one `remote::failed_tests`. New E2E test `shared_connections_report_the_new_key_and_carry_every_probe` (multiplexing on, as the CLI's default; the other E2E tests turn it off): `site test -g qa --trust-new-host-key --json` reports the key the master's starter recorded once, both sites ready, `~/.apvm/ssh-mux` `0700` with a socket, then strict checking passes. Docs: `site edit` "never connects" (SKILL.md, references, README), the `timeout` row. Checked and kept: remedies paste only shell-safe text (ids by the inventory's rules; a known_hosts path by `ssh_path`'s `[A-Za-z0-9._/\:+-]`, `~/` first, left unquoted so `~` expands; ssh's name in single quotes, refused when it holds one; a `\` path never reaches ssh on Unix); remote text in reports is escaped by the library (`printable`, the facts' allowlists); the control directory and its `/tmp/apvm-mux-<uid>` fallback (`prepare_dir`: no link, this user's, `0700`-like, ancestors root's or this user's and sticky when shared, P3.4) and a master's tag (the whole file, so `--trust-new-host-key` never rides a strict master or the reverse); one JSON document on every path (`TestFailed` is `reported`); the prompt on a pty (`y` saves with a warning, `^D`/`n` saves nothing, typeahead during the probe kept: no ssh child reads the terminal), without a terminal (`None`), a failed prompt (`Prompt`); Ctrl-C (no handler: the process ends before saving; masters end after their 15 s); a broken stdout (best-effort writes); concurrency (`bounded` polls only its own futures on one thread, slots are per server id and waited before a call's timeout; 8 sites on one server with `-j 32` passed); the save re-checks the record under the lock (a concurrent add of the same id is refused; settings changed elsewhere during the test are not re-tested, as for any edit). Known, not changed: a test within 15 s of another rides its master, so a key changed in known_hosts meanwhile is not re-checked (OpenSSH's own multiplexing behavior); the unknown-key remedy names no fingerprint command (`ssh-keyscan` cannot follow jump hosts or ssh_config aliases); `ssh-keygen -R` without `-f` edits `~/.ssh/known_hosts` only, while apvm also reads `known_hosts2`; `SshTransport::multiplexing()` (why sharing is off) is not shown by the CLI.
 - **Depends:** P4.2, P2.2 · **Parallel:** P5.1, P6.1
 
+#### P4.4 — lib: `wp_user` inventory field
+- **Goal:** store, validate and resolve `wp_user` (§6.16, §7). Effort **S**, difficulty low.
+- **Changes:** `inventory/model.rs`: `Site::wp_user: Option<WpUser>`, `enum WpUser { None, Named(String) }`, serialized as JSON `false` / a string (custom serde: `true`, numbers, arrays and objects are refused; `null` stays "unset", as for every field); the `wp_user` rule in `allowlist/` (§7 row); `inventory/validate.rs` (location `sites[i].wp_user`); `inventory/resolve.rs` (the resolved site carries it).
+- **Edge cases:** a JSON number (`7`) is refused with the hint `quote it: "7"`; the string `"false"` is a login, not the keyword (only JSON `false` means none, so no keyword collision, unlike rev 8's `auto`/`login`); 100 characters pass, 101 fail; a non-ASCII login passes, a Unicode Cf/Zl/Zp character fails. No inventory `version` bump: no release has shipped the inventory yet.
+- **Tests:** round trip of unset / `false` / a login / an email / `"7"`; every refusal with its location; `null` = unset; resolution carries the value.
+- **Depends:** P1 · **Parallel:** P4.7, P5.1, P6.1
+
+#### P4.5 — lib: resolve and pass the WordPress user
+- **Goal:** step W reports the user (§6.16); lifecycle commands carry `--user=<ID>`. Effort **M**, difficulty medium.
+- **Step 0 (harness, before code):** add checks under `tests/e2e/sites/checks/` and record the results in §3.6 with their check names: `wp --user=1 eval 'echo get_current_user_id();'` prints `1`; an unknown user gives the §3.6 error and exit 1; a numeric login colliding with an ID prints the `Ambiguous` warning on stderr only (stdout unchanged); under `DISALLOW_FILE_MODS` the admin's `allcaps` still grants `install_plugins` while `user_can()` refuses; on the `multi` site the pick is the super admin; `--user` works together with `--skip-plugins --skip-themes`. A result that differs from §3.6 changes this phase before any code.
+- **Changes:**
+  - `wp/snippets.rs`: `SITE_FACTS` prints the `wp_user` object (§6.16) as its 12th key (`SITE_FACTS_KEYS`); still one constant line (the existing snippet tests apply).
+  - `wp/parse.rs`: parse it strictly: ids are `u64`, `pick` > 0 or `null`, `current` ≥ 0; a login is ≤ 60 characters with no control character, or `null` (unencodable: shown as `#<id>`).
+  - `wp/probe.rs`: W adds `--user=<wp_user>` when set; `Error: Invalid user ID, email or login:` → `wp_user_invalid` (new code in `error.rs`); a configured user with `current_eligible: false` → `wp_user_invalid` naming the missing capability or "not a super admin"; `current: 0` with a configured user → `probe_failed` (WP-CLI should have refused). `SiteProbe::wp_user: Option<ResolvedWpUser { id, login, source }>`; unset with no pick → `ProbeWarning::WpUserMissing`.
+  - `remote/script.rs`: `WpCli::user(NonZeroU64)` renders `--user=<id>` right after `--url` (fixed order, golden).
+  - `session.rs`: `run_on` adds the user to lifecycle kinds (`CommandKind::targets_plugin` and install); with none and `wp_user` not `false` → `wp_user_missing`, nothing runs. Reads and `cli version` are unchanged.
+  - `tests/support/fake-remote/fake-wp`: honor `--user` and print the new key.
+- **Tests:** a parser table (every field and refusal); probe over `FakeTransport` for each §6.16 row (picked, configured, `false`, missing, unknown, not eligible); `--user=` goldens per identity; `run_on` refuses a lifecycle command without a user and adds `--user` with one; reads carry no `--user`; E2E: the Step 0 checks.
+- **Depends:** P4.2, P4.4 · **Parallel:** P4.7, P5.1, P6.1
+
+#### P4.6 — cli: `--wp-user`, `--no-wp-user`, the user in `site test`
+- **Goal:** set and see the user from the CLI. Effort **S**, difficulty low.
+- **Changes:** `commands/site/fields.rs` (`--wp-user <LOGIN|EMAIL|ID>` conflicts with `--no-wp-user`; `--unset wp-user`), `site/render.rs` (`show`/`list`: `picked` when unset, `none` for `false`), the `site test` renderer (`WordPress user:` line and `--json` `wp_user`, §6.16), remedies for both codes; `SKILL.md` + `references/sites.md`; CLAUDE.md's skill-maintenance flag list for `site` (`--wp-user`, `--no-wp-user`, `--unset wp-user`).
+- **Edge cases:** `--wp-user ""` → `to clear it: --unset wp-user`; `--wp-user false` stores the login `false` (only `--no-wp-user` means none; the skill says so); setting and unsetting in one command is refused (existing rule).
+- **Tests:** clap conflicts; add/edit/unset round trips; `show`/`list` text and `--json`; `site test` over the fake `Remote` for picked, configured, none, missing (warning, exit 0) and invalid (failure, exit 1).
+- **Depends:** P2.2, P4.3, P4.5 · **Parallel:** P4.7, P5.x, P6.1
+
+#### P4.7 — napi: `wpUser` on `SiteInventory`
+- **Goal:** the field from Node. Effort **XS**, difficulty low.
+- **Changes:** `sites_types.rs` (`wpUser?: string | false`, napi `Either<String, bool>`), `sites_input.rs` (`true` → `InvalidArg` with the location), `__tests__/`. Generated `index.d.ts`/`.node` files stay uncommitted (CLAUDE.md).
+- **Tests:** round trip of unset / `false` / a login; `true` and a number refused; `null` = unset.
+- **Depends:** P2.4, P4.4 · **Parallel:** P4.5, P4.6
+
 ### P5 — Read path
 
 #### P5.1 — lib: fan-out runner, events, log reporter (+ cli renderer)
@@ -1656,7 +1735,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 #### P5.4 — napi: `SiteManager` (create, probe, listPlugins, status, isInstalled, isActive) + `apvm.sites()`
 - **Goal:** the read path from Node.
 - **Changes:** `sites.rs`, `sites_progress.rs` (ThreadsafeFunction, same as `JsProgressReporter`), `__tests__/sites.test.ts` (hermetic, skipped on Windows).
-- **Tests:** report shapes, events, rejection codes (`Undetermined` for `isActive` on an unreachable site), hints included.
+- **Tests:** report shapes, events, rejection codes (`Undetermined` for `isActive` on an unreachable site), hints included; the probe result's `wpUser` (`{ id, login, source }` or `null`, §6.16).
 - **Depends:** P5.3, P2.4 · **Parallel:** P6.x
 
 ### P6 — Lifecycle engine (lib)
@@ -1680,8 +1759,9 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
   - a variant switch deactivates before it activates;
   - a failed deactivation blocks its family members' pass 2 in the same batch only, not unrelated items;
   - transport loss → done/failed/unknown; the expected state with a non-zero exit or `Error:` → done + warning; an unexpected state → failed, whatever the exit code;
-  - drift; health failure; hermetic fake-wp run.
-- **Depends:** P6.1, P5.1 · **Parallel:** P8.1
+  - drift; health failure; hermetic fake-wp run;
+  - every lifecycle step carries `--user=<ID>`, verification reads and `Boots` none; `wp_user_missing` blocks lifecycle items only; `files_changed` per site (§6.4, §6.16).
+- **Depends:** P6.1, P5.1, P4.5 · **Parallel:** P8.1
 
 #### P6.3 — Ownership, group, group access
 - **Goal:** §6.8 check + repair ladder.
@@ -1715,7 +1795,8 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 #### P7.1 — cli: shared plumbing
 - **Goal:** consistent plan/confirm/result UX.
 - **Changes:** `commands/wp/args.rs` (`PluginArgs`, `--dry-run`, `-y`, `--json`, `-j`), plan/result renderers, confirmation rules, JSON (`"schema": 1`).
-- **Tests:** snapshots (`NO_COLOR`), confirmation matrix, JSON shape.
+- **Also (rev 19):** the plan header names the WordPress user per site (§6.16); the OPcache note prints once after a run with `files_changed` (§6.4), never with `--json` (the field is there).
+- **Tests:** snapshots (`NO_COLOR`), confirmation matrix, JSON shape; the note (shown once, only after file changes, never in `--json`).
 - **Depends:** P6.2, P5.2 · **Parallel:** P6.3, P6.4, P8.1
 
 #### P7.2 — cli: `apvm wp activate | deactivate`
@@ -1819,6 +1900,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** §6.12 in the library.
 - **Changes:** `wp/classify.rs`, `ops/run.rs`, `SiteManager::run_wp`.
 - **Tests:** classification tables (read-only paths at depth 1–3, `--dry-run` cases incl. `search-replace --dry-run --log/--export` → may-write, every global parameter outside the allowed overrides refused incl. `--exec`/`--require` in any position and `--exec=…` forms, refused commands, `@alias`, two-phase violators); every `wp run` takes the lock; single-target exit codes (WP-CLI's, 254, 255 = not run); hermetic run with arguments holding quotes, backslashes, newlines and `$()` arriving verbatim; a read-only command also acquires and releases the lock, waits for a busy one and then fails with `site_locked`; the lock is released on every exit path; timeouts; per-site results.
+- **WordPress user (rev 19):** `--user=<ID>` from the probe unless the arguments carry `--user=…` (never both) or `wp_user` is `false`; none resolved → runs without, with a warning. Tests for each case.
 - **Audit notes (rev 14):** `WpCli::arg` already enforces §6.12's global-parameter rule (`allowlist::wp_cli_arg`); the classifier adds the command rules. Treat `post edit`, `config edit` and `--edit` as refused or `may-write` (they run `$EDITOR`, which apvm now unsets). `help` is safe (`PAGER=cat`).
 - **Depends:** P6.4 · **Parallel:** P7.x, P8.x
 
@@ -1840,6 +1922,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** §6.11 in probe + planner.
 - **Changes:** snippets (headers, subsite activations), probe/plan rules.
 - **Tests:** multisite planner tables; snippet parsing; `--network` on a single site → input error.
+- **WordPress user (rev 19):** network activation and deactivation need a super admin; P4.5's pick already is one on multisite. Test that a configured non-super-admin is `wp_user_invalid` on `multi`.
 - **Audit notes (rev 10):** subsites added as separate sites with the same `path` raise the same-WordPress warning (§4.2). That is correct (one plugins directory); document it in the multisite docs.
 - **Depends:** P6.1, P4.2 · **Parallel:** P7.x, P8.x, P9.x
 
@@ -1853,7 +1936,7 @@ Tracks: **lib** = `apvm-sites`/core, **cli**, **napi**.
 - **Goal:** ship.
 - **Changes:**
   - root `README.md`; `crates/{sites,cli,core,napi}/README.md`;
-  - final `SKILL.md` + `references/sites.md` (sudoers recipes incl. FTP-owned sites, requirements, codes);
+  - final `SKILL.md` + `references/sites.md` (sudoers recipes incl. FTP-owned sites, requirements, codes, the WordPress user, the OPcache limitation, D24);
   - version 3.4.0 in `Cargo.toml`/`Cargo.lock`/`package.json`/`package-lock.json`/`SKILL.md`;
   - tag `v3.4.0` after CI is green.
 - **Depends:** P0–P10 · **Parallel:** —
@@ -1877,9 +1960,11 @@ P1.1 ┬ P1.2 ┬ P2.1 ─ P2.2 ─ P2.3 ─────────────
      ├ P1.5 ─────────────┐                    │              │
      └ P3.1 ┬ P3.2 ─ P3.3 ─ P3.4              │              │
             └ P4.1 ─ P4.2 ┬ P4.3              │              │
+                          ├ P4.5(+P4.4) ─ P4.6(+P2.2, P4.3)
                           ├ P5.1 ─ P5.2 ◄─────┘ ─ P5.3 ─ P5.4 ◄─────┘
                           ├ P8.1
-P4.1+P1.5 ─ P6.1 ─ P6.2(+P5.1) ┬ P6.3 ┐
+P1 ─ P4.4 ;  P4.4+P2.4 ─ P4.7
+P4.1+P1.5 ─ P6.1 ─ P6.2(+P5.1, P4.5) ┬ P6.3 ┐
                                └ P6.4 ┴─ P7.5(+P5.4)
 P6.2+P5.2 ─ P7.1 ─ P7.2(+P6.4) ─ P7.3(+P6.3) ;  P7.1+P6.3+P6.4 ─ P7.4
 P8.1+P6.3+P6.4 ─ P8.2 ┬ P8.3(+P7.1) ─ P8.6(+P8.5)
@@ -1925,13 +2010,15 @@ all ─ P11 ─ P12
 | 3 | Variants (revised in rev 3) | Free and pro fully independent: nothing is blocked because of a sibling, both may be installed or active; activation next to an active sibling switches by default, `--keep-siblings` keeps both; pro-de/pro-en (same slug) conflict, `--force` replaces |
 | 4 | Identity | `run_as = auto`: owner **and group** of the plugins dir; `login` kept as an option |
 | 5 | Inventory file | `~/.apvm/inventory.json` |
+| 6 | WordPress user (2026-11-23) | D23: `wp_user`, else the lowest-ID eligible admin (super admin on multisite), picked every run, never saved |
+| 7 | OPcache (2026-11-23) | D24: documented + one note after file changes; no cache reset |
 
 ---
 
 ## Sources
 
-- WP-CLI handbook (Context7 `/wp-cli/handbook`); `wp-cli/extension-command` `Plugin_Command.php`, `CommandWithUpgrade.php`, releases; `wp-cli/wp-cli` `utils.php`, `Runner.php`, releases.
-- WordPress `wp-admin/includes/class-wp-upgrader.php`, `file.php`, `plugin.php`.
+- WP-CLI handbook (Context7 `/wp-cli/handbook`); `wp-cli/extension-command` `Plugin_Command.php`, `CommandWithUpgrade.php`, releases; `wp-cli/wp-cli` `utils.php`, `Runner.php`, `Fetchers/{User,Base}.php` (v2.12.0), releases.
+- WordPress `wp-admin/includes/class-wp-upgrader.php`, `file.php`, `plugin.php`; 7.1.3 `wp-includes/{capabilities,class-wp-user,class-wp-user-query,kses}.php`.
 - ssh(1), ssh_config(5), sshd(8), sshd_config(5) (OpenBSD); sudo(8), sudoers(5) (sudo.ws); GNU coreutils `chown`.
 - zip crate docs (Context7 `/websites/rs_zip_zip`).
 - Local artifacts: `~/.apvm/cache/backwpup/commits/9.99.99/1dceea8/*` (pro-de/pro-en full-tree diff), `releases/5.7.6/*`.
